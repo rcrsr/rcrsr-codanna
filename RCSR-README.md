@@ -12,7 +12,12 @@ upstream base. For the how, see the commit history.
 `codanna serve --proxy` lets several MCP clients share a single backing server
 for a workspace instead of each starting its own. Point every client at the
 proxy: the first one starts (or discovers) a backing server for the workspace,
-and the rest attach to it. When you close them, the shared server goes with them.
+and the rest attach to it.
+
+The backing server is started as a detached background process and keeps running
+after the clients disconnect, so the next client reattaches to the warm index
+instead of paying startup again. It is not shut down automatically — stop it
+yourself when you're done with the workspace (or leave it running).
 
 ```bash
 codanna serve --proxy
