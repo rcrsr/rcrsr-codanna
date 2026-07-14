@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **serve proxy mode:** stdio<->HTTP delegation discovering or spawning workspace MCP servers for multi-client sharing with HTTPS endpoint pinning. ([#1](https://github.com/rcrsr/rcrsr-codanna/pull/1))
+
 ## [0.9.23] - 2026-07-03
 
 Resolver precision release. Resolved-relationship counts drop across the board, and the drop is the fix: method-call edges that resolve now target the call site's actual receiver, method calls whose receiver type cannot be named return nothing instead of a guess, and resolution output is deterministic run to run. On the recall side, Python imports resolve across package boundaries and re-exports, and `super()` calls resolve to the parent's method instead of the caller's own override.
