@@ -36,6 +36,21 @@ health_poll_ms = 100    # how often to poll for readiness while waiting
 The defaults shown above apply when the keys are absent, so an initialized
 workspace works with no `[server]` block at all.
 
+### Ports
+
+When the proxy auto-spawns a backing server, it binds a random free port on
+`127.0.0.1` (the OS assigns it). You never choose or need that port: the server
+records it, and the proxy reads the record to connect. Your MCP clients only ever
+talk to the proxy over stdio, so nothing on your side depends on the number.
+
+If you start a backing server yourself instead (`codanna serve --http` /
+`--https`), it uses the normal bind address — `--bind`, or `[server] bind` in
+`settings.toml`, defaulting to `127.0.0.1:8080` for HTTP and `127.0.0.1:8443` for
+HTTPS. All backing servers listen on loopback only; nothing is exposed off-host.
+
+That port serves the MCP protocol (plus a `/health` check) — it is not a browser
+dashboard or web UI. There is no separate web/UI port.
+
 ```bash
 codanna serve --proxy
 ```
