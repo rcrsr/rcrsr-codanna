@@ -48,9 +48,6 @@ If you start a backing server yourself instead (`codanna serve --http` /
 `settings.toml`, defaulting to `127.0.0.1:8080` for HTTP and `127.0.0.1:8443` for
 HTTPS. All backing servers listen on loopback only; nothing is exposed off-host.
 
-That port serves the MCP protocol (plus a `/health` check) — it is not a browser
-dashboard or web UI. There is no separate web/UI port.
-
 ```bash
 codanna serve --proxy
 ```
