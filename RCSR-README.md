@@ -4,8 +4,8 @@ This is a fork of [`bartolli/codanna`](https://github.com/bartolli/codanna). Thi
 file lists what the fork adds or changes for you as a user, on top of its
 upstream base. For the how, see the commit history.
 
-- **Upstream base:** `codanna` v0.9.23
-- **Fork build:** `0.9.23+rcrsr.1` (see [Identifying the fork](#identifying-the-fork))
+- **Upstream base:** the latest `codanna` release the fork is built on
+- **Fork build:** the upstream version with a `+rcrsr.N` suffix (see [Identifying the fork](#identifying-the-fork))
 
 ## Proxy mode: one backing server per workspace
 
@@ -28,17 +28,17 @@ is unchanged.
 
 ## Identifying the fork
 
-Fork builds report a version of `0.9.23+rcrsr.N`, so you can tell a fork build
-from an upstream one:
+Fork builds carry a `+rcrsr.N` suffix on the upstream version, so you can tell a
+fork build from an upstream one:
 
 ```bash
-codanna --version        # -> codanna 0.9.23+rcrsr.1
+codanna --version        # e.g. codanna <upstream-version>+rcrsr.N
 ```
 
 MCP clients see the same string in the `initialize` handshake, so a connected
 client can confirm which build it is talking to. The `+rcrsr.N` suffix is build
-metadata — it does not change how the version compares, so `0.9.23+rcrsr.1`
-counts as the same release as upstream `0.9.23`. `N` is just a running count of
-fork additions on the current upstream base.
+metadata — it does not change how the version compares, so a fork build counts as
+the same release as the upstream version it is built on. `N` is just a running
+count of fork additions on the current upstream base.
 
 Everything not listed here behaves as it does in upstream codanna.
