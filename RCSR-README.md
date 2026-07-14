@@ -19,6 +19,23 @@ after the clients disconnect, so the next client reattaches to the warm index
 instead of paying startup again. It is not shut down automatically — stop it
 yourself when you're done with the workspace (or leave it running).
 
+### Configuration
+
+The workspace must be initialized (`codanna init` writes `.codanna/settings.toml`);
+the proxy refuses to auto-spawn a backing server for a tree that has no config.
+Proxy behavior is controlled by the `[server]` section of that file:
+
+```toml
+[server]
+auto_spawn = true       # let the proxy start a backing server when none is found;
+                        # set false to require starting `codanna serve --http --watch` yourself
+spawn_timeout_ms = 8000 # how long to wait for a spawned server to become ready
+health_poll_ms = 100    # how often to poll for readiness while waiting
+```
+
+The defaults shown above apply when the keys are absent, so an initialized
+workspace works with no `[server]` block at all.
+
 ```bash
 codanna serve --proxy
 ```
