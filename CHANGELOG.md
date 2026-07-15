@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **serve proxy mode:** stdio<->HTTP delegation discovering or spawning workspace MCP servers for multi-client sharing with HTTPS endpoint pinning. ([#1](https://github.com/rcrsr/rcrsr-codanna/pull/1))
+- **MCP reindex tool:** server-driven in-place force-reindex exposed as a first-class tool in list_tools across all serve modes. ([#3](https://github.com/rcrsr/rcrsr-codanna/pull/3))
 
 ## [0.9.23] - 2026-07-03
 
