@@ -110,7 +110,8 @@ impl ClientHandler for NotificationRelay {
         params: LoggingMessageNotificationParam,
         _context: NotificationContext<RoleClient>,
     ) {
-        if let Some(peer) = self.downstream.lock().await.as_ref() {
+        let peer = { self.downstream.lock().await.as_ref().cloned() };
+        if let Some(peer) = peer {
             // Logging notifications are deprecated by SEP-2577; forward them
             // anyway for client compatibility, mirroring `CodeIntelligenceServer`.
             #[allow(deprecated)]
@@ -123,25 +124,29 @@ impl ClientHandler for NotificationRelay {
         params: ResourceUpdatedNotificationParam,
         _context: NotificationContext<RoleClient>,
     ) {
-        if let Some(peer) = self.downstream.lock().await.as_ref() {
+        let peer = { self.downstream.lock().await.as_ref().cloned() };
+        if let Some(peer) = peer {
             let _ = peer.notify_resource_updated(params).await;
         }
     }
 
     async fn on_resource_list_changed(&self, _context: NotificationContext<RoleClient>) {
-        if let Some(peer) = self.downstream.lock().await.as_ref() {
+        let peer = { self.downstream.lock().await.as_ref().cloned() };
+        if let Some(peer) = peer {
             let _ = peer.notify_resource_list_changed().await;
         }
     }
 
     async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
-        if let Some(peer) = self.downstream.lock().await.as_ref() {
+        let peer = { self.downstream.lock().await.as_ref().cloned() };
+        if let Some(peer) = peer {
             let _ = peer.notify_tool_list_changed().await;
         }
     }
 
     async fn on_prompt_list_changed(&self, _context: NotificationContext<RoleClient>) {
-        if let Some(peer) = self.downstream.lock().await.as_ref() {
+        let peer = { self.downstream.lock().await.as_ref().cloned() };
+        if let Some(peer) = peer {
             let _ = peer.notify_prompt_list_changed().await;
         }
     }
@@ -151,7 +156,8 @@ impl ClientHandler for NotificationRelay {
         params: ProgressNotificationParam,
         _context: NotificationContext<RoleClient>,
     ) {
-        if let Some(peer) = self.downstream.lock().await.as_ref() {
+        let peer = { self.downstream.lock().await.as_ref().cloned() };
+        if let Some(peer) = peer {
             let _ = peer.notify_progress(params).await;
         }
     }
@@ -164,6 +170,29 @@ impl ClientHandler for NotificationRelay {
 struct DelegatingProxyHandler {
     upstream: Arc<RunningService<RoleClient, NotificationRelay>>,
     downstream: Arc<Mutex<Option<Peer<RoleServer>>>>,
+}
+
+/// Maximum time to wait for a single delegated upstream call. A hung
+/// upstream must not leave the stdio client's request pending forever; this
+/// is a fixed budget rather than a new config knob, kept minimal per scope.
+const UPSTREAM_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Awaits `fut` under [`UPSTREAM_CALL_TIMEOUT`], mapping both delegation
+/// failures and timeout expiry to the `McpError` shape `ServerHandler`
+/// methods return.
+async fn with_upstream_timeout<T>(
+    fut: impl std::future::Future<Output = Result<T, ServiceError>>,
+) -> Result<T, McpError> {
+    match tokio::time::timeout(UPSTREAM_CALL_TIMEOUT, fut).await {
+        Ok(result) => result.map_err(map_service_err),
+        Err(_) => Err(McpError::internal_error(
+            format!(
+                "delegated upstream call timed out after {}s",
+                UPSTREAM_CALL_TIMEOUT.as_secs()
+            ),
+            None,
+        )),
+    }
 }
 
 impl ServerHandler for DelegatingProxyHandler {
@@ -203,10 +232,7 @@ impl ServerHandler for DelegatingProxyHandler {
         request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        self.upstream
-            .list_tools(request)
-            .await
-            .map_err(map_service_err)
+        with_upstream_timeout(self.upstream.list_tools(request)).await
     }
 
     async fn call_tool(
@@ -214,10 +240,7 @@ impl ServerHandler for DelegatingProxyHandler {
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.upstream
-            .call_tool(request)
-            .await
-            .map_err(map_service_err)
+        with_upstream_timeout(self.upstream.call_tool(request)).await
     }
 
     async fn list_resources(
@@ -225,10 +248,7 @@ impl ServerHandler for DelegatingProxyHandler {
         request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
-        self.upstream
-            .list_resources(request)
-            .await
-            .map_err(map_service_err)
+        with_upstream_timeout(self.upstream.list_resources(request)).await
     }
 
     async fn list_resource_templates(
@@ -236,10 +256,7 @@ impl ServerHandler for DelegatingProxyHandler {
         request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourceTemplatesResult, McpError> {
-        self.upstream
-            .list_resource_templates(request)
-            .await
-            .map_err(map_service_err)
+        with_upstream_timeout(self.upstream.list_resource_templates(request)).await
     }
 
     async fn read_resource(
@@ -247,10 +264,7 @@ impl ServerHandler for DelegatingProxyHandler {
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, McpError> {
-        self.upstream
-            .read_resource(request)
-            .await
-            .map_err(map_service_err)
+        with_upstream_timeout(self.upstream.read_resource(request)).await
     }
 
     async fn list_prompts(
@@ -258,10 +272,7 @@ impl ServerHandler for DelegatingProxyHandler {
         request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListPromptsResult, McpError> {
-        self.upstream
-            .list_prompts(request)
-            .await
-            .map_err(map_service_err)
+        with_upstream_timeout(self.upstream.list_prompts(request)).await
     }
 
     async fn get_prompt(
@@ -269,10 +280,7 @@ impl ServerHandler for DelegatingProxyHandler {
         request: GetPromptRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<GetPromptResult, McpError> {
-        self.upstream
-            .get_prompt(request)
-            .await
-            .map_err(map_service_err)
+        with_upstream_timeout(self.upstream.get_prompt(request)).await
     }
 
     async fn complete(
@@ -280,10 +288,7 @@ impl ServerHandler for DelegatingProxyHandler {
         request: CompleteRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<CompleteResult, McpError> {
-        self.upstream
-            .complete(request)
-            .await
-            .map_err(map_service_err)
+        with_upstream_timeout(self.upstream.complete(request)).await
     }
 
     async fn set_level(
@@ -291,10 +296,7 @@ impl ServerHandler for DelegatingProxyHandler {
         request: SetLevelRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
-        self.upstream
-            .set_level(request)
-            .await
-            .map_err(map_service_err)
+        with_upstream_timeout(self.upstream.set_level(request)).await
     }
 
     async fn subscribe(
@@ -302,10 +304,7 @@ impl ServerHandler for DelegatingProxyHandler {
         request: SubscribeRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
-        self.upstream
-            .subscribe(request)
-            .await
-            .map_err(map_service_err)
+        with_upstream_timeout(self.upstream.subscribe(request)).await
     }
 
     async fn unsubscribe(
@@ -313,10 +312,7 @@ impl ServerHandler for DelegatingProxyHandler {
         request: UnsubscribeRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
-        self.upstream
-            .unsubscribe(request)
-            .await
-            .map_err(map_service_err)
+        with_upstream_timeout(self.upstream.unsubscribe(request)).await
     }
 
     async fn on_custom_request(
@@ -324,18 +320,19 @@ impl ServerHandler for DelegatingProxyHandler {
         request: CustomRequest,
         _context: RequestContext<RoleServer>,
     ) -> Result<CustomResult, McpError> {
-        match self
-            .upstream
-            .peer()
-            .send_request(ClientRequest::CustomRequest(request))
-            .await
-        {
-            Ok(ServerResult::CustomResult(custom)) => Ok(custom),
-            Ok(other) => Err(McpError::internal_error(
+        let result = with_upstream_timeout(
+            self.upstream
+                .peer()
+                .send_request(ClientRequest::CustomRequest(request)),
+        )
+        .await?;
+
+        match result {
+            ServerResult::CustomResult(custom) => Ok(custom),
+            other => Err(McpError::internal_error(
                 format!("unexpected upstream response to custom request: {other:?}"),
                 None,
             )),
-            Err(e) => Err(map_service_err(e)),
         }
     }
 }
@@ -345,7 +342,20 @@ impl ServerHandler for DelegatingProxyHandler {
 /// No `IndexFacade` is constructed in this process: discovery/spawn of the
 /// backing HTTP server (and all index state) lives entirely in the process
 /// `serve_discovery::discover_or_spawn` finds or launches.
-pub async fn serve_proxy(config: Settings) -> ProxyResult<()> {
+pub async fn serve_proxy(
+    config: Settings,
+    config_path: Option<std::path::PathBuf>,
+) -> ProxyResult<()> {
+    // `serve_proxy` can be invoked from contexts other than `main.rs`'s own
+    // provider install (it is re-exported from `crate::mcp`). Installing
+    // idempotently here guards against a panic on the first
+    // `reqwest::Client` built by rmcp's bundled HTTP transport when this
+    // function is the entry point. Mirrors the install in `main.rs`.
+    #[cfg(feature = "https-server")]
+    {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
     let workspace_root =
         serve_discovery::resolve_workspace_root(&config).ok_or(ProxyError::NoWorkspaceRoot)?;
 
@@ -353,7 +363,9 @@ pub async fn serve_proxy(config: Settings) -> ProxyResult<()> {
         "Proxy: discovering backing HTTP MCP server for {}",
         workspace_root.display()
     );
-    let record = serve_discovery::discover_or_spawn(&workspace_root, &config).await?;
+    let record =
+        serve_discovery::discover_or_spawn(&workspace_root, &config, config_path.as_deref())
+            .await?;
     eprintln!(
         "Proxy: delegating to backing MCP server at {}://127.0.0.1:{} (pid {})",
         record.scheme.as_str(),

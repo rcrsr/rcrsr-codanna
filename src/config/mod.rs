@@ -263,10 +263,6 @@ pub struct ServerConfig {
     #[serde(default = "default_auto_spawn")]
     pub auto_spawn: bool,
 
-    /// Idle timeout for the auto-spawned server, in seconds (0 = never)
-    #[serde(default = "default_idle_timeout_secs")]
-    pub idle_timeout_secs: u64,
-
     /// Timeout for spawning the backing server, in milliseconds
     #[serde(default = "default_spawn_timeout_ms")]
     pub spawn_timeout_ms: u64,
@@ -423,7 +419,6 @@ impl Default for ServerConfig {
             bind: default_bind_address(),
             watch_interval: default_watch_interval(),
             auto_spawn: default_auto_spawn(),
-            idle_timeout_secs: default_idle_timeout_secs(),
             spawn_timeout_ms: default_spawn_timeout_ms(),
             health_poll_ms: default_health_poll_ms(),
         }
@@ -672,7 +667,6 @@ mode = "stdio"
         assert_eq!(server.bind, default_bind_address());
         assert_eq!(server.watch_interval, default_watch_interval());
         assert!(server.auto_spawn);
-        assert_eq!(server.idle_timeout_secs, 0);
         assert_eq!(server.spawn_timeout_ms, 8000);
         assert_eq!(server.health_poll_ms, 100);
     }
@@ -689,7 +683,6 @@ mode = "proxy"
         let round_tripped: ServerConfig = toml::from_str(&serialized).unwrap();
         assert_eq!(round_tripped.mode, "proxy");
         assert_eq!(round_tripped.auto_spawn, server.auto_spawn);
-        assert_eq!(round_tripped.idle_timeout_secs, server.idle_timeout_secs);
         assert_eq!(round_tripped.spawn_timeout_ms, server.spawn_timeout_ms);
         assert_eq!(round_tripped.health_poll_ms, server.health_poll_ms);
     }

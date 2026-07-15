@@ -3,18 +3,20 @@
 //! When an HTTP MCP server starts for a project tree, it writes a small
 //! `.codanna/serve.json` record `{pid, port}` so other tools (e.g. the CLI
 //! proxy) can discover a running server without guessing ports. The record
-//! is written atomically (temp file + rename) at mode 0600 and removed on
-//! graceful shutdown.
+//! is written atomically (temp file + rename) and removed on graceful
+//! shutdown. On Unix, permissions are tightened to mode 0600 as a
+//! best-effort privacy measure before the file is made visible; this
+//! tightening does not apply on non-Unix platforms.
 
 use std::fs::OpenOptions;
-use std::io::{self, Read, Write};
-use std::net::TcpStream;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::config::Settings;
 
@@ -151,13 +153,15 @@ fn record_path(codanna_dir: &Path) -> PathBuf {
     codanna_dir.join("serve.json")
 }
 
-/// Write `record` to `<codanna_dir>/serve.json` atomically at mode 0600.
+/// Write `record` to `<codanna_dir>/serve.json` atomically.
 ///
-/// The record is first written to a sibling temp file, permissions are set,
-/// then it is renamed into place. This mirrors the `PidLockGuard` acquire
-/// discipline: a partial write (e.g. a crash mid-write) can never be
-/// observed as a corrupt `serve.json` because the rename is the only
-/// operation that makes the file visible under its final name.
+/// The record is first written to a sibling temp file; on Unix its
+/// permissions are tightened to mode 0600 as a best-effort privacy measure
+/// (not applied on non-Unix platforms), then it is renamed into place. This
+/// mirrors the `PidLockGuard` acquire discipline: a partial write (e.g. a
+/// crash mid-write) can never be observed as a corrupt `serve.json` because
+/// the rename is the only operation that makes the file visible under its
+/// final name.
 pub fn write_record(codanna_dir: &Path, record: &ServeRecord) -> DiscoveryResult<()> {
     std::fs::create_dir_all(codanna_dir).map_err(|source| DiscoveryError::CreateDir {
         path: codanna_dir.to_path_buf(),
@@ -239,9 +243,51 @@ enum Decision {
 /// alive (crashed/killed server, stale leftover) both resolve to `Spawn`.
 fn decide(record: Option<&ServeRecord>) -> Decision {
     match record {
-        Some(r) if pid_is_alive(r.pid) => Decision::Discover,
+        Some(r) if pid_is_alive(r.pid) && pid_looks_like_codanna_serve(r) => Decision::Discover,
         _ => Decision::Spawn,
     }
+}
+
+/// For `Http` records, verify the recorded PID's command line looks like a
+/// codanna serve process before trusting it. A bare PID-alive check has no
+/// binding between a `serve.json` record and the process that actually wrote
+/// it -- a stale record naming a PID number that the OS has since reused for
+/// an unrelated process would otherwise be blindly trusted.
+///
+/// Deliberately does NOT require a literal `--http` token: `codanna serve`
+/// can enter HTTP mode via `server.mode = "http"` in `settings.toml` with no
+/// CLI flag at all (`resolve_server_mode` in `cli::commands::serve`), so a
+/// legitimately-running HTTP server's cmdline may never contain `--http`.
+/// The record's own `scheme` field already carries which mode was recorded;
+/// this check only needs to confirm the PID is *some* codanna serve process.
+///
+/// Not applied to `Https` records: their identity is already established
+/// out-of-band by the pinned certificate (`serve_tls::pinned_client`), so no
+/// additional cmdline check is needed there.
+fn pid_looks_like_codanna_serve(record: &ServeRecord) -> bool {
+    if record.scheme != ServeScheme::Http {
+        return true;
+    }
+
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    let mut sys = System::new();
+    let pid = Pid::from_u32(record.pid);
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
+    );
+    let Some(process) = sys.process(pid) else {
+        return false;
+    };
+
+    let cmdline = process
+        .cmd()
+        .iter()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ");
+    cmdline.contains("codanna") && cmdline.contains("serve")
 }
 
 /// PID lockfile guard shared by the stdio serve lock (`.codanna/index/serve.lock`,
@@ -362,29 +408,46 @@ async fn check_health(port: u16, scheme: ServeScheme) -> bool {
     match scheme {
         ServeScheme::Http => {
             let addr = format!("127.0.0.1:{port}");
-            let Ok(socket_addr) = addr.parse() else {
-                return false;
-            };
-            let Ok(mut stream) =
-                TcpStream::connect_timeout(&socket_addr, Duration::from_millis(500))
+            let budget = Duration::from_millis(500);
+
+            let Ok(Ok(mut stream)) =
+                tokio::time::timeout(budget, tokio::net::TcpStream::connect(&addr)).await
             else {
                 return false;
             };
-            let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-            let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
 
-            let request = format!(
-                "GET /health HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
-            );
-            if stream.write_all(request.as_bytes()).is_err() {
+            let request =
+                format!("GET /health HTTP/1.0\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+            if tokio::time::timeout(budget, stream.write_all(request.as_bytes()))
+                .await
+                .is_err()
+            {
                 return false;
             }
 
-            let mut buf = [0u8; 32];
-            let Ok(n) = stream.read(&mut buf) else {
-                return false;
+            // Read in a loop until the status line (terminated by "\r\n") has
+            // been fully received or the timeout budget expires -- a single
+            // `read` call is not guaranteed to return the whole status line
+            // under a fragmented delivery.
+            let mut buf = Vec::with_capacity(64);
+            let read_status_line = async {
+                let mut chunk = [0u8; 64];
+                loop {
+                    match stream.read(&mut chunk).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&chunk[..n]);
+                            if buf.windows(2).any(|w| w == b"\r\n") || buf.len() >= 256 {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
             };
-            let status_line = String::from_utf8_lossy(&buf[..n]);
+            let _ = tokio::time::timeout(budget, read_status_line).await;
+
+            let status_line = String::from_utf8_lossy(&buf);
             status_line.starts_with("HTTP/1.0 200") || status_line.starts_with("HTTP/1.1 200")
         }
         ServeScheme::Https => {
@@ -412,7 +475,10 @@ async fn wait_until_healthy(
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(record) = read_record(codanna_dir) {
-            if pid_is_alive(record.pid) && check_health(record.port, record.scheme).await {
+            if pid_is_alive(record.pid)
+                && pid_looks_like_codanna_serve(&record)
+                && check_health(record.port, record.scheme).await
+            {
                 return Ok(record);
             }
         }
@@ -438,12 +504,19 @@ async fn wait_until_healthy(
 /// `/health`, matching the record+lock discipline this module relies on
 /// instead of a reaper or `ss`/`lsof`/`pgrep` process scan (deliberately
 /// dropped: record+lock alone make duplicate servers unarisable).
-fn spawn_detached(workspace_root: &Path) -> DiscoveryResult<()> {
+///
+/// `config_path`, when set, is forwarded as `--config <path>` so the spawned
+/// server loads the same configuration file that started the proxy, rather
+/// than falling back to config discovery from `workspace_root`.
+fn spawn_detached(workspace_root: &Path, config_path: Option<&Path>) -> DiscoveryResult<()> {
     let exe = std::env::current_exe().map_err(|source| DiscoveryError::CurrentExe { source })?;
 
     let mut cmd = Command::new(exe);
-    cmd.args(["serve", "--http", "--watch", "--bind", "127.0.0.1:0"])
-        .current_dir(workspace_root)
+    cmd.args(["serve", "--http", "--watch", "--bind", "127.0.0.1:0"]);
+    if let Some(config_path) = config_path {
+        cmd.arg("--config").arg(config_path);
+    }
+    cmd.current_dir(workspace_root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -503,6 +576,7 @@ fn spawn_detached(workspace_root: &Path) -> DiscoveryResult<()> {
 pub async fn discover_or_spawn(
     workspace_root: &Path,
     settings: &Settings,
+    original_config_path: Option<&Path>,
 ) -> DiscoveryResult<ServeRecord> {
     let codanna_dir = discovery_dir(workspace_root);
     let lock_path = codanna_dir.join("http.lock");
@@ -560,7 +634,7 @@ pub async fn discover_or_spawn(
                 }
             }
 
-            spawn_detached(workspace_root)?;
+            spawn_detached(workspace_root, original_config_path)?;
             wait_until_healthy(&codanna_dir, &lock_path, timeout, poll_interval).await
             // `_guard` drops here, releasing the lock once the winner's
             // spawn attempt has succeeded, timed out, or errored. Holding
@@ -582,8 +656,62 @@ pub async fn discover_or_spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
     use std::net::TcpListener;
     use tempfile::TempDir;
+
+    /// Spawns a short-lived process whose cmdline contains "codanna", "serve"
+    /// and "--http" tokens, satisfying `pid_looks_like_codanna_serve` without
+    /// actually being a real codanna server. Used by tests that assert an
+    /// `Http`-scheme record naming a live, matching-cmdline PID is trusted.
+    ///
+    /// The marker tokens are passed as arguments to the shell's `:` no-op
+    /// builtin (never executed as a command) rather than as a literal
+    /// `codanna serve --http` invocation, so this cannot accidentally launch
+    /// a real `codanna` binary that happens to be on the test runner's PATH.
+    /// The trailing `sleep 30 & wait` keeps the shell itself alive (rather
+    /// than exec-replacing into `sleep`), so `cmd()` for this PID still
+    /// reflects the marker arguments for the life of the process. The caller
+    /// is responsible for killing the returned child.
+    #[cfg(unix)]
+    fn spawn_fake_http_serve_process() -> std::process::Child {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(": codanna serve --http; sleep 30 & wait")
+            .spawn()
+            .expect("failed to spawn fake codanna serve process for test")
+    }
+
+    #[cfg(windows)]
+    fn spawn_fake_http_serve_process() -> std::process::Child {
+        std::process::Command::new("cmd")
+            .args(["/C", "rem codanna serve --http & timeout /T 30"])
+            .spawn()
+            .expect("failed to spawn fake codanna serve process for test")
+    }
+
+    /// Same as [`spawn_fake_http_serve_process`], but with a cmdline
+    /// containing only "codanna" and "serve" -- no "--http" token. Models a
+    /// `codanna serve` process that entered HTTP mode via
+    /// `server.mode = "http"` in `settings.toml` rather than a CLI flag
+    /// (`resolve_server_mode` in `cli::commands::serve`, case 4), which never
+    /// has "--http" on its cmdline.
+    #[cfg(unix)]
+    fn spawn_fake_bare_serve_process() -> std::process::Child {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(": codanna serve; sleep 30 & wait")
+            .spawn()
+            .expect("failed to spawn fake codanna serve process for test")
+    }
+
+    #[cfg(windows)]
+    fn spawn_fake_bare_serve_process() -> std::process::Child {
+        std::process::Command::new("cmd")
+            .args(["/C", "rem codanna serve & timeout /T 30"])
+            .spawn()
+            .expect("failed to spawn fake codanna serve process for test")
+    }
 
     #[test]
     fn write_then_read_round_trips() {
@@ -640,22 +768,24 @@ mod tests {
 
     #[tokio::test]
     async fn discover_or_spawn_returns_live_record_without_spawning() {
-        // Given a workspace with a serve.json whose PID is *this* live test
-        // process, discover_or_spawn must return it directly. If it instead
-        // fell through to spawning, this test would hang (or fail) trying to
+        // Given a workspace with a serve.json whose PID is a live process
+        // whose cmdline matches a codanna HTTP serve process,
+        // discover_or_spawn must return it directly. If it instead fell
+        // through to spawning, this test would hang (or fail) trying to
         // launch a real `codanna serve` child, since `current_exe()` in a
         // test binary is the test harness, not the CLI.
+        let mut fake_server = spawn_fake_http_serve_process();
         let workspace = TempDir::new().unwrap();
         let codanna_dir = workspace.path().join(crate::init::local_dir_name());
         let record = ServeRecord {
-            pid: std::process::id(),
+            pid: fake_server.id(),
             port: 12345,
             scheme: ServeScheme::Http,
         };
         write_record(&codanna_dir, &record).expect("write_record should succeed");
 
         let settings = Settings::default();
-        let discovered = discover_or_spawn(workspace.path(), &settings)
+        let discovered = discover_or_spawn(workspace.path(), &settings, None)
             .await
             .expect("live record should short-circuit discovery");
 
@@ -663,6 +793,8 @@ mod tests {
         assert_eq!(discovered.port, record.port);
         // No lock should have been created on the fast path.
         assert!(!codanna_dir.join("http.lock").exists());
+        let _ = fake_server.kill();
+        let _ = fake_server.wait();
     }
 
     /// A `.codanna/` directory that holds no `settings.toml` is NOT a configured
@@ -677,7 +809,7 @@ mod tests {
         std::fs::create_dir_all(&codanna_dir).unwrap();
 
         let settings = Settings::default();
-        let err = discover_or_spawn(workspace.path(), &settings)
+        let err = discover_or_spawn(workspace.path(), &settings, None)
             .await
             .expect_err("an unconfigured tree must not get a spawned server");
 
@@ -706,7 +838,7 @@ mod tests {
         let mut settings = Settings::default();
         settings.server.auto_spawn = false;
 
-        let err = discover_or_spawn(workspace.path(), &settings)
+        let err = discover_or_spawn(workspace.path(), &settings, None)
             .await
             .expect_err("auto_spawn = false must not spawn a server");
 
@@ -722,10 +854,11 @@ mod tests {
     /// it (auto_spawn off, and no settings.toml on disk).
     #[tokio::test]
     async fn discovers_live_server_even_when_spawning_would_be_refused() {
+        let mut fake_server = spawn_fake_http_serve_process();
         let workspace = TempDir::new().unwrap();
         let codanna_dir = workspace.path().join(crate::init::local_dir_name());
         let record = ServeRecord {
-            pid: std::process::id(),
+            pid: fake_server.id(),
             port: 12345,
             scheme: ServeScheme::Http,
         };
@@ -734,12 +867,14 @@ mod tests {
         let mut settings = Settings::default();
         settings.server.auto_spawn = false;
 
-        let discovered = discover_or_spawn(workspace.path(), &settings)
+        let discovered = discover_or_spawn(workspace.path(), &settings, None)
             .await
             .expect("a live server must be discovered regardless of the spawn guards");
 
         assert_eq!(discovered.pid, record.pid);
         assert_eq!(discovered.port, record.port);
+        let _ = fake_server.kill();
+        let _ = fake_server.wait();
     }
 
     #[test]
@@ -882,12 +1017,34 @@ mod tests {
 
     #[test]
     fn decide_returns_discover_when_recorded_pid_is_alive() {
+        let mut fake_server = spawn_fake_http_serve_process();
         let live = ServeRecord {
-            pid: std::process::id(),
+            pid: fake_server.id(),
             port: 8080,
             scheme: ServeScheme::Http,
         };
         assert_eq!(decide(Some(&live)), Decision::Discover);
+        let _ = fake_server.kill();
+        let _ = fake_server.wait();
+    }
+
+    /// `codanna serve` entering HTTP mode via `server.mode = "http"` in
+    /// `settings.toml` (no `--http` CLI flag) must still be discoverable.
+    /// `pid_looks_like_codanna_serve` must not require a literal `--http`
+    /// token on the cmdline -- only that the process is some codanna serve
+    /// process; the record's own `scheme` field already carries which mode
+    /// was recorded.
+    #[test]
+    fn decide_returns_discover_for_bare_serve_cmdline_without_http_flag() {
+        let mut fake_server = spawn_fake_bare_serve_process();
+        let live = ServeRecord {
+            pid: fake_server.id(),
+            port: 8080,
+            scheme: ServeScheme::Http,
+        };
+        assert_eq!(decide(Some(&live)), Decision::Discover);
+        let _ = fake_server.kill();
+        let _ = fake_server.wait();
     }
 
     /// THE LOAD-BEARING REGRESSION TEST.
@@ -947,6 +1104,7 @@ mod tests {
     /// (`discover_or_spawn`'s fast path) agree on exactly one directory.
     #[tokio::test]
     async fn discovery_dir_matches_discover_or_spawn_fast_path() {
+        let mut fake_server = spawn_fake_http_serve_process();
         let workspace = TempDir::new().unwrap();
         let settings = Settings {
             workspace_root: Some(workspace.path().to_path_buf()),
@@ -957,13 +1115,13 @@ mod tests {
         let codanna_dir = discovery_dir(&resolved_root);
 
         let record = ServeRecord {
-            pid: std::process::id(),
+            pid: fake_server.id(),
             port: 12345,
             scheme: ServeScheme::Http,
         };
         write_record(&codanna_dir, &record).expect("write_record should succeed");
 
-        let discovered = discover_or_spawn(workspace.path(), &settings)
+        let discovered = discover_or_spawn(workspace.path(), &settings, None)
             .await
             .expect("live record at discovery_dir(&workspace_root) should short-circuit discovery");
 
@@ -971,6 +1129,8 @@ mod tests {
         assert_eq!(discovered.port, record.port);
         // No lock should have been created on the fast path.
         assert!(!codanna_dir.join("http.lock").exists());
+        let _ = fake_server.kill();
+        let _ = fake_server.wait();
     }
 
     /// THE LOAD-BEARING COMPAT TEST.

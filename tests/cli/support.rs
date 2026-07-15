@@ -45,6 +45,7 @@ pub fn run_cli(workspace: &Path, args: &[&str]) -> (i32, String, String) {
         .args(args)
         .current_dir(workspace)
         .env("HOME", &test_home)
+        .env("XDG_CONFIG_HOME", &test_home)
         .output()
         .expect("run codanna CLI");
 

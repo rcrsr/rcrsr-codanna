@@ -156,7 +156,14 @@ pub fn pinned_client() -> TlsResult<rmcp_reqwest::Client> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{LazyLock, Mutex};
     use tempfile::TempDir;
+
+    /// Guards mutation of the process-wide `HOME`/`XDG_CONFIG_HOME` env vars
+    /// below. Tests run in parallel by default, so without this lock two
+    /// tests mutating these vars concurrently would race and could read each
+    /// other's temp-dir paths mid-test.
+    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     /// On Linux, `dirs::config_dir()` prefers `XDG_CONFIG_HOME` over
     /// `HOME/.config`. Overriding only `HOME` does not isolate this test from
@@ -165,6 +172,7 @@ mod tests {
     /// `codanna serve --https` run), so both must be pointed at the temp dir.
     #[test]
     fn pinned_client_errors_when_cert_absent() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp_dir = TempDir::new().expect("failed to create temp dir");
 
         let original_home = std::env::var("HOME").ok();

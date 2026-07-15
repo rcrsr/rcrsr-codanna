@@ -305,11 +305,6 @@ pub async fn serve_https(config: crate::Settings, watch: bool, bind: String) -> 
     eprintln!();
     eprintln!("Press Ctrl+C to stop the server");
 
-    // Publish a discovery record under the tree's `.codanna/` so other tools
-    // (e.g. the CLI proxy) can find this server without guessing ports.
-    // `local_addr().port()` is read above rather than parsing `bind` so an
-    // ephemeral `:0` bind resolves to the actual assigned port.
-    //
     // The directory is derived from the workspace root, not `index_path`:
     // `index_path` may be absolute or resolved relative to a `--config`
     // file's parent (`init::resolve_index_path`), so it can diverge from
@@ -317,6 +312,21 @@ pub async fn serve_https(config: crate::Settings, watch: bool, bind: String) -> 
     let codanna_dir = crate::serve_discovery::resolve_workspace_root(&config)
         .map(|root| crate::serve_discovery::discovery_dir(&root));
 
+    // Convert to std listener for axum_server's Rustls acceptor. `into_std`
+    // preserves the non-blocking mode tokio's listener already has, which
+    // `from_tcp_rustls` requires.
+    let std_listener = listener.into_std()?;
+    let server =
+        axum_server::from_tcp_rustls(std_listener, tls_config)?.serve(router.into_make_service());
+
+    // Publish a discovery record under the tree's `.codanna/` so other tools
+    // (e.g. the CLI proxy) can find this server without guessing ports. This
+    // is deliberately placed AFTER the two fallible calls above
+    // (`into_std()?`, `from_tcp_rustls(...)?`): publishing first and then
+    // failing one of those would leave a discovery record naming a PID that
+    // never actually started serving. `local_addr().port()` is read above
+    // rather than parsing `bind` so an ephemeral `:0` bind resolves to the
+    // actual assigned port.
     match &codanna_dir {
         Some(codanna_dir) => {
             let serve_record = crate::serve_discovery::ServeRecord {
@@ -340,13 +350,6 @@ pub async fn serve_https(config: crate::Settings, watch: bool, bind: String) -> 
             );
         }
     }
-
-    // Convert to std listener for axum_server's Rustls acceptor. `into_std`
-    // preserves the non-blocking mode tokio's listener already has, which
-    // `from_tcp_rustls` requires.
-    let std_listener = listener.into_std()?;
-    let server =
-        axum_server::from_tcp_rustls(std_listener, tls_config)?.serve(router.into_make_service());
 
     // Handle graceful shutdown
     tokio::select! {

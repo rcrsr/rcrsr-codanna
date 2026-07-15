@@ -55,6 +55,7 @@ pub async fn run(
     settings: Arc<Settings>,
     facade: Option<IndexFacade>,
     index_path: PathBuf,
+    config_path: Option<PathBuf>,
 ) {
     let ServeArgs {
         watch,
@@ -96,7 +97,7 @@ pub async fn run(
             run_http_server(config, watch, bind_address).await;
         }
         "proxy" => {
-            run_proxy_server(config).await;
+            run_proxy_server(config, config_path).await;
         }
         _ => {
             run_stdio_server(
@@ -141,13 +142,13 @@ async fn run_https_server(config: &Settings, watch: bool, bind_address: String) 
     }
 }
 
-async fn run_proxy_server(config: Settings) {
+async fn run_proxy_server(config: Settings, config_path: Option<PathBuf>) {
     // Proxy mode - stdio-facing delegate that discovers/spawns a backing
     // `codanna serve --http` and relays MCP traffic to it. No IndexFacade is
     // constructed in this process (§4.5).
     eprintln!("Starting MCP server in proxy mode (stdio <-> HTTP delegate)");
 
-    if let Err(e) = crate::mcp::proxy::serve_proxy(config).await {
+    if let Err(e) = crate::mcp::proxy::serve_proxy(config, config_path).await {
         eprintln!("Proxy server error: {e}");
         std::process::exit(1);
     }

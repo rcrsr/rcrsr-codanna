@@ -74,9 +74,6 @@ pub(super) fn default_watch_interval() -> u64 {
 pub(super) fn default_auto_spawn() -> bool {
     true
 }
-pub(super) fn default_idle_timeout_secs() -> u64 {
-    0
-}
 pub(super) fn default_spawn_timeout_ms() -> u64 {
     8000
 }

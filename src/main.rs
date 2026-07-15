@@ -740,6 +740,7 @@ async fn main() {
                 settings,
                 facade,
                 index_path,
+                cli.config.clone(),
             )
             .await;
         }
