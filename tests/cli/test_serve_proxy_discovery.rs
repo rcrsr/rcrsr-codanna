@@ -16,6 +16,8 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
+// Arc/Mutex are only used by the https-server-gated pinned-cert test below.
+#[cfg(feature = "https-server")]
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -388,6 +390,11 @@ fn any_file_named(root: &Path, filename: &str) -> bool {
 /// child also reports a non-success exit status, so `!status.success()` alone
 /// cannot tell "the process refused to proceed" apart from "the process was
 /// working fine and we killed it".
+///
+/// Only the https-server-gated pinned-cert test calls this today, so the
+/// helper is gated to match and avoid a dead-code warning under default
+/// features.
+#[cfg(feature = "https-server")]
 fn wait_for_self_exit(child: &mut Child, deadline: Duration) -> Option<std::process::ExitStatus> {
     let start = std::time::Instant::now();
     loop {
