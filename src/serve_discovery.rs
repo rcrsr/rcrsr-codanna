@@ -806,6 +806,7 @@ mod tests {
             scheme: ServeScheme::Http,
         };
         write_record(&codanna_dir, &record).expect("write_record should succeed");
+        wait_until_decide_ready(&record);
 
         let settings = Settings::default();
         let discovered = discover_or_spawn(workspace.path(), &settings, None)
@@ -886,6 +887,7 @@ mod tests {
             scheme: ServeScheme::Http,
         };
         write_record(&codanna_dir, &record).expect("write_record should succeed");
+        wait_until_decide_ready(&record);
 
         let mut settings = Settings::default();
         settings.server.auto_spawn = false;
@@ -1145,6 +1147,7 @@ mod tests {
             scheme: ServeScheme::Http,
         };
         write_record(&codanna_dir, &record).expect("write_record should succeed");
+        wait_until_decide_ready(&record);
 
         let discovered = discover_or_spawn(workspace.path(), &settings, None)
             .await
