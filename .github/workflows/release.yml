@@ -33,13 +33,19 @@ jobs:
           # (release artifacts and binstall URLs both derive from the Cargo.toml
           # version, so a drifted tag would produce assets nobody can resolve).
           tag="${GITHUB_REF_NAME}"
-          if [[ "$tag" != "v$version" ]]; then
-            echo "Error: tag '$tag' does not match Cargo.toml version 'v$version'"
+          expected_tag="v$version"
+          if [[ "$tag" != "$expected_tag" ]]; then
+            echo "Error: release tag does not match the Cargo.toml version."
+            echo "  pushed tag:          $tag"
+            echo "  Cargo.toml version:  $version"
+            echo "  expected tag:        $expected_tag"
+            echo "The tag must be the Cargo.toml version prefixed with 'v',"
+            echo "including any '+rcrsr.N' build-metadata suffix (e.g. v0.9.23+rcrsr.1)."
             echo "Bump Cargo.toml or retag so they agree before releasing."
             exit 1
           fi
 
-          echo "version=$version" >> $GITHUB_OUTPUT
+          echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "Found version: $version"
 
   build:
