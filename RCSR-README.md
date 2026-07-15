@@ -86,6 +86,46 @@ against codanna's own certificate.
 If you only ever run a single client, you don't need this — plain `codanna serve`
 is unchanged.
 
+## Reindexing on demand (`reindex` MCP tool)
+
+The fork exposes reindexing as a first-class MCP tool named `reindex`,
+discoverable through `list_tools` in every serve mode — stdio, HTTP, HTTPS, and
+proxy. Upstream reindexing is a CLI-only operation, so an MCP client (an editor
+or agent) could not trigger it over the protocol; with the fork it can, without
+restarting the server or reloading the index.
+
+A client calls it like any other tool:
+
+```jsonc
+// reindex everything configured (incremental — unchanged files are skipped)
+{ "name": "reindex", "arguments": {} }
+
+// reindex specific files and/or directories
+{ "name": "reindex", "arguments": { "paths": ["src/foo.rs", "src/bar/"] } }
+
+// force a full clear-and-rebuild
+{ "name": "reindex", "arguments": { "force": true } }
+```
+
+It is also reachable from the CLI as `codanna mcp reindex`.
+
+### Arguments
+
+- `paths` (optional array of strings) — files or directories to reindex. Omit to
+  reindex all configured `indexed_paths`. Explicit paths must resolve **inside
+  the workspace root**; anything outside is rejected. At most 1024 paths per call.
+- `force` (optional bool, default `false`) — for a **full** reindex (no `paths`),
+  clears the entire index before rebuilding it. For **scoped** `paths`, re-indexes
+  just those paths without a global clear: files are re-parsed even when their
+  content hash is unchanged, and directories bypass the incremental hash-skip.
+
+The call returns a short summary — files reindexed, symbols, and elapsed
+milliseconds.
+
+Reindexing does not block reads: the walk-and-parse work runs without holding the
+index write lock, so concurrent read-only tools (`find_symbol`, `search_symbols`,
+`semantic_search_docs`, and the rest) keep serving while a reindex is in flight.
+
 ## Identifying the fork
 
 Fork builds carry a `+rcrsr.N` suffix on the upstream version, so you can tell a

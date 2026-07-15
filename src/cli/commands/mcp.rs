@@ -68,6 +68,13 @@ struct CollectionInfo {
 }
 
 #[derive(Debug, Serialize)]
+struct ReindexInfo {
+    reindexed: usize,
+    symbols: usize,
+    duration_ms: u128,
+}
+
+#[derive(Debug, Serialize)]
 struct SymbolKindBreakdown {
     functions: usize,
     methods: usize,
@@ -270,6 +277,7 @@ pub async fn run(
         "semantic_search_docs",
         "semantic_search_with_context",
         "search_documents",
+        "reindex",
     ];
     if !KNOWN_TOOLS.contains(&tool.as_str()) {
         if json {
@@ -279,14 +287,14 @@ pub async fn run(
                 ExitCode::GeneralError,
                 &format!("Unknown tool: {tool}"),
                 vec![
-                    "Available tools: find_symbol, get_calls, find_callers, analyze_impact, get_index_info, search_symbols, semantic_search_docs, semantic_search_with_context, search_documents",
+                    "Available tools: find_symbol, get_calls, find_callers, analyze_impact, get_index_info, search_symbols, semantic_search_docs, semantic_search_with_context, search_documents, reindex",
                 ],
             );
             println!("{}", serde_json::to_string_pretty(&response).unwrap());
         } else {
             eprintln!("Unknown tool: {tool}");
             eprintln!(
-                "Available tools: find_symbol, get_calls, find_callers, analyze_impact, get_index_info, search_symbols, semantic_search_docs, semantic_search_with_context, search_documents"
+                "Available tools: find_symbol, get_calls, find_callers, analyze_impact, get_index_info, search_symbols, semantic_search_docs, semantic_search_with_context, search_documents, reindex"
             );
         }
         std::process::exit(1);
@@ -814,6 +822,42 @@ pub async fn run(
         }
     };
 
+    // Invoke reindex now for JSON output. reindex mutates the index, and
+    // json mode's dispatch match below is a text-only no-op (see below), so
+    // this cannot wait for the shared dispatch path used by read-only tools.
+    let reindex_data = if json && tool == "reindex" {
+        let (paths, force) =
+            match crate::mcp::requests::ReindexRequest::parse_args(arguments.as_ref()) {
+                Ok(v) => v,
+                Err(e) => {
+                    use crate::io::envelope::{Envelope, ResultCode};
+                    let envelope: Envelope<()> = Envelope::error(
+                        ResultCode::InvalidQuery,
+                        format!("Invalid reindex arguments: {e}"),
+                    );
+                    println!("{}", envelope.to_json().expect("envelope serialization"));
+                    std::process::exit(2);
+                }
+            };
+
+        match server.run_reindex(paths, force).await {
+            Ok(outcome) => Some(ReindexInfo {
+                reindexed: outcome.reindexed,
+                symbols: outcome.symbols,
+                duration_ms: outcome.duration_ms,
+            }),
+            Err(e) => {
+                use crate::io::envelope::{Envelope, ResultCode};
+                let envelope: Envelope<()> =
+                    Envelope::error(ResultCode::IndexError, format!("Reindex failed: {e}"));
+                println!("{}", envelope.to_json().expect("envelope serialization"));
+                std::process::exit(2);
+            }
+        }
+    } else {
+        None
+    };
+
     // Call the tool directly
     use crate::mcp::*;
     use rmcp::handler::server::wrapper::Parameters;
@@ -821,6 +865,15 @@ pub async fn run(
     // JSON mode already collected everything above through the shared
     // service layer — one execution per invocation. The JSON emit arms
     // below use only pre-collected data; handler dispatch is text-only.
+    //
+    // For "reindex" specifically: `reindex_data` above (the `json && tool ==
+    // "reindex"` branch) is the sole execution of `run_reindex` on the JSON
+    // path. That is only safe because the `"reindex" =>` arm in the `match`
+    // below — which calls `server.reindex()` and would run a second
+    // reindex — is gated behind this `if json { .. } else { match .. } }`
+    // and never reached when `json` is true. If this `if json` gate is ever
+    // removed or the "reindex" match arm is moved outside it, `reindex_data`
+    // must be updated in lockstep or a JSON-mode reindex will run twice.
     let result = if json {
         Ok(rmcp::model::CallToolResult::success(vec![]))
     } else {
@@ -1077,6 +1130,17 @@ pub async fn run(
                     }))
                     .await
             }
+            "reindex" => {
+                let (paths, force) =
+                    crate::mcp::requests::ReindexRequest::parse_args(arguments.as_ref())
+                        .unwrap_or_else(|e| {
+                            eprintln!("Error: invalid reindex arguments: {e}");
+                            std::process::exit(1);
+                        });
+                server
+                    .reindex(Parameters(ReindexRequest { paths, force }))
+                    .await
+            }
             _ => {
                 if json {
                     use crate::io::exit_code::ExitCode;
@@ -1085,14 +1149,14 @@ pub async fn run(
                         ExitCode::GeneralError,
                         &format!("Unknown tool: {tool}"),
                         vec![
-                            "Available tools: find_symbol, get_calls, find_callers, analyze_impact, get_index_info, search_symbols, semantic_search_docs, semantic_search_with_context, search_documents",
+                            "Available tools: find_symbol, get_calls, find_callers, analyze_impact, get_index_info, search_symbols, semantic_search_docs, semantic_search_with_context, search_documents, reindex",
                         ],
                     );
                     println!("{}", serde_json::to_string_pretty(&response).unwrap());
                 } else {
                     eprintln!("Unknown tool: {tool}");
                     eprintln!(
-                        "Available tools: find_symbol, get_calls, find_callers, analyze_impact, get_index_info, search_symbols, semantic_search_docs, semantic_search_with_context, search_documents"
+                        "Available tools: find_symbol, get_calls, find_callers, analyze_impact, get_index_info, search_symbols, semantic_search_docs, semantic_search_with_context, search_documents, reindex"
                     );
                 }
                 std::process::exit(1);
@@ -1672,6 +1736,18 @@ pub async fn run(
 
                     println!("{}", envelope.to_json().expect("envelope serialization"));
                     std::process::exit(1);
+                }
+            } else if json && tool == "reindex" {
+                use crate::io::envelope::Envelope;
+
+                if let Some(reindex_info) = reindex_data {
+                    let envelope = Envelope::success(reindex_info).with_message("Reindex complete");
+
+                    let output = match &fields {
+                        Some(f) => envelope.to_json_with_fields(f),
+                        None => envelope.to_json(),
+                    };
+                    println!("{}", output.expect("envelope serialization"));
                 }
             } else {
                 // Default text output

@@ -1062,6 +1062,27 @@ impl IndexFacade {
         Ok(())
     }
 
+    /// Clear all documents from the index.
+    ///
+    /// Reuses the already-open `DocumentIndex`/Tantivy writer handle and the
+    /// in-memory semantic search store rather than removing files on disk or
+    /// constructing new writers. Resets directory tracking so a subsequent
+    /// `index_directory` call re-populates `indexed_paths` from scratch.
+    pub fn clear_index(&mut self) -> FacadeResult<()> {
+        self.document_index.clear()?;
+
+        if let Some(ref semantic) = self.semantic_search {
+            let mut sem = semantic
+                .lock()
+                .map_err(|e| IndexError::LockError(format!("semantic search: {e}")))?;
+            sem.clear();
+        }
+
+        self.indexed_paths.clear();
+
+        Ok(())
+    }
+
     /// Index a directory using the parallel pipeline.
     ///
     /// This is the primary indexing entry point using Pipeline.
@@ -1245,6 +1266,182 @@ impl IndexFacade {
         // TODO: Implement using CleanupStage
         // For now, this is a placeholder
         Ok(())
+    }
+
+    /// Captures cloneable handles under the caller's lock so the heavy walk
+    /// can run with no facade lock held; mirrors the lock-acquire-then-swap
+    /// pattern used by `watcher::hot_reload` to keep the write lock window
+    /// short.
+    pub fn snapshot_reindex_handles(&mut self) -> FacadeResult<ReindexHandles> {
+        if self.has_semantic_search() {
+            self.ensure_embedding_pool()?;
+        }
+
+        Ok(ReindexHandles {
+            pipeline: self.pipeline.clone(),
+            document_index: Arc::clone(&self.document_index),
+            semantic_search: self.semantic_search.clone(),
+            embedding_pool: self.embedding_pool.clone(),
+        })
+    }
+}
+
+// =========================================================================
+// Off-lock reindex seam
+// =========================================================================
+
+/// Move-only bundle of cloned handles needed to run a reindex walk without
+/// holding the `IndexFacade` lock.
+///
+/// Captured via [`IndexFacade::snapshot_reindex_handles`] and consumed once
+/// by [`ReindexHandles::run`].
+pub struct ReindexHandles {
+    pipeline: Pipeline,
+    document_index: Arc<DocumentIndex>,
+    semantic_search: Option<Arc<Mutex<SimpleSemanticSearch>>>,
+    embedding_pool: Option<Arc<EmbeddingBackend>>,
+}
+
+/// Outcome of an off-lock reindex walk.
+#[derive(Debug, Clone)]
+pub struct ReindexOutcome {
+    pub reindexed: usize,
+    pub symbol_count: usize,
+    pub indexed_dirs: Vec<PathBuf>,
+}
+
+impl ReindexHandles {
+    /// Runs the reindex walk without holding the facade lock, consuming the
+    /// handles captured by [`IndexFacade::snapshot_reindex_handles`].
+    ///
+    /// Preserves the branch behavior previously implemented in the MCP
+    /// server's request handler:
+    /// - An explicit file path is indexed via `Pipeline::index_file_single`.
+    ///   When `force` is true, the file's existing symbols/embeddings are
+    ///   removed first so a re-parse always runs even if its content hash
+    ///   is unchanged (mirrors `IndexFacade::index_file_with_force`).
+    /// - An explicit directory path is indexed via `Pipeline::index_incremental`
+    ///   with the caller-supplied `force` flag.
+    /// - When `paths` is `None`, every directory in `indexing.indexed_paths`
+    ///   (from the pipeline's settings) is indexed with the caller-supplied
+    ///   `force` flag. For the `paths: None` case this is redundant with any
+    ///   clear the caller already ran under lock (force mode does a full
+    ///   walk of an already-empty index either way), but passing it through
+    ///   keeps this call site honoring `force` rather than reading as if it
+    ///   were silently dropped.
+    ///
+    /// Per-path failures are logged with `tracing::warn!` and skipped rather
+    /// than aborting the whole walk. Successfully indexed directories are
+    /// collected into `ReindexOutcome::indexed_dirs` for the caller to record
+    /// via `IndexFacade::add_indexed_path`.
+    pub fn run(self, paths: Option<Vec<String>>, force: bool) -> FacadeResult<ReindexOutcome> {
+        let ReindexHandles {
+            pipeline,
+            document_index,
+            semantic_search,
+            embedding_pool,
+        } = self;
+
+        let mut indexed_dirs = Vec::new();
+
+        let reindexed = if let Some(paths) = paths {
+            let mut total_reindexed = 0;
+            for path in &paths {
+                let path = Path::new(path);
+                if path.is_file() {
+                    if force {
+                        // `index_file_single` no-ops (unchanged-hash skip)
+                        // when the file's content hash matches what's
+                        // already indexed, which would silently drop
+                        // `force` for an explicit file path. Remove the
+                        // file's existing symbols/embeddings first so the
+                        // subsequent call always re-parses, mirroring
+                        // `IndexFacade::index_file_with_force`.
+                        use crate::indexing::pipeline::stages::CleanupStage;
+                        let semantic_path = pipeline.settings().index_path.join("semantic");
+                        let cleanup_stage = if let Some(ref sem) = semantic_search {
+                            CleanupStage::new(Arc::clone(&document_index), &semantic_path)
+                                .with_semantic(Arc::clone(sem))
+                        } else {
+                            CleanupStage::new(Arc::clone(&document_index), &semantic_path)
+                        };
+                        if let Err(e) = cleanup_stage.cleanup_files(&[path.to_path_buf()]) {
+                            tracing::warn!(
+                                "Failed to clear {} before force reindex: {e}",
+                                path.display()
+                            );
+                        }
+                    }
+                    match pipeline.index_file_single(
+                        path,
+                        Arc::clone(&document_index),
+                        semantic_search.clone(),
+                        embedding_pool.clone(),
+                    ) {
+                        Ok(_stats) => {
+                            // Mirrors the original `run_reindex` handler
+                            // (server.rs), which counted any successfully
+                            // processed explicit file path as reindexed
+                            // regardless of cache status, since
+                            // `IndexFacade::index_file` never actually
+                            // produced `IndexingResult::Cached`.
+                            total_reindexed += 1;
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to reindex {}: {e}", path.display());
+                        }
+                    }
+                } else if path.is_dir() {
+                    match pipeline.index_incremental(
+                        path,
+                        Arc::clone(&document_index),
+                        semantic_search.clone(),
+                        embedding_pool.clone(),
+                        force,
+                    ) {
+                        Ok(stats) => {
+                            total_reindexed += stats.new_files + stats.modified_files;
+                            indexed_dirs.push(path.to_path_buf());
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to reindex {}: {e}", path.display());
+                        }
+                    }
+                }
+            }
+            total_reindexed
+        } else {
+            let indexed_paths = pipeline.settings().indexing.indexed_paths.clone();
+            let mut total_reindexed = 0;
+            for path in &indexed_paths {
+                if path.is_dir() {
+                    match pipeline.index_incremental(
+                        path,
+                        Arc::clone(&document_index),
+                        semantic_search.clone(),
+                        embedding_pool.clone(),
+                        force,
+                    ) {
+                        Ok(stats) => {
+                            total_reindexed += stats.new_files + stats.modified_files;
+                            indexed_dirs.push(path.clone());
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to reindex {}: {e}", path.display());
+                        }
+                    }
+                }
+            }
+            total_reindexed
+        };
+
+        let symbol_count = document_index.count_symbols().unwrap_or(0);
+
+        Ok(ReindexOutcome {
+            reindexed,
+            symbol_count,
+            indexed_dirs,
+        })
     }
 }
 
