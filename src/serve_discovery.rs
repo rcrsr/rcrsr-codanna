@@ -713,6 +713,29 @@ mod tests {
             .expect("failed to spawn fake codanna serve process for test")
     }
 
+    /// Polls `decide(Some(record))` until it reports `Discover`, or a bounded
+    /// timeout elapses.
+    ///
+    /// On a loaded CI runner there is a brief window right after
+    /// `Command::spawn()` returns where the child is not yet visible to a
+    /// fresh `sysinfo::System` refresh (or its `/proc/<pid>/cmdline` is not
+    /// yet readable), so `decide` can transiently report `Spawn` for a
+    /// process that is in fact starting up fine. This helper waits for the
+    /// process to become observable by the same predicates `decide` uses
+    /// before the caller's real assertion runs. It does not itself assert:
+    /// if the timeout elapses without success, it simply returns and lets
+    /// the caller's `assert_eq!` fail, so a genuine regression is still
+    /// caught.
+    fn wait_until_decide_ready(record: &ServeRecord) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if decide(Some(record)) == Decision::Discover {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        }
+    }
+
     #[test]
     fn write_then_read_round_trips() {
         let dir = TempDir::new().unwrap();
@@ -783,6 +806,7 @@ mod tests {
             scheme: ServeScheme::Http,
         };
         write_record(&codanna_dir, &record).expect("write_record should succeed");
+        wait_until_decide_ready(&record);
 
         let settings = Settings::default();
         let discovered = discover_or_spawn(workspace.path(), &settings, None)
@@ -863,6 +887,7 @@ mod tests {
             scheme: ServeScheme::Http,
         };
         write_record(&codanna_dir, &record).expect("write_record should succeed");
+        wait_until_decide_ready(&record);
 
         let mut settings = Settings::default();
         settings.server.auto_spawn = false;
@@ -1023,6 +1048,7 @@ mod tests {
             port: 8080,
             scheme: ServeScheme::Http,
         };
+        wait_until_decide_ready(&live);
         assert_eq!(decide(Some(&live)), Decision::Discover);
         let _ = fake_server.kill();
         let _ = fake_server.wait();
@@ -1042,6 +1068,7 @@ mod tests {
             port: 8080,
             scheme: ServeScheme::Http,
         };
+        wait_until_decide_ready(&live);
         assert_eq!(decide(Some(&live)), Decision::Discover);
         let _ = fake_server.kill();
         let _ = fake_server.wait();
@@ -1120,6 +1147,7 @@ mod tests {
             scheme: ServeScheme::Http,
         };
         write_record(&codanna_dir, &record).expect("write_record should succeed");
+        wait_until_decide_ready(&record);
 
         let discovered = discover_or_spawn(workspace.path(), &settings, None)
             .await

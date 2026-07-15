@@ -12,7 +12,7 @@
 //! # Cert trust
 //!
 //! [`pinned_client`] pins the persisted server certificate via
-//! [`reqwest::ClientBuilder::tls_certs_only`]: only that one certificate is
+//! `reqwest::ClientBuilder::tls_certs_only`: only that one certificate is
 //! trusted, system/native roots are excluded entirely, and there is no
 //! verification bypass on any error path. This is deliberate and
 //! non-negotiable -- do not replace `tls_certs_only` with
