@@ -1267,6 +1267,152 @@ impl IndexFacade {
         // For now, this is a placeholder
         Ok(())
     }
+
+    /// Captures cloneable handles under the caller's lock so the heavy walk
+    /// can run with no facade lock held; mirrors the lock-acquire-then-swap
+    /// pattern used by `watcher::hot_reload` to keep the write lock window
+    /// short.
+    pub fn snapshot_reindex_handles(&mut self) -> FacadeResult<ReindexHandles> {
+        if self.has_semantic_search() {
+            self.ensure_embedding_pool()?;
+        }
+
+        Ok(ReindexHandles {
+            pipeline: self.pipeline.clone(),
+            document_index: Arc::clone(&self.document_index),
+            semantic_search: self.semantic_search.clone(),
+            embedding_pool: self.embedding_pool.clone(),
+        })
+    }
+}
+
+// =========================================================================
+// Off-lock reindex seam
+// =========================================================================
+
+/// Move-only bundle of cloned handles needed to run a reindex walk without
+/// holding the `IndexFacade` lock.
+///
+/// Captured via [`IndexFacade::snapshot_reindex_handles`] and consumed once
+/// by [`ReindexHandles::run`].
+pub struct ReindexHandles {
+    pipeline: Pipeline,
+    document_index: Arc<DocumentIndex>,
+    semantic_search: Option<Arc<Mutex<SimpleSemanticSearch>>>,
+    embedding_pool: Option<Arc<EmbeddingBackend>>,
+}
+
+/// Outcome of an off-lock reindex walk.
+#[derive(Debug, Clone)]
+pub struct ReindexOutcome {
+    pub reindexed: usize,
+    pub symbol_count: usize,
+    pub indexed_dirs: Vec<PathBuf>,
+}
+
+impl ReindexHandles {
+    /// Runs the reindex walk without holding the facade lock, consuming the
+    /// handles captured by [`IndexFacade::snapshot_reindex_handles`].
+    ///
+    /// Preserves the branch behavior previously implemented in the MCP
+    /// server's request handler:
+    /// - An explicit file path is indexed via `Pipeline::index_file_single`.
+    /// - An explicit directory path is indexed via `Pipeline::index_incremental`
+    ///   with the caller-supplied `force` flag.
+    /// - When `paths` is `None`, every directory in `indexing.indexed_paths`
+    ///   (from the pipeline's settings) is indexed with `force: false`, since
+    ///   any requested clear already ran under the caller's lock.
+    ///
+    /// Per-path failures are logged with `tracing::warn!` and skipped rather
+    /// than aborting the whole walk. Successfully indexed directories are
+    /// collected into `ReindexOutcome::indexed_dirs` for the caller to record
+    /// via `IndexFacade::add_indexed_path`.
+    pub fn run(self, paths: Option<Vec<String>>, force: bool) -> FacadeResult<ReindexOutcome> {
+        let ReindexHandles {
+            pipeline,
+            document_index,
+            semantic_search,
+            embedding_pool,
+        } = self;
+
+        let mut indexed_dirs = Vec::new();
+
+        let reindexed = if let Some(paths) = paths {
+            let mut total_reindexed = 0;
+            for path in &paths {
+                let path = Path::new(path);
+                if path.is_file() {
+                    match pipeline.index_file_single(
+                        path,
+                        Arc::clone(&document_index),
+                        semantic_search.clone(),
+                        embedding_pool.clone(),
+                    ) {
+                        Ok(_stats) => {
+                            // Mirrors the original `run_reindex` handler
+                            // (server.rs), which counted any successfully
+                            // processed explicit file path as reindexed
+                            // regardless of cache status, since
+                            // `IndexFacade::index_file` never actually
+                            // produced `IndexingResult::Cached`.
+                            total_reindexed += 1;
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to reindex {}: {e}", path.display());
+                        }
+                    }
+                } else if path.is_dir() {
+                    match pipeline.index_incremental(
+                        path,
+                        Arc::clone(&document_index),
+                        semantic_search.clone(),
+                        embedding_pool.clone(),
+                        force,
+                    ) {
+                        Ok(stats) => {
+                            total_reindexed += stats.new_files + stats.modified_files;
+                            indexed_dirs.push(path.to_path_buf());
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to reindex {}: {e}", path.display());
+                        }
+                    }
+                }
+            }
+            total_reindexed
+        } else {
+            let indexed_paths = pipeline.settings().indexing.indexed_paths.clone();
+            let mut total_reindexed = 0;
+            for path in &indexed_paths {
+                if path.is_dir() {
+                    match pipeline.index_incremental(
+                        path,
+                        Arc::clone(&document_index),
+                        semantic_search.clone(),
+                        embedding_pool.clone(),
+                        false,
+                    ) {
+                        Ok(stats) => {
+                            total_reindexed += stats.new_files + stats.modified_files;
+                            indexed_dirs.push(path.clone());
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to reindex {}: {e}", path.display());
+                        }
+                    }
+                }
+            }
+            total_reindexed
+        };
+
+        let symbol_count = document_index.count_symbols().unwrap_or(0);
+
+        Ok(ReindexOutcome {
+            reindexed,
+            symbol_count,
+            indexed_dirs,
+        })
+    }
 }
 
 // ── Embedding backend factory ──────────────────────────────────────────────

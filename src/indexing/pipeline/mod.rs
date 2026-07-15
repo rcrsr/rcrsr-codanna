@@ -66,6 +66,7 @@ use std::sync::{Arc, Mutex};
 ///
 /// [PIPELINE API] Orchestrates multiple stages to efficiently index source code
 /// using all available CPU cores.
+#[derive(Clone)]
 pub struct Pipeline {
     settings: Arc<Settings>,
     config: PipelineConfig,

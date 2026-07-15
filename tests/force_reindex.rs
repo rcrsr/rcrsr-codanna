@@ -10,6 +10,23 @@ use std::sync::Arc;
 use codanna::config::Settings;
 use codanna::indexing::facade::IndexFacade;
 
+/// Write a small set of Python fixture files into `dir`, each defining one
+/// module-level function whose name is derived from the file stem. Returns
+/// the sorted list of defined function names.
+fn write_python_fixtures(dir: &std::path::Path, names: &[&str]) -> Vec<String> {
+    std::fs::create_dir_all(dir).expect("create fixture dir");
+    for name in names {
+        std::fs::write(
+            dir.join(format!("{name}.py")),
+            format!("def {name}():\n    pass\n"),
+        )
+        .unwrap_or_else(|e| panic!("write {name}.py fixture: {e}"));
+    }
+    let mut sorted: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+    sorted.sort();
+    sorted
+}
+
 /// Build a `Settings` value rooted at a fresh temp index directory.
 fn settings_for(index_dir: &std::path::Path) -> Settings {
     Settings {
@@ -173,4 +190,196 @@ fn full_force_reindex_drops_symbols_from_deconfigured_directory() {
         facade.find_symbol("beta").is_none(),
         "beta must be gone: it belongs to a directory no longer in indexed_paths after full-force reindex"
     );
+}
+
+// =============================================================================
+// Group 3c: off-lock reindex seam equivalence
+//
+// `snapshot_reindex_handles()` + `ReindexHandles::run(...)` is the seam the
+// MCP server drives with no facade lock held (src/mcp/server.rs
+// `run_reindex`). These tests assert it produces the same outcome as the
+// pre-existing `index_directory` path when driven directly against the same
+// fixture, for both non-force and force runs.
+// =============================================================================
+
+/// Build a `Settings` value rooted at a fresh temp index directory with
+/// `indexing.indexed_paths` pre-populated, mirroring what `ReindexHandles::run`
+/// reads when invoked with `paths: None` (the server's default-reindex path).
+fn settings_with_indexed_paths(
+    index_dir: &std::path::Path,
+    indexed_paths: Vec<std::path::PathBuf>,
+) -> Settings {
+    let mut settings = settings_for(index_dir);
+    settings.indexing.indexed_paths = indexed_paths;
+    settings
+}
+
+#[test]
+fn off_lock_reindex_matches_index_directory_non_force() {
+    let temp = tempfile::tempdir().expect("create temp root");
+    let source_dir = temp.path().join("src");
+    let names = write_python_fixtures(&source_dir, &["alpha", "beta", "gamma"]);
+
+    // Reference path: index_directory driven directly.
+    let settings_a = settings_for(&temp.path().join("index_a"));
+    let mut facade_a = IndexFacade::new(Arc::new(settings_a)).expect("create reference facade");
+    let stats_a = facade_a
+        .index_directory(&source_dir, false)
+        .expect("index via index_directory");
+    let symbol_count_a = facade_a.symbol_count();
+    for name in &names {
+        assert!(
+            facade_a.find_symbol(name).is_some(),
+            "reference facade must resolve {name} after index_directory"
+        );
+    }
+
+    // Off-lock seam: snapshot_reindex_handles() + ReindexHandles::run(None, false).
+    let settings_b =
+        settings_with_indexed_paths(&temp.path().join("index_b"), vec![source_dir.clone()]);
+    let mut facade_b = IndexFacade::new(Arc::new(settings_b)).expect("create off-lock-seam facade");
+    let handles = facade_b
+        .snapshot_reindex_handles()
+        .expect("snapshot reindex handles");
+    let outcome = handles
+        .run(None, false)
+        .expect("run off-lock reindex walk (non-force)");
+
+    assert_eq!(
+        outcome.reindexed, stats_a.files_indexed,
+        "off-lock seam must reindex the same file count as index_directory"
+    );
+    assert_eq!(
+        outcome.symbol_count, symbol_count_a,
+        "off-lock seam must produce the same symbol_count as index_directory"
+    );
+    for name in &names {
+        assert!(
+            facade_b.find_symbol(name).is_some(),
+            "off-lock-seam facade must resolve {name} after ReindexHandles::run"
+        );
+    }
+}
+
+#[test]
+fn off_lock_reindex_matches_index_directory_force() {
+    let temp = tempfile::tempdir().expect("create temp root");
+    let source_dir = temp.path().join("src");
+    let names = write_python_fixtures(&source_dir, &["alpha", "beta", "gamma"]);
+
+    // Reference path: the pre-existing facade-level force sequence — clear
+    // the index, then reindex the (now-empty) index via `index_directory`.
+    // This mirrors what `run_reindex`'s Phase 1 (clear under lock) + a
+    // direct (non-off-lock) Phase 2 reindex would do, and is the semantic
+    // definition of "full-force reindex" for the `paths: None` case per
+    // `ReindexHandles::run`'s doc comment (force is only meaningful there
+    // via a prior clear, not via a `force: true` pipeline call).
+    let settings_a = settings_for(&temp.path().join("index_a"));
+    let mut facade_a = IndexFacade::new(Arc::new(settings_a)).expect("create reference facade");
+    facade_a
+        .index_directory(&source_dir, false)
+        .expect("seed reference facade");
+    facade_a
+        .clear_index()
+        .expect("clear_index before reference force reindex");
+    let stats_a = facade_a
+        .index_directory(&source_dir, false)
+        .expect("reindex via index_directory after clear");
+    let symbol_count_a = facade_a.symbol_count();
+    for name in &names {
+        assert!(
+            facade_a.find_symbol(name).is_some(),
+            "reference facade must resolve {name} after force index_directory"
+        );
+    }
+
+    // Off-lock seam: same seed-then-force sequence, but mirroring the actual
+    // `run_reindex` Phase 1/Phase 2 split — when `paths` is `None` and
+    // `force` is true, the caller clears the index under lock *before*
+    // snapshotting handles, and `ReindexHandles::run` then walks relying on
+    // that prior clear (see facade.rs `ReindexHandles::run` doc comment).
+    let settings_b =
+        settings_with_indexed_paths(&temp.path().join("index_b"), vec![source_dir.clone()]);
+    let mut facade_b = IndexFacade::new(Arc::new(settings_b)).expect("create off-lock-seam facade");
+    facade_b
+        .index_directory(&source_dir, false)
+        .expect("seed off-lock-seam facade");
+    facade_b
+        .clear_index()
+        .expect("clear_index before off-lock force reindex (mirrors run_reindex Phase 1)");
+    let handles = facade_b
+        .snapshot_reindex_handles()
+        .expect("snapshot reindex handles");
+    let outcome = handles
+        .run(None, true)
+        .expect("run off-lock reindex walk (force)");
+
+    assert_eq!(
+        outcome.reindexed, stats_a.files_indexed,
+        "off-lock seam must reindex the same file count as force index_directory"
+    );
+    assert_eq!(
+        outcome.symbol_count, symbol_count_a,
+        "off-lock seam must produce the same symbol_count as force index_directory"
+    );
+    for name in &names {
+        assert!(
+            facade_b.find_symbol(name).is_some(),
+            "off-lock-seam facade must resolve {name} after force ReindexHandles::run"
+        );
+    }
+}
+
+/// Discriminating: driving `ReindexHandles::run` against a facade whose
+/// index was just cleared (mirrors the server's Phase 1 `clear_index()` under
+/// lock, immediately followed by the off-lock Phase 2 walk) must repopulate
+/// the index from scratch rather than leave it empty.
+#[test]
+fn off_lock_reindex_repopulates_after_clear_index() {
+    let temp = tempfile::tempdir().expect("create temp root");
+    let source_dir = temp.path().join("src");
+    let names = write_python_fixtures(&source_dir, &["alpha", "beta", "gamma"]);
+
+    let settings =
+        settings_with_indexed_paths(&temp.path().join("index"), vec![source_dir.clone()]);
+    let mut facade = IndexFacade::new(Arc::new(settings)).expect("create facade");
+
+    // Seed the index so clear_index() has something to drop.
+    facade
+        .index_directory(&source_dir, false)
+        .expect("seed facade before clear");
+    assert!(
+        facade.symbol_count() > 0,
+        "facade must have symbols before clear"
+    );
+
+    // Mirrors run_reindex's Phase 1 (clear under lock, snapshot handles)
+    // immediately followed by Phase 2 (off-lock walk).
+    facade
+        .clear_index()
+        .expect("clear_index before off-lock force reindex");
+    assert_eq!(
+        facade.symbol_count(),
+        0,
+        "symbol_count must be zero immediately after clear_index"
+    );
+
+    let handles = facade
+        .snapshot_reindex_handles()
+        .expect("snapshot reindex handles after clear");
+    let outcome = handles
+        .run(None, true)
+        .expect("off-lock reindex walk must repopulate after clear_index");
+
+    assert!(
+        outcome.symbol_count > 0,
+        "off-lock reindex must repopulate symbols after clear_index, got {}",
+        outcome.symbol_count
+    );
+    for name in &names {
+        assert!(
+            facade.find_symbol(name).is_some(),
+            "{name} must resolve again after off-lock reindex repopulates a cleared index"
+        );
+    }
 }
