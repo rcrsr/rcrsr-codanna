@@ -826,27 +826,25 @@ pub async fn run(
     // json mode's dispatch match below is a text-only no-op (see below), so
     // this cannot wait for the shared dispatch path used by read-only tools.
     let reindex_data = if json && tool == "reindex" {
-        let paths = arguments
-            .as_ref()
-            .and_then(|m| m.get("paths"))
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                    .collect::<Vec<_>>()
-            });
-        let force = arguments
-            .as_ref()
-            .and_then(|m| m.get("force"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let (paths, force) =
+            match crate::mcp::requests::ReindexRequest::parse_args(arguments.as_ref()) {
+                Ok(v) => v,
+                Err(e) => {
+                    use crate::io::envelope::{Envelope, ResultCode};
+                    let envelope: Envelope<()> = Envelope::error(
+                        ResultCode::InvalidQuery,
+                        format!("Invalid reindex arguments: {e}"),
+                    );
+                    println!("{}", envelope.to_json().expect("envelope serialization"));
+                    std::process::exit(2);
+                }
+            };
 
-        let start = std::time::Instant::now();
         match server.run_reindex(paths, force).await {
-            Ok((reindexed, symbols)) => Some(ReindexInfo {
-                reindexed,
-                symbols,
-                duration_ms: start.elapsed().as_millis(),
+            Ok(outcome) => Some(ReindexInfo {
+                reindexed: outcome.reindexed,
+                symbols: outcome.symbols,
+                duration_ms: outcome.duration_ms,
             }),
             Err(e) => {
                 use crate::io::envelope::{Envelope, ResultCode};
@@ -867,6 +865,15 @@ pub async fn run(
     // JSON mode already collected everything above through the shared
     // service layer — one execution per invocation. The JSON emit arms
     // below use only pre-collected data; handler dispatch is text-only.
+    //
+    // For "reindex" specifically: `reindex_data` above (the `json && tool ==
+    // "reindex"` branch) is the sole execution of `run_reindex` on the JSON
+    // path. That is only safe because the `"reindex" =>` arm in the `match`
+    // below — which calls `server.reindex()` and would run a second
+    // reindex — is gated behind this `if json { .. } else { match .. } }`
+    // and never reached when `json` is true. If this `if json` gate is ever
+    // removed or the "reindex" match arm is moved outside it, `reindex_data`
+    // must be updated in lockstep or a JSON-mode reindex will run twice.
     let result = if json {
         Ok(rmcp::model::CallToolResult::success(vec![]))
     } else {
@@ -1124,20 +1131,12 @@ pub async fn run(
                     .await
             }
             "reindex" => {
-                let paths = arguments
-                    .as_ref()
-                    .and_then(|m| m.get("paths"))
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                            .collect::<Vec<_>>()
-                    });
-                let force = arguments
-                    .as_ref()
-                    .and_then(|m| m.get("force"))
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
+                let (paths, force) =
+                    crate::mcp::requests::ReindexRequest::parse_args(arguments.as_ref())
+                        .unwrap_or_else(|e| {
+                            eprintln!("Error: invalid reindex arguments: {e}");
+                            std::process::exit(1);
+                        });
                 server
                     .reindex(Parameters(ReindexRequest { paths, force }))
                     .await

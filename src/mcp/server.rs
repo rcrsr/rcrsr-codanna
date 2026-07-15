@@ -194,43 +194,40 @@ impl ServerHandler for CodeIntelligenceServer {
     }
 }
 
+/// Outcome of a [`CodeIntelligenceServer::run_reindex`] call, including
+/// timing. Built once inside `run_reindex` and shared by every caller (the
+/// `force-reindex` custom request, the `reindex` MCP tool, and the CLI's
+/// JSON `reindex` path) so each one doesn't independently wrap
+/// `Instant::now()`/`elapsed()` around the call and risk drifting on the
+/// duration type (a prior copy used `u64` while others used `u128`). Callers
+/// format their own output shape from these fields; this type does not
+/// change any external JSON output shape.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReindexRunOutcome {
+    pub reindexed: usize,
+    pub symbols: usize,
+    pub duration_ms: u128,
+}
+
 // Custom request handlers
 impl CodeIntelligenceServer {
     /// Handle force-reindex request
     async fn handle_force_reindex(&self, request: CustomRequest) -> Result<CustomResult, McpError> {
-        use std::time::Instant;
+        let params = request.params.as_ref().and_then(|p| p.as_object());
+        let (paths, force) = crate::mcp::requests::ReindexRequest::parse_args(params)
+            .map_err(|e| McpError::new(ErrorCode::INVALID_PARAMS, e.to_string(), None))?;
 
-        let start = Instant::now();
-
-        // Parse optional paths parameter
-        let paths: Option<Vec<String>> = request
-            .params
-            .as_ref()
-            .and_then(|p| p.get("paths"))
-            .and_then(|v| serde_json::from_value(v.clone()).ok());
-
-        // Parse optional force parameter (defaults to false for backward compatibility)
-        let force: bool = request
-            .params
-            .as_ref()
-            .and_then(|p| p.get("force"))
-            .and_then(|v| serde_json::from_value::<bool>(v.clone()).ok())
-            .unwrap_or(false);
-
-        let (reindexed, symbols) = self.run_reindex(paths, force).await?;
-
-        let duration_ms = start.elapsed().as_millis() as u64;
+        let outcome = self.run_reindex(paths, force).await?;
 
         Ok(CustomResult(serde_json::json!({
-            "reindexed": reindexed,
-            "symbols": symbols,
-            "duration_ms": duration_ms
+            "reindexed": outcome.reindexed,
+            "symbols": outcome.symbols,
+            "duration_ms": outcome.duration_ms
         })))
     }
 
     /// Run a reindex over the given paths (or all indexed_paths from settings if None),
     /// optionally clearing the index first when `force` is true.
-    /// Returns (reindexed_files, symbol_count).
     ///
     /// During a force reindex, concurrent readers are no longer blocked but may
     /// transiently observe an empty/repopulating index (clear-then-rebuild is not
@@ -239,7 +236,7 @@ impl CodeIntelligenceServer {
         &self,
         paths: Option<Vec<String>>,
         force: bool,
-    ) -> Result<(usize, usize), McpError> {
+    ) -> Result<ReindexRunOutcome, McpError> {
         self.run_reindex_with_phase2_signal(paths, force, None)
             .await
     }
@@ -257,7 +254,7 @@ impl CodeIntelligenceServer {
         paths: Option<Vec<String>>,
         force: bool,
         phase2_started: tokio::sync::oneshot::Sender<()>,
-    ) -> Result<(usize, usize), McpError> {
+    ) -> Result<ReindexRunOutcome, McpError> {
         self.run_reindex_with_phase2_signal(paths, force, Some(phase2_started))
             .await
     }
@@ -269,7 +266,9 @@ impl CodeIntelligenceServer {
         #[cfg_attr(not(test), allow(unused_variables))] phase2_started: Option<
             tokio::sync::oneshot::Sender<()>,
         >,
-    ) -> Result<(usize, usize), McpError> {
+    ) -> Result<ReindexRunOutcome, McpError> {
+        let start = std::time::Instant::now();
+
         // Bounds the number of explicitly-passed paths only (protects against
         // unbounded request payloads); it must never silently skip files
         // discovered while walking a given path/directory.
@@ -285,6 +284,71 @@ impl CodeIntelligenceServer {
                 ),
                 None,
             ));
+        }
+
+        // Reject explicit paths outside the configured workspace root before
+        // any work runs. Client-supplied `paths` are otherwise passed
+        // straight to `index_file`/`index_directory` with no containment
+        // check, letting a request walk/parse arbitrary host files (e.g.
+        // "/etc", "../../..") into the index. A brief read lock is enough
+        // here since only `settings()` is needed; this runs before the
+        // write-lock-held phase 1 below and before the off-lock walk.
+        if let Some(paths) = &paths {
+            let workspace_root = {
+                let indexer = self.facade.read().await;
+                indexer.settings().workspace_root.clone()
+            };
+
+            if let Some(workspace_root) = workspace_root {
+                // `canonicalize()` is a blocking syscall; offload the
+                // containment check to `spawn_blocking` to match the rest
+                // of this function, which never does blocking I/O directly
+                // on the async task (see the off-lock walk below).
+                let paths_to_check = paths.clone();
+                tokio::task::spawn_blocking(move || {
+                    let canonical_root = workspace_root.canonicalize().map_err(|e| {
+                        McpError::new(
+                            ErrorCode::INTERNAL_ERROR,
+                            format!(
+                                "Failed to canonicalize workspace root {}: {e}",
+                                workspace_root.display()
+                            ),
+                            None,
+                        )
+                    })?;
+
+                    for path in &paths_to_check {
+                        let canonical = std::path::Path::new(path).canonicalize().map_err(|e| {
+                            McpError::new(
+                                ErrorCode::INVALID_PARAMS,
+                                format!("Invalid reindex path '{path}': {e}"),
+                                None,
+                            )
+                        })?;
+
+                        if !canonical.starts_with(&canonical_root) {
+                            return Err(McpError::new(
+                                ErrorCode::INVALID_PARAMS,
+                                format!(
+                                    "Reindex path '{path}' is outside the workspace root ({}) and was rejected",
+                                    canonical_root.display()
+                                ),
+                                None,
+                            ));
+                        }
+                    }
+
+                    Ok(())
+                })
+                .await
+                .map_err(|e| {
+                    McpError::new(
+                        ErrorCode::INTERNAL_ERROR,
+                        format!("path containment check task panicked: {e}"),
+                        None,
+                    )
+                })??;
+            }
         }
 
         // Phase 1: brief write lock to optionally clear the index and snapshot
@@ -344,7 +408,11 @@ impl CodeIntelligenceServer {
             }
         }
 
-        Ok((outcome.reindexed, outcome.symbol_count))
+        Ok(ReindexRunOutcome {
+            reindexed: outcome.reindexed,
+            symbols: outcome.symbol_count,
+            duration_ms: start.elapsed().as_millis(),
+        })
     }
 
     /// Handle index-stats request
@@ -536,10 +604,102 @@ mod tests {
              in-flight duration"
         );
 
-        let (_reindexed, symbol_count) = result.expect("run_reindex must return Ok");
+        let outcome = result.expect("run_reindex must return Ok");
         assert_eq!(
-            symbol_count, expected_symbol_count,
+            outcome.symbols, expected_symbol_count,
             "expected run_reindex to produce the ground-truth symbol count for the fixture"
+        );
+    }
+
+    /// Security-boundary regression for `run_reindex`'s path containment
+    /// check (server.rs): with `workspace_root` set, an explicit reindex
+    /// path outside that root must be rejected with `INVALID_PARAMS` rather
+    /// than being walked/parsed into the index. The existing
+    /// `run_reindex_releases_write_lock_during_off_lock_walk` test above
+    /// uses `workspace_root: None`, which the containment check
+    /// intentionally skips (mirroring the existing path-normalization
+    /// no-op pattern elsewhere in the crate when no workspace root is
+    /// configured) and therefore never reaches the `canonicalize()`/
+    /// `starts_with()` check this test exercises.
+    #[tokio::test]
+    async fn run_reindex_rejects_explicit_path_outside_workspace_root() {
+        let temp = tempfile::tempdir().expect("create temp root");
+
+        let workspace_root = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace root dir");
+
+        let inside_dir = workspace_root.join("src");
+        std::fs::create_dir_all(&inside_dir).expect("create inside-workspace dir");
+        std::fs::write(
+            inside_dir.join("inside.py"),
+            "def inside_symbol():\n    pass\n",
+        )
+        .expect("write inside-workspace fixture");
+
+        // A sibling directory that exists on disk but is NOT under
+        // `workspace_root` — the containment check must reject it.
+        let outside_dir = temp.path().join("outside");
+        std::fs::create_dir_all(&outside_dir).expect("create outside-workspace dir");
+        std::fs::write(
+            outside_dir.join("outside.py"),
+            "def outside_symbol():\n    pass\n",
+        )
+        .expect("write outside-workspace fixture");
+
+        let settings = Settings {
+            index_path: temp.path().join("index"),
+            workspace_root: Some(workspace_root.clone()),
+            ..Default::default()
+        };
+
+        let facade =
+            IndexFacade::new(Arc::new(settings)).expect("create facade over temp index dir");
+        let server = CodeIntelligenceServer::new(facade);
+
+        // (a) An explicit path OUTSIDE the workspace root must be rejected
+        // with INVALID_PARAMS, not silently walked/parsed into the index.
+        let outside_path = outside_dir.to_str().expect("utf8 path").to_string();
+        let outside_result = server.run_reindex(Some(vec![outside_path]), false).await;
+        let outside_err =
+            outside_result.expect_err("reindex path outside the workspace root must be rejected");
+        assert_eq!(
+            outside_err.code,
+            ErrorCode::INVALID_PARAMS,
+            "expected INVALID_PARAMS for a reindex path outside the workspace root, got: {outside_err:?}"
+        );
+
+        // (b) An explicit path INSIDE the workspace root must succeed and
+        // actually index the file.
+        let inside_path = inside_dir
+            .join("inside.py")
+            .to_str()
+            .expect("utf8 path")
+            .to_string();
+        let inside_outcome = server
+            .run_reindex(Some(vec![inside_path]), false)
+            .await
+            .expect("reindex path inside the workspace root must succeed");
+        assert_eq!(
+            inside_outcome.reindexed, 1,
+            "expected the in-workspace file to be reindexed"
+        );
+
+        // (c) A nonexistent explicit path must error (canonicalize fails)
+        // rather than silently no-op'ing.
+        let nonexistent_path = workspace_root
+            .join("does_not_exist.py")
+            .to_str()
+            .expect("utf8 path")
+            .to_string();
+        let nonexistent_result = server
+            .run_reindex(Some(vec![nonexistent_path]), false)
+            .await;
+        let nonexistent_err = nonexistent_result
+            .expect_err("reindex over a nonexistent explicit path must error, not silently no-op");
+        assert_eq!(
+            nonexistent_err.code,
+            ErrorCode::INVALID_PARAMS,
+            "expected INVALID_PARAMS for a nonexistent reindex path, got: {nonexistent_err:?}"
         );
     }
 }

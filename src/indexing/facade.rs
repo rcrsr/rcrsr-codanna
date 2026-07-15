@@ -1317,11 +1317,18 @@ impl ReindexHandles {
     /// Preserves the branch behavior previously implemented in the MCP
     /// server's request handler:
     /// - An explicit file path is indexed via `Pipeline::index_file_single`.
+    ///   When `force` is true, the file's existing symbols/embeddings are
+    ///   removed first so a re-parse always runs even if its content hash
+    ///   is unchanged (mirrors `IndexFacade::index_file_with_force`).
     /// - An explicit directory path is indexed via `Pipeline::index_incremental`
     ///   with the caller-supplied `force` flag.
     /// - When `paths` is `None`, every directory in `indexing.indexed_paths`
-    ///   (from the pipeline's settings) is indexed with `force: false`, since
-    ///   any requested clear already ran under the caller's lock.
+    ///   (from the pipeline's settings) is indexed with the caller-supplied
+    ///   `force` flag. For the `paths: None` case this is redundant with any
+    ///   clear the caller already ran under lock (force mode does a full
+    ///   walk of an already-empty index either way), but passing it through
+    ///   keeps this call site honoring `force` rather than reading as if it
+    ///   were silently dropped.
     ///
     /// Per-path failures are logged with `tracing::warn!` and skipped rather
     /// than aborting the whole walk. Successfully indexed directories are
@@ -1342,6 +1349,29 @@ impl ReindexHandles {
             for path in &paths {
                 let path = Path::new(path);
                 if path.is_file() {
+                    if force {
+                        // `index_file_single` no-ops (unchanged-hash skip)
+                        // when the file's content hash matches what's
+                        // already indexed, which would silently drop
+                        // `force` for an explicit file path. Remove the
+                        // file's existing symbols/embeddings first so the
+                        // subsequent call always re-parses, mirroring
+                        // `IndexFacade::index_file_with_force`.
+                        use crate::indexing::pipeline::stages::CleanupStage;
+                        let semantic_path = pipeline.settings().index_path.join("semantic");
+                        let cleanup_stage = if let Some(ref sem) = semantic_search {
+                            CleanupStage::new(Arc::clone(&document_index), &semantic_path)
+                                .with_semantic(Arc::clone(sem))
+                        } else {
+                            CleanupStage::new(Arc::clone(&document_index), &semantic_path)
+                        };
+                        if let Err(e) = cleanup_stage.cleanup_files(&[path.to_path_buf()]) {
+                            tracing::warn!(
+                                "Failed to clear {} before force reindex: {e}",
+                                path.display()
+                            );
+                        }
+                    }
                     match pipeline.index_file_single(
                         path,
                         Arc::clone(&document_index),
@@ -1390,7 +1420,7 @@ impl ReindexHandles {
                         Arc::clone(&document_index),
                         semantic_search.clone(),
                         embedding_pool.clone(),
-                        false,
+                        force,
                     ) {
                         Ok(stats) => {
                             total_reindexed += stats.new_files + stats.modified_files;

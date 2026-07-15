@@ -383,3 +383,79 @@ fn off_lock_reindex_repopulates_after_clear_index() {
         );
     }
 }
+
+/// Discriminating: `force: true` against a single explicit FILE path must
+/// bypass the unchanged-content-hash skip in `Pipeline::index_file_single`,
+/// not silently no-op. A file's content hash is unchanged between the seed
+/// index and the forced reindex (so a non-force call would hit the
+/// `SingleFileStats { cached: true, .. }` early return), which is exactly
+/// the scenario a naive `force`-dropping implementation would still pass a
+/// weaker "reindexed count > 0" assertion for, since `ReindexHandles::run`
+/// counts any successfully processed explicit file path as reindexed
+/// regardless of cache status. Instead this asserts the file's `FileId` is
+/// reassigned, which can only happen if the force path actually removed and
+/// re-inserted the file's index records rather than hitting the cached
+/// early return.
+#[test]
+fn off_lock_reindex_force_bypasses_hash_skip_for_unchanged_file() {
+    let temp = tempfile::tempdir().expect("create temp root");
+    let source_dir = temp.path().join("src");
+    std::fs::create_dir_all(&source_dir).expect("create source dir");
+    let file_path = source_dir.join("alpha.py");
+    std::fs::write(&file_path, "def alpha():\n    pass\n").expect("write alpha fixture");
+
+    let settings = settings_for(&temp.path().join("index"));
+    let mut facade = IndexFacade::new(Arc::new(settings)).expect("create facade");
+
+    // Seed the index with the file via the normal single-file path.
+    facade
+        .index_file(&file_path)
+        .expect("seed index with alpha.py");
+    assert!(
+        facade.find_symbol("alpha").is_some(),
+        "alpha must resolve after the initial seed index"
+    );
+
+    let path_str = file_path.to_str().expect("utf8 path");
+    let (original_file_id, original_hash, _mtime) = facade
+        .document_index()
+        .get_file_info(path_str)
+        .expect("query file info after seed index")
+        .expect("alpha.py must be tracked in the index after seed index");
+
+    // File content is deliberately left unchanged, so a non-force reindex
+    // (or a force reindex that silently drops `force`) would hit the
+    // unchanged-hash `cached: true` early return in `index_file_single`.
+    let handles = facade
+        .snapshot_reindex_handles()
+        .expect("snapshot reindex handles");
+    let outcome = handles
+        .run(Some(vec![path_str.to_string()]), true)
+        .expect("run off-lock force reindex over the explicit file path");
+
+    assert_eq!(
+        outcome.reindexed, 1,
+        "force reindex over a single explicit file path must count it as reindexed"
+    );
+    assert!(
+        facade.find_symbol("alpha").is_some(),
+        "alpha must still resolve after force reindex of the unchanged file"
+    );
+
+    let (new_file_id, new_hash, _mtime) = facade
+        .document_index()
+        .get_file_info(path_str)
+        .expect("query file info after force reindex")
+        .expect("alpha.py must still be tracked in the index after force reindex");
+
+    assert_eq!(
+        new_hash, original_hash,
+        "file content (and therefore its hash) must be unchanged by this test"
+    );
+    assert_ne!(
+        new_file_id, original_file_id,
+        "force reindex of an explicit file path with an unchanged hash must remove and \
+         re-insert the file's index records (yielding a new FileId) rather than silently \
+         hitting the unchanged-hash cache skip"
+    );
+}
