@@ -7,6 +7,32 @@ upstream base. For the how, see the commit history.
 - **Upstream base:** the latest `codanna` release the fork is built on
 - **Fork build:** the upstream version with a `+rcrsr.N` suffix (see [Identifying the fork](#identifying-the-fork))
 
+## Installing the fork
+
+The fork is distributed through its own [GitHub Releases](https://github.com/rcrsr/rcrsr-codanna/releases),
+not crates.io or Homebrew. Each release is cut by pushing a `v<version>` tag; CI
+builds Linux, macOS (x64 + arm64), and Windows binaries and attaches them.
+
+Prebuilt binary via [`cargo binstall`](https://github.com/cargo-bins/cargo-binstall)
+(reads this repo's binstall metadata, so it must be pointed at the fork with `--git`):
+
+```bash
+cargo binstall --git https://github.com/rcrsr/rcrsr-codanna codanna
+```
+
+Plain `cargo binstall codanna` resolves the **upstream** crate from crates.io — use
+the `--git` form above to get the fork.
+
+From source:
+
+```bash
+cargo install --git https://github.com/rcrsr/rcrsr-codanna --all-features codanna
+```
+
+Or download a platform archive directly from the [releases page](https://github.com/rcrsr/rcrsr-codanna/releases)
+and put the `codanna` binary on your `PATH`. The binary is named `codanna` (same as
+upstream), so it will shadow an upstream install on the same `PATH`.
+
 ## Proxy mode: one backing server per workspace
 
 `codanna serve --proxy` lets several MCP clients share a single backing server

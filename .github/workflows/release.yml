@@ -1,10 +1,9 @@
 name: Release
 
 on:
-  workflow_dispatch:
   push:
     tags:
-      - "v*.*.*"
+      - "v*"
 
 env:
   CARGO_TERM_COLOR: always
@@ -27,6 +26,16 @@ jobs:
 
           if [[ -z "$version" ]]; then
             echo "Error: no version found in Cargo.toml"
+            exit 1
+          fi
+
+          # Version consistency: the pushed tag must match the Cargo.toml version
+          # (release artifacts and binstall URLs both derive from the Cargo.toml
+          # version, so a drifted tag would produce assets nobody can resolve).
+          tag="${GITHUB_REF_NAME}"
+          if [[ "$tag" != "v$version" ]]; then
+            echo "Error: tag '$tag' does not match Cargo.toml version 'v$version'"
+            echo "Bump Cargo.toml or retag so they agree before releasing."
             exit 1
           fi
 
@@ -186,9 +195,10 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ needs.info.outputs.version }}
-          name: v${{ needs.info.outputs.version }}
-          draft: true
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          draft: false
+          generate_release_notes: true
           files: |
             dist-manifest.json
             codanna-*.tar.xz
