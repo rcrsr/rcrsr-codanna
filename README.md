@@ -27,6 +27,10 @@ Built for rapid R&D and pair programming—instant answers when LSP is too slow.
 
 <h3 align="left"></h3>
 
+## Fork Notice
+
+This is **rcrsr-codanna**, a fork of [`bartolli/codanna`](https://github.com/bartolli/codanna). It carries fork-private additions (including `serve --proxy` mode) and reports its build with a `+rcrsr.N` suffix. See **[RCSR-README.md](RCSR-README.md)** for the list of changes and the versioning convention.
+
 ## Quick Start
 
 ### Install (macOS, Linux, WSL)

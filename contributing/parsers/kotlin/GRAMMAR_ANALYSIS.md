@@ -1,7 +1,5 @@
 # Kotlin Grammar Analysis
 
-*Generated: 2026-07-01 23:18:07 UTC*
-
 ## Statistics
 - Total nodes in grammar JSON: 136
 - Nodes found in comprehensive.kt: 152

@@ -1,7 +1,5 @@
 # Lua Grammar Analysis
 
-*Generated: 2026-07-01 23:18:07 UTC*
-
 ## Statistics
 - Total nodes in grammar JSON: 0
 - Nodes found in comprehensive.lua: 75
