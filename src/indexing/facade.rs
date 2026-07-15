@@ -1062,6 +1062,27 @@ impl IndexFacade {
         Ok(())
     }
 
+    /// Clear all documents from the index.
+    ///
+    /// Reuses the already-open `DocumentIndex`/Tantivy writer handle and the
+    /// in-memory semantic search store rather than removing files on disk or
+    /// constructing new writers. Resets directory tracking so a subsequent
+    /// `index_directory` call re-populates `indexed_paths` from scratch.
+    pub fn clear_index(&mut self) -> FacadeResult<()> {
+        self.document_index.clear()?;
+
+        if let Some(ref semantic) = self.semantic_search {
+            let mut sem = semantic
+                .lock()
+                .map_err(|e| IndexError::LockError(format!("semantic search: {e}")))?;
+            sem.clear();
+        }
+
+        self.indexed_paths.clear();
+
+        Ok(())
+    }
+
     /// Index a directory using the parallel pipeline.
     ///
     /// This is the primary indexing entry point using Pipeline.

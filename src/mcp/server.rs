@@ -209,6 +209,14 @@ impl CodeIntelligenceServer {
             .and_then(|p| p.get("paths"))
             .and_then(|v| serde_json::from_value(v.clone()).ok());
 
+        // Parse optional force parameter (defaults to false for backward compatibility)
+        let force: bool = request
+            .params
+            .as_ref()
+            .and_then(|p| p.get("force"))
+            .and_then(|v| serde_json::from_value::<bool>(v.clone()).ok())
+            .unwrap_or(false);
+
         let mut indexer = self.facade.write().await;
 
         let (reindexed, symbols) = if let Some(paths) = paths {
@@ -225,7 +233,7 @@ impl CodeIntelligenceServer {
                         }
                     }
                 } else if path.is_dir() {
-                    match indexer.index_directory(path, false) {
+                    match indexer.index_directory(path, force) {
                         Ok(stats) => total_reindexed += stats.files_indexed,
                         Err(e) => {
                             tracing::warn!("Failed to reindex {}: {e}", path.display());
@@ -236,6 +244,16 @@ impl CodeIntelligenceServer {
             (total_reindexed, indexer.symbol_count())
         } else {
             // Full reindex using indexed_paths from settings
+            if force {
+                indexer.clear_index().map_err(|e| {
+                    McpError::new(
+                        ErrorCode::INTERNAL_ERROR,
+                        format!("Failed to clear index before force reindex: {e}"),
+                        None,
+                    )
+                })?;
+            }
+
             let indexed_paths = indexer.settings().indexing.indexed_paths.clone();
             let mut total_reindexed = 0;
 
