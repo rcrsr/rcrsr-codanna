@@ -64,7 +64,7 @@ impl CodeIntelligenceServer {
         Self {
             facade: Arc::new(RwLock::new(facade)),
             document_store: None,
-            tool_router: Self::symbols_router() + Self::search_router(),
+            tool_router: Self::symbols_router() + Self::search_router() + Self::admin_router(),
             peer: Arc::new(Mutex::new(None)),
         }
     }
@@ -74,7 +74,7 @@ impl CodeIntelligenceServer {
         Self {
             facade,
             document_store: None,
-            tool_router: Self::symbols_router() + Self::search_router(),
+            tool_router: Self::symbols_router() + Self::search_router() + Self::admin_router(),
             peer: Arc::new(Mutex::new(None)),
         }
     }
@@ -84,7 +84,7 @@ impl CodeIntelligenceServer {
         Self {
             facade,
             document_store: None,
-            tool_router: Self::symbols_router() + Self::search_router(),
+            tool_router: Self::symbols_router() + Self::search_router() + Self::admin_router(),
             peer: Arc::new(Mutex::new(None)),
         }
     }
@@ -217,6 +217,25 @@ impl CodeIntelligenceServer {
             .and_then(|v| serde_json::from_value::<bool>(v.clone()).ok())
             .unwrap_or(false);
 
+        let (reindexed, symbols) = self.run_reindex(paths, force).await?;
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        Ok(CustomResult(serde_json::json!({
+            "reindexed": reindexed,
+            "symbols": symbols,
+            "duration_ms": duration_ms
+        })))
+    }
+
+    /// Run a reindex over the given paths (or all indexed_paths from settings if None),
+    /// optionally clearing the index first when `force` is true.
+    /// Returns (reindexed_files, symbol_count).
+    pub(crate) async fn run_reindex(
+        &self,
+        paths: Option<Vec<String>>,
+        force: bool,
+    ) -> Result<(usize, usize), McpError> {
         let mut indexer = self.facade.write().await;
 
         let (reindexed, symbols) = if let Some(paths) = paths {
@@ -270,13 +289,7 @@ impl CodeIntelligenceServer {
             (total_reindexed, indexer.symbol_count())
         };
 
-        let duration_ms = start.elapsed().as_millis() as u64;
-
-        Ok(CustomResult(serde_json::json!({
-            "reindexed": reindexed,
-            "symbols": symbols,
-            "duration_ms": duration_ms
-        })))
+        Ok((reindexed, symbols))
     }
 
     /// Handle index-stats request

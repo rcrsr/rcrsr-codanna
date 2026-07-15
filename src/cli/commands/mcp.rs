@@ -68,6 +68,13 @@ struct CollectionInfo {
 }
 
 #[derive(Debug, Serialize)]
+struct ReindexInfo {
+    reindexed: usize,
+    symbols: usize,
+    duration_ms: u128,
+}
+
+#[derive(Debug, Serialize)]
 struct SymbolKindBreakdown {
     functions: usize,
     methods: usize,
@@ -270,6 +277,7 @@ pub async fn run(
         "semantic_search_docs",
         "semantic_search_with_context",
         "search_documents",
+        "reindex",
     ];
     if !KNOWN_TOOLS.contains(&tool.as_str()) {
         if json {
@@ -279,14 +287,14 @@ pub async fn run(
                 ExitCode::GeneralError,
                 &format!("Unknown tool: {tool}"),
                 vec![
-                    "Available tools: find_symbol, get_calls, find_callers, analyze_impact, get_index_info, search_symbols, semantic_search_docs, semantic_search_with_context, search_documents",
+                    "Available tools: find_symbol, get_calls, find_callers, analyze_impact, get_index_info, search_symbols, semantic_search_docs, semantic_search_with_context, search_documents, reindex",
                 ],
             );
             println!("{}", serde_json::to_string_pretty(&response).unwrap());
         } else {
             eprintln!("Unknown tool: {tool}");
             eprintln!(
-                "Available tools: find_symbol, get_calls, find_callers, analyze_impact, get_index_info, search_symbols, semantic_search_docs, semantic_search_with_context, search_documents"
+                "Available tools: find_symbol, get_calls, find_callers, analyze_impact, get_index_info, search_symbols, semantic_search_docs, semantic_search_with_context, search_documents, reindex"
             );
         }
         std::process::exit(1);
@@ -814,6 +822,44 @@ pub async fn run(
         }
     };
 
+    // Invoke reindex now for JSON output. reindex mutates the index, and
+    // json mode's dispatch match below is a text-only no-op (see below), so
+    // this cannot wait for the shared dispatch path used by read-only tools.
+    let reindex_data = if json && tool == "reindex" {
+        let paths = arguments
+            .as_ref()
+            .and_then(|m| m.get("paths"))
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect::<Vec<_>>()
+            });
+        let force = arguments
+            .as_ref()
+            .and_then(|m| m.get("force"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let start = std::time::Instant::now();
+        match server.run_reindex(paths, force).await {
+            Ok((reindexed, symbols)) => Some(ReindexInfo {
+                reindexed,
+                symbols,
+                duration_ms: start.elapsed().as_millis(),
+            }),
+            Err(e) => {
+                use crate::io::envelope::{Envelope, ResultCode};
+                let envelope: Envelope<()> =
+                    Envelope::error(ResultCode::IndexError, format!("Reindex failed: {e}"));
+                println!("{}", envelope.to_json().expect("envelope serialization"));
+                std::process::exit(2);
+            }
+        }
+    } else {
+        None
+    };
+
     // Call the tool directly
     use crate::mcp::*;
     use rmcp::handler::server::wrapper::Parameters;
@@ -1077,6 +1123,25 @@ pub async fn run(
                     }))
                     .await
             }
+            "reindex" => {
+                let paths = arguments
+                    .as_ref()
+                    .and_then(|m| m.get("paths"))
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect::<Vec<_>>()
+                    });
+                let force = arguments
+                    .as_ref()
+                    .and_then(|m| m.get("force"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                server
+                    .reindex(Parameters(ReindexRequest { paths, force }))
+                    .await
+            }
             _ => {
                 if json {
                     use crate::io::exit_code::ExitCode;
@@ -1085,14 +1150,14 @@ pub async fn run(
                         ExitCode::GeneralError,
                         &format!("Unknown tool: {tool}"),
                         vec![
-                            "Available tools: find_symbol, get_calls, find_callers, analyze_impact, get_index_info, search_symbols, semantic_search_docs, semantic_search_with_context, search_documents",
+                            "Available tools: find_symbol, get_calls, find_callers, analyze_impact, get_index_info, search_symbols, semantic_search_docs, semantic_search_with_context, search_documents, reindex",
                         ],
                     );
                     println!("{}", serde_json::to_string_pretty(&response).unwrap());
                 } else {
                     eprintln!("Unknown tool: {tool}");
                     eprintln!(
-                        "Available tools: find_symbol, get_calls, find_callers, analyze_impact, get_index_info, search_symbols, semantic_search_docs, semantic_search_with_context, search_documents"
+                        "Available tools: find_symbol, get_calls, find_callers, analyze_impact, get_index_info, search_symbols, semantic_search_docs, semantic_search_with_context, search_documents, reindex"
                     );
                 }
                 std::process::exit(1);
@@ -1672,6 +1737,18 @@ pub async fn run(
 
                     println!("{}", envelope.to_json().expect("envelope serialization"));
                     std::process::exit(1);
+                }
+            } else if json && tool == "reindex" {
+                use crate::io::envelope::Envelope;
+
+                if let Some(reindex_info) = reindex_data {
+                    let envelope = Envelope::success(reindex_info).with_message("Reindex complete");
+
+                    let output = match &fields {
+                        Some(f) => envelope.to_json_with_fields(f),
+                        None => envelope.to_json(),
+                    };
+                    println!("{}", output.expect("envelope serialization"));
                 }
             } else {
                 // Default text output

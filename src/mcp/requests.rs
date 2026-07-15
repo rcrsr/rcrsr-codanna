@@ -135,6 +135,16 @@ pub struct SearchDocumentsRequest {
     pub limit: u32,
 }
 
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ReindexRequest {
+    /// Paths (files or directories) to reindex; omit to reindex all configured indexed_paths
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paths: Option<Vec<String>>,
+    /// Force a full reindex, clearing the existing index first (default: false)
+    #[serde(default)]
+    pub force: bool,
+}
+
 fn default_depth() -> u32 {
     3
 }

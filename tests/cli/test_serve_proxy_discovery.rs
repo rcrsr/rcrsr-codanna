@@ -671,6 +671,86 @@ async fn proxy_serves_real_mcp_traffic_from_shared_upstream() {
         .expect("proxy client should shut down cleanly");
 }
 
+/// W-6(C): PROXY + HTTP MODE E2E for the `reindex` tool.
+///
+/// This drives the exact same real subprocess pattern as
+/// `proxy_serves_real_mcp_traffic_from_shared_upstream` above (a real
+/// `codanna serve --proxy` child, which `discover_or_spawn`s a real
+/// `codanna serve --http` backing server, connected to over real MCP stdio
+/// framing -- no mocks anywhere in the chain), but targets `reindex`
+/// specifically:
+///
+/// - `list_tools()` through the proxy proves the HTTP backing server (the
+///   `new_with_facade` constructor, see `src/cli/commands/serve.rs`) really
+///   registers `reindex` -- the proxy itself registers no tools of its own
+///   (`src/mcp/proxy.rs`), so a `reindex` entry can only have come from the
+///   upstream HTTP server's tool router.
+/// - `call_tool("reindex")` through the proxy proves BOTH that the upstream
+///   HTTP server can actually execute the tool AND that the proxy correctly
+///   forwards an admin-router tool call end-to-end, not just the read-only
+///   tools already covered by the `find_symbol` assertions above. A
+///   `METHOD_NOT_FOUND` error here would mean either the upstream never
+///   wired `reindex` into its router, or the proxy's forwarding path
+///   silently drops/misroutes it.
+#[tokio::test]
+async fn proxy_forwards_reindex_tool_from_http_upstream() {
+    let workspace = prepare_workspace();
+    let _reaper = Reaper(workspace.path().to_path_buf());
+
+    let client = tokio::time::timeout(DEADLINE, connect_proxy_client(workspace.path()))
+        .await
+        .expect("proxy client should connect within the deadline");
+
+    // (a) `reindex` is present in the tool list relayed through the proxy
+    // from the real HTTP backing server.
+    let tools = tokio::time::timeout(DEADLINE, client.list_tools(Default::default()))
+        .await
+        .expect("list_tools should complete within the deadline")
+        .expect("list_tools should succeed through the proxy");
+    let tool_names: Vec<&str> = tools.tools.iter().map(|t| t.name.as_ref()).collect();
+    assert!(
+        tool_names.contains(&"reindex"),
+        "upstream HTTP server's tool list relayed through the proxy should contain reindex, got: \
+         {tool_names:?}"
+    );
+
+    // (b) calling `reindex` through the proxy actually reaches the upstream
+    // and executes -- not a METHOD_NOT_FOUND, and not an application-level
+    // error result either.
+    let call_result = tokio::time::timeout(
+        DEADLINE,
+        client.call_tool(
+            rmcp::model::CallToolRequestParams::new("reindex").with_arguments(
+                serde_json::json!({})
+                    .as_object()
+                    .cloned()
+                    .expect("json object"),
+            ),
+        ),
+    )
+    .await
+    .expect("call_tool should complete within the deadline");
+
+    let call_result = match call_result {
+        Ok(result) => result,
+        Err(err) => panic!(
+            "reindex call through the proxy should not fail at the protocol level (e.g. \
+             METHOD_NOT_FOUND), got: {err:?}"
+        ),
+    };
+    assert_ne!(
+        call_result.is_error,
+        Some(true),
+        "reindex call through the proxy should not be an application-level error result, got: \
+         {call_result:?}"
+    );
+
+    client
+        .cancel()
+        .await
+        .expect("proxy client should shut down cleanly");
+}
+
 #[tokio::test]
 async fn second_proxy_shares_one_upstream_one_record_one_pid() {
     let workspace = prepare_workspace();
