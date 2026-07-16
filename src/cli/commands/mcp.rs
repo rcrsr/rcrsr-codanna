@@ -5,26 +5,21 @@ use crate::config::Settings;
 use crate::indexing::facade::IndexFacade;
 use crate::io::args::parse_positional_args;
 use crate::io::envelope::EntityType;
-use crate::mcp::service::{SymbolResolution, resolve_symbol_or_id};
-use serde::Serialize;
+use crate::mcp::service::{RelationOutcome, SearchOutcome, ambiguous_envelope, filter_callers};
 
-/// Print an INVALID_QUERY envelope for an ambiguous symbol name and exit 2.
-/// Mirrors the MCP handlers' refuse-and-list policy: JSON mode must never
-/// merge relationships across same-named symbols.
+/// Print the shared `Ambiguous`-status envelope for an ambiguous symbol name
+/// and exit with its `exit_code`. Delegates to `service::ambiguous_envelope`
+/// — the single source of the status/code/exit_code mapping — so an
+/// identical ambiguous-name request produces the same status/code/exit_code
+/// whether it comes through `codanna mcp <tool> --json` or the MCP tool's
+/// own `output_format: json` path (previously this CLI path hardcoded
+/// `ResultCode::InvalidQuery`/exit 2 while the MCP handlers used
+/// `Status::Ambiguous`/`ResultCode::Ambiguous`/exit 3, drifting apart).
 fn exit_ambiguous(entity: EntityType, name: &str, candidates: Vec<Symbol>) -> ! {
-    use crate::io::envelope::{Envelope, ResultCode};
-    let count = candidates.len();
-    let mut envelope = Envelope::error(
-        ResultCode::InvalidQuery,
-        format!("Ambiguous: found {count} symbol(s) named '{name}'"),
-    )
-    .with_entity_type(entity)
-    .with_query(name)
-    .with_count(count)
-    .with_hint("Ambiguous name: re-run with symbol_id:<id> using a candidate from data");
-    envelope.data = Some(candidates);
+    let envelope = ambiguous_envelope(entity, name, candidates);
+    let exit_code = envelope.exit_code;
     println!("{}", envelope.to_json().expect("envelope serialization"));
-    std::process::exit(2);
+    std::process::exit(exit_code.into());
 }
 
 /// Print an INDEX_ERROR envelope and exit 2. A backend failure must be
@@ -41,119 +36,13 @@ fn exit_index_error(entity: EntityType, query: &str, error: impl std::fmt::Displ
     std::process::exit(2);
 }
 
-// MCP tool JSON output structures
-#[derive(Debug, Serialize)]
-struct IndexInfo {
-    symbol_count: usize,
-    file_count: usize,
-    relationship_count: usize,
-    symbol_kinds: SymbolKindBreakdown,
-    semantic_search: SemanticSearchInfo,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    documents: Option<DocumentsInfo>,
-}
-
-#[derive(Debug, Serialize)]
-struct DocumentsInfo {
-    enabled: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    collections: Option<Vec<CollectionInfo>>,
-}
-
-#[derive(Debug, Serialize)]
-struct CollectionInfo {
-    name: String,
-    chunk_count: usize,
-    file_count: usize,
-}
-
-#[derive(Debug, Serialize)]
-struct ReindexInfo {
-    reindexed: usize,
-    symbols: usize,
-    duration_ms: u128,
-}
-
-#[derive(Debug, Serialize)]
-struct SymbolKindBreakdown {
-    functions: usize,
-    methods: usize,
-    structs: usize,
-    traits: usize,
-}
-
-#[derive(Debug, Serialize)]
-struct SemanticSearchInfo {
-    enabled: bool,
-    model_name: Option<String>,
-    embeddings: Option<usize>,
-    dimensions: Option<usize>,
-    created: Option<String>,
-    updated: Option<String>,
-}
-
-/// Flattened call/caller info combining symbol with call site metadata.
-/// Avoids tuple waste like `[[symbol, null], ...]` in JSON output.
-#[derive(Debug, Serialize)]
-struct CallRelation {
-    #[serde(flatten)]
-    symbol: Symbol,
-    /// Line number of the call site (1-indexed)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    call_line: Option<u32>,
-    /// Column of the call site
-    #[serde(skip_serializing_if = "Option::is_none")]
-    call_column: Option<u16>,
-}
-
-/// Symbol info extracted from search result for consistent JSON shape.
-/// Matches the nested `symbol: {...}` pattern used by semantic_search_docs.
-#[derive(Debug, Serialize)]
-struct SymbolInfo {
-    id: crate::types::SymbolId,
-    name: String,
-    kind: crate::types::SymbolKind,
-    file_path: String,
-    line: u32,
-    column: u16,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    doc_comment: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    signature: Option<String>,
-    module_path: String,
-}
-
-/// Search result with nested symbol for consistent JSON output.
-/// Standardizes on `symbol: {...}` rather than flat `symbol_id: ...`.
-#[derive(Debug, Serialize)]
-struct SearchSymbolResult {
-    symbol: SymbolInfo,
-    score: f32,
-    highlights: Vec<crate::storage::tantivy::TextHighlight>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    context: Option<String>,
-}
-
-impl From<crate::storage::tantivy::SearchResult> for SearchSymbolResult {
-    fn from(sr: crate::storage::tantivy::SearchResult) -> Self {
-        Self {
-            symbol: SymbolInfo {
-                id: sr.symbol_id,
-                name: sr.name,
-                kind: sr.kind,
-                file_path: sr.file_path,
-                line: sr.line,
-                column: sr.column,
-                doc_comment: sr.doc_comment,
-                signature: sr.signature,
-                module_path: sr.module_path,
-            },
-            score: sr.score,
-            highlights: sr.highlights,
-            context: sr.context,
-        }
-    }
-}
+// MCP tool JSON output structures.
+//
+// The typed data payloads themselves (IndexInfo, CallRelation,
+// SearchSymbolResult, SemanticSearchResult, SemanticSearchWithContextResult,
+// ReindexInfo) live in `crate::mcp::service` and are imported above: they
+// are shared with the MCP tools' `output_format: json` path, so this file
+// must not re-declare them (§BASIC.2).
 
 /// Run the MCP direct tool invocation command.
 pub async fn run(
@@ -199,15 +88,18 @@ pub async fn run(
                             serde_json::Value::String(pos_arg.clone()),
                         );
                     }
-                    "get_calls" | "find_callers" => {
+                    "get_calls" | "find_callers" | "analyze_impact" | "read_symbol" => {
+                        // Canonical key is `name` (old `function_name` /
+                        // `symbol_name` keys are still accepted via serde
+                        // aliases when passed explicitly through --args).
                         args_map.insert(
-                            "function_name".to_string(),
+                            "name".to_string(),
                             serde_json::Value::String(pos_arg.clone()),
                         );
                     }
-                    "analyze_impact" => {
+                    "get_file_outline" => {
                         args_map.insert(
-                            "symbol_name".to_string(),
+                            "path".to_string(),
                             serde_json::Value::String(pos_arg.clone()),
                         );
                     }
@@ -267,8 +159,17 @@ pub async fn run(
 
     // Validate the tool name up front: JSON mode never reaches the dispatch
     // match below, so its unknown-tool arm cannot cover this.
+    //
+    // Every tool below (including `reindex`) also accepts an `output_format`
+    // argument (`text`, the default, or `json`) when invoked directly over
+    // MCP JSON-RPC (e.g. `--args '{"output_format":"json"}'`): `json`
+    // returns a single `Envelope<T>`-shaped `ContentBlock::text`, the same
+    // schema this CLI's own `--json` flag produces. This CLI's `--json`
+    // flag is the primary and independently-maintained CLI JSON path and
+    // takes precedence over any `output_format` passed via `--args`.
     const KNOWN_TOOLS: &[&str] = &[
         "find_symbol",
+        "find_symbols",
         "get_calls",
         "find_callers",
         "analyze_impact",
@@ -278,6 +179,8 @@ pub async fn run(
         "semantic_search_with_context",
         "search_documents",
         "reindex",
+        "get_file_outline",
+        "read_symbol",
     ];
     if !KNOWN_TOOLS.contains(&tool.as_str()) {
         if json {
@@ -287,14 +190,14 @@ pub async fn run(
                 ExitCode::GeneralError,
                 &format!("Unknown tool: {tool}"),
                 vec![
-                    "Available tools: find_symbol, get_calls, find_callers, analyze_impact, get_index_info, search_symbols, semantic_search_docs, semantic_search_with_context, search_documents, reindex",
+                    "Available tools: find_symbol, find_symbols, get_calls, find_callers, analyze_impact, get_index_info, search_symbols, semantic_search_docs, semantic_search_with_context, search_documents, reindex, get_file_outline, read_symbol",
                 ],
             );
             println!("{}", serde_json::to_string_pretty(&response).unwrap());
         } else {
             eprintln!("Unknown tool: {tool}");
             eprintln!(
-                "Available tools: find_symbol, get_calls, find_callers, analyze_impact, get_index_info, search_symbols, semantic_search_docs, semantic_search_with_context, search_documents, reindex"
+                "Available tools: find_symbol, find_symbols, get_calls, find_callers, analyze_impact, get_index_info, search_symbols, semantic_search_docs, semantic_search_with_context, search_documents, reindex, get_file_outline, read_symbol"
             );
         }
         std::process::exit(1);
@@ -311,45 +214,58 @@ pub async fn run(
             .and_then(|m| m.get("lang"))
             .and_then(|v| v.as_str());
 
-        if let Some(symbol_name) = name {
-            let mut symbols = facade.find_symbols_by_name(symbol_name, language);
-            if symbols.is_empty() {
-                symbols = crate::mcp::service::find_dotted_members(symbol_name, |n| {
-                    facade.find_symbols_by_name(n, language)
-                });
+        name.map(|symbol_name| {
+            crate::mcp::service::find_symbol_data(&facade, symbol_name, language)
+        })
+    } else {
+        None
+    };
+
+    // Collect data for find_symbols if JSON output is requested. Reuses the
+    // batch tool's own `find_symbols_entry` builder and cap constant
+    // (`crate::mcp::tools::symbols`) rather than re-deriving per-name
+    // resolution or the size limit here — mirrors `find_symbol_data` above.
+    let find_symbols_data: Option<
+        std::collections::BTreeMap<String, crate::mcp::tools::symbols::FindSymbolsEntry>,
+    > = if json && tool == "find_symbols" {
+        let names: Vec<String> = match arguments.as_ref().and_then(|m| m.get("names")) {
+            Some(value) => serde_json::from_value(value.clone()).unwrap_or_else(|e| {
+                eprintln!("Error: `names` must be an array of strings: {e}");
+                std::process::exit(1);
+            }),
+            None => {
+                eprintln!("Error: find_symbols requires a 'names' array parameter");
+                std::process::exit(1);
             }
-            if !symbols.is_empty() {
-                use crate::symbol::context::ContextIncludes;
-                let mut results = Vec::new();
-
-                for symbol in symbols {
-                    // Get full context with callers using the same approach as MCP
-                    let context =
-                        facade.get_symbol_context(symbol.id, ContextIncludes::SYMBOL_CARD);
-
-                    // Build result with context if available
-                    if let Some(ctx) = context {
-                        results.push(ctx);
-                    } else {
-                        // Fallback: create minimal context
-                        let file_path = facade
-                            .get_file_path(symbol.file_id)
-                            .unwrap_or_else(|| "unknown".to_string());
-
-                        results.push(crate::symbol::context::SymbolContext {
-                            symbol,
-                            file_path,
-                            relationships: Default::default(),
-                        });
-                    }
-                }
-                Some(results)
-            } else {
-                Some(Vec::new())
-            }
-        } else {
-            None
+        };
+        if names.len() > crate::mcp::tools::symbols::MAX_FIND_SYMBOLS_NAMES {
+            use crate::io::envelope::{Envelope, ResultCode};
+            let envelope: Envelope<()> = Envelope::error(
+                ResultCode::InvalidQuery,
+                format!(
+                    "Too many names requested for find_symbols: {} (max {})",
+                    names.len(),
+                    crate::mcp::tools::symbols::MAX_FIND_SYMBOLS_NAMES
+                ),
+            );
+            println!("{}", envelope.to_json().expect("envelope serialization"));
+            std::process::exit(2);
         }
+        let language = arguments
+            .as_ref()
+            .and_then(|m| m.get("lang"))
+            .and_then(|v| v.as_str());
+
+        Some(
+            names
+                .iter()
+                .map(|name| {
+                    let entry =
+                        crate::mcp::tools::symbols::find_symbols_entry(&facade, name, language);
+                    (name.clone(), entry)
+                })
+                .collect(),
+        )
     } else {
         None
     };
@@ -363,43 +279,47 @@ pub async fn run(
             .and_then(|m| m.get("symbol_id"))
             .and_then(|v| v.as_u64())
             .map(|id| id as u32);
-        let function_name = arguments
+        let name = arguments
             .as_ref()
-            .and_then(|m| m.get("function_name"))
+            .and_then(|m| m.get("name").or_else(|| m.get("function_name")))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        use crate::symbol::context::ContextIncludes;
-        match resolve_symbol_or_id(&facade, symbol_id, function_name) {
-            SymbolResolution::Resolved { symbol, .. } => {
-                let mut all_calls = Vec::new();
-                if let Some(ctx) = facade.get_symbol_context(symbol.id, ContextIncludes::CALLS) {
-                    if let Some(calls) = ctx.relationships.calls {
-                        for (called, metadata) in calls {
-                            all_calls.push(CallRelation {
-                                symbol: called,
-                                call_line: metadata.as_ref().and_then(|m| m.line).map(|l| l + 1),
-                                call_column: metadata.as_ref().and_then(|m| m.column),
-                            });
-                        }
-                    }
-                }
-                Some(all_calls)
-            }
-            SymbolResolution::NotFoundById(_) | SymbolResolution::NotFoundByName(_) => None,
-            SymbolResolution::Ambiguous { name, candidates } => {
+        match crate::mcp::service::get_calls_data(&facade, symbol_id, name) {
+            RelationOutcome::Data(calls) => Some(calls),
+            RelationOutcome::NotFound => None,
+            RelationOutcome::Ambiguous { name, candidates } => {
                 exit_ambiguous(EntityType::Calls, &name, candidates)
             }
-            SymbolResolution::MissingParam => {
-                eprintln!(
-                    "Error: get_calls requires either 'function_name' or 'symbol_id' parameter"
-                );
+            RelationOutcome::MissingParam => {
+                eprintln!("Error: get_calls requires either 'name' or 'symbol_id' parameter");
                 std::process::exit(1);
             }
         }
     } else {
         None
     };
+
+    // `filter`/`count_only` for find_callers: read once here so both the
+    // JSON data-collection block below and the JSON render block later in
+    // this function (`if json && tool == "find_callers"`) see identical
+    // values; the text-mode dispatch further down parses its own copy from
+    // `arguments` into a `FindCallersRequest`.
+    let find_callers_filter = arguments
+        .as_ref()
+        .and_then(|m| m.get("filter"))
+        .and_then(|v| v.as_str())
+        .map(|s| match s {
+            "production" => CallerFilter::Production,
+            "test" => CallerFilter::Test,
+            _ => CallerFilter::All,
+        })
+        .unwrap_or_default();
+    let find_callers_count_only = arguments
+        .as_ref()
+        .and_then(|m| m.get("count_only"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     // Collect data for find_callers if JSON output is requested.
     // Same shared resolution policy as get_calls: refuse-and-list on
@@ -410,39 +330,59 @@ pub async fn run(
             .and_then(|m| m.get("symbol_id"))
             .and_then(|v| v.as_u64())
             .map(|id| id as u32);
-        let function_name = arguments
+        let name = arguments
             .as_ref()
-            .and_then(|m| m.get("function_name"))
+            .and_then(|m| m.get("name").or_else(|| m.get("function_name")))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        match resolve_symbol_or_id(&facade, symbol_id, function_name) {
-            SymbolResolution::Resolved { symbol, .. } => {
-                let callers = facade.get_calling_functions_with_metadata(symbol.id);
-                let all_callers: Vec<_> = callers
-                    .into_iter()
-                    .map(|(caller, metadata)| CallRelation {
-                        symbol: caller,
-                        call_line: metadata.as_ref().and_then(|m| m.line).map(|l| l + 1),
-                        call_column: metadata.as_ref().and_then(|m| m.column),
-                    })
-                    .collect();
-                Some(all_callers)
-            }
-            SymbolResolution::NotFoundById(_) | SymbolResolution::NotFoundByName(_) => None,
-            SymbolResolution::Ambiguous { name, candidates } => {
+        // Unfiltered: `filter` is applied at render time so a `count_only`
+        // request's per-role breakdown can still be built over the
+        // UNFILTERED caller set (see `service::find_callers_counts_envelope`).
+        match crate::mcp::service::find_callers_data(
+            &facade,
+            symbol_id,
+            name,
+            &config.caller_classification.test_path_patterns,
+        ) {
+            RelationOutcome::Data(callers) => Some(callers),
+            RelationOutcome::NotFound => None,
+            RelationOutcome::Ambiguous { name, candidates } => {
                 exit_ambiguous(EntityType::Callers, &name, candidates)
             }
-            SymbolResolution::MissingParam => {
-                eprintln!(
-                    "Error: find_callers requires either 'function_name' or 'symbol_id' parameter"
-                );
+            RelationOutcome::MissingParam => {
+                eprintln!("Error: find_callers requires either 'name' or 'symbol_id' parameter");
                 std::process::exit(1);
             }
         }
     } else {
         None
     };
+
+    // `count_only`/`max_results`/`group_by` for analyze_impact: read once
+    // here so both the JSON render block below (`if json && tool ==
+    // "analyze_impact"`) and the text-mode dispatch further down see
+    // identical values; the text-mode dispatch parses its own copy from
+    // `arguments` into an `AnalyzeImpactRequest`.
+    let analyze_impact_count_only = arguments
+        .as_ref()
+        .and_then(|m| m.get("count_only"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let analyze_impact_max_results = arguments
+        .as_ref()
+        .and_then(|m| m.get("max_results"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+    let analyze_impact_group_by = arguments
+        .as_ref()
+        .and_then(|m| m.get("group_by"))
+        .and_then(|v| v.as_str())
+        .map(|s| match s {
+            "file" => GroupBy::File,
+            _ => GroupBy::Kind,
+        })
+        .unwrap_or_default();
 
     // Collect data for analyze_impact if JSON output is requested
     let analyze_impact_data = if json && tool == "analyze_impact" {
@@ -451,39 +391,25 @@ pub async fn run(
             .and_then(|m| m.get("symbol_id"))
             .and_then(|v| v.as_u64())
             .map(|id| id as u32);
-        let symbol_name = arguments
+        let name = arguments
             .as_ref()
-            .and_then(|m| m.get("symbol_name"))
-            .and_then(|v| v.as_str());
+            .and_then(|m| m.get("name").or_else(|| m.get("symbol_name")))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let max_depth = arguments
+            .as_ref()
+            .and_then(|m| m.get("max_depth"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(3) as usize;
 
-        match resolve_symbol_or_id(&facade, symbol_id, symbol_name.map(|s| s.to_string())) {
-            SymbolResolution::Resolved { symbol, .. } => {
-                let max_depth = arguments
-                    .as_ref()
-                    .and_then(|m| m.get("max_depth"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(3) as usize;
-
-                let impacted_ids = facade.get_impact_radius(symbol.id, Some(max_depth));
-
-                // Convert SymbolIds to full Symbols
-                let mut impacted_symbols = Vec::new();
-                for impact_id in impacted_ids {
-                    if let Some(sym) = facade.get_symbol(impact_id) {
-                        impacted_symbols.push(sym);
-                    }
-                }
-
-                Some(impacted_symbols)
-            }
-            SymbolResolution::NotFoundById(_) | SymbolResolution::NotFoundByName(_) => None,
-            SymbolResolution::Ambiguous { name, candidates } => {
+        match crate::mcp::service::analyze_impact_data(&facade, symbol_id, name, max_depth) {
+            RelationOutcome::Data(impacted) => Some(impacted),
+            RelationOutcome::NotFound => None,
+            RelationOutcome::Ambiguous { name, candidates } => {
                 exit_ambiguous(EntityType::ImpactGraph, &name, candidates)
             }
-            SymbolResolution::MissingParam => {
-                eprintln!(
-                    "Error: analyze_impact requires either 'symbol_name' or 'symbol_id' parameter"
-                );
+            RelationOutcome::MissingParam => {
+                eprintln!("Error: analyze_impact requires either 'name' or 'symbol_id' parameter");
                 std::process::exit(1);
             }
         }
@@ -503,12 +429,11 @@ pub async fn run(
                 .as_ref()
                 .and_then(|m| m.get("limit"))
                 .and_then(|v| v.as_u64())
-                .unwrap_or(10) as u32;
+                .unwrap_or(10) as usize;
             let kind = arguments
                 .as_ref()
                 .and_then(|m| m.get("kind"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
+                .and_then(|v| v.as_str());
             let module = arguments
                 .as_ref()
                 .and_then(|m| m.get("module"))
@@ -518,25 +443,19 @@ pub async fn run(
                 .and_then(|m| m.get("lang"))
                 .and_then(|v| v.as_str());
 
-            // One kind vocabulary (SymbolKind::from_str); unknown kinds
-            // error instead of silently returning unfiltered results.
-            let kind_filter = match kind.as_deref().map(str::parse::<crate::SymbolKind>) {
-                None => None,
-                Some(Ok(k)) => Some(k),
-                Some(Err(e)) => {
+            match crate::mcp::service::search_symbols_data(
+                &facade, q, limit, kind, module, language,
+            ) {
+                SearchOutcome::Data(results) => Some(results),
+                SearchOutcome::InvalidQuery(msg) => {
                     use crate::io::envelope::{Envelope, ResultCode};
-                    let envelope: Envelope<()> =
-                        Envelope::error(ResultCode::InvalidQuery, format!("{e}"))
-                            .with_entity_type(EntityType::SearchResult)
-                            .with_query(q);
+                    let envelope: Envelope<()> = Envelope::error(ResultCode::InvalidQuery, msg)
+                        .with_entity_type(EntityType::SearchResult)
+                        .with_query(q);
                     println!("{}", envelope.to_json().expect("envelope serialization"));
                     std::process::exit(2);
                 }
-            };
-
-            match facade.search(q, limit as usize, kind_filter, module, language) {
-                Ok(results) => Some(results),
-                Err(e) => exit_index_error(EntityType::SearchResult, q, e),
+                SearchOutcome::Error(msg) => exit_index_error(EntityType::SearchResult, q, msg),
             }
         } else {
             None
@@ -545,74 +464,47 @@ pub async fn run(
         None
     };
 
-    // Collect data for semantic_search_docs if JSON output is requested
-    #[derive(serde::Serialize)]
-    struct SemanticSearchResult {
-        symbol: Symbol,
-        score: f32,
-    }
-
-    /// Context without the symbol (avoids duplication since symbol is at top level)
-    #[derive(serde::Serialize)]
-    struct ContextWithoutSymbol {
-        file_path: String,
-        relationships: crate::symbol::context::SymbolRelationships,
-    }
-
-    #[derive(serde::Serialize)]
-    struct SemanticSearchWithContextResult {
-        symbol: Symbol,
-        score: f32,
-        context: ContextWithoutSymbol,
-    }
-
-    // Get guidance config before moving indexer
-    let guidance_config = facade.settings().guidance.clone();
-
     let semantic_search_docs_data = if json && tool == "semantic_search_docs" {
-        if !facade.has_semantic_search() {
-            None // Semantic search not enabled
-        } else {
-            let query = arguments
+        let query = arguments
+            .as_ref()
+            .and_then(|m| m.get("query"))
+            .and_then(|v| v.as_str());
+
+        if let Some(q) = query {
+            let limit = arguments
                 .as_ref()
-                .and_then(|m| m.get("query"))
+                .and_then(|m| m.get("limit"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(10) as usize;
+            let threshold = arguments
+                .as_ref()
+                .and_then(|m| m.get("threshold"))
+                .and_then(|v| v.as_f64())
+                .map(|t| t as f32);
+            let language = arguments
+                .as_ref()
+                .and_then(|m| m.get("lang"))
                 .and_then(|v| v.as_str());
 
-            if let Some(q) = query {
-                let limit = arguments
-                    .as_ref()
-                    .and_then(|m| m.get("limit"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(10) as usize;
-                let threshold = arguments
-                    .as_ref()
-                    .and_then(|m| m.get("threshold"))
-                    .and_then(|v| v.as_f64())
-                    .map(|t| t as f32);
-                let language = arguments
-                    .as_ref()
-                    .and_then(|m| m.get("lang"))
-                    .and_then(|v| v.as_str());
-
-                let results = match threshold {
-                    Some(t) => facade
-                        .semantic_search_docs_with_threshold_and_language(q, limit, t, language),
-                    None => facade.semantic_search_docs_with_language(q, limit, language),
-                };
-
-                match results {
-                    Ok(results) => {
-                        let semantic_results: Vec<SemanticSearchResult> = results
-                            .into_iter()
-                            .map(|(symbol, score)| SemanticSearchResult { symbol, score })
-                            .collect();
-                        Some(semantic_results)
+            match crate::mcp::service::semantic_search_docs_data(
+                &facade, q, limit, threshold, language,
+            ) {
+                SearchOutcome::Data(results) => Some(results),
+                // "Semantic search is not enabled" is treated as "no data"
+                // here (matching the pre-refactor behavior), not a hard
+                // error; the emission arm below re-checks
+                // `has_semantic_search` for the distinct envelope.
+                SearchOutcome::InvalidQuery(_) => None,
+                SearchOutcome::Error(msg) => {
+                    if facade.has_semantic_search() {
+                        exit_index_error(EntityType::SearchResult, q, msg)
+                    } else {
+                        None
                     }
-                    Err(e) => exit_index_error(EntityType::SearchResult, q, e),
                 }
-            } else {
-                None
             }
+        } else {
+            None
         }
     } else {
         None
@@ -620,69 +512,42 @@ pub async fn run(
 
     // Collect data for semantic_search_with_context if JSON output is requested
     let semantic_search_with_context_data = if json && tool == "semantic_search_with_context" {
-        if !facade.has_semantic_search() {
-            None // Semantic search not enabled
-        } else {
-            let query = arguments
+        let query = arguments
+            .as_ref()
+            .and_then(|m| m.get("query"))
+            .and_then(|v| v.as_str());
+
+        if let Some(q) = query {
+            let limit = arguments
                 .as_ref()
-                .and_then(|m| m.get("query"))
+                .and_then(|m| m.get("limit"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(5) as usize; // Default 5 for context version
+            let threshold = arguments
+                .as_ref()
+                .and_then(|m| m.get("threshold"))
+                .and_then(|v| v.as_f64())
+                .map(|t| t as f32);
+            let language = arguments
+                .as_ref()
+                .and_then(|m| m.get("lang"))
                 .and_then(|v| v.as_str());
 
-            if let Some(q) = query {
-                let limit = arguments
-                    .as_ref()
-                    .and_then(|m| m.get("limit"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(5) as u32; // Default 5 for context version
-                let threshold = arguments
-                    .as_ref()
-                    .and_then(|m| m.get("threshold"))
-                    .and_then(|v| v.as_f64())
-                    .map(|t| t as f32);
-                let language = arguments
-                    .as_ref()
-                    .and_then(|m| m.get("lang"))
-                    .and_then(|v| v.as_str());
-
-                let search_results = match threshold {
-                    Some(t) => facade.semantic_search_docs_with_threshold_and_language(
-                        q,
-                        limit as usize,
-                        t,
-                        language,
-                    ),
-                    None => facade.semantic_search_docs_with_language(q, limit as usize, language),
-                };
-
-                match search_results {
-                    Ok(results) => {
-                        use crate::symbol::context::ContextIncludes;
-                        let context_results: Vec<SemanticSearchWithContextResult> = results
-                            .into_iter()
-                            .filter_map(|(symbol, score)| {
-                                // Get full context for each symbol
-                                let context = facade.get_symbol_context(
-                                    symbol.id,
-                                    ContextIncludes::SYMBOL_CARD | ContextIncludes::CALLS,
-                                );
-
-                                context.map(|ctx| SemanticSearchWithContextResult {
-                                    symbol,
-                                    score,
-                                    context: ContextWithoutSymbol {
-                                        file_path: ctx.file_path,
-                                        relationships: ctx.relationships,
-                                    },
-                                })
-                            })
-                            .collect();
-                        Some(context_results)
+            match crate::mcp::service::semantic_search_with_context_data(
+                &facade, q, limit, threshold, language,
+            ) {
+                SearchOutcome::Data(results) => Some(results),
+                SearchOutcome::InvalidQuery(_) => None,
+                SearchOutcome::Error(msg) => {
+                    if facade.has_semantic_search() {
+                        exit_index_error(EntityType::SearchResult, q, msg)
+                    } else {
+                        None
                     }
-                    Err(e) => exit_index_error(EntityType::SearchResult, q, e),
                 }
-            } else {
-                None
             }
+        } else {
+            None
         }
     } else {
         None
@@ -700,65 +565,8 @@ pub async fn run(
         None
     };
 
-    // If we need JSON output for get_index_info, collect data before moving indexer
-    let index_info_data = if json && tool == "get_index_info" {
-        let symbol_count = facade.symbol_count();
-        let file_count = facade.file_count();
-        let relationship_count = facade.relationship_count();
-
-        // Count symbols by kind
-        let mut kind_counts = std::collections::HashMap::new();
-        for symbol in facade.get_all_symbols() {
-            *kind_counts.entry(symbol.kind).or_insert(0) += 1;
-        }
-
-        let functions = *kind_counts.get(&crate::SymbolKind::Function).unwrap_or(&0);
-        let methods = *kind_counts.get(&crate::SymbolKind::Method).unwrap_or(&0);
-        let structs = *kind_counts.get(&crate::SymbolKind::Struct).unwrap_or(&0);
-        let traits = *kind_counts.get(&crate::SymbolKind::Trait).unwrap_or(&0);
-
-        // Get semantic search info
-        let semantic_search = if let Some(metadata) = facade.get_semantic_metadata() {
-            SemanticSearchInfo {
-                enabled: true,
-                model_name: Some(metadata.model_name),
-                embeddings: Some(metadata.embedding_count),
-                dimensions: Some(metadata.dimension),
-                created: Some(crate::mcp::format_relative_time(metadata.created_at)),
-                updated: Some(crate::mcp::format_relative_time(metadata.updated_at)),
-            }
-        } else {
-            SemanticSearchInfo {
-                enabled: false,
-                model_name: None,
-                embeddings: None,
-                dimensions: None,
-                created: None,
-                updated: None,
-            }
-        };
-
-        // Document collections info is skipped for performance
-        // Loading DocumentStore requires ML model (~1s) which defeats fast index info
-        // TODO: Add fast stats-only document store loader
-        let documents: Option<DocumentsInfo> = None;
-
-        Some(IndexInfo {
-            symbol_count,
-            file_count: file_count as usize,
-            relationship_count,
-            symbol_kinds: SymbolKindBreakdown {
-                functions,
-                methods,
-                structs,
-                traits,
-            },
-            semantic_search,
-            documents,
-        })
-    } else {
-        None
-    };
+    // get_index_info needs no pre-collection: `service::index_info_envelope`
+    // is built directly at render time from the read guard acquired there.
 
     // Pre-collect search_documents data for JSON output
     let search_documents_data = if json && tool == "search_documents" {
@@ -781,25 +589,9 @@ pub async fn run(
                 .unwrap_or(5) as usize;
 
             let mut store = store_arc.write().await;
-            let search_query = crate::documents::SearchQuery {
-                text: query.clone(),
-                collection,
-                document: None,
-                limit,
-                preview_config: Some(config.documents.search.clone()),
-            };
-
-            // Auto-sync collections before searching — same behavior as the
-            // MCP handler; JSON mode must not return stale chunks.
-            for (name, coll_config) in &config.documents.collections {
-                if let Err(e) =
-                    store.index_collection(name, coll_config, &config.documents.defaults)
-                {
-                    tracing::warn!(target: "rag", "auto-sync failed for collection '{}': {}", name, e);
-                }
-            }
-
-            match store.search(search_query) {
+            match crate::mcp::service::search_documents_data(
+                &mut store, config, &query, collection, limit,
+            ) {
                 Ok(results) => Some((query, results)),
                 Err(e) => exit_index_error(EntityType::Document, &query, e),
             }
@@ -841,11 +633,7 @@ pub async fn run(
             };
 
         match server.run_reindex(paths, force).await {
-            Ok(outcome) => Some(ReindexInfo {
-                reindexed: outcome.reindexed,
-                symbols: outcome.symbols,
-                duration_ms: outcome.duration_ms,
-            }),
+            Ok(outcome) => Some(outcome),
             Err(e) => {
                 use crate::io::envelope::{Envelope, ResultCode};
                 let envelope: Envelope<()> =
@@ -892,17 +680,52 @@ pub async fn run(
                     .and_then(|m| m.get("lang"))
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
+                let symbol_id = arguments
+                    .as_ref()
+                    .and_then(|m| m.get("symbol_id"))
+                    .and_then(|v| v.as_u64())
+                    .map(|id| id as u32);
                 server
                     .find_symbol(Parameters(FindSymbolRequest {
                         name: name.to_string(),
+                        symbol_id,
                         lang,
+                        output_format: crate::mcp::requests::OutputFormat::Text,
+                    }))
+                    .await
+            }
+            "find_symbols" => {
+                // Strict parsing, mirroring `ReindexRequest::parse_args`: a
+                // present-but-malformed `names` array (e.g. a non-string
+                // element) is a hard error rather than silently dropping the
+                // offending entries, which would silently narrow the batch.
+                let names: Vec<String> = match arguments.as_ref().and_then(|m| m.get("names")) {
+                    Some(value) => serde_json::from_value(value.clone()).unwrap_or_else(|e| {
+                        eprintln!("Error: `names` must be an array of strings: {e}");
+                        std::process::exit(1);
+                    }),
+                    None => {
+                        eprintln!("Error: find_symbols requires a 'names' array parameter");
+                        std::process::exit(1);
+                    }
+                };
+                let lang = arguments
+                    .as_ref()
+                    .and_then(|m| m.get("lang"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                server
+                    .find_symbols(Parameters(FindSymbolsRequest {
+                        names,
+                        lang,
+                        output_format: crate::mcp::requests::OutputFormat::Text,
                     }))
                     .await
             }
             "get_calls" => {
-                let function_name = arguments
+                let name = arguments
                     .as_ref()
-                    .and_then(|m| m.get("function_name"))
+                    .and_then(|m| m.get("name").or_else(|| m.get("function_name")))
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
 
@@ -912,25 +735,24 @@ pub async fn run(
                     .and_then(|v| v.as_u64())
                     .map(|id| id as u32);
 
-                // Require either function_name or symbol_id
-                if function_name.is_none() && symbol_id.is_none() {
-                    eprintln!(
-                        "Error: get_calls requires either 'function_name' or 'symbol_id' parameter"
-                    );
+                // Require either name or symbol_id
+                if name.is_none() && symbol_id.is_none() {
+                    eprintln!("Error: get_calls requires either 'name' or 'symbol_id' parameter");
                     std::process::exit(1);
                 }
 
                 server
                     .get_calls(Parameters(GetCallsRequest {
-                        function_name,
+                        name,
                         symbol_id,
+                        output_format: crate::mcp::requests::OutputFormat::Text,
                     }))
                     .await
             }
             "find_callers" => {
-                let function_name = arguments
+                let name = arguments
                     .as_ref()
-                    .and_then(|m| m.get("function_name"))
+                    .and_then(|m| m.get("name").or_else(|| m.get("function_name")))
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
 
@@ -940,25 +762,28 @@ pub async fn run(
                     .and_then(|v| v.as_u64())
                     .map(|id| id as u32);
 
-                // Require either function_name or symbol_id
-                if function_name.is_none() && symbol_id.is_none() {
+                // Require either name or symbol_id
+                if name.is_none() && symbol_id.is_none() {
                     eprintln!(
-                        "Error: find_callers requires either 'function_name' or 'symbol_id' parameter"
+                        "Error: find_callers requires either 'name' or 'symbol_id' parameter"
                     );
                     std::process::exit(1);
                 }
 
                 server
                     .find_callers(Parameters(FindCallersRequest {
-                        function_name,
+                        name,
                         symbol_id,
+                        filter: find_callers_filter,
+                        count_only: find_callers_count_only,
+                        output_format: crate::mcp::requests::OutputFormat::Text,
                     }))
                     .await
             }
             "analyze_impact" => {
-                let symbol_name = arguments
+                let name = arguments
                     .as_ref()
-                    .and_then(|m| m.get("symbol_name"))
+                    .and_then(|m| m.get("name").or_else(|| m.get("symbol_name")))
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
 
@@ -968,10 +793,10 @@ pub async fn run(
                     .and_then(|v| v.as_u64())
                     .map(|id| id as u32);
 
-                // Require either symbol_name or symbol_id
-                if symbol_name.is_none() && symbol_id.is_none() {
+                // Require either name or symbol_id
+                if name.is_none() && symbol_id.is_none() {
                     eprintln!(
-                        "Error: analyze_impact requires either 'symbol_name' or 'symbol_id' parameter"
+                        "Error: analyze_impact requires either 'name' or 'symbol_id' parameter"
                     );
                     std::process::exit(1);
                 }
@@ -983,9 +808,13 @@ pub async fn run(
                     .unwrap_or(3) as u32;
                 server
                     .analyze_impact(Parameters(AnalyzeImpactRequest {
-                        symbol_name,
+                        name,
                         symbol_id,
                         max_depth,
+                        count_only: analyze_impact_count_only,
+                        max_results: analyze_impact_max_results,
+                        group_by: analyze_impact_group_by,
+                        output_format: crate::mcp::requests::OutputFormat::Text,
                     }))
                     .await
             }
@@ -993,7 +822,9 @@ pub async fn run(
                 use crate::mcp::GetIndexInfoRequest;
                 use rmcp::handler::server::wrapper::Parameters;
                 server
-                    .get_index_info(Parameters(GetIndexInfoRequest {}))
+                    .get_index_info(Parameters(GetIndexInfoRequest {
+                        output_format: crate::mcp::requests::OutputFormat::Text,
+                    }))
                     .await
             }
             "search_symbols" => {
@@ -1032,6 +863,7 @@ pub async fn run(
                         kind,
                         module,
                         lang,
+                        output_format: crate::mcp::requests::OutputFormat::Text,
                     }))
                     .await
             }
@@ -1065,6 +897,7 @@ pub async fn run(
                         limit,
                         threshold,
                         lang,
+                        output_format: crate::mcp::requests::OutputFormat::Text,
                     }))
                     .await
             }
@@ -1098,6 +931,7 @@ pub async fn run(
                         limit,
                         threshold,
                         lang,
+                        output_format: crate::mcp::requests::OutputFormat::Text,
                     }))
                     .await
             }
@@ -1127,6 +961,7 @@ pub async fn run(
                         query,
                         collection,
                         limit,
+                        output_format: crate::mcp::requests::OutputFormat::Text,
                     }))
                     .await
             }
@@ -1138,7 +973,58 @@ pub async fn run(
                             std::process::exit(1);
                         });
                 server
-                    .reindex(Parameters(ReindexRequest { paths, force }))
+                    .reindex(Parameters(ReindexRequest {
+                        paths,
+                        force,
+                        output_format: crate::mcp::requests::OutputFormat::Text,
+                    }))
+                    .await
+            }
+            "get_file_outline" => {
+                let path = arguments
+                    .as_ref()
+                    .and_then(|m| m.get("path"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_else(|| {
+                        eprintln!("Error: get_file_outline requires 'path' parameter");
+                        std::process::exit(1);
+                    });
+                let max_results = arguments
+                    .as_ref()
+                    .and_then(|m| m.get("max_results"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32;
+                server
+                    .get_file_outline(Parameters(crate::mcp::requests::GetFileOutlineRequest {
+                        path: path.to_string(),
+                        max_results,
+                        output_format: crate::mcp::requests::OutputFormat::Text,
+                    }))
+                    .await
+            }
+            "read_symbol" => {
+                let name = arguments
+                    .as_ref()
+                    .and_then(|m| m.get("name"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let symbol_id = arguments
+                    .as_ref()
+                    .and_then(|m| m.get("symbol_id"))
+                    .and_then(|v| v.as_u64())
+                    .map(|id| id as u32);
+
+                if name.is_none() && symbol_id.is_none() {
+                    eprintln!("Error: read_symbol requires either 'name' or 'symbol_id' parameter");
+                    std::process::exit(1);
+                }
+
+                server
+                    .read_symbol(Parameters(crate::mcp::requests::ReadSymbolRequest {
+                        name,
+                        symbol_id,
+                        output_format: crate::mcp::requests::OutputFormat::Text,
+                    }))
                     .await
             }
             _ => {
@@ -1149,14 +1035,14 @@ pub async fn run(
                         ExitCode::GeneralError,
                         &format!("Unknown tool: {tool}"),
                         vec![
-                            "Available tools: find_symbol, get_calls, find_callers, analyze_impact, get_index_info, search_symbols, semantic_search_docs, semantic_search_with_context, search_documents, reindex",
+                            "Available tools: find_symbol, find_symbols, get_calls, find_callers, analyze_impact, get_index_info, search_symbols, semantic_search_docs, semantic_search_with_context, search_documents, reindex, get_file_outline, read_symbol",
                         ],
                     );
                     println!("{}", serde_json::to_string_pretty(&response).unwrap());
                 } else {
                     eprintln!("Unknown tool: {tool}");
                     eprintln!(
-                        "Available tools: find_symbol, get_calls, find_callers, analyze_impact, get_index_info, search_symbols, semantic_search_docs, semantic_search_with_context, search_documents, reindex"
+                        "Available tools: find_symbol, find_symbols, get_calls, find_callers, analyze_impact, get_index_info, search_symbols, semantic_search_docs, semantic_search_with_context, search_documents, reindex, get_file_outline, read_symbol"
                     );
                 }
                 std::process::exit(1);
@@ -1164,35 +1050,25 @@ pub async fn run(
         }
     };
 
+    // Read guard used only for building JSON envelopes below via the
+    // shared `crate::mcp::service` builders (§BASIC.2): acquired here,
+    // after the mutating `reindex_data` collection above has already
+    // released its own write lock, so this never contends with it.
+    let indexer = server.facade.read().await;
+
     // Print result
     match result {
         Ok(call_result) => {
             if json && tool == "get_index_info" {
-                use crate::io::envelope::Envelope;
-                use crate::io::guidance_engine::generate_guidance_from_config;
-
-                if let Some(index_info) = index_info_data {
-                    let mut envelope =
-                        Envelope::success(index_info).with_message("Index statistics");
-
-                    if let Some(hint) =
-                        generate_guidance_from_config(&guidance_config, "get_index_info", None, 1)
-                    {
-                        envelope = envelope.with_hint(hint);
-                    }
-
-                    let output = match &fields {
-                        Some(f) => envelope.to_json_with_fields(f),
-                        None => envelope.to_json(),
-                    };
-                    println!("{}", output.expect("envelope serialization"));
-                }
+                let envelope = crate::mcp::service::index_info_envelope(&indexer);
+                let output = match &fields {
+                    Some(f) => envelope.to_json_with_fields(f),
+                    None => envelope.to_json(),
+                };
+                println!("{}", output.expect("envelope serialization"));
             } else if json && tool == "find_symbol" {
                 // Use pre-collected data for JSON output
                 if let Some(symbol_contexts) = find_symbol_data {
-                    use crate::io::envelope::{EntityType, Envelope};
-                    use crate::io::guidance_engine::generate_guidance_from_config;
-
                     let name = arguments
                         .as_ref()
                         .and_then(|m| m.get("name"))
@@ -1203,60 +1079,43 @@ pub async fn run(
                         .and_then(|m| m.get("lang"))
                         .and_then(|v| v.as_str());
 
-                    if symbol_contexts.is_empty() {
-                        let mut envelope: Envelope<()> =
-                            Envelope::not_found(format!("Symbol '{name}' not found"))
-                                .with_entity_type(EntityType::Symbol)
-                                .with_query(name);
-
-                        if let Some(lang) = language {
-                            envelope = envelope.with_lang(lang);
-                        }
-
-                        if let Some(hint) = generate_guidance_from_config(
-                            &guidance_config,
-                            "find_symbol",
-                            Some(name),
-                            0,
-                        ) {
-                            envelope = envelope.with_hint(hint);
-                        }
-
+                    let is_not_found = symbol_contexts.is_empty();
+                    let envelope = crate::mcp::service::find_symbol_envelope(
+                        &indexer,
+                        name,
+                        language,
+                        symbol_contexts,
+                    );
+                    if is_not_found {
                         // Envelope serialization is infallible for simple types
                         println!("{}", envelope.to_json().expect("envelope serialization"));
                         std::process::exit(3);
-                    } else {
-                        let count = symbol_contexts.len();
-                        let mut envelope = Envelope::success(symbol_contexts)
-                            .with_entity_type(EntityType::Symbol)
-                            .with_count(count)
-                            .with_query(name)
-                            .with_message(format!("Found {count} symbol(s)"));
-
-                        if let Some(lang) = language {
-                            envelope = envelope.with_lang(lang);
-                        }
-
-                        if let Some(hint) = generate_guidance_from_config(
-                            &guidance_config,
-                            "find_symbol",
-                            Some(name),
-                            count,
-                        ) {
-                            envelope = envelope.with_hint(hint);
-                        }
-
-                        let output = match &fields {
-                            Some(f) => envelope.to_json_with_fields(f),
-                            None => envelope.to_json(),
-                        };
-                        println!("{}", output.expect("envelope serialization"));
                     }
+                    let output = match &fields {
+                        Some(f) => envelope.to_json_with_fields(f),
+                        None => envelope.to_json(),
+                    };
+                    println!("{}", output.expect("envelope serialization"));
+                }
+            } else if json && tool == "find_symbols" {
+                // Use pre-collected data for JSON output — mirrors find_symbol
+                // above, but the envelope wraps a per-name map rather than a
+                // single symbol's candidate list.
+                if let Some(results) = find_symbols_data {
+                    let language = arguments
+                        .as_ref()
+                        .and_then(|m| m.get("lang"))
+                        .and_then(|v| v.as_str());
+
+                    let envelope =
+                        crate::mcp::service::find_symbols_envelope(&indexer, results, language);
+                    let output = match &fields {
+                        Some(f) => envelope.to_json_with_fields(f),
+                        None => envelope.to_json(),
+                    };
+                    println!("{}", output.expect("envelope serialization"));
                 }
             } else if json && tool == "get_calls" {
-                use crate::io::envelope::{EntityType, Envelope};
-                use crate::io::guidance_engine::generate_guidance_from_config;
-
                 let identifier = if let Some(id) = arguments
                     .as_ref()
                     .and_then(|m| m.get("symbol_id"))
@@ -1266,68 +1125,30 @@ pub async fn run(
                 } else {
                     arguments
                         .as_ref()
-                        .and_then(|m| m.get("function_name"))
+                        .and_then(|m| m.get("name").or_else(|| m.get("function_name")))
                         .and_then(|v| v.as_str())
                         .unwrap_or("unknown")
                         .to_string()
                 };
-                let language = arguments
-                    .as_ref()
-                    .and_then(|m| m.get("lang"))
-                    .and_then(|v| v.as_str());
 
                 if let Some(calls) = get_calls_data {
-                    let count = calls.len();
-                    let mut envelope = Envelope::success(calls)
-                        .with_entity_type(EntityType::Calls)
-                        .with_count(count)
-                        .with_query(&identifier)
-                        .with_message(format!("Calls {count} function(s)"));
-
-                    if let Some(lang) = language {
-                        envelope = envelope.with_lang(lang);
-                    }
-
-                    if let Some(hint) = generate_guidance_from_config(
-                        &guidance_config,
-                        "get_calls",
-                        Some(&identifier),
-                        count,
-                    ) {
-                        envelope = envelope.with_hint(hint);
-                    }
-
+                    let envelope = crate::mcp::service::get_calls_success_envelope(
+                        &indexer,
+                        &identifier,
+                        calls,
+                    );
                     let output = match &fields {
                         Some(f) => envelope.to_json_with_fields(f),
                         None => envelope.to_json(),
                     };
                     println!("{}", output.expect("envelope serialization"));
                 } else {
-                    let mut envelope: Envelope<()> =
-                        Envelope::not_found(format!("Function '{identifier}' not found"))
-                            .with_entity_type(EntityType::Calls)
-                            .with_query(&identifier);
-
-                    if let Some(lang) = language {
-                        envelope = envelope.with_lang(lang);
-                    }
-
-                    if let Some(hint) = generate_guidance_from_config(
-                        &guidance_config,
-                        "get_calls",
-                        Some(&identifier),
-                        0,
-                    ) {
-                        envelope = envelope.with_hint(hint);
-                    }
-
+                    let envelope =
+                        crate::mcp::service::get_calls_not_found_envelope(&indexer, &identifier);
                     println!("{}", envelope.to_json().expect("envelope serialization"));
                     std::process::exit(3);
                 }
             } else if json && tool == "find_callers" {
-                use crate::io::envelope::{EntityType, Envelope};
-                use crate::io::guidance_engine::generate_guidance_from_config;
-
                 let identifier = if let Some(id) = arguments
                     .as_ref()
                     .and_then(|m| m.get("symbol_id"))
@@ -1337,68 +1158,47 @@ pub async fn run(
                 } else {
                     arguments
                         .as_ref()
-                        .and_then(|m| m.get("function_name"))
+                        .and_then(|m| m.get("name").or_else(|| m.get("function_name")))
                         .and_then(|v| v.as_str())
                         .unwrap_or("unknown")
                         .to_string()
                 };
-                let language = arguments
-                    .as_ref()
-                    .and_then(|m| m.get("lang"))
-                    .and_then(|v| v.as_str());
 
-                if let Some(callers) = find_callers_data {
-                    let count = callers.len();
-                    let mut envelope = Envelope::success(callers)
-                        .with_entity_type(EntityType::Callers)
-                        .with_count(count)
-                        .with_query(&identifier)
-                        .with_message(format!("Called by {count} function(s)"));
-
-                    if let Some(lang) = language {
-                        envelope = envelope.with_lang(lang);
-                    }
-
-                    if let Some(hint) = generate_guidance_from_config(
-                        &guidance_config,
-                        "find_callers",
-                        Some(&identifier),
-                        count,
-                    ) {
-                        envelope = envelope.with_hint(hint);
-                    }
-
-                    let output = match &fields {
-                        Some(f) => envelope.to_json_with_fields(f),
-                        None => envelope.to_json(),
+                if let Some(unfiltered) = find_callers_data {
+                    // Per-role breakdown is always computed over the
+                    // UNFILTERED caller set — `filter` narrows the returned
+                    // listing, never the counted breakdown (see
+                    // `service::find_callers_counts_envelope`).
+                    let output = if find_callers_count_only {
+                        let envelope = crate::mcp::service::find_callers_counts_envelope(
+                            &indexer,
+                            &identifier,
+                            &unfiltered,
+                        );
+                        match &fields {
+                            Some(f) => envelope.to_json_with_fields(f),
+                            None => envelope.to_json(),
+                        }
+                    } else {
+                        let filtered = filter_callers(unfiltered, find_callers_filter);
+                        let envelope = crate::mcp::service::find_callers_list_envelope(
+                            &indexer,
+                            &identifier,
+                            filtered,
+                        );
+                        match &fields {
+                            Some(f) => envelope.to_json_with_fields(f),
+                            None => envelope.to_json(),
+                        }
                     };
                     println!("{}", output.expect("envelope serialization"));
                 } else {
-                    let mut envelope: Envelope<()> =
-                        Envelope::not_found(format!("Function '{identifier}' not found"))
-                            .with_entity_type(EntityType::Callers)
-                            .with_query(&identifier);
-
-                    if let Some(lang) = language {
-                        envelope = envelope.with_lang(lang);
-                    }
-
-                    if let Some(hint) = generate_guidance_from_config(
-                        &guidance_config,
-                        "find_callers",
-                        Some(&identifier),
-                        0,
-                    ) {
-                        envelope = envelope.with_hint(hint);
-                    }
-
+                    let envelope =
+                        crate::mcp::service::find_callers_not_found_envelope(&indexer, &identifier);
                     println!("{}", envelope.to_json().expect("envelope serialization"));
                     std::process::exit(3);
                 }
             } else if json && tool == "analyze_impact" {
-                use crate::io::envelope::{EntityType, Envelope};
-                use crate::io::guidance_engine::generate_guidance_from_config;
-
                 // Get identifier for messages
                 let identifier = if let Some(id) = arguments
                     .as_ref()
@@ -1409,7 +1209,7 @@ pub async fn run(
                 } else {
                     arguments
                         .as_ref()
-                        .and_then(|m| m.get("symbol_name"))
+                        .and_then(|m| m.get("name").or_else(|| m.get("symbol_name")))
                         .and_then(|v| v.as_str())
                         .unwrap_or("unknown")
                         .to_string()
@@ -1422,50 +1222,43 @@ pub async fn run(
                     .unwrap_or(3) as u32;
 
                 if let Some(impacted) = analyze_impact_data {
-                    let count = impacted.len();
-                    let mut envelope = Envelope::success(impacted)
-                        .with_entity_type(EntityType::ImpactGraph)
-                        .with_count(count)
-                        .with_query(&identifier)
-                        .with_depth(max_depth)
-                        .with_message(format!("{count} symbol(s) would be impacted"));
-
-                    if let Some(hint) = generate_guidance_from_config(
-                        &guidance_config,
-                        "analyze_impact",
-                        Some(&identifier),
-                        count,
-                    ) {
-                        envelope = envelope.with_hint(hint);
-                    }
-
-                    let output = match &fields {
-                        Some(f) => envelope.to_json_with_fields(f),
-                        None => envelope.to_json(),
+                    let output = if analyze_impact_count_only {
+                        let envelope = crate::mcp::service::analyze_impact_counts_envelope(
+                            &indexer,
+                            &identifier,
+                            max_depth,
+                            &impacted,
+                        );
+                        match &fields {
+                            Some(f) => envelope.to_json_with_fields(f),
+                            None => envelope.to_json(),
+                        }
+                    } else {
+                        let envelope = crate::mcp::service::analyze_impact_listing_envelope(
+                            &indexer,
+                            &identifier,
+                            max_depth,
+                            impacted,
+                            analyze_impact_group_by,
+                            analyze_impact_max_results,
+                        );
+                        match &fields {
+                            Some(f) => envelope.to_json_with_fields(f),
+                            None => envelope.to_json(),
+                        }
                     };
                     println!("{}", output.expect("envelope serialization"));
                 } else {
                     // Symbol not found
-                    let mut envelope: Envelope<()> =
-                        Envelope::not_found(format!("Symbol '{identifier}' not found"))
-                            .with_entity_type(EntityType::ImpactGraph)
-                            .with_query(&identifier);
-
-                    if let Some(hint) = generate_guidance_from_config(
-                        &guidance_config,
-                        "analyze_impact",
-                        Some(&identifier),
-                        0,
-                    ) {
-                        envelope = envelope.with_hint(hint);
-                    }
-
+                    let envelope = crate::mcp::service::analyze_impact_not_found_envelope(
+                        &indexer,
+                        &identifier,
+                    );
                     println!("{}", envelope.to_json().expect("envelope serialization"));
                     std::process::exit(3);
                 }
             } else if json && tool == "search_symbols" {
                 use crate::io::envelope::{EntityType, Envelope, ResultCode};
-                use crate::io::guidance_engine::generate_guidance_from_config;
 
                 let query = arguments
                     .as_ref()
@@ -1478,38 +1271,11 @@ pub async fn run(
                     .and_then(|v| v.as_str());
 
                 if let Some(results) = search_symbols_data {
-                    // Transform to consistent nested symbol shape
-                    let transformed: Vec<SearchSymbolResult> =
-                        results.into_iter().map(Into::into).collect();
-                    let count = transformed.len();
-
-                    let mut envelope = if count == 0 {
-                        Envelope::<Vec<SearchSymbolResult>>::not_found(format!(
-                            "No symbols found for '{query}'"
-                        ))
-                        .with_entity_type(EntityType::SearchResult)
-                        .with_query(query)
-                    } else {
-                        Envelope::success(transformed)
-                            .with_entity_type(EntityType::SearchResult)
-                            .with_count(count)
-                            .with_query(query)
-                            .with_message(format!("Found {count} symbol(s)"))
-                    };
-
-                    if let Some(lang) = language {
-                        envelope = envelope.with_lang(lang);
-                    }
-
-                    if let Some(hint) = generate_guidance_from_config(
-                        &guidance_config,
-                        "search_symbols",
-                        Some(query),
-                        count,
-                    ) {
-                        envelope = envelope.with_hint(hint);
-                    }
-
+                    // `crate::mcp::service::search_symbols_data` already
+                    // returns the nested-symbol shape.
+                    let envelope = crate::mcp::service::search_symbols_envelope(
+                        &indexer, query, language, results,
+                    );
                     let output = match &fields {
                         Some(f) => envelope.to_json_with_fields(f),
                         None => envelope.to_json(),
@@ -1528,8 +1294,7 @@ pub async fn run(
                     std::process::exit(1);
                 }
             } else if json && tool == "semantic_search_docs" {
-                use crate::io::envelope::{EntityType, Envelope, ResultCode};
-                use crate::io::guidance_engine::generate_guidance_from_config;
+                use crate::io::envelope::{Envelope, ResultCode};
 
                 let query = arguments
                     .as_ref()
@@ -1542,49 +1307,19 @@ pub async fn run(
                     .and_then(|v| v.as_str());
 
                 if let Some(results) = semantic_search_docs_data {
-                    let count = results.len();
-
-                    let mut envelope = if count == 0 {
-                        Envelope::<Vec<SemanticSearchResult>>::not_found(format!(
-                            "No similar documentation found for '{query}'"
-                        ))
-                        .with_entity_type(EntityType::Symbol)
-                        .with_query(query)
-                    } else {
-                        Envelope::success(results)
-                            .with_entity_type(EntityType::Symbol)
-                            .with_count(count)
-                            .with_query(query)
-                            .with_message(format!("Found {count} similar symbol(s)"))
-                    };
-
-                    if let Some(lang) = language {
-                        envelope = envelope.with_lang(lang);
-                    }
-
-                    if let Some(hint) = generate_guidance_from_config(
-                        &guidance_config,
-                        "semantic_search_docs",
-                        Some(query),
-                        count,
-                    ) {
-                        envelope = envelope.with_hint(hint);
-                    }
-
+                    let envelope = crate::mcp::service::semantic_search_docs_envelope(
+                        &indexer, query, language, results,
+                    );
                     let output = match &fields {
                         Some(f) => envelope.to_json_with_fields(f),
                         None => envelope.to_json(),
                     };
                     println!("{}", output.expect("envelope serialization"));
                 } else if !has_semantic_search {
-                    let envelope: Envelope<()> =
-                        Envelope::error(ResultCode::IndexError, "Semantic search is not enabled")
-                            .with_entity_type(EntityType::Symbol)
-                            .with_query(query)
-                            .with_hint(
-                                "Enable semantic search in settings.toml and rebuild the index",
-                            );
-
+                    let envelope = crate::mcp::service::semantic_search_error_envelope(
+                        query,
+                        "Semantic search is not enabled",
+                    );
                     println!("{}", envelope.to_json().expect("envelope serialization"));
                     std::process::exit(1);
                 } else {
@@ -1592,7 +1327,7 @@ pub async fn run(
                         ResultCode::InvalidQuery,
                         format!("Failed to search for '{query}'"),
                     )
-                    .with_entity_type(EntityType::Symbol)
+                    .with_entity_type(crate::io::envelope::EntityType::Symbol)
                     .with_query(query)
                     .with_hint("Check query syntax");
 
@@ -1600,8 +1335,7 @@ pub async fn run(
                     std::process::exit(1);
                 }
             } else if json && tool == "semantic_search_with_context" {
-                use crate::io::envelope::{EntityType, Envelope, ResultCode};
-                use crate::io::guidance_engine::generate_guidance_from_config;
+                use crate::io::envelope::{Envelope, ResultCode};
 
                 let query = arguments
                     .as_ref()
@@ -1614,49 +1348,19 @@ pub async fn run(
                     .and_then(|v| v.as_str());
 
                 if let Some(results) = semantic_search_with_context_data {
-                    let count = results.len();
-
-                    let mut envelope = if count == 0 {
-                        Envelope::<Vec<SemanticSearchWithContextResult>>::not_found(format!(
-                            "No similar symbols found for '{query}'"
-                        ))
-                        .with_entity_type(EntityType::Symbol)
-                        .with_query(query)
-                    } else {
-                        Envelope::success(results)
-                            .with_entity_type(EntityType::Symbol)
-                            .with_count(count)
-                            .with_query(query)
-                            .with_message(format!("Found {count} symbol(s) with context"))
-                    };
-
-                    if let Some(lang) = language {
-                        envelope = envelope.with_lang(lang);
-                    }
-
-                    if let Some(hint) = generate_guidance_from_config(
-                        &guidance_config,
-                        "semantic_search_with_context",
-                        Some(query),
-                        count,
-                    ) {
-                        envelope = envelope.with_hint(hint);
-                    }
-
+                    let envelope = crate::mcp::service::semantic_search_with_context_envelope(
+                        &indexer, query, language, results,
+                    );
                     let output = match &fields {
                         Some(f) => envelope.to_json_with_fields(f),
                         None => envelope.to_json(),
                     };
                     println!("{}", output.expect("envelope serialization"));
                 } else if !has_semantic_search {
-                    let envelope: Envelope<()> =
-                        Envelope::error(ResultCode::IndexError, "Semantic search is not enabled")
-                            .with_entity_type(EntityType::Symbol)
-                            .with_query(query)
-                            .with_hint(
-                                "Enable semantic search in settings.toml and rebuild the index",
-                            );
-
+                    let envelope = crate::mcp::service::semantic_search_error_envelope(
+                        query,
+                        "Semantic search is not enabled",
+                    );
                     println!("{}", envelope.to_json().expect("envelope serialization"));
                     std::process::exit(1);
                 } else {
@@ -1664,7 +1368,7 @@ pub async fn run(
                         ResultCode::InvalidQuery,
                         format!("Failed to search for '{query}'"),
                     )
-                    .with_entity_type(EntityType::Symbol)
+                    .with_entity_type(crate::io::envelope::EntityType::Symbol)
                     .with_query(query)
                     .with_hint("Check query syntax");
 
@@ -1738,10 +1442,8 @@ pub async fn run(
                     std::process::exit(1);
                 }
             } else if json && tool == "reindex" {
-                use crate::io::envelope::Envelope;
-
-                if let Some(reindex_info) = reindex_data {
-                    let envelope = Envelope::success(reindex_info).with_message("Reindex complete");
+                if let Some(outcome) = reindex_data {
+                    let envelope = crate::mcp::service::reindex_envelope(&outcome);
 
                     let output = match &fields {
                         Some(f) => envelope.to_json_with_fields(f),

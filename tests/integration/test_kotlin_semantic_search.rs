@@ -168,6 +168,7 @@ async fn test_kotlin_semantic_search_and_dependency_injection() {
             limit: 5,
             threshold: None,
             lang: Some("kotlin".to_string()),
+            output_format: Default::default(),
         }))
         .await
         .expect("semantic_search_docs should succeed");
@@ -194,6 +195,7 @@ async fn test_kotlin_semantic_search_and_dependency_injection() {
             limit: 3,
             threshold: None,
             lang: Some("kotlin".to_string()),
+            output_format: Default::default(),
         }))
         .await
         .expect("semantic_search_with_context should succeed");
@@ -217,7 +219,9 @@ async fn test_kotlin_semantic_search_and_dependency_injection() {
     let find_result = server
         .find_symbol(Parameters(FindSymbolRequest {
             name: "ReadWritePgClient".to_string(),
+            symbol_id: None,
             lang: Some("kotlin".to_string()),
+            output_format: Default::default(),
         }))
         .await
         .expect("find_symbol should succeed");
@@ -332,6 +336,7 @@ class UserService(
             limit: 10,
             threshold: None,
             lang: Some("kotlin".to_string()),
+            output_format: Default::default(),
         }))
         .await
         .expect("semantic_search_docs should succeed");

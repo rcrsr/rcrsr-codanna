@@ -41,6 +41,8 @@ pub enum Status {
     PartialSuccess,
     /// Operation failed
     Error,
+    /// Operation succeeded but the result is ambiguous
+    Ambiguous,
 }
 
 /// Machine-readable result codes.
@@ -53,6 +55,7 @@ pub enum ResultCode {
     IndexError,
     InvalidQuery,
     InternalError,
+    Ambiguous,
 }
 
 impl ResultCode {
@@ -65,6 +68,7 @@ impl ResultCode {
             Self::IndexError => "INDEX_ERROR",
             Self::InvalidQuery => "INVALID_QUERY",
             Self::InternalError => "INTERNAL_ERROR",
+            Self::Ambiguous => "AMBIGUOUS",
         }
     }
 }
@@ -206,6 +210,21 @@ impl<T> Envelope<T> {
             message: message.into(),
             hint: None,
             data: None,
+            error: None,
+            meta: Meta::default(),
+        }
+    }
+
+    /// Create an ambiguous-result envelope.
+    pub fn ambiguous(message: impl Into<String>, data: Option<T>) -> Self {
+        Self {
+            message_type: MessageType::Result,
+            status: Status::Ambiguous,
+            code: ResultCode::Ambiguous,
+            exit_code: 3,
+            message: message.into(),
+            hint: None,
+            data,
             error: None,
             meta: Meta::default(),
         }
@@ -390,6 +409,21 @@ mod tests {
         assert_eq!(envelope.code, ResultCode::ParseError);
         assert_eq!(envelope.exit_code, 2);
         assert!(envelope.error.is_some());
+    }
+
+    #[test]
+    fn test_ambiguous_envelope_serialization() {
+        let envelope: Envelope<serde_json::Value> =
+            Envelope::ambiguous("Multiple symbols match 'foo'", None);
+
+        assert_eq!(envelope.status, Status::Ambiguous);
+        assert_eq!(envelope.code, ResultCode::Ambiguous);
+        assert_ne!(envelope.exit_code, 0);
+        assert_ne!(envelope.exit_code, 2);
+
+        let json = envelope.to_json().unwrap();
+        assert!(json.contains("\"status\": \"ambiguous\""));
+        assert!(json.contains("\"code\": \"AMBIGUOUS\""));
     }
 
     #[test]

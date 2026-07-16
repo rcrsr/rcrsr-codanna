@@ -80,6 +80,16 @@ pub(super) fn default_spawn_timeout_ms() -> u64 {
 pub(super) fn default_health_poll_ms() -> u64 {
     100
 }
+pub(super) fn default_test_path_patterns() -> Vec<String> {
+    vec![
+        "tests/".to_string(),
+        "/test/".to_string(),
+        "*_test.*".to_string(),
+        "test_*.py".to_string(),
+        "*.spec.*".to_string(),
+        "__tests__/".to_string(),
+    ]
+}
 
 pub(super) fn default_guidance_templates() -> IndexMap<String, GuidanceTemplate> {
     let mut templates = IndexMap::new();

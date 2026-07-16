@@ -66,3 +66,18 @@ mod test_resolve_param_type_inference;
 
 #[path = "integration/test_resolve_php_keyword_static_call.rs"]
 mod test_resolve_php_keyword_static_call;
+
+#[path = "integration/test_output_format.rs"]
+mod test_output_format;
+
+#[path = "integration/test_find_symbols_mcp.rs"]
+mod test_find_symbols_mcp;
+
+#[path = "integration/test_find_callers_role_filter.rs"]
+mod test_find_callers_role_filter;
+
+#[path = "integration/test_read_symbol_and_outline_mcp.rs"]
+mod test_read_symbol_and_outline_mcp;
+
+#[path = "integration/test_analyze_impact_grouping.rs"]
+mod test_analyze_impact_grouping;
