@@ -30,15 +30,25 @@ use crate::support::{codanna_binary, run_cli};
 /// Test-only idle threshold, injected into the backing server via
 /// `CODANNA_TEST_IDLE_THRESHOLD_MS` (see `idle_threshold_override` in
 /// `src/mcp/http_server.rs`) so this test observes the real idle-exit
-/// `select!` arm on a millisecond timescale rather than waiting on
+/// `select!` arm on a compressed timescale rather than waiting on
 /// `idle_shutdown_minutes`' whole-minute production granularity.
-const TEST_IDLE_THRESHOLD_MS: u64 = 500;
+///
+/// This is 3s, not sub-second, on purpose: `idle_timeout_exceeded` compares
+/// **whole-second** unix timestamps (`Duration::from_secs(now - last)`), so any
+/// threshold under ~1s collapses to "fire at the next 1-second boundary" --
+/// leaving the published `serve.json` alive for only 0-1s before the idle arm
+/// removes it. That window is too short for this test's discovery poll to
+/// observe reliably under load, which manifests as a flaky timeout on step (1)
+/// ("first backing server to publish serve.json"). A 3s threshold keeps
+/// `serve.json` observable for ~2-3s while still exiting fast enough to keep
+/// the test brief.
+const TEST_IDLE_THRESHOLD_MS: u64 = 3000;
 
 /// Test-only idle poll interval, injected via `CODANNA_TEST_IDLE_POLL_MS`
-/// (see `idle_poll_interval_override`), shrunk in step with
-/// `TEST_IDLE_THRESHOLD_MS` so the poll cadence doesn't pad the observed
-/// shutdown time relative to the (also shrunk) threshold.
-const TEST_IDLE_POLL_MS: u64 = 50;
+/// (see `idle_poll_interval_override`), kept well under `TEST_IDLE_THRESHOLD_MS`
+/// so the poll cadence doesn't pad the observed shutdown time relative to the
+/// threshold.
+const TEST_IDLE_POLL_MS: u64 = 100;
 
 /// Upper bound for the wait on the backing server's self-initiated idle
 /// exit: the injected millisecond-scale threshold plus generous headroom for

@@ -118,6 +118,47 @@ struct DownstreamState {
     pending: VecDeque<CustomNotification>,
 }
 
+impl DownstreamState {
+    /// Buffer a custom notification received before `downstream` is set,
+    /// enforcing the bounded drop-oldest policy
+    /// (`PENDING_CUSTOM_NOTIFICATIONS_CAP`). This is the exact code the
+    /// pre-init branch of [`NotificationRelay::on_custom_notification`] runs,
+    /// factored out so it is unit-tested directly instead of through a copy.
+    fn buffer_pending(&mut self, notification: CustomNotification) {
+        if self.pending.len() >= PENDING_CUSTOM_NOTIFICATIONS_CAP {
+            self.pending.pop_front();
+        }
+        self.pending.push_back(notification);
+    }
+
+    /// Take all buffered notifications in FIFO order, emptying the buffer.
+    /// This is the exact drain [`DelegatingProxyHandler::initialize`] performs
+    /// after setting `downstream`.
+    fn drain_pending(&mut self) -> Vec<CustomNotification> {
+        self.pending.drain(..).collect()
+    }
+
+    /// Route an inbound custom notification under the caller's lock: if a
+    /// downstream peer is present, return `Some((peer, notification))` for the
+    /// caller to forward off-lock; otherwise buffer it (bounded, drop-oldest)
+    /// and return `None`. This encapsulates the entire branch
+    /// [`NotificationRelay::on_custom_notification`] takes, so a regression
+    /// that failed to buffer when no downstream peer is set is caught by a
+    /// unit test that drives this method directly.
+    fn route_custom_notification(
+        &mut self,
+        notification: CustomNotification,
+    ) -> Option<(Peer<RoleServer>, CustomNotification)> {
+        match self.downstream.clone() {
+            Some(peer) => Some((peer, notification)),
+            None => {
+                self.buffer_pending(notification);
+                None
+            }
+        }
+    }
+}
+
 /// `ClientHandler` for the connection to the backing HTTP MCP server.
 ///
 /// Its only job is forwarding server-initiated notifications down to the
@@ -211,17 +252,16 @@ impl ClientHandler for NotificationRelay {
         notification: CustomNotification,
         _context: NotificationContext<RoleClient>,
     ) {
-        let mut state = self.state.lock().await;
-        if let Some(peer) = state.downstream.clone() {
-            drop(state);
+        // Decide forward-vs-buffer under a single lock acquisition (closing
+        // the set-then-drain TOCTOU with `initialize`), then send off-lock.
+        let forward = {
+            let mut state = self.state.lock().await;
+            state.route_custom_notification(notification)
+        };
+        if let Some((peer, notification)) = forward {
             let _ = peer
                 .send_notification(ServerNotification::CustomNotification(notification))
                 .await;
-        } else {
-            if state.pending.len() >= PENDING_CUSTOM_NOTIFICATIONS_CAP {
-                state.pending.pop_front();
-            }
-            state.pending.push_back(notification);
         }
     }
 }
@@ -296,7 +336,7 @@ impl ServerHandler for DelegatingProxyHandler {
         let drained: Vec<CustomNotification> = {
             let mut state = self.state.lock().await;
             state.downstream = Some(context.peer.clone());
-            state.pending.drain(..).collect()
+            state.drain_pending()
         };
         for notification in drained {
             let _ = context
@@ -512,17 +552,17 @@ pub async fn serve_proxy(
     Ok(())
 }
 
-// `NotificationContext<RoleClient>`/`Peer<RoleServer>` can only be
-// constructed via rmcp's own (crate-private) `Peer::new`, so a live
-// `NotificationRelay::on_custom_notification` call or a real
-// `initialize`-time drain-and-forward can't be driven from outside rmcp.
-// These tests instead exercise the buffering/draining semantics -- push
-// while no downstream peer is available, bounded drop-oldest overflow, and
-// FIFO drain order -- directly against a `pending` queue built the same way
-// `DownstreamState` holds one. End-to-end custom-notification forwarding
-// (relay -> downstream peer, including the `initialize`-time flush) is
-// covered by manual MCP smoke test; a full transport harness is out of
-// scope here.
+// A live `NotificationRelay::on_custom_notification` / `initialize`-time
+// drain-and-forward can't be driven from outside rmcp: both need a real
+// `Peer<RoleServer>`, constructible only via rmcp's crate-private
+// `Peer::new`. So the tests below drive the buffering/routing/draining
+// through the *same* `DownstreamState` methods the production handlers call
+// (`route_custom_notification`, `buffer_pending`, `drain_pending`) -- not a
+// reimplementation -- so a regression in the pre-init buffering or the
+// bounded drop-oldest / FIFO-drain policy fails a test. Only the final
+// `peer.send_notification` hop (the `Some(peer)` arm's off-lock send and the
+// `initialize` flush) needs a live peer and is left to the manual MCP smoke
+// test.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,55 +571,42 @@ mod tests {
         CustomNotification::new(method.to_string(), None)
     }
 
-    /// Pushes `notification` onto `pending`, dropping the oldest entry once
-    /// `PENDING_CUSTOM_NOTIFICATIONS_CAP` is reached -- the same bounding
-    /// behavior `NotificationRelay::on_custom_notification` applies when
-    /// `downstream` is `None`.
-    async fn push_pending(
-        pending: &Mutex<VecDeque<CustomNotification>>,
-        notification: CustomNotification,
-    ) {
-        let mut pending = pending.lock().await;
-        if pending.len() >= PENDING_CUSTOM_NOTIFICATIONS_CAP {
-            pending.pop_front();
-        }
-        pending.push_back(notification);
-    }
-
-    #[tokio::test]
-    async fn buffers_custom_notifications_while_downstream_is_none() {
-        let pending: Mutex<VecDeque<CustomNotification>> = Mutex::new(VecDeque::new());
+    #[test]
+    fn routes_to_buffer_when_downstream_is_none() {
+        // The production pre-init branch: with no downstream peer,
+        // `route_custom_notification` returns `None` (nothing to forward) and
+        // buffers the notification rather than dropping it. A wrong impl that
+        // silently discarded the notification would fail here.
+        let mut state = DownstreamState::default();
         let evt = notification("notifications/codanna/file-reindexed");
 
-        push_pending(&pending, evt.clone()).await;
+        let forward = state.route_custom_notification(evt.clone());
 
-        let pending = pending.lock().await;
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].method, evt.method);
+        assert!(
+            forward.is_none(),
+            "no downstream peer -> nothing to forward yet"
+        );
+        assert_eq!(state.pending.len(), 1, "notification must be buffered");
+        assert_eq!(state.pending[0].method, evt.method);
     }
 
-    #[tokio::test]
-    async fn overflow_drops_oldest_entry() {
-        let pending: Mutex<VecDeque<CustomNotification>> = Mutex::new(VecDeque::new());
+    #[test]
+    fn overflow_drops_oldest_entry() {
+        let mut state = DownstreamState::default();
 
         for i in 0..(PENDING_CUSTOM_NOTIFICATIONS_CAP + 5) {
-            push_pending(
-                &pending,
-                notification(&format!("notifications/codanna/evt-{i}")),
-            )
-            .await;
+            state.buffer_pending(notification(&format!("notifications/codanna/evt-{i}")));
         }
 
-        let pending = pending.lock().await;
-        assert_eq!(pending.len(), PENDING_CUSTOM_NOTIFICATIONS_CAP);
+        assert_eq!(state.pending.len(), PENDING_CUSTOM_NOTIFICATIONS_CAP);
         // The first 5 pushed (evt-0..evt-4) must have been dropped; the
         // oldest surviving entry is evt-5.
         assert_eq!(
-            pending.front().unwrap().method,
+            state.pending.front().unwrap().method,
             "notifications/codanna/evt-5"
         );
         assert_eq!(
-            pending.back().unwrap().method,
+            state.pending.back().unwrap().method,
             format!(
                 "notifications/codanna/evt-{}",
                 PENDING_CUSTOM_NOTIFICATIONS_CAP + 4
@@ -587,24 +614,15 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn drain_preserves_fifo_order() {
-        let pending: Mutex<VecDeque<CustomNotification>> = Mutex::new(VecDeque::new());
+    #[test]
+    fn drain_preserves_fifo_order_and_empties_buffer() {
+        let mut state = DownstreamState::default();
         for i in 0..10 {
-            push_pending(
-                &pending,
-                notification(&format!("notifications/codanna/evt-{i}")),
-            )
-            .await;
+            state.buffer_pending(notification(&format!("notifications/codanna/evt-{i}")));
         }
 
-        // Mirrors the drain step inlined into `DelegatingProxyHandler::initialize`
-        // (minus the actual `peer.send_notification` call, which needs a live
-        // `Peer<RoleServer>` -- see module doc comment above).
-        let drained: Vec<CustomNotification> = {
-            let mut pending = pending.lock().await;
-            pending.drain(..).collect()
-        };
+        // The exact drain `DelegatingProxyHandler::initialize` performs.
+        let drained = state.drain_pending();
 
         let methods: Vec<String> = drained.into_iter().map(|n| n.method).collect();
         let expected: Vec<String> = (0..10)
@@ -613,7 +631,7 @@ mod tests {
         assert_eq!(methods, expected);
 
         // Buffer is empty after drain -- nothing left to re-flush.
-        assert!(pending.lock().await.is_empty());
+        assert!(state.pending.is_empty());
     }
 
     #[test]

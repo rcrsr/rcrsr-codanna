@@ -700,8 +700,9 @@ pub async fn serve_http(
 #[cfg(all(test, feature = "http-server"))]
 mod tests {
     use super::is_authorized;
-    use super::{idle_timeout_exceeded, should_stamp_activity, wait_for_idle};
-    use std::sync::atomic::AtomicU64;
+    use super::{idle_timeout_exceeded, should_stamp_activity, unix_now_secs, wait_for_idle};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::Duration;
 
     #[test]
@@ -794,6 +795,57 @@ mod tests {
         .await
         .expect(
             "wait_for_idle should resolve well within the timeout once the threshold is exceeded",
+        );
+    }
+
+    /// Complement of the resolves-once-idle test: proves ongoing activity
+    /// actually holds the idle timer off. A concurrent stamper refreshes
+    /// `last_activity` to "now" on a tight cadence -- exactly what the
+    /// `stamp_activity` middleware does on each inbound POST /mcp -- and
+    /// `wait_for_idle` must NOT resolve while that traffic continues. A timer
+    /// that ignored `last_activity` would fire at the threshold regardless and
+    /// fail this test; a correct one, re-reading the refreshed timestamp on
+    /// every poll, keeps waiting for the full window.
+    ///
+    /// The 2s threshold is deliberately two seconds, not one: `unix_now_secs`
+    /// / `idle_timeout_exceeded` are whole-second granular, so right at a
+    /// second boundary a poll can momentarily observe `last_activity` as one
+    /// second stale even while the 40ms stamper is keeping it current. A 2s
+    /// threshold leaves a full one-second margin over that boundary artifact,
+    /// so the assertion is not flaky, while still being tripped by a timer
+    /// that ignores activity entirely.
+    #[tokio::test]
+    async fn wait_for_idle_does_not_resolve_while_activity_stays_fresh() {
+        let last_activity = Arc::new(AtomicU64::new(unix_now_secs()));
+        let keep_stamping = Arc::new(AtomicBool::new(true));
+
+        let stamp_target = last_activity.clone();
+        let stamp_flag = keep_stamping.clone();
+        let stamper = tokio::spawn(async move {
+            while stamp_flag.load(Ordering::Relaxed) {
+                stamp_target.store(unix_now_secs(), Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+        });
+
+        // Poll for 2.2s -- past the 2s threshold, so a timer ignoring
+        // `last_activity` would resolve -- and require that it does not.
+        let result = tokio::time::timeout(
+            Duration::from_millis(2200),
+            wait_for_idle(
+                &last_activity,
+                Duration::from_secs(2),
+                Duration::from_millis(25),
+            ),
+        )
+        .await;
+
+        keep_stamping.store(false, Ordering::Relaxed);
+        stamper.await.unwrap();
+
+        assert!(
+            result.is_err(),
+            "wait_for_idle must not resolve while activity is continuously refreshed"
         );
     }
 }
