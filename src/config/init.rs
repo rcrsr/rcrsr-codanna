@@ -242,7 +242,7 @@ impl Settings {
                 result.push_str("\n# Watch interval for stdio mode in seconds (how often to check for file changes)\n");
             } else if line.starts_with("idle_shutdown_minutes = ") {
                 result.push_str(
-                    "\n# Idle shutdown timeout for the backing server, in minutes (0 = never)\n",
+                    "\n# Idle shutdown timeout for a --http backing server, in minutes (0 = never).\n# Has no effect on --https or stdio backing servers.\n",
                 );
             } else if line == "[logging]" {
                 result.push_str("\n[logging]\n");

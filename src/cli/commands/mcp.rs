@@ -556,9 +556,16 @@ pub async fn run(
     // Check semantic search status before moving indexer
     let has_semantic_search = facade.has_semantic_search();
 
-    // Only load document store for tools that need it (search_documents)
-    // This is expensive (~1s to load ML model) so we skip it for other tools
-    let needs_document_store = tool == "search_documents";
+    // Only load document store for tools that need it (search_documents, or
+    // reindex when it was requested with documents:true). This is expensive
+    // (~1s to load ML model) so we skip it for other tools.
+    let needs_document_store = tool == "search_documents"
+        || (tool == "reindex"
+            && arguments
+                .as_ref()
+                .and_then(|m| m.get("documents"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false));
     let document_store = if needs_document_store {
         crate::documents::load_from_settings(config)
     } else {

@@ -48,13 +48,21 @@ after a spell of inactivity — the next tool call transparently respawns it.
 
 ### Idle shutdown
 
+**Scope: `--http` backing servers only.** The idle timer (activity tracking,
+the poll loop, and the shutdown trigger) is implemented in `serve_http`; a
+backing server started with `--https` has none of this plumbing, so
+`idle_shutdown_minutes` is silently inert for it. If you auto-spawn backing
+servers through the proxy (the common case), they are started with `--http`
+and this section applies as written. If you manually start a backing server
+with `codanna serve --https`, `idle_shutdown_minutes` has no effect on it.
+
 By default a backing server runs indefinitely, so every workspace you touch
 accumulates a resident process. Set `idle_shutdown_minutes` in `[server]` to a
-non-zero value and the server exits cleanly after that many minutes with no MCP
-request activity, removing its `.codanna/serve.json` record exactly as a Ctrl+C
-shutdown does. The next tool call through the proxy finds no record and
-auto-spawns a fresh server (paying only startup latency), so idle shutdown is
-transparent to clients.
+non-zero value and the (`--http`) server exits cleanly after that many minutes
+with no MCP request activity, removing its `.codanna/serve.json` record exactly
+as a Ctrl+C shutdown does. The next tool call through the proxy finds no record
+and auto-spawns a fresh server (paying only startup latency), so idle shutdown
+is transparent to clients.
 
 Only real inbound MCP requests count as activity — SSE keep-alive pings do not
 reset the idle clock, so a merely *connected* client does not keep the server
@@ -90,6 +98,9 @@ If you start a backing server yourself instead (`codanna serve --http` /
 `--https`), it uses the normal bind address — `--bind`, or `[server] bind` in
 `settings.toml`, defaulting to `127.0.0.1:8080` for HTTP and `127.0.0.1:8443` for
 HTTPS. All backing servers listen on loopback only; nothing is exposed off-host.
+Note that `idle_shutdown_minutes` (above) only applies to `--http` backing
+servers — a manually-started `--https` server runs indefinitely regardless of
+that setting.
 
 ```bash
 codanna serve --proxy
@@ -176,12 +187,39 @@ guard, and both scope it as narrowly as possible:
   guard, scoped to just that scan, then drops it before searching.
   `DocumentStore::search` itself only needs read access, so the search step
   runs under a read guard and concurrent `search_documents` calls make
-  progress against each other instead of serializing.
+  progress against each other at the `DocumentStore` level instead of
+  serializing there.
 - **A force reindex's brief write-lock phases** (see above): phase 1 and
   phase 3 each hold the index write lock briefly; the walk in between runs
   off-lock. While the walk is in flight, readers may transiently observe a
   repopulating index (some symbols reindexed, others not yet) until phase 3
   completes.
+
+**Known limitation — vector-layer read lock.** The "make progress against
+each other" claim above is scoped to `DocumentStore`'s own locking; it does
+not extend through the vector storage layer underneath. When an embedding
+generator is configured (the production default), `DocumentStore`'s
+similarity scoring reads vectors via `ConcurrentVectorStorage::read_vector`,
+which takes an *exclusive* lock per call (see that method's doc comment in
+`src/vector/storage.rs`) rather than a shared one, so concurrent
+`search_documents` calls serialize on that lock while scoring candidates.
+Separately, `FastEmbedGenerator::generate_embeddings` runs blocking ONNX
+inference under a `std::sync::Mutex` with no `spawn_blocking`, so concurrent
+embedding generation also serializes and can block the async runtime worker
+thread while it runs. Both are known limitations of the current vector layer,
+tracked for a future fix rather than addressed in this change.
+
+**Known limitation — `reindex documents:true` runs synchronously per
+collection.** The `reindex` tool's document pass takes the same exclusive
+write guard as the auto-sync above, scoped per collection (acquired and
+dropped once per collection rather than once for the whole reindex), but each
+collection's own work — reading files from disk, committing to Tantivy, and
+generating embeddings — still runs synchronously on the async task, without
+`spawn_blocking`. A large collection can therefore hold the write guard for
+that collection's full duration and block the async runtime worker thread
+while doing so. This is bounded to one collection at a time rather than the
+entire reindex, but is not "brief" in the same sense as the two operations
+above; tracked for a future fix.
 
 ## Catch-up reindex on watch-queue overflow
 

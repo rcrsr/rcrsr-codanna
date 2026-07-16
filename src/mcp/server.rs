@@ -216,9 +216,9 @@ pub(crate) struct ReindexRunOutcome {
 }
 
 /// Aggregated document-collection reindex totals, produced by
-/// [`CodeIntelligenceServer::run_document_reindex`] when a reindex request
+/// `CodeIntelligenceServer::run_document_reindex` when a reindex request
 /// asks for `documents: true`. All-`usize` and `Copy` so it can live inline
-/// inside [`ReindexRunOutcome`] without breaking that type's `Copy` bound
+/// inside `ReindexRunOutcome` without breaking that type's `Copy` bound
 /// (`Option<T>` is `Copy` iff `T` is `Copy`).
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct DocReindexTotals {
@@ -422,7 +422,7 @@ impl CodeIntelligenceServer {
     async fn run_document_reindex(&self) -> Result<DocReindexTotals, McpError> {
         let Some(store_arc) = &self.document_store else {
             return Err(McpError::new(
-                ErrorCode::INTERNAL_ERROR,
+                ErrorCode::INVALID_PARAMS,
                 "Document reindex requested but no document store is configured. \
                 Enable `[documents] enabled = true` and configure a collection, \
                 then restart the MCP server."
@@ -443,17 +443,26 @@ impl CodeIntelligenceServer {
             chunks_removed: 0,
         };
 
-        let mut store = store_arc.write().await;
+        // The write guard is scoped per-collection (acquired and dropped
+        // inside the loop body) rather than held once across the whole loop,
+        // so a slow collection (file I/O, tantivy commit, embedding
+        // generation) does not hold the exclusive lock for the other
+        // collections' worth of work too -- readers get a chance to
+        // interleave between collections instead of being blocked for the
+        // entire reindex.
         for (name, config) in &settings.documents.collections {
-            let stats = store
-                .index_collection(name, config, &settings.documents.defaults)
-                .map_err(|e| {
-                    McpError::new(
-                        ErrorCode::INTERNAL_ERROR,
-                        format!("Document reindex failed for collection '{name}': {e}"),
-                        None,
-                    )
-                })?;
+            let stats = {
+                let mut store = store_arc.write().await;
+                store
+                    .index_collection(name, config, &settings.documents.defaults)
+                    .map_err(|e| {
+                        McpError::new(
+                            ErrorCode::INTERNAL_ERROR,
+                            format!("Document reindex failed for collection '{name}': {e}"),
+                            None,
+                        )
+                    })?
+            };
 
             totals.collections += 1;
             totals.files_processed += stats.files_processed;

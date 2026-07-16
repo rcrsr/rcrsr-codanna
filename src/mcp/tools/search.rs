@@ -1130,6 +1130,7 @@ mod search_documents_concurrency_tests {
     use crate::mcp::server::CodeIntelligenceServer;
     use crate::vector::VectorDimension;
     use std::sync::Arc;
+    use tempfile::TempDir;
 
     fn text_of(result: &CallToolResult) -> String {
         result
@@ -1153,7 +1154,13 @@ mod search_documents_concurrency_tests {
     /// amount of content, so `chunks_per_file` mostly controls the cost of
     /// `search`'s per-chunk KWIC-enrichment step (one tantivy lookup per
     /// candidate) rather than the cost of auto-sync's file hashing.
-    fn fixture_settings(file_count: usize, chunks_per_file: usize) -> Settings {
+    /// Returns the fixture `Settings` together with the backing `TempDir`.
+    /// The settings hold paths into the temp dir, so callers must keep the
+    /// returned `TempDir` alive (bound to a variable) for as long as the
+    /// settings/server are in use -- dropping it removes the temp dir from
+    /// disk. Returning it here (instead of leaking it) keeps fixture temp
+    /// dirs from accumulating across test runs.
+    fn fixture_settings(file_count: usize, chunks_per_file: usize) -> (Settings, TempDir) {
         let temp = tempfile::tempdir().expect("create temp root");
         let docs_dir = temp.path().join("docs");
         std::fs::create_dir_all(&docs_dir).expect("create docs dir");
@@ -1184,12 +1191,7 @@ mod search_documents_concurrency_tests {
             },
         );
 
-        // Leak the temp dir for the lifetime of the test process: the
-        // server/store hold paths into it and the test asserts happen
-        // before the process exits.
-        std::mem::forget(temp);
-
-        settings
+        (settings, temp)
     }
 
     /// Builds a `CodeIntelligenceServer` over the given settings, with a
@@ -1270,7 +1272,8 @@ mod search_documents_concurrency_tests {
         const CHUNKS_PER_FILE: usize = 6000;
         const TOTAL_CHUNKS: usize = FILE_COUNT * CHUNKS_PER_FILE;
 
-        let server = build_server(fixture_settings(FILE_COUNT, CHUNKS_PER_FILE));
+        let (settings, _temp) = fixture_settings(FILE_COUNT, CHUNKS_PER_FILE);
+        let server = build_server(settings);
         let store_arc = server
             .document_store
             .clone()
@@ -1361,7 +1364,8 @@ mod search_documents_concurrency_tests {
         const CHUNKS_PER_FILE: usize = 50;
         const TOTAL_CHUNKS: usize = FILE_COUNT * CHUNKS_PER_FILE;
 
-        let server = build_server(fixture_settings(FILE_COUNT, CHUNKS_PER_FILE));
+        let (settings, _temp) = fixture_settings(FILE_COUNT, CHUNKS_PER_FILE);
+        let server = build_server(settings);
 
         let server_a = server.clone();
         let server_b = server.clone();
@@ -1407,7 +1411,7 @@ mod search_documents_concurrency_tests {
     async fn search_documents_text_output_includes_configured_guidance() {
         use crate::config::{GuidanceRange, GuidanceTemplate};
 
-        let mut settings = fixture_settings(3, 1);
+        let (mut settings, _temp) = fixture_settings(3, 1);
         settings.guidance.enabled = true;
         settings.guidance.templates.insert(
             "search_documents".to_string(),

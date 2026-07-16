@@ -201,8 +201,11 @@ fn await_upstream(child: &mut Child) -> (u32, u16) {
         .expect("proxy should report the backing HTTP server within the deadline")
 }
 
-/// Best-effort SIGKILL of `pid` via sysinfo, used to reap any process left
-/// running at test teardown.
+/// Best-effort termination of `pid` via sysinfo, used to reap any process
+/// left running at test teardown. `Process::kill()` sends a generic
+/// terminate signal (not necessarily `SIGKILL`); that's sufficient here since
+/// this is just teardown cleanup, not a correctness assertion about signal
+/// handling.
 fn kill_pid(pid: u32) {
     let target = Pid::from_u32(pid);
     let mut sys = System::new();

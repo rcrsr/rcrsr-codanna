@@ -83,8 +83,11 @@ async fn wait_for_idle(
 /// waiting on `idle_shutdown_minutes`' whole-minute production granularity.
 /// Unset (the production default) or unparseable values fall back to the
 /// config-derived threshold; this is not a documented/supported
-/// configuration knob.
-#[cfg(feature = "http-server")]
+/// configuration knob. Gated on `debug_assertions` (in addition to the
+/// `http-server` feature, which is in the default feature set) so this
+/// env-var override never compiles into a release build and can't silently
+/// override an operator's `idle_shutdown_minutes`.
+#[cfg(all(feature = "http-server", debug_assertions))]
 fn idle_threshold_override() -> Option<std::time::Duration> {
     std::env::var("CODANNA_TEST_IDLE_THRESHOLD_MS")
         .ok()
@@ -92,16 +95,31 @@ fn idle_threshold_override() -> Option<std::time::Duration> {
         .map(std::time::Duration::from_millis)
 }
 
+/// Release-build stand-in for [`idle_threshold_override`]: the env-var
+/// override is compiled out entirely, so this always returns `None`.
+#[cfg(all(feature = "http-server", not(debug_assertions)))]
+fn idle_threshold_override() -> Option<std::time::Duration> {
+    None
+}
+
 /// Test-only override for the idle-timer poll interval, read from
 /// `CODANNA_TEST_IDLE_POLL_MS`. Paired with [`idle_threshold_override`] so
 /// the e2e test can also shrink the poll cadence and avoid padding the
-/// observed shutdown time relative to the (also shrunk) threshold.
-#[cfg(feature = "http-server")]
+/// observed shutdown time relative to the (also shrunk) threshold. Gated on
+/// `debug_assertions` for the same reason as `idle_threshold_override`.
+#[cfg(all(feature = "http-server", debug_assertions))]
 fn idle_poll_interval_override() -> Option<std::time::Duration> {
     std::env::var("CODANNA_TEST_IDLE_POLL_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .map(std::time::Duration::from_millis)
+}
+
+/// Release-build stand-in for [`idle_poll_interval_override`]: the env-var
+/// override is compiled out entirely, so this always returns `None`.
+#[cfg(all(feature = "http-server", not(debug_assertions)))]
+fn idle_poll_interval_override() -> Option<std::time::Duration> {
+    None
 }
 
 #[cfg(feature = "http-server")]
