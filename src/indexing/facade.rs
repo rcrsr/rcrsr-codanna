@@ -930,6 +930,19 @@ impl IndexFacade {
         self.document_index.get_file_path(file_id).ok().flatten()
     }
 
+    /// Get the stored content hash for a file path.
+    ///
+    /// Delegates to `DocumentIndex::get_file_info`. Returns None on error or
+    /// if the path has no indexed file-info entry, for SimpleIndexer API
+    /// compatibility.
+    pub fn get_file_hash_for_path(&self, path: &str) -> Option<String> {
+        self.document_index
+            .get_file_info(path)
+            .ok()
+            .flatten()
+            .map(|(_, hash, _)| hash)
+    }
+
     /// Get all indexed file paths.
     pub fn get_all_indexed_paths(&self) -> Vec<PathBuf> {
         self.document_index

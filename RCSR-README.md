@@ -120,7 +120,8 @@ It is also reachable from the CLI as `codanna mcp reindex`.
   content hash is unchanged, and directories bypass the incremental hash-skip.
 
 The call returns a short summary — files reindexed, symbols, and elapsed
-milliseconds.
+milliseconds. Like every other tool, `reindex` accepts `output_format: "json"`
+for a structured `Envelope` response instead of the default text summary.
 
 Reindexing does not block reads: the walk-and-parse work runs without holding the
 index write lock, so concurrent read-only tools (`find_symbol`, `search_symbols`,
@@ -167,6 +168,69 @@ one-time startup warning).
 
 If you don't run with `--watch`, this feature is inert; the `reindex` tool above
 is the way to re-sync on demand.
+
+## MCP tool enhancements for agent workflows
+
+The fork extends the MCP tool surface so agents can machine-parse results, batch
+lookups, and read symbol bodies without pulling whole files. Every change is
+additive — omit the new parameters and behavior is identical to upstream.
+
+### Structured JSON output (`output_format`)
+
+Every MCP tool accepts `output_format: "text" | "json"` (default `"text"`, so the
+compact prose output is unchanged). With `"json"`, the tool emits a structured
+envelope carrying `status`, `code`, `exit_code`, `message`, `data`, and `meta`
+(with a `schema_version`). The status taxonomy distinguishes `success`,
+`not_found`, `ambiguous`, and `error` — so a consumer can tell "no such symbol"
+apart from "the query failed" instead of parsing prose. This is the same envelope
+the CLI `--json` path already emitted; the two paths now share one builder per
+tool.
+
+### Batch symbol lookup (`find_symbols`)
+
+A new `find_symbols` tool takes `names: [ ... ]` and returns a per-name map —
+each entry is `found` (with location, kind, signature, line range), `not_found`,
+or `ambiguous` (with candidates). One round-trip instead of one per name. Batches
+are capped at 1024 names, matching `reindex`.
+
+### Canonical `name` parameter across symbol tools
+
+`find_symbol`, `get_calls`, `find_callers`, and `analyze_impact` now all accept a
+single canonical `name` parameter. The old parameter names (`function_name` on
+`get_calls`/`find_callers`, `symbol_name` on `analyze_impact`) still work as
+serde aliases, so no existing client breaks. `find_symbol` also gains a typed
+`symbol_id` parameter (previously only the `symbol_id:NNN` string prefix worked).
+
+### Test/production classification on `find_callers`
+
+`find_callers` tags each caller with a `role` of `production` or `test`, and
+accepts `filter: all | production | test` (default `all`) plus `count_only: bool`
+(returns totals with a per-role breakdown). "Is this safe to delete" becomes
+"zero *production* callers" without a manual second grep over test directories.
+Classification is a path heuristic; the patterns are configurable:
+
+```toml
+[caller_classification]
+test_path_patterns = ["tests/", "/test/", "*_test.*", "test_*.py", "*.spec.*", "__tests__/"]
+```
+
+### Symbol-scoped reads (`get_file_outline`, `read_symbol`)
+
+Two new tools let an agent judge and read a symbol without loading its whole file:
+
+- `get_file_outline(path)` — every symbol in a file with kind, signature,
+  visibility, and start/end lines.
+- `read_symbol(name | symbol_id)` — the exact source span of one symbol plus its
+  metadata. It guards against a stale index: if the file's current hash differs
+  from what was indexed, it reports that instead of returning a possibly-shifted
+  span.
+
+### Slimmer `analyze_impact`
+
+`analyze_impact` gains three parameters: `count_only: bool` (just the symbol count
+and distinct-file count, no listing — for scope gates), `max_results` (truncates
+the listing and flags `truncated` in the envelope meta), and
+`group_by: kind | file` (default `kind`, the current behavior).
 
 ## Identifying the fork
 

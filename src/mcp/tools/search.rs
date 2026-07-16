@@ -7,20 +7,34 @@ use rmcp::{handler::server::wrapper::Parameters, tool, tool_router};
 
 use crate::documents::SearchQuery as DocSearchQuery;
 
+use crate::io::envelope::{EntityType, Envelope, ResultCode};
 use crate::mcp::requests::{
-    GetIndexInfoRequest, SearchDocumentsRequest, SearchSymbolsRequest, SemanticSearchRequest,
-    SemanticSearchWithContextRequest,
+    GetIndexInfoRequest, OutputFormat, SearchDocumentsRequest, SearchSymbolsRequest,
+    SemanticSearchRequest, SemanticSearchWithContextRequest,
 };
 use crate::mcp::server::{CodeIntelligenceServer, format_relative_time, generate_mcp_guidance};
+use crate::mcp::service::{self, SearchOutcome};
+
+/// Render a JSON [`Envelope`] as a single-block tool result.
+fn json_result<T: serde::Serialize>(envelope: Envelope<T>) -> CallToolResult {
+    let text = serde_json::to_string(&envelope).unwrap_or_else(|e| {
+        format!(r#"{{"type":"error","message":"envelope serialization failed: {e}"}}"#)
+    });
+    CallToolResult::success(vec![ContentBlock::text(text)])
+}
 
 #[tool_router(router = search_router, vis = "pub(crate)")]
 impl CodeIntelligenceServer {
     #[tool(description = "Get information about the indexed codebase")]
     pub async fn get_index_info(
         &self,
-        Parameters(_params): Parameters<GetIndexInfoRequest>,
+        Parameters(GetIndexInfoRequest { output_format }): Parameters<GetIndexInfoRequest>,
     ) -> Result<CallToolResult, McpError> {
         let indexer = self.facade.read().await;
+
+        if output_format == OutputFormat::Json {
+            return Ok(json_result(service::index_info_envelope(&indexer)));
+        }
         let symbol_count = indexer.symbol_count();
         let file_count = indexer.file_count();
         let relationship_count = indexer.relationship_count();
@@ -72,9 +86,34 @@ impl CodeIntelligenceServer {
             limit,
             threshold,
             lang,
+            output_format,
         }): Parameters<SemanticSearchRequest>,
     ) -> Result<CallToolResult, McpError> {
         let indexer = self.facade.read().await;
+
+        if output_format == OutputFormat::Json {
+            return Ok(
+                match service::semantic_search_docs_data(
+                    &indexer,
+                    &query,
+                    limit as usize,
+                    threshold,
+                    lang.as_deref(),
+                ) {
+                    SearchOutcome::Data(results) => {
+                        json_result(service::semantic_search_docs_envelope(
+                            &indexer,
+                            &query,
+                            lang.as_deref(),
+                            results,
+                        ))
+                    }
+                    SearchOutcome::InvalidQuery(msg) | SearchOutcome::Error(msg) => {
+                        json_result(service::semantic_search_error_envelope(&query, msg))
+                    }
+                },
+            );
+        }
 
         tracing::debug!(
             target: "mcp",
@@ -198,9 +237,34 @@ impl CodeIntelligenceServer {
             limit,
             threshold,
             lang,
+            output_format,
         }): Parameters<SemanticSearchWithContextRequest>,
     ) -> Result<CallToolResult, McpError> {
         let indexer = self.facade.read().await;
+
+        if output_format == OutputFormat::Json {
+            return Ok(
+                match service::semantic_search_with_context_data(
+                    &indexer,
+                    &query,
+                    limit as usize,
+                    threshold,
+                    lang.as_deref(),
+                ) {
+                    SearchOutcome::Data(results) => {
+                        json_result(service::semantic_search_with_context_envelope(
+                            &indexer,
+                            &query,
+                            lang.as_deref(),
+                            results,
+                        ))
+                    }
+                    SearchOutcome::InvalidQuery(msg) | SearchOutcome::Error(msg) => {
+                        json_result(service::semantic_search_error_envelope(&query, msg))
+                    }
+                },
+            );
+        }
 
         if !indexer.has_semantic_search() {
             tracing::debug!(
@@ -728,9 +792,46 @@ impl CodeIntelligenceServer {
             kind,
             module,
             lang,
+            output_format,
         }): Parameters<SearchSymbolsRequest>,
     ) -> Result<CallToolResult, McpError> {
         let indexer = self.facade.read().await;
+
+        if output_format == OutputFormat::Json {
+            return Ok(
+                match service::search_symbols_data(
+                    &indexer,
+                    &query,
+                    limit as usize,
+                    kind.as_deref(),
+                    module.as_deref(),
+                    lang.as_deref(),
+                ) {
+                    SearchOutcome::Data(results) => json_result(service::search_symbols_envelope(
+                        &indexer,
+                        &query,
+                        lang.as_deref(),
+                        results,
+                    )),
+                    SearchOutcome::InvalidQuery(msg) => {
+                        let envelope: Envelope<()> = Envelope::error(ResultCode::InvalidQuery, msg)
+                            .with_entity_type(EntityType::SearchResult)
+                            .with_query(&query);
+                        json_result(envelope)
+                    }
+                    SearchOutcome::Error(msg) => {
+                        let envelope: Envelope<()> = Envelope::error(
+                            ResultCode::InvalidQuery,
+                            format!("Failed to search for '{query}': {msg}"),
+                        )
+                        .with_entity_type(EntityType::SearchResult)
+                        .with_query(&query)
+                        .with_hint("Check query syntax");
+                        json_result(envelope)
+                    }
+                },
+            );
+        }
 
         // One kind vocabulary (SymbolKind::from_str); unknown kinds error
         // instead of silently returning unfiltered results.
@@ -827,11 +928,22 @@ impl CodeIntelligenceServer {
             query,
             collection,
             limit,
+            output_format,
         }): Parameters<SearchDocumentsRequest>,
     ) -> Result<CallToolResult, McpError> {
         let store = match &self.document_store {
             Some(s) => s,
             None => {
+                if output_format == OutputFormat::Json {
+                    let envelope: Envelope<()> = Envelope::error(
+                        ResultCode::IndexError,
+                        "Document search not available. No document collections are indexed.",
+                    )
+                    .with_entity_type(EntityType::Document)
+                    .with_query(&query)
+                    .with_hint("Run 'codanna documents index' to create the index");
+                    return Ok(json_result(envelope));
+                }
                 return Ok(CallToolResult::error(vec![ContentBlock::text(
                     "Document search not available. No document collections are indexed.\n\n\
                     To enable:\n\
@@ -844,6 +956,48 @@ impl CodeIntelligenceServer {
 
         let mut store = store.write().await;
         let indexer = self.facade.read().await;
+
+        if output_format == OutputFormat::Json {
+            return Ok(
+                match service::search_documents_data(
+                    &mut store,
+                    indexer.settings(),
+                    &query,
+                    collection,
+                    limit as usize,
+                ) {
+                    Ok(results) => {
+                        let count = results.len();
+                        let envelope = if count == 0 {
+                            Envelope::<Vec<crate::documents::SearchResult>>::not_found(format!(
+                                "No documents found for '{query}'"
+                            ))
+                            .with_entity_type(EntityType::Document)
+                            .with_query(&query)
+                        } else {
+                            Envelope::success(results)
+                                .with_entity_type(EntityType::Document)
+                                .with_count(count)
+                                .with_query(&query)
+                                .with_message(format!("Found {count} matching documents"))
+                                .with_hint(
+                                    "Use the file paths and byte ranges to read specific sections",
+                                )
+                        };
+                        json_result(envelope)
+                    }
+                    Err(e) => {
+                        let envelope: Envelope<()> = Envelope::error(
+                            ResultCode::IndexError,
+                            format!("Document search failed: {e}"),
+                        )
+                        .with_entity_type(EntityType::Document)
+                        .with_query(&query);
+                        json_result(envelope)
+                    }
+                },
+            );
+        }
 
         // Auto-sync: check for file changes in all collections before searching
         let settings = indexer.settings();

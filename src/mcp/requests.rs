@@ -3,46 +3,165 @@
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 
+/// Output rendering mode for an MCP tool call.
+///
+/// `Text` (the default) returns the tool's existing human-readable string
+/// content, byte-identical to behavior before `output_format` existed.
+/// `Json` returns a single `ContentBlock::text` whose payload is a
+/// serialized `Envelope<T>` (see `crate::io::envelope`) — the same schema
+/// version and status vocabulary used by `codanna mcp --json`.
+#[derive(
+    Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputFormat {
+    #[default]
+    Text,
+    Json,
+}
+
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct FindSymbolRequest {
-    /// Name of the symbol to find
+    /// Name of the symbol to find. Ignored when `symbol_id` is present.
+    #[serde(default)]
     pub name: String,
+    /// Symbol ID for direct lookup (recommended to avoid ambiguity). Takes
+    /// precedence over `name` when both are present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol_id: Option<u32>,
     /// Filter by programming language (e.g., "rust", "python", "typescript", "php")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lang: Option<String>,
+    /// Output rendering: "text" (default) or "json"
+    #[serde(default)]
+    pub output_format: OutputFormat,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct FindSymbolsRequest {
+    /// Symbol names to look up in a single batch call. Capped at 1024
+    /// entries; a larger batch is rejected with an error envelope.
+    pub names: Vec<String>,
+    /// Filter by programming language (e.g., "rust", "python", "typescript", "php")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lang: Option<String>,
+    /// Output rendering: "text" (default) or "json"
+    #[serde(default)]
+    pub output_format: OutputFormat,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct GetCallsRequest {
-    /// Name of the function to analyze (use symbol_id for unambiguous lookup)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub function_name: Option<String>,
+    /// Name of the function to analyze (use symbol_id for unambiguous lookup).
+    /// Legacy key `function_name` is still accepted as an alias for `name`.
+    #[serde(alias = "function_name", skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// Symbol ID for direct lookup (recommended to avoid ambiguity)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symbol_id: Option<u32>,
+    /// Output rendering: "text" (default) or "json"
+    #[serde(default)]
+    pub output_format: OutputFormat,
+}
+
+/// Caller-role filter for `find_callers`. Roles are computed by the
+/// path-heuristic classifier in `crate::mcp::service` against the caller's
+/// `Symbol.file_path`; `All` (the default) applies no filtering.
+#[derive(
+    Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CallerFilter {
+    #[default]
+    All,
+    Production,
+    Test,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct FindCallersRequest {
-    /// Name of the function to find callers for (use symbol_id for unambiguous lookup)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub function_name: Option<String>,
+    /// Name of the function to find callers for (use symbol_id for unambiguous lookup).
+    /// Legacy key `function_name` is still accepted as an alias for `name`.
+    #[serde(alias = "function_name", skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// Symbol ID for direct lookup (recommended to avoid ambiguity)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symbol_id: Option<u32>,
+    /// Restrict results to callers tagged `production` or `test` (default: `all`)
+    #[serde(default)]
+    pub filter: CallerFilter,
+    /// Return only totals (with a per-role breakdown) instead of the caller list
+    #[serde(default)]
+    pub count_only: bool,
+    /// Output rendering: "text" (default) or "json"
+    #[serde(default)]
+    pub output_format: OutputFormat,
+}
+
+/// Listing grouping for `analyze_impact`. `Kind` (the default) reproduces
+/// the pre-existing "group by symbol kind" behavior byte-for-byte; `File`
+/// regroups the same impact set by `Symbol.file_path` instead.
+#[derive(
+    Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupBy {
+    #[default]
+    Kind,
+    File,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct AnalyzeImpactRequest {
-    /// Name of the symbol to analyze impact for (use symbol_id for unambiguous lookup)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub symbol_name: Option<String>,
+    /// Name of the symbol to analyze impact for (use symbol_id for unambiguous lookup).
+    /// Legacy key `symbol_name` is still accepted as an alias for `name`.
+    #[serde(alias = "symbol_name", skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// Symbol ID for direct lookup (recommended to avoid ambiguity)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symbol_id: Option<u32>,
-    /// Maximum depth to search (default: 3)
+    /// Maximum depth to search. Defaults to 3 via `default_depth()` below;
+    /// `IndexFacade::get_impact_radius`'s own `unwrap_or(2)` fallback
+    /// (`facade.rs`) is unreachable from this request type, since this
+    /// field is always `Some`-wrapped before being passed down.
     #[serde(default = "default_depth")]
     pub max_depth: u32,
+    /// Return only the symbol count and distinct-file count instead of the
+    /// full listing.
+    #[serde(default)]
+    pub count_only: bool,
+    /// Cap the number of symbols included in the listing. `0` (the
+    /// default) means unlimited. Truncation sets `meta.truncated: true`.
+    #[serde(default)]
+    pub max_results: u32,
+    /// Group the listing by symbol kind (default) or by file.
+    #[serde(default)]
+    pub group_by: GroupBy,
+    /// Output rendering: "text" (default) or "json"
+    #[serde(default)]
+    pub output_format: OutputFormat,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct GetFileOutlineRequest {
+    /// Path of the indexed file to outline (as stored in the index, e.g. "src/lib.rs")
+    pub path: String,
+    /// Output rendering: "text" (default) or "json"
+    #[serde(default)]
+    pub output_format: OutputFormat,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ReadSymbolRequest {
+    /// Name of the symbol to read (use symbol_id for unambiguous lookup)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Symbol ID for direct lookup (recommended to avoid ambiguity)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol_id: Option<u32>,
+    /// Output rendering: "text" (default) or "json"
+    #[serde(default)]
+    pub output_format: OutputFormat,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -61,6 +180,9 @@ pub struct SearchSymbolsRequest {
     /// Filter by programming language (e.g., "rust", "python", "typescript", "php")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lang: Option<String>,
+    /// Output rendering: "text" (default) or "json"
+    #[serde(default)]
+    pub output_format: OutputFormat,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -76,6 +198,9 @@ pub struct SemanticSearchRequest {
     /// Filter by programming language (e.g., "rust", "python", "typescript", "php")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lang: Option<String>,
+    /// Output rendering: "text" (default) or "json"
+    #[serde(default)]
+    pub output_format: OutputFormat,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -91,10 +216,17 @@ pub struct SemanticSearchWithContextRequest {
     /// Filter by programming language (e.g., "rust", "python", "typescript", "php")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lang: Option<String>,
+    /// Output rendering: "text" (default) or "json"
+    #[serde(default)]
+    pub output_format: OutputFormat,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-pub struct GetIndexInfoRequest {}
+pub struct GetIndexInfoRequest {
+    /// Output rendering: "text" (default) or "json"
+    #[serde(default)]
+    pub output_format: OutputFormat,
+}
 
 impl schemars::JsonSchema for GetIndexInfoRequest {
     fn schema_name() -> std::borrow::Cow<'static, str> {
@@ -109,11 +241,18 @@ impl schemars::JsonSchema for GetIndexInfoRequest {
         // MCP spec recommends `{"type":"object","additionalProperties":false}` for
         // no-parameter tools. We also include an empty `properties` map because
         // OpenAI's strict function-calling validation rejects object schemas that
-        // lack `properties` entirely.
+        // lack `properties` entirely. `output_format` is the sole accepted
+        // parameter (text/json rendering selector).
         schemars::Schema::from(
             serde_json::json!({
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "output_format": {
+                        "type": "string",
+                        "enum": ["text", "json"],
+                        "default": "text"
+                    }
+                },
                 "additionalProperties": false
             })
             .as_object()
@@ -133,6 +272,9 @@ pub struct SearchDocumentsRequest {
     /// Maximum number of results (default: 5)
     #[serde(default = "default_context_limit")]
     pub limit: u32,
+    /// Output rendering: "text" (default) or "json"
+    #[serde(default)]
+    pub output_format: OutputFormat,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -147,6 +289,9 @@ pub struct ReindexRequest {
     /// check. Default: false.
     #[serde(default)]
     pub force: bool,
+    /// Output rendering: "text" (default) or "json"
+    #[serde(default)]
+    pub output_format: OutputFormat,
 }
 
 impl ReindexRequest {

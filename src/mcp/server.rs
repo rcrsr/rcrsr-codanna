@@ -155,7 +155,12 @@ impl ServerHandler for CodeIntelligenceServer {
             Then use 'find_symbol' and 'search_symbols' to lock onto exact files and kinds. \
             Treat 'get_calls', 'find_callers', and 'analyze_impact' as hints; confirm with code reading or tighter queries (unique names, kind filters). \
             Use 'search_documents' to find relevant project documentation (markdown files). \
-            Use 'get_index_info' to understand what's indexed.",
+            Use 'get_index_info' to understand what's indexed. \
+            OUTPUT FORMAT: every tool above accepts an optional `output_format` parameter, \
+            either \"text\" (the default, human-readable) or \"json\" (a single machine-readable \
+            content block containing a schema_version-tagged envelope with status \
+            success/not_found/ambiguous/error and a typed `data` payload). Use \"json\" when \
+            you need to parse results programmatically rather than read prose.",
         )
     }
 

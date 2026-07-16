@@ -84,6 +84,10 @@ pub struct Settings {
     /// Document embedding settings for RAG
     #[serde(default)]
     pub documents: crate::documents::DocumentsConfig,
+
+    /// Caller classification settings (e.g. distinguishing test callers)
+    #[serde(default)]
+    pub caller_classification: CallerClassificationConfig,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -256,6 +260,21 @@ pub struct FileWatchConfig {
     pub churn_threshold: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallerClassificationConfig {
+    /// Glob-style patterns used to classify a caller's source path as a test
+    #[serde(default = "default_test_path_patterns")]
+    pub test_path_patterns: Vec<String>,
+}
+
+impl Default for CallerClassificationConfig {
+    fn default() -> Self {
+        Self {
+            test_path_patterns: default_test_path_patterns(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ServerConfig {
     /// Default server mode: "stdio" or "http"
@@ -365,6 +384,7 @@ impl Default for Settings {
             logging: LoggingConfig::default(),
             guidance: GuidanceConfig::default(),
             documents: crate::documents::DocumentsConfig::default(),
+            caller_classification: CallerClassificationConfig::default(),
         }
     }
 }
@@ -805,6 +825,71 @@ default = "info"
             std::env::remove_var("CI_LOGGING__DEFAULT");
         }
         std::env::set_current_dir(original_dir).unwrap();
+    }
+
+    #[test]
+    fn test_caller_classification_config_defaults() {
+        println!("\n=== TEST: CallerClassificationConfig Defaults ===");
+
+        let config = CallerClassificationConfig::default();
+        assert_eq!(
+            config.test_path_patterns,
+            vec![
+                "tests/".to_string(),
+                "/test/".to_string(),
+                "*_test.*".to_string(),
+                "test_*.py".to_string(),
+                "*.spec.*".to_string(),
+                "__tests__/".to_string(),
+            ]
+        );
+
+        println!(
+            "  ✓ Default test_path_patterns: {:?}",
+            config.test_path_patterns
+        );
+        println!("=== TEST PASSED ===");
+    }
+
+    #[test]
+    fn test_caller_classification_config_from_toml() {
+        println!("\n=== TEST: CallerClassificationConfig from TOML ===");
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("settings.toml");
+
+        // Write a custom [caller_classification] table
+        let config_content = r#"
+[caller_classification]
+test_path_patterns = ["spec/", "*_spec.rb"]
+"#;
+        fs::write(&config_path, config_content).unwrap();
+
+        // Load config using Figment directly
+        let settings: Settings = Figment::new()
+            .merge(Serialized::defaults(Settings::default()))
+            .merge(Toml::file(config_path))
+            .extract()
+            .unwrap();
+
+        assert_eq!(
+            settings.caller_classification.test_path_patterns,
+            vec!["spec/".to_string(), "*_spec.rb".to_string()]
+        );
+
+        // Round-trip: serialize back to TOML and deserialize again
+        let toml_str = toml::to_string(&settings).unwrap();
+        let round_tripped: Settings = toml::from_str(&toml_str).unwrap();
+        assert_eq!(
+            round_tripped.caller_classification.test_path_patterns,
+            settings.caller_classification.test_path_patterns
+        );
+
+        println!(
+            "  ✓ Loaded and round-tripped custom patterns: {:?}",
+            settings.caller_classification.test_path_patterns
+        );
+        println!("=== TEST PASSED ===");
     }
 
     #[test]
