@@ -218,6 +218,13 @@ impl Settings {
             } else if line.starts_with("debounce_ms = ") {
                 result.push_str("\n# Debounce interval in milliseconds\n");
                 result.push_str("# How long to wait after a file change before re-indexing\n");
+            } else if line.starts_with("refresh_on_overflow = ") {
+                result
+                    .push_str("\n# Force a full refresh when the OS watch event queue overflows\n");
+                result.push_str("# Default: true\n");
+            } else if line.starts_with("churn_threshold = ") {
+                result.push_str("\n# Reserved for future use: churn-based refresh threshold\n");
+                result.push_str("# Not yet consumed by the watcher. Default: 0 (disabled)\n");
             } else if line == "[server]" {
                 result.push_str("\n[server]\n");
                 result.push_str("# Server mode: \"stdio\" (default) or \"http\"\n");

@@ -27,6 +27,12 @@ pub enum WatchError {
 
     #[error("Channel closed unexpectedly")]
     ChannelClosed,
+
+    #[error("Catch-up reindex after overflow/rescan failed: {source}")]
+    CatchUpReindexFailed {
+        #[source]
+        source: crate::error::IndexError,
+    },
 }
 
 impl From<notify::Error> for WatchError {

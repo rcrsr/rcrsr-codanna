@@ -1445,6 +1445,68 @@ impl ReindexHandles {
     }
 }
 
+/// Runs the full 3-phase reindex orchestration (brief write lock ->
+/// off-lock walk -> brief write lock) against a shared, lock-guarded
+/// facade.
+///
+/// This is the single seam through which both the MCP server's reindex
+/// request handler and the file-watcher's catch-up path drive a reindex, so
+/// the phase ordering (snapshot handles under lock, run the heavy walk with
+/// no lock held, then record indexed directories under lock again) is
+/// guaranteed regardless of caller.
+///
+/// - Phase 1: acquires a brief write lock. When `paths` is `None` and
+///   `force` is `true`, clears the index first; then snapshots cloneable
+///   reindex handles via [`IndexFacade::snapshot_reindex_handles`].
+/// - Phase 2: with the write guard already dropped, runs the heavy reindex
+///   walk off-lock via [`ReindexHandles::run`] on a blocking thread.
+/// - Phase 3: acquires a brief write lock again to record any newly
+///   indexed directories via [`IndexFacade::add_indexed_path`].
+///
+/// `phase2_started`, when provided, is signaled the instant phase 1's write
+/// guard has been dropped and before the off-lock walk begins; this exists
+/// for test synchronization and is `None` in production call sites.
+pub async fn reindex_locked(
+    facade: &Arc<tokio::sync::RwLock<IndexFacade>>,
+    paths: Option<Vec<String>>,
+    force: bool,
+    phase2_started: Option<tokio::sync::oneshot::Sender<()>>,
+) -> FacadeResult<ReindexOutcome> {
+    // Phase 1: brief write lock to optionally clear the index and snapshot
+    // cloneable handles for the off-lock reindex walk.
+    let handles = {
+        let mut indexer = facade.write().await;
+
+        if paths.is_none() && force {
+            indexer.clear_index()?;
+        }
+
+        indexer.snapshot_reindex_handles()?
+    };
+
+    // The write guard above is dropped at the end of its block, strictly
+    // before this point. Signal test observers that phase 2 (the off-lock
+    // walk) is about to begin.
+    if let Some(tx) = phase2_started {
+        let _ = tx.send(());
+    }
+
+    // Phase 2: run the heavy reindex walk with no facade lock held.
+    let outcome = tokio::task::spawn_blocking(move || handles.run(paths, force))
+        .await
+        .map_err(|e| IndexError::General(format!("reindex task panicked: {e}")))??;
+
+    // Phase 3: brief write lock to record any newly indexed directories.
+    {
+        let mut indexer = facade.write().await;
+        for dir in &outcome.indexed_dirs {
+            indexer.add_indexed_path(dir);
+        }
+    }
+
+    Ok(outcome)
+}
+
 // ── Embedding backend factory ──────────────────────────────────────────────
 
 /// Resolve the effective remote model name, applying env-var-first precedence.

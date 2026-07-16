@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 use tokio::sync::{RwLock, mpsc};
@@ -45,6 +46,17 @@ pub struct UnifiedWatcher {
     index_path: PathBuf,
     /// Workspace root for path resolution.
     workspace_root: PathBuf,
+    /// Whether the index is potentially stale due to a backend overflow/rescan
+    /// or watch error (i.e. we may have missed filesystem events).
+    stale: bool,
+    /// When the staleness window started (or was last extended by a new signal).
+    stale_since: Option<Instant>,
+    /// Whether to actively refresh the index when an overflow/rescan is detected.
+    refresh_on_overflow: bool,
+    /// Quiet window duration used both for debouncing individual file events
+    /// and for deciding when a stale/overflow episode has settled enough to
+    /// fire a catch-up reindex.
+    debounce_window: Duration,
 }
 
 impl UnifiedWatcher {
@@ -116,6 +128,11 @@ impl UnifiedWatcher {
                         }
                         Err(e) => {
                             tracing::error!("[watcher] file watch error: {e}");
+                            // A backend error means we may have missed events -
+                            // the index may be stale until a rescan/reindex resolves it.
+                            if self.refresh_on_overflow {
+                                self.mark_stale();
+                            }
                         }
                     }
                 }
@@ -125,6 +142,55 @@ impl UnifiedWatcher {
                     let ready = self.debouncer.take_ready();
                     for path in ready {
                         self.process_modification(&path).await;
+                    }
+
+                    // After draining debounced work, check whether the quiet
+                    // window for a prior overflow/rescan signal has elapsed.
+                    // If so, fire exactly one catch-up reindex.
+                    if let Some(since) = self.stale_since {
+                        let window = self.debounce_window;
+                        if should_catch_up(
+                            self.stale,
+                            self.debouncer.has_pending(),
+                            since.elapsed(),
+                            window,
+                        ) {
+                            crate::log_event!(
+                                "watcher",
+                                "catch-up reindex",
+                                "quiet window elapsed after overflow/rescan; reindexing"
+                            );
+
+                            let result = crate::indexing::facade::reindex_locked(
+                                &self.facade,
+                                None,
+                                true,
+                                None,
+                            )
+                            .await
+                            .map_err(|source| WatchError::CatchUpReindexFailed { source });
+
+                            match result {
+                                Ok(outcome) => {
+                                    crate::log_event!(
+                                        "watcher",
+                                        "catch-up reindex complete",
+                                        "{} files reindexed, {} symbols",
+                                        outcome.reindexed,
+                                        outcome.symbol_count
+                                    );
+                                    self.broadcaster.send(FileChangeEvent::IndexReloaded);
+                                }
+                                Err(e) => {
+                                    tracing::error!("[watcher] {e}");
+                                }
+                            }
+
+                            // Fire exactly once per overflow episode, whether
+                            // the catch-up reindex succeeded or failed.
+                            self.stale = false;
+                            self.stale_since = None;
+                        }
                     }
                 }
 
@@ -162,8 +228,41 @@ impl UnifiedWatcher {
         }
     }
 
+    /// Mark the index as potentially stale and (re)start the quiet-window clock.
+    ///
+    /// While stale, every subsequent observed watcher signal (Ok or Err) bumps
+    /// `stale_since` so the quiet window measures quiet-since-last-signal.
+    fn mark_stale(&mut self) {
+        self.stale = true;
+        self.stale_since = Some(Instant::now());
+    }
+
+    /// While already stale, restart the quiet-window clock without touching the
+    /// `stale` flag. Called for every observed watcher signal so the window
+    /// measures quiet-since-last-signal and catch-up only fires once activity
+    /// truly settles. A no-op when not stale.
+    fn bump_stale_clock(&mut self) {
+        if self.stale {
+            self.stale_since = Some(Instant::now());
+        }
+    }
+
     /// Handle an incoming file event.
     async fn handle_event(&mut self, event: Event) {
+        // notify 8.2.0 signals backend overflow/rescan (e.g. inotify IN_Q_OVERFLOW)
+        // via a backend-agnostic flag rather than a path-bearing event kind. A
+        // rescan/overflow event carries EMPTY paths, so the loop below would
+        // silently drop it without this check - the index may be stale because
+        // filesystem events were dropped by the OS or backend.
+        if event.need_rescan() && self.refresh_on_overflow {
+            crate::log_event!(
+                "watcher",
+                "overflow/rescan",
+                "backend reported a rescan condition; index may be stale until refreshed"
+            );
+            self.mark_stale();
+        }
+
         for path in event.paths {
             // Check if any handler cares about this path
             let matched = self.handlers.iter().any(|h| h.matches(&path));
@@ -191,6 +290,11 @@ impl UnifiedWatcher {
                 _ => {}
             }
         }
+
+        // Any observed signal received while stale restarts the quiet window,
+        // so a rescan followed by ongoing activity settles into a single
+        // catch-up reindex rather than firing mid-burst.
+        self.bump_stale_clock();
     }
 
     /// Process a debounced file modification.
@@ -426,6 +530,18 @@ impl UnifiedWatcher {
     }
 }
 
+/// Pure decision predicate for firing a catch-up reindex after an
+/// overflow/rescan signal.
+///
+/// Fires exactly when the index is marked stale, there is no pending
+/// (still-debouncing) file activity, and the quiet window has elapsed since
+/// the last staleness signal. Callers are responsible for clearing `stale`
+/// after a `true` result so the predicate does not re-fire on subsequent
+/// ticks for the same episode.
+fn should_catch_up(stale: bool, has_pending: bool, elapsed: Duration, window: Duration) -> bool {
+    stale && !has_pending && elapsed >= window
+}
+
 /// Builder for constructing a UnifiedWatcher.
 pub struct UnifiedWatcherBuilder {
     handlers: Vec<Box<dyn WatchHandler>>,
@@ -436,6 +552,7 @@ pub struct UnifiedWatcherBuilder {
     index_path: Option<PathBuf>,
     workspace_root: Option<PathBuf>,
     debounce_ms: u64,
+    refresh_on_overflow: bool,
 }
 
 impl UnifiedWatcherBuilder {
@@ -450,6 +567,7 @@ impl UnifiedWatcherBuilder {
             index_path: None,
             workspace_root: None,
             debounce_ms: 500,
+            refresh_on_overflow: false,
         }
     }
 
@@ -501,6 +619,13 @@ impl UnifiedWatcherBuilder {
         self
     }
 
+    /// Set whether to actively refresh the index when a backend
+    /// overflow/rescan condition is detected.
+    pub fn refresh_on_overflow(mut self, refresh: bool) -> Self {
+        self.refresh_on_overflow = refresh;
+        self
+    }
+
     /// Build the UnifiedWatcher.
     pub fn build(self) -> Result<UnifiedWatcher, WatchError> {
         let broadcaster = self.broadcaster.ok_or_else(|| WatchError::InitFailed {
@@ -539,6 +664,10 @@ impl UnifiedWatcherBuilder {
             chunking_config: self.chunking_config,
             index_path,
             workspace_root,
+            stale: false,
+            stale_since: None,
+            refresh_on_overflow: self.refresh_on_overflow,
+            debounce_window: Duration::from_millis(self.debounce_ms),
         })
     }
 }
@@ -546,5 +675,196 @@ impl UnifiedWatcherBuilder {
 impl Default for UnifiedWatcherBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use notify::event::Flag;
+
+    /// A real kernel IN_Q_OVERFLOW (or platform-equivalent rescan condition) is
+    /// not unit-testable without a live filesystem watcher, so we synthesize
+    /// the `notify::Event` directly with the rescan flag set and empty paths -
+    /// this mirrors exactly what a backend-driven overflow event looks like.
+    fn rescan_event() -> Event {
+        Event::new(EventKind::Other).set_flag(Flag::Rescan)
+    }
+
+    #[test]
+    fn rescan_event_reports_need_rescan_with_empty_paths() {
+        let event = rescan_event();
+
+        assert!(event.need_rescan());
+        assert!(
+            event.paths.is_empty(),
+            "a rescan/overflow event carries no paths"
+        );
+    }
+
+    /// Build a minimal real `UnifiedWatcher` against a temp-dir-backed index,
+    /// so `handle_event` can be exercised directly instead of re-simulating
+    /// its branching logic.
+    fn test_watcher(tempdir: &tempfile::TempDir) -> UnifiedWatcher {
+        use crate::config::Settings;
+        use crate::indexing::facade::IndexFacade;
+
+        let settings = Settings {
+            index_path: tempdir.path().to_path_buf(),
+            workspace_root: None,
+            ..Default::default()
+        };
+        let facade = IndexFacade::new(std::sync::Arc::new(settings))
+            .expect("facade construction against a fresh temp dir must succeed");
+
+        UnifiedWatcher::builder()
+            .broadcaster(Arc::new(NotificationBroadcaster::new(16)))
+            .indexer(Arc::new(RwLock::new(facade)))
+            .workspace_root(tempdir.path().to_path_buf())
+            .build()
+            .expect("builder has all required fields")
+    }
+
+    #[tokio::test]
+    async fn rescan_with_refresh_on_overflow_marks_stale() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut watcher = test_watcher(&tempdir);
+        watcher.refresh_on_overflow = true;
+
+        assert!(!watcher.stale);
+        assert!(watcher.stale_since.is_none());
+
+        let event = rescan_event();
+        assert!(event.paths.is_empty());
+        watcher.handle_event(event).await;
+
+        assert!(watcher.stale, "rescan event must flip stale to true");
+        assert!(
+            watcher.stale_since.is_some(),
+            "rescan event must record stale_since"
+        );
+    }
+
+    #[tokio::test]
+    async fn rescan_without_refresh_on_overflow_leaves_stale_unset() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut watcher = test_watcher(&tempdir);
+        watcher.refresh_on_overflow = false;
+
+        let event = rescan_event();
+        watcher.handle_event(event).await;
+
+        assert!(
+            !watcher.stale,
+            "stale must stay false when refresh_on_overflow is disabled"
+        );
+        assert!(watcher.stale_since.is_none());
+    }
+
+    #[tokio::test]
+    async fn ordinary_event_while_stale_bumps_stale_clock() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut watcher = test_watcher(&tempdir);
+        watcher.refresh_on_overflow = true;
+
+        // Enter the stale episode via a rescan/overflow signal.
+        watcher.handle_event(rescan_event()).await;
+        let first = watcher.stale_since.expect("rescan must set stale_since");
+
+        // A later ordinary (non-rescan) signal must restart the quiet-window
+        // clock so catch-up does not fire while activity is still arriving.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let mut modify = Event::new(EventKind::Modify(notify::event::ModifyKind::Any));
+        modify.paths.push(tempdir.path().join("some_file.rs"));
+        watcher.handle_event(modify).await;
+
+        let second = watcher.stale_since.expect("must still be stale");
+        assert!(
+            second > first,
+            "an ordinary signal received while stale must advance stale_since"
+        );
+        assert!(watcher.stale, "an ordinary signal must not clear stale");
+    }
+
+    #[tokio::test]
+    async fn ordinary_event_while_not_stale_does_not_set_stale() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut watcher = test_watcher(&tempdir);
+        watcher.refresh_on_overflow = true;
+
+        let mut modify = Event::new(EventKind::Modify(notify::event::ModifyKind::Any));
+        modify.paths.push(tempdir.path().join("some_file.rs"));
+        watcher.handle_event(modify).await;
+
+        assert!(
+            !watcher.stale && watcher.stale_since.is_none(),
+            "a non-rescan signal must not start a stale episode"
+        );
+    }
+
+    #[test]
+    fn should_catch_up_fires_once_when_stale_unpending_and_window_elapsed() {
+        let window = Duration::from_millis(500);
+
+        assert!(
+            should_catch_up(true, false, Duration::from_millis(600), window),
+            "stale + no pending + elapsed >= window must fire"
+        );
+
+        // Caller clears `stale` after firing; a second call with stale=false
+        // must not fire again for the same episode.
+        assert!(
+            !should_catch_up(false, false, Duration::from_millis(600), window),
+            "cleared stale must not re-fire"
+        );
+    }
+
+    #[test]
+    fn should_catch_up_does_not_fire_while_debouncer_has_pending() {
+        let window = Duration::from_millis(500);
+
+        assert!(!should_catch_up(
+            true,
+            true,
+            Duration::from_millis(600),
+            window
+        ));
+    }
+
+    #[test]
+    fn should_catch_up_does_not_fire_before_window_elapses() {
+        let window = Duration::from_millis(500);
+
+        assert!(!should_catch_up(
+            true,
+            false,
+            Duration::from_millis(100),
+            window
+        ));
+    }
+
+    #[test]
+    fn should_catch_up_does_not_refire_on_repeated_ticks_after_one_fire() {
+        let window = Duration::from_millis(500);
+
+        // First tick: fires.
+        assert!(should_catch_up(
+            true,
+            false,
+            Duration::from_millis(500),
+            window
+        ));
+
+        // Caller clears stale/stale_since on fire. Subsequent ticks, even
+        // with a large elapsed value (as if stale_since were never reset),
+        // must not re-fire once stale is false.
+        for elapsed_ms in [500, 1000, 5000] {
+            assert!(!should_catch_up(
+                false,
+                false,
+                Duration::from_millis(elapsed_ms),
+                window
+            ));
+        }
     }
 }
