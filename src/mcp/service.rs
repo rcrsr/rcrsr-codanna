@@ -16,7 +16,28 @@ use crate::indexing::facade::IndexFacade;
 use crate::io::envelope::{EntityType, Envelope};
 use crate::io::guidance_engine::generate_guidance_from_config;
 use crate::mcp::requests::{CallerFilter, GroupBy};
+use rmcp::model::{CallToolResult, ContentBlock};
 use serde::Serialize;
+
+/// Render a JSON [`Envelope`] as a single-block tool result. Falls back to
+/// serializing a fallback `Envelope<()>` error if the primary envelope
+/// fails to serialize (keeping the `output_format: json` contract of always
+/// returning a parseable `Envelope<T>` shape), and only as an absolute last
+/// resort — if even the fallback envelope fails to serialize — emits a raw
+/// text error block. Shared by every MCP tool's json branch
+/// (`mcp/tools/*.rs`) so the fallback behavior cannot drift per file.
+pub fn json_result<T: Serialize>(envelope: Envelope<T>) -> CallToolResult {
+    let text = serde_json::to_string(&envelope).unwrap_or_else(|e| {
+        let fallback = Envelope::<()>::error(
+            crate::io::envelope::ResultCode::InternalError,
+            format!("envelope serialization failed: {e}"),
+        );
+        serde_json::to_string(&fallback).unwrap_or_else(|_| {
+            format!(r#"{{"type":"error","message":"envelope serialization failed: {e}"}}"#)
+        })
+    });
+    CallToolResult::success(vec![ContentBlock::text(text)])
+}
 
 /// Outcome of resolving a tool's target symbol from `symbol_id` or name.
 pub enum SymbolResolution {
@@ -354,23 +375,14 @@ pub fn count_callers_by_role(callers: &[CallerRelation]) -> CallerCounts {
     count_roles(callers.iter().map(|c| c.role))
 }
 
-/// Build the `find_symbol` JSON data payload: full symbol-card context for
-/// every match (including the dotted-member fallback). An empty result
-/// means "not found"; `find_symbol` treats multiple matches as ordinary
-/// success data, never ambiguity.
-pub fn find_symbol_data(
+/// Build full symbol-card contexts for an already-resolved symbol list.
+/// Shared tail of [`find_symbol_data`] and [`find_symbol_data_by_id_or_name`]
+/// so the context-building fallback (missing relationship-index entry ->
+/// bare context from the facade's file path) lives in one place.
+fn symbols_to_contexts(
     facade: &IndexFacade,
-    name: &str,
-    lang: Option<&str>,
+    symbols: Vec<Symbol>,
 ) -> Vec<crate::symbol::context::SymbolContext> {
-    let mut symbols = facade.find_symbols_by_name(name, lang);
-    if symbols.is_empty() {
-        symbols = find_dotted_members(name, |n| facade.find_symbols_by_name(n, lang));
-    }
-    if symbols.is_empty() {
-        return Vec::new();
-    }
-
     use crate::symbol::context::ContextIncludes;
     let mut results = Vec::new();
     for symbol in symbols {
@@ -389,6 +401,46 @@ pub fn find_symbol_data(
         }
     }
     results
+}
+
+/// Build the `find_symbol` JSON data payload: full symbol-card context for
+/// every match (including the dotted-member fallback). An empty result
+/// means "not found"; `find_symbol` treats multiple matches as ordinary
+/// success data, never ambiguity.
+pub fn find_symbol_data(
+    facade: &IndexFacade,
+    name: &str,
+    lang: Option<&str>,
+) -> Vec<crate::symbol::context::SymbolContext> {
+    let mut symbols = facade.find_symbols_by_name(name, lang);
+    if symbols.is_empty() {
+        symbols = find_dotted_members(name, |n| facade.find_symbols_by_name(n, lang));
+    }
+    if symbols.is_empty() {
+        return Vec::new();
+    }
+    symbols_to_contexts(facade, symbols)
+}
+
+/// Build the `find_symbol` JSON data payload, resolving by `symbol_id` when
+/// present (mirroring the text-mode path's typed-id preference) and falling
+/// back to name-based resolution (via [`find_symbol_data`]) otherwise. Keeps
+/// the JSON and text renderings consistent: `find_symbol(symbol_id:...)`
+/// must resolve identically in both output modes.
+pub fn find_symbol_data_by_id_or_name(
+    facade: &IndexFacade,
+    symbol_id: Option<u32>,
+    name: &str,
+    lang: Option<&str>,
+) -> Vec<crate::symbol::context::SymbolContext> {
+    if let Some(id) = symbol_id {
+        let symbols = facade
+            .get_symbol(crate::SymbolId(id))
+            .map(|s| vec![s])
+            .unwrap_or_default();
+        return symbols_to_contexts(facade, symbols);
+    }
+    find_symbol_data(facade, name, lang)
 }
 
 /// Build the `get_calls` JSON data payload.
@@ -776,6 +828,28 @@ pub fn index_info_data(facade: &IndexFacade) -> IndexInfo {
 // [`resolve_symbol_or_id`]/[`RelationOutcome`] and call these builders only
 // for the resolved-data and not-found cases, which share identical shape.
 
+/// Build the `Ambiguous`-status envelope shared by get_calls, find_callers,
+/// and analyze_impact's `output_format: json` path, and by the CLI's
+/// `--json` `exit_ambiguous` (`cli/commands/mcp.rs`). Refuse-and-list, never
+/// merge: relationships from same-named but unrelated symbols must not
+/// merge into one result. Single source of the status/code/exit_code
+/// mapping so the CLI and MCP tool paths cannot drift apart (§BASIC.2).
+pub fn ambiguous_envelope(
+    entity: EntityType,
+    name: &str,
+    candidates: Vec<Symbol>,
+) -> Envelope<Vec<Symbol>> {
+    let count = candidates.len();
+    Envelope::ambiguous(
+        format!("Ambiguous: found {count} symbol(s) named '{name}'"),
+        Some(candidates),
+    )
+    .with_entity_type(entity)
+    .with_query(name)
+    .with_count(count)
+    .with_hint("Ambiguous name: re-run with symbol_id:<id> using a candidate from data")
+}
+
 /// Resolve the display identifier shared by get_calls/find_callers/
 /// analyze_impact envelopes: `symbol_id:<id>` when an id was supplied,
 /// otherwise the queried name, defaulting to `"unknown"`.
@@ -1008,13 +1082,16 @@ pub fn group_impact(impacted: Vec<Symbol>, group_by: GroupBy) -> Vec<Symbol> {
 /// Partition an impact-radius listing into labeled display sections for the
 /// text-mode renderer, per [`GroupBy`]. `Kind` groups by `Symbol.kind`
 /// (the pre-`group_by` text-mode behavior); `File` groups by
-/// `Symbol.file_path` instead.
+/// `Symbol.file_path` instead. A `BTreeMap` (rather than a `HashMap`) keeps
+/// section iteration order deterministic — sorted by the section label —
+/// so `group_by: file` text output is ordered by `file_path` like the JSON
+/// listing, instead of an arbitrary hash-bucket order.
 pub fn group_impact_sections(
     impacted: Vec<Symbol>,
     group_by: GroupBy,
-) -> std::collections::HashMap<String, Vec<Symbol>> {
-    let mut sections: std::collections::HashMap<String, Vec<Symbol>> =
-        std::collections::HashMap::new();
+) -> std::collections::BTreeMap<String, Vec<Symbol>> {
+    let mut sections: std::collections::BTreeMap<String, Vec<Symbol>> =
+        std::collections::BTreeMap::new();
     for sym in impacted {
         let key = match group_by {
             GroupBy::Kind => format!("{:?}", sym.kind),

@@ -146,6 +146,10 @@ pub struct AnalyzeImpactRequest {
 pub struct GetFileOutlineRequest {
     /// Path of the indexed file to outline (as stored in the index, e.g. "src/lib.rs")
     pub path: String,
+    /// Cap the number of symbols included in the outline. `0` (the
+    /// default) means unlimited. Truncation sets `meta.truncated: true`.
+    #[serde(default)]
+    pub max_results: u32,
     /// Output rendering: "text" (default) or "json"
     #[serde(default)]
     pub output_format: OutputFormat,

@@ -77,6 +77,7 @@ async fn get_file_outline_lists_symbol_count_and_kinds() {
     let result = server
         .get_file_outline(Parameters(GetFileOutlineRequest {
             path,
+            max_results: 0,
             output_format: OutputFormat::Json,
         }))
         .await

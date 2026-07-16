@@ -13,15 +13,7 @@ use crate::mcp::requests::{
     SemanticSearchRequest, SemanticSearchWithContextRequest,
 };
 use crate::mcp::server::{CodeIntelligenceServer, format_relative_time, generate_mcp_guidance};
-use crate::mcp::service::{self, SearchOutcome};
-
-/// Render a JSON [`Envelope`] as a single-block tool result.
-fn json_result<T: serde::Serialize>(envelope: Envelope<T>) -> CallToolResult {
-    let text = serde_json::to_string(&envelope).unwrap_or_else(|e| {
-        format!(r#"{{"type":"error","message":"envelope serialization failed: {e}"}}"#)
-    });
-    CallToolResult::success(vec![ContentBlock::text(text)])
-}
+use crate::mcp::service::{self, SearchOutcome, json_result};
 
 #[tool_router(router = search_router, vis = "pub(crate)")]
 impl CodeIntelligenceServer {

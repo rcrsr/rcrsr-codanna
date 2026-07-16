@@ -14,8 +14,8 @@ use crate::mcp::requests::{
 };
 use crate::mcp::server::{CodeIntelligenceServer, generate_mcp_guidance};
 use crate::mcp::service::{
-    self, RelationOutcome, SymbolResolution, parse_receiver_context, qualified_call,
-    render_ambiguity,
+    self, RelationOutcome, SymbolResolution, ambiguous_envelope, json_result,
+    parse_receiver_context, qualified_call, render_ambiguity,
 };
 use serde::Serialize;
 
@@ -66,10 +66,18 @@ impl FindSymbolsCandidate {
 }
 
 /// Classify one name's lookup result into found/not_found/ambiguous.
-/// Reuses [`service::find_symbol_data`] — the single source of the
-/// resolution algorithm (exact match falling back to dotted-member
-/// lookup), shared with `find_symbol`'s own JSON path. The batch loop
-/// must never re-derive per-name resolution logic.
+///
+/// Deliberately lighter than [`service::find_symbol_data`]: it resolves via
+/// the plain `find_symbols_by_name`/`find_dotted_members` facade lookups
+/// (the same resolution algorithm — exact match falling back to
+/// dotted-member lookup) instead of building each match's full
+/// symbol-card context (`get_symbol_context` with `SYMBOL_CARD`, ~8
+/// relationship-index queries). `FindSymbolsCandidate` only reads
+/// name/kind/signature/location/line_range off the plain `Symbol`, so a
+/// batch of up to [`MAX_FIND_SYMBOLS_NAMES`] names would otherwise discard
+/// thousands of relationship lookups it never uses. `find_symbol`'s own
+/// JSON path still calls `service::find_symbol_data` for its full-context
+/// single-name result.
 ///
 /// `pub(crate)` so the CLI's `--json` pre-collection path (`cli/commands/mcp.rs`)
 /// can build the identical per-name results without a parallel implementation.
@@ -78,11 +86,14 @@ pub(crate) fn find_symbols_entry(
     name: &str,
     lang: Option<&str>,
 ) -> FindSymbolsEntry {
-    let contexts = service::find_symbol_data(indexer, name, lang);
-    match contexts.len() {
+    let mut symbols = indexer.find_symbols_by_name(name, lang);
+    if symbols.is_empty() {
+        symbols = service::find_dotted_members(name, |n| indexer.find_symbols_by_name(n, lang));
+    }
+    match symbols.len() {
         0 => FindSymbolsEntry::NotFound,
         1 => {
-            let candidate = FindSymbolsCandidate::from_symbol(&contexts[0].symbol);
+            let candidate = FindSymbolsCandidate::from_symbol(&symbols[0]);
             FindSymbolsEntry::Found {
                 location: candidate.location,
                 kind: candidate.kind,
@@ -91,42 +102,12 @@ pub(crate) fn find_symbols_entry(
             }
         }
         _ => FindSymbolsEntry::Ambiguous {
-            candidates: contexts
+            candidates: symbols
                 .iter()
-                .map(|ctx| FindSymbolsCandidate::from_symbol(&ctx.symbol))
+                .map(FindSymbolsCandidate::from_symbol)
                 .collect(),
         },
     }
-}
-
-/// Render a JSON [`Envelope`] as a single-block tool result. `status` and
-/// `code` follow the caller's mapping (§ successful data -> Success,
-/// no hits -> NotFound, ambiguous -> Ambiguous, failure -> Error); this
-/// helper only handles serialization.
-fn json_result<T: serde::Serialize>(envelope: Envelope<T>) -> CallToolResult {
-    let text = serde_json::to_string(&envelope).unwrap_or_else(|e| {
-        format!(r#"{{"type":"error","message":"envelope serialization failed: {e}"}}"#)
-    });
-    CallToolResult::success(vec![ContentBlock::text(text)])
-}
-
-/// Build the `Ambiguous`-status envelope shared by get_calls, find_callers,
-/// and analyze_impact's `output_format: json` path. Mirrors the CLI JSON
-/// path's `exit_ambiguous` (mcp.rs): refuse-and-list, never merge.
-fn ambiguous_envelope(
-    entity: EntityType,
-    name: &str,
-    candidates: Vec<Symbol>,
-) -> Envelope<Vec<Symbol>> {
-    let count = candidates.len();
-    Envelope::ambiguous(
-        format!("Ambiguous: found {count} symbol(s) named '{name}'"),
-        Some(candidates),
-    )
-    .with_entity_type(entity)
-    .with_query(name)
-    .with_count(count)
-    .with_hint("Ambiguous name: re-run with symbol_id:<id> using a candidate from data")
 }
 
 /// One symbol row in a `get_file_outline` response: enough to navigate
@@ -237,16 +218,22 @@ fn extract_span(content: &str, range: &crate::types::Range) -> String {
     result
 }
 
-/// Read a symbol's exact source span from disk, guarded by a staleness
-/// check against the indexed file hash (W-3's `get_file_hash_for_path`
-/// facade accessor, which delegates to `DocumentIndex::get_file_info` ->
-/// `query.rs`; this function never builds its own Tantivy query).
-fn read_symbol_source(indexer: &IndexFacade, symbol: &Symbol) -> ReadSymbolOutcome {
+/// Resolve the on-disk path and indexed hash for a symbol's file using only
+/// facade lookups (no file I/O). Split out of the former `read_symbol_source`
+/// so the caller can release the facade's async read lock before the
+/// blocking file I/O in [`read_symbol_span`] runs. `Err` carries the file
+/// path (not the full `ReadSymbolOutcome`, to keep the `Result`'s error
+/// variant small per `clippy::result_large_err`); the caller wraps it into
+/// `ReadSymbolOutcome::NoFileInfo`.
+fn resolve_symbol_read_target(
+    indexer: &IndexFacade,
+    symbol: &Symbol,
+) -> Result<(std::path::PathBuf, String), String> {
     let path_str: &str = &symbol.file_path;
 
     let indexed_hash = match indexer.get_file_hash_for_path(path_str) {
         Some(hash) => hash,
-        None => return ReadSymbolOutcome::NoFileInfo(path_str.to_string()),
+        None => return Err(path_str.to_string()),
     };
 
     let candidate = std::path::Path::new(path_str);
@@ -261,11 +248,29 @@ fn read_symbol_source(indexer: &IndexFacade, symbol: &Symbol) -> ReadSymbolOutco
             .join(candidate)
     };
 
+    Ok((full_path, indexed_hash))
+}
+
+/// Read a symbol's exact source span from disk, guarded by a staleness
+/// check against the indexed file hash (W-3's `get_file_hash_for_path`
+/// facade accessor, which delegates to `DocumentIndex::get_file_info` ->
+/// `query.rs`; this function never builds its own Tantivy query).
+///
+/// Pure blocking file I/O + SHA256 hashing over the whole file — callers
+/// must run this off the async runtime (`tokio::task::spawn_blocking`),
+/// never while holding the facade's async read lock.
+fn read_symbol_span(
+    full_path: std::path::PathBuf,
+    indexed_hash: String,
+    symbol: &Symbol,
+) -> ReadSymbolOutcome {
+    let path_str = symbol.file_path.to_string();
+
     let content = match std::fs::read_to_string(&full_path) {
         Ok(content) => content,
         Err(e) => {
             return ReadSymbolOutcome::ReadError {
-                path: path_str.to_string(),
+                path: path_str,
                 error: e.to_string(),
             };
         }
@@ -274,7 +279,7 @@ fn read_symbol_source(indexer: &IndexFacade, symbol: &Symbol) -> ReadSymbolOutco
     let current_hash = crate::indexing::file_info::calculate_hash(&content);
     if current_hash != indexed_hash {
         return ReadSymbolOutcome::Stale {
-            path: path_str.to_string(),
+            path: path_str,
             indexed_hash,
             current_hash,
         };
@@ -308,7 +313,12 @@ impl CodeIntelligenceServer {
         let indexer = self.facade.read().await;
 
         if output_format == OutputFormat::Json {
-            let symbol_contexts = service::find_symbol_data(&indexer, &name, lang.as_deref());
+            let symbol_contexts = service::find_symbol_data_by_id_or_name(
+                &indexer,
+                symbol_id,
+                &name,
+                lang.as_deref(),
+            );
             let envelope =
                 service::find_symbol_envelope(&indexer, &name, lang.as_deref(), symbol_contexts);
             return Ok(json_result(envelope));
@@ -1177,6 +1187,7 @@ impl CodeIntelligenceServer {
         &self,
         Parameters(GetFileOutlineRequest {
             path,
+            max_results,
             output_format,
         }): Parameters<GetFileOutlineRequest>,
     ) -> Result<CallToolResult, McpError> {
@@ -1211,12 +1222,20 @@ impl CodeIntelligenceServer {
                         .map(FileOutlineEntry::from_symbol)
                         .collect();
                     entries.sort_by_key(|e| e.start_line);
+                    let total = entries.len();
+                    let truncated = max_results > 0 && (max_results as usize) < entries.len();
+                    if truncated {
+                        entries.truncate(max_results as usize);
+                    }
                     let count = entries.len();
                     let mut envelope = Envelope::success(entries)
                         .with_entity_type(EntityType::Symbol)
-                        .with_count(count)
+                        .with_count(total)
                         .with_query(&path)
-                        .with_message(format!("{count} symbol(s) in {path}"));
+                        .with_message(format!("{total} symbol(s) in {path}"));
+                    if truncated {
+                        envelope = envelope.with_truncated(true);
+                    }
                     if let Some(hint) = hint_fn(count) {
                         envelope = envelope.with_hint(hint);
                     }
@@ -1250,6 +1269,10 @@ impl CodeIntelligenceServer {
         }
 
         let symbol_count = symbols.len();
+        let truncated = max_results > 0 && (max_results as usize) < symbols.len();
+        if truncated {
+            symbols.truncate(max_results as usize);
+        }
         let mut result = format!("Outline for {path}: {symbol_count} symbol(s)\n\n");
         for symbol in &symbols {
             result.push_str(&format!(
@@ -1263,6 +1286,12 @@ impl CodeIntelligenceServer {
             if let Some(sig) = symbol.as_signature() {
                 result.push_str(&format!("  Signature: {sig}\n"));
             }
+        }
+
+        if truncated {
+            result.push_str(&format!(
+                "\n(truncated to {max_results} of {symbol_count} symbol(s))\n"
+            ));
         }
 
         if let Some(guidance) =
@@ -1345,7 +1374,26 @@ impl CodeIntelligenceServer {
             }
         };
 
-        Ok(match read_symbol_source(&indexer, &symbol) {
+        // Resolve the read target from the facade, then release the async
+        // read lock before the blocking file I/O + SHA256 hashing runs on a
+        // blocking-pool thread instead of the async runtime.
+        let read_target = resolve_symbol_read_target(&indexer, &symbol);
+        drop(indexer);
+
+        let file_path_for_errors = symbol.file_path.to_string();
+        let read_outcome = match read_target {
+            Ok((full_path, indexed_hash)) => tokio::task::spawn_blocking(move || {
+                read_symbol_span(full_path, indexed_hash, &symbol)
+            })
+            .await
+            .unwrap_or_else(|e| ReadSymbolOutcome::ReadError {
+                path: file_path_for_errors,
+                error: format!("blocking task panicked: {e}"),
+            }),
+            Err(path) => ReadSymbolOutcome::NoFileInfo(path),
+        };
+
+        Ok(match read_outcome {
             ReadSymbolOutcome::Ok(data) => {
                 if output_format == OutputFormat::Json {
                     json_result(

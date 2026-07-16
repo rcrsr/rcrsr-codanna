@@ -5,25 +5,21 @@ use crate::config::Settings;
 use crate::indexing::facade::IndexFacade;
 use crate::io::args::parse_positional_args;
 use crate::io::envelope::EntityType;
-use crate::mcp::service::{RelationOutcome, SearchOutcome, filter_callers};
+use crate::mcp::service::{RelationOutcome, SearchOutcome, ambiguous_envelope, filter_callers};
 
-/// Print an INVALID_QUERY envelope for an ambiguous symbol name and exit 2.
-/// Mirrors the MCP handlers' refuse-and-list policy: JSON mode must never
-/// merge relationships across same-named symbols.
+/// Print the shared `Ambiguous`-status envelope for an ambiguous symbol name
+/// and exit with its `exit_code`. Delegates to `service::ambiguous_envelope`
+/// — the single source of the status/code/exit_code mapping — so an
+/// identical ambiguous-name request produces the same status/code/exit_code
+/// whether it comes through `codanna mcp <tool> --json` or the MCP tool's
+/// own `output_format: json` path (previously this CLI path hardcoded
+/// `ResultCode::InvalidQuery`/exit 2 while the MCP handlers used
+/// `Status::Ambiguous`/`ResultCode::Ambiguous`/exit 3, drifting apart).
 fn exit_ambiguous(entity: EntityType, name: &str, candidates: Vec<Symbol>) -> ! {
-    use crate::io::envelope::{Envelope, ResultCode};
-    let count = candidates.len();
-    let mut envelope = Envelope::error(
-        ResultCode::InvalidQuery,
-        format!("Ambiguous: found {count} symbol(s) named '{name}'"),
-    )
-    .with_entity_type(entity)
-    .with_query(name)
-    .with_count(count)
-    .with_hint("Ambiguous name: re-run with symbol_id:<id> using a candidate from data");
-    envelope.data = Some(candidates);
+    let envelope = ambiguous_envelope(entity, name, candidates);
+    let exit_code = envelope.exit_code;
     println!("{}", envelope.to_json().expect("envelope serialization"));
-    std::process::exit(2);
+    std::process::exit(exit_code.into());
 }
 
 /// Print an INDEX_ERROR envelope and exit 2. A backend failure must be
@@ -993,9 +989,15 @@ pub async fn run(
                         eprintln!("Error: get_file_outline requires 'path' parameter");
                         std::process::exit(1);
                     });
+                let max_results = arguments
+                    .as_ref()
+                    .and_then(|m| m.get("max_results"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32;
                 server
                     .get_file_outline(Parameters(crate::mcp::requests::GetFileOutlineRequest {
                         path: path.to_string(),
+                        max_results,
                         output_format: crate::mcp::requests::OutputFormat::Text,
                     }))
                     .await
