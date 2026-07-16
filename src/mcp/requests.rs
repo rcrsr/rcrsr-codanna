@@ -296,17 +296,21 @@ pub struct ReindexRequest {
     /// Output rendering: "text" (default) or "json"
     #[serde(default)]
     pub output_format: OutputFormat,
+    /// Reindex all configured document collections when true. Default: false.
+    #[serde(default)]
+    pub documents: bool,
 }
 
 impl ReindexRequest {
-    /// Extracts `(paths, force)` from a loosely-typed JSON object. Shared by
-    /// every call site that parses reindex arguments out of a raw JSON map
-    /// rather than through typed `Parameters` extraction (the
+    /// Extracts `(paths, force, documents)` from a loosely-typed JSON object.
+    /// Shared by every call site that parses reindex arguments out of a raw
+    /// JSON map rather than through typed `Parameters` extraction (the
     /// `force-reindex` custom request handler and the CLI's
-    /// `codanna mcp reindex` dispatch), so the `paths`/`force` extraction
-    /// logic lives in one place instead of being copied at each site.
+    /// `codanna mcp reindex` dispatch), so the `paths`/`force`/`documents`
+    /// extraction logic lives in one place instead of being copied at each
+    /// site.
     ///
-    /// A missing `paths` field is `Ok((None, _))` (full reindex, the
+    /// A missing `paths` field is `Ok((None, _, _))` (full reindex, the
     /// documented default). A *present but malformed* `paths` field (e.g.
     /// an array containing a non-string element) is a hard error rather
     /// than silently falling back to `None`: `paths: None` means "reindex
@@ -315,7 +319,7 @@ impl ReindexRequest {
     /// full one instead of surfacing the caller's mistake.
     pub fn parse_args(
         args: Option<&serde_json::Map<String, serde_json::Value>>,
-    ) -> crate::error::McpResult<(Option<Vec<String>>, bool)> {
+    ) -> crate::error::McpResult<(Option<Vec<String>>, bool, bool)> {
         let paths = match args.and_then(|m| m.get("paths")) {
             Some(value) => {
                 let parsed: Vec<String> = serde_json::from_value(value.clone()).map_err(|e| {
@@ -333,7 +337,12 @@ impl ReindexRequest {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        Ok((paths, force))
+        let documents = args
+            .and_then(|m| m.get("documents"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        Ok((paths, force, documents))
     }
 }
 

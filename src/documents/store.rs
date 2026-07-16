@@ -40,8 +40,8 @@ use super::schema::DocumentSchema;
 use super::types::{ChunkId, CollectionId, FileState};
 use crate::indexing::file_info::{calculate_hash, get_utc_timestamp};
 use crate::vector::{
-    ClusterId, EmbeddingGenerator, MmapVectorStorage, SegmentOrdinal, VectorDimension, VectorId,
-    VectorStorageError, cosine_similarity, kmeans_clustering,
+    ClusterId, ConcurrentVectorStorage, EmbeddingGenerator, MmapVectorStorage, SegmentOrdinal,
+    VectorDimension, VectorId, VectorStorageError, cosine_similarity, kmeans_clustering,
 };
 
 /// Errors from document storage operations.
@@ -309,8 +309,11 @@ pub struct DocumentStore {
     /// Index writer (lazily created).
     writer: Mutex<Option<IndexWriter<Document>>>,
 
-    /// Vector storage for chunk embeddings.
-    vector_storage: Option<MmapVectorStorage>,
+    /// Vector storage for chunk embeddings. Wrapped in `ConcurrentVectorStorage`
+    /// (interior `parking_lot::RwLock`) so vector reads during `search` only
+    /// need `&self`, letting `search` run under a document-store read guard
+    /// concurrently with other readers.
+    vector_storage: Option<ConcurrentVectorStorage>,
 
     /// Cluster assignments for IVFFlat search.
     cluster_assignments: HashMap<VectorId, ClusterId>,
@@ -428,7 +431,7 @@ impl DocumentStore {
             self.dimension,
         )?;
 
-        self.vector_storage = Some(vector_storage);
+        self.vector_storage = Some(ConcurrentVectorStorage::new(vector_storage));
         self.embedding_generator = Some(generator);
 
         // Load cluster data if available
@@ -702,7 +705,12 @@ impl DocumentStore {
     }
 
     /// Search for chunks matching a query.
-    pub fn search(&mut self, query: SearchQuery) -> StoreResult<Vec<SearchResult>> {
+    ///
+    /// Takes `&self`: vector reads go through `ConcurrentVectorStorage`'s
+    /// interior locking, so callers can hold only a read guard on the
+    /// enclosing `DocumentStore` while searching, letting concurrent
+    /// searches make progress against each other.
+    pub fn search(&self, query: SearchQuery) -> StoreResult<Vec<SearchResult>> {
         if query.text.is_empty() {
             return Ok(Vec::new());
         }
@@ -1047,7 +1055,7 @@ impl DocumentStore {
             return Ok(());
         };
 
-        let Some(ref mut vector_storage) = self.vector_storage else {
+        let Some(ref vector_storage) = self.vector_storage else {
             return Ok(());
         };
 
@@ -1189,11 +1197,11 @@ impl DocumentStore {
     }
 
     fn score_by_similarity(
-        &mut self,
+        &self,
         candidates: &[ChunkId],
         query_vec: &[f32],
     ) -> StoreResult<Vec<(ChunkId, f32)>> {
-        let Some(ref mut vector_storage) = self.vector_storage else {
+        let Some(ref vector_storage) = self.vector_storage else {
             // No vectors, return with zero scores
             return Ok(candidates.iter().map(|&id| (id, 0.0)).collect());
         };

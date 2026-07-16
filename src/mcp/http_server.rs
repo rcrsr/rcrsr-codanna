@@ -14,6 +14,96 @@ fn is_authorized(auth_header: Option<&str>) -> bool {
         .is_some_and(|token| token == crate::mcp::DUMMY_BEARER_TOKEN)
 }
 
+/// Current wall-clock time as unix seconds. Used for both the activity
+/// timestamp stamped by inbound `/mcp` requests and the idle-timer's "now"
+/// reading, so both sides of the comparison share one clock source. Falls
+/// back to 0 only if the system clock is set before the epoch, which is not
+/// a case worth failing startup over.
+#[cfg(feature = "http-server")]
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Whether an inbound request to the protected `/mcp` router should reset
+/// the idle-activity clock. Only JSON-RPC calls (POST) count; GET
+/// (SSE stream open/reconnect) and DELETE (session teardown) reach the same
+/// `nest_service` but must not count as activity, per the idle-timer spec.
+/// Extracted as a pure function so `stamp_activity`'s method-scoping can be
+/// unit-tested without spinning up an axum app.
+#[cfg(feature = "http-server")]
+fn should_stamp_activity(method: &axum::http::Method) -> bool {
+    *method == axum::http::Method::POST
+}
+
+/// Pure elapsed/threshold comparison, extracted so it can be unit-tested in
+/// isolation without waiting on a real clock or a real `idle_shutdown_minutes`
+/// (whole-minute) duration. `now_secs` and `last_activity_secs` are unix
+/// seconds; `idle_threshold` is the configured idle timeout expressed as a
+/// `Duration` (test callers can inject sub-second thresholds; production
+/// derives it from `idle_shutdown_minutes * 60`).
+#[cfg(feature = "http-server")]
+fn idle_timeout_exceeded(
+    now_secs: u64,
+    last_activity_secs: u64,
+    idle_threshold: std::time::Duration,
+) -> bool {
+    std::time::Duration::from_secs(now_secs.saturating_sub(last_activity_secs)) >= idle_threshold
+}
+
+/// Polls `last_activity` every `poll_interval` until `idle_threshold` has
+/// elapsed since the last recorded activity, then returns. Kept private and
+/// parameterized on both `Duration`s (rather than hardcoding real-world
+/// `idle_shutdown_minutes`-scale values) so unit tests can inject
+/// millisecond-scale thresholds/intervals instead of waiting minutes for a
+/// real idle timeout to fire.
+#[cfg(feature = "http-server")]
+async fn wait_for_idle(
+    last_activity: &std::sync::atomic::AtomicU64,
+    idle_threshold: std::time::Duration,
+    poll_interval: std::time::Duration,
+) {
+    let mut ticker = tokio::time::interval(poll_interval);
+    loop {
+        ticker.tick().await;
+        let now = unix_now_secs();
+        let last = last_activity.load(std::sync::atomic::Ordering::Relaxed);
+        if idle_timeout_exceeded(now, last, idle_threshold) {
+            return;
+        }
+    }
+}
+
+/// Test-only override for the idle-shutdown threshold, read from
+/// `CODANNA_TEST_IDLE_THRESHOLD_MS`. Exists so the subprocess-driven
+/// end-to-end test (`tests/cli/test_idle_shutdown.rs`) can exercise the real
+/// `serve --http` idle-exit path on a millisecond timescale instead of
+/// waiting on `idle_shutdown_minutes`' whole-minute production granularity.
+/// Unset (the production default) or unparseable values fall back to the
+/// config-derived threshold; this is not a documented/supported
+/// configuration knob.
+#[cfg(feature = "http-server")]
+fn idle_threshold_override() -> Option<std::time::Duration> {
+    std::env::var("CODANNA_TEST_IDLE_THRESHOLD_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+}
+
+/// Test-only override for the idle-timer poll interval, read from
+/// `CODANNA_TEST_IDLE_POLL_MS`. Paired with [`idle_threshold_override`] so
+/// the e2e test can also shrink the poll cadence and avoid padding the
+/// observed shutdown time relative to the (also shrunk) threshold.
+#[cfg(feature = "http-server")]
+fn idle_poll_interval_override() -> Option<std::time::Duration> {
+    std::env::var("CODANNA_TEST_IDLE_POLL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+}
+
 #[cfg(feature = "http-server")]
 pub async fn serve_http(config: crate::Settings, watch: bool, bind: String) -> anyhow::Result<()> {
     use crate::IndexPersistence;
@@ -63,6 +153,14 @@ pub async fn serve_http(config: crate::Settings, watch: bool, bind: String) -> a
 
     // Create cancellation token for coordinated shutdown
     let ct = CancellationToken::new();
+
+    // Idle-shutdown activity tracking (unix seconds). Stamped to `now` by the
+    // `stamp_activity` middleware on every inbound POST /mcp request; read by
+    // the idle-timer `select!` arm below. SSE keep-alives
+    // (`with_sse_keep_alive` below, 15s) are outbound comments on an
+    // already-open GET stream and generate no inbound POST, so they correctly
+    // do NOT reset this timestamp.
+    let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(unix_now_secs()));
 
     // Start index watcher if watch mode is enabled
     if watch {
@@ -444,9 +542,36 @@ pub async fn serve_http(config: crate::Settings, watch: bool, bind: String) -> a
         Err(axum::http::StatusCode::UNAUTHORIZED)
     }
 
+    // Idle-timer activity stamp middleware. Implemented as an
+    // `axum::middleware::from_fn` closure (rather than threading
+    // `last_activity` through the `CodeIntelligenceServer` constructors or a
+    // hand-rolled `call_tool`) because `#[tool_handler]` auto-generates
+    // `call_tool` for the tool router: a hand-rolled override would be a
+    // duplicate-method compile error, and per-tool stamping would duplicate
+    // this single stamp across every tool. Layered inside
+    // `validate_bearer_token` so only requests that pass (or are exempt from,
+    // e.g. CORS preflight) auth validation count as activity.
+    //
+    // Only inbound POST /mcp (JSON-RPC calls) count as activity. GET (SSE
+    // stream open/reconnect) and DELETE (session teardown) reach this same
+    // `nest_service` but must not reset the idle clock, so `req.method()` is
+    // checked before stamping.
+    let last_activity_for_middleware = last_activity.clone();
+    let stamp_activity = move |req: axum::http::Request<axum::body::Body>,
+                               next: axum::middleware::Next| {
+        let last_activity = last_activity_for_middleware.clone();
+        async move {
+            if should_stamp_activity(req.method()) {
+                last_activity.store(unix_now_secs(), std::sync::atomic::Ordering::Relaxed);
+            }
+            next.run(req).await
+        }
+    };
+
     // Create protected MCP router with Bearer token validation
     let protected_mcp_router = Router::new()
         .nest_service("/mcp", mcp_service)
+        .layer(axum::middleware::from_fn(stamp_activity))
         .layer(axum::middleware::from_fn(validate_bearer_token));
 
     // Create main router - OAuth endpoints FIRST (no auth), then MCP endpoints (with auth)
@@ -511,6 +636,24 @@ pub async fn serve_http(config: crate::Settings, watch: bool, bind: String) -> a
     // Create server future
     let server = axum::serve(listener, router);
 
+    // Idle-shutdown configuration: 0 disables the timer entirely (the
+    // `select!` arm below is guarded on `idle_minutes > 0` and is never
+    // polled in that case). The poll interval is intentionally short (a few
+    // seconds) relative to `idle_shutdown_minutes` granularity so the actual
+    // shutdown fires close to the configured threshold rather than being
+    // padded by a coarse poll.
+    //
+    // `idle_threshold`/`idle_poll_interval` accept a test-only env var
+    // override (see `idle_threshold_override`/`idle_poll_interval_override`)
+    // so the real subprocess-driven e2e test can drive the actual idle-exit
+    // `select!` arm below without waiting on `idle_shutdown_minutes`'
+    // whole-minute granularity. `idle_minutes > 0` still gates whether the
+    // arm is enabled at all.
+    let idle_minutes = config.server.idle_shutdown_minutes;
+    let idle_threshold = idle_threshold_override()
+        .unwrap_or_else(|| Duration::from_secs(idle_minutes.saturating_mul(60)));
+    let idle_poll_interval = idle_poll_interval_override().unwrap_or(Duration::from_secs(5));
+
     // Handle graceful shutdown with tokio::select!
     tokio::select! {
         result = server => {
@@ -521,6 +664,17 @@ pub async fn serve_http(config: crate::Settings, watch: bool, bind: String) -> a
         }
         _ = shutdown_signal() => {
             eprintln!("Shutting down HTTP server...");
+            ct.cancel();
+            if let Some(codanna_dir) = &codanna_dir {
+                crate::serve_discovery::remove_record(codanna_dir);
+            }
+        }
+        // Respawn after idle exit is already handled by discover_or_spawn
+        // once serve.json is gone: removing the record here (before
+        // exiting) makes this backing server undiscoverable, so the next
+        // `discover_or_spawn` call for this workspace spawns a fresh one.
+        _ = wait_for_idle(&last_activity, idle_threshold, idle_poll_interval), if idle_minutes > 0 => {
+            eprintln!("Shutting down HTTP server after {idle_minutes} minute(s) of inactivity...");
             ct.cancel();
             if let Some(codanna_dir) = &codanna_dir {
                 crate::serve_discovery::remove_record(codanna_dir);
@@ -546,6 +700,9 @@ pub async fn serve_http(
 #[cfg(all(test, feature = "http-server"))]
 mod tests {
     use super::is_authorized;
+    use super::{idle_timeout_exceeded, should_stamp_activity, wait_for_idle};
+    use std::sync::atomic::AtomicU64;
+    use std::time::Duration;
 
     #[test]
     fn accepts_bearer_prefixed_dummy_token() {
@@ -565,5 +722,78 @@ mod tests {
     #[test]
     fn rejects_missing_header() {
         assert!(!is_authorized(None));
+    }
+
+    // -------------------------------------------------------------------
+    // Idle timer: method-scoping of the activity stamp. GET (SSE stream
+    // open/reconnect) and DELETE (session teardown) reach the same
+    // `nest_service("/mcp", ...)` as POST but must not reset the idle
+    // clock.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn post_to_mcp_counts_as_activity() {
+        assert!(should_stamp_activity(&axum::http::Method::POST));
+    }
+
+    #[test]
+    fn get_to_mcp_does_not_count_as_activity() {
+        assert!(!should_stamp_activity(&axum::http::Method::GET));
+    }
+
+    #[test]
+    fn delete_to_mcp_does_not_count_as_activity() {
+        assert!(!should_stamp_activity(&axum::http::Method::DELETE));
+    }
+
+    // -------------------------------------------------------------------
+    // Idle timer: elapsed/threshold computation, tested in isolation with
+    // no real waiting.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn idle_timeout_not_exceeded_before_threshold() {
+        assert!(!idle_timeout_exceeded(100, 95, Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn idle_timeout_exceeded_exactly_at_threshold() {
+        assert!(idle_timeout_exceeded(105, 95, Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn idle_timeout_exceeded_well_past_threshold() {
+        assert!(idle_timeout_exceeded(1_000, 0, Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn idle_timeout_not_exceeded_when_now_precedes_last_activity() {
+        // Clock skew / stamped-in-the-future guard: `saturating_sub` must
+        // keep this from underflowing into a huge elapsed value.
+        assert!(!idle_timeout_exceeded(5, 100, Duration::from_secs(10)));
+    }
+
+    /// Exercises the private `wait_for_idle` seam directly with
+    /// millisecond-scale injected `Duration`s -- proving the loop actually
+    /// resolves once the threshold is exceeded, without waiting on a real
+    /// `idle_shutdown_minutes`-scale (whole-minute) timeout.
+    #[tokio::test]
+    async fn wait_for_idle_resolves_once_threshold_elapses() {
+        // Recorded activity far enough in the past that even the very first
+        // poll tick observes the threshold as exceeded.
+        let last_activity = AtomicU64::new(0);
+
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            wait_for_idle(
+                &last_activity,
+                Duration::from_millis(1),
+                Duration::from_millis(10),
+            ),
+        )
+        .await
+        .expect(
+            "wait_for_idle should resolve well within the timeout once the threshold is exceeded",
+        );
     }
 }

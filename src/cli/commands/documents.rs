@@ -96,7 +96,7 @@ pub fn run(action: DocumentAction, config: &Settings, cli_config: Option<&PathBu
             // Collection can come from --collection flag or collection:name
             let final_collection = collection.or_else(|| params.get("collection").cloned());
 
-            let mut store = match create_store_with_embeddings() {
+            let store = match create_store_with_embeddings() {
                 Ok(s) => s,
                 Err(e) => {
                     if json {

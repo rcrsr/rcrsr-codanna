@@ -300,6 +300,10 @@ pub struct ServerConfig {
     /// Poll interval while waiting for the backing server to become healthy, in milliseconds
     #[serde(default = "default_health_poll_ms")]
     pub health_poll_ms: u64,
+
+    /// Idle shutdown timeout for the backing server, in minutes (0 = never)
+    #[serde(default = "default_idle_shutdown_minutes")]
+    pub idle_shutdown_minutes: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -454,6 +458,7 @@ impl Default for ServerConfig {
             auto_spawn: default_auto_spawn(),
             spawn_timeout_ms: default_spawn_timeout_ms(),
             health_poll_ms: default_health_poll_ms(),
+            idle_shutdown_minutes: default_idle_shutdown_minutes(),
         }
     }
 }
@@ -714,6 +719,17 @@ mode = "stdio"
         assert!(server.auto_spawn);
         assert_eq!(server.spawn_timeout_ms, 8000);
         assert_eq!(server.health_poll_ms, 100);
+        assert_eq!(server.idle_shutdown_minutes, 0);
+    }
+
+    #[test]
+    fn test_server_config_idle_shutdown_minutes_parses_explicit_value() {
+        let toml_content = r#"
+mode = "stdio"
+idle_shutdown_minutes = 1
+"#;
+        let server: ServerConfig = toml::from_str(toml_content).unwrap();
+        assert_eq!(server.idle_shutdown_minutes, 1);
     }
 
     #[test]

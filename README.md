@@ -79,6 +79,14 @@ codanna documents index
 codanna mcp search_documents query:"authentication flow"
 ```
 
+Read-only tools, including `search_documents`, are safe to call concurrently
+from multiple clients in every `serve` mode: `search_documents` only takes a
+brief exclusive lock to check document collections for changes, then releases
+it before searching. A force reindex takes a similarly brief write lock around
+the walk, so readers may transiently observe a repopulating index while it's
+in flight — see RCSR-README.md's "Concurrency contract" section for the full
+picture.
+
 ## What It Does
 
 Your AI assistant gains structured knowledge of your code:

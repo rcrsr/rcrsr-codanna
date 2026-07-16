@@ -31,17 +31,18 @@
 // allowance already used in `mcp::server` and `mcp::notifications`.
 #![allow(deprecated)]
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, ClientRequest, CompleteRequestParams, CompleteResult,
-    CustomRequest, CustomResult, ErrorData as McpError, GetPromptRequestParams, GetPromptResult,
-    Implementation, InitializeRequestParams, InitializeResult, ListPromptsResult,
+    CustomNotification, CustomRequest, CustomResult, ErrorData as McpError, GetPromptRequestParams,
+    GetPromptResult, Implementation, InitializeRequestParams, InitializeResult, ListPromptsResult,
     ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
     LoggingMessageNotificationParam, PaginatedRequestParams, ProgressNotificationParam,
     ReadResourceRequestParams, ReadResourceResult, ResourceUpdatedNotificationParam,
-    ServerCapabilities, ServerInfo, ServerResult, SetLevelRequestParams, SubscribeRequestParams,
-    UnsubscribeRequestParams,
+    ServerCapabilities, ServerInfo, ServerNotification, ServerResult, SetLevelRequestParams,
+    SubscribeRequestParams, UnsubscribeRequestParams,
 };
 use rmcp::service::{
     NotificationContext, Peer, RequestContext, RoleClient, RoleServer, RunningService, ServiceError,
@@ -92,16 +93,45 @@ fn map_service_err(err: ServiceError) -> McpError {
     }
 }
 
+/// Maximum number of buffered custom notifications awaiting a downstream
+/// peer, mirroring [`crate::mcp::notifications::NotificationBroadcaster`]'s
+/// default channel capacity. Once full, the oldest buffered notification is
+/// dropped to make room for the newest.
+const PENDING_CUSTOM_NOTIFICATIONS_CAP: usize = 100;
+
+/// Combined downstream-peer/pending-buffer state, guarded by a single lock
+/// shared between [`NotificationRelay`] and [`DelegatingProxyHandler`].
+///
+/// `downstream` and `pending` must be updated atomically with respect to
+/// each other: checking whether a downstream peer exists and, if not,
+/// buffering a custom notification (`on_custom_notification`) must never be
+/// split across two lock acquisitions from `DelegatingProxyHandler::initialize`
+/// setting `downstream` and draining `pending`. A single `Mutex` guarding
+/// both fields makes that interleaving impossible -- either the buffering
+/// happens-before the drain (and gets flushed) or the drain happens-before
+/// the check (and the notification is forwarded directly), with no window
+/// in which a notification can be queued after `pending` has already been
+/// drained for good.
+#[derive(Default)]
+struct DownstreamState {
+    downstream: Option<Peer<RoleServer>>,
+    pending: VecDeque<CustomNotification>,
+}
+
 /// `ClientHandler` for the connection to the backing HTTP MCP server.
 ///
 /// Its only job is forwarding server-initiated notifications down to the
 /// stdio client once the downstream `initialize` handshake has populated
-/// `downstream`. Before that point (a narrow window right at startup)
-/// notifications are dropped rather than buffered, since there is no
-/// downstream peer yet to forward them to.
+/// `state.downstream`. Before that point (a narrow window right at startup)
+/// most notification kinds are dropped rather than buffered, since there is
+/// no downstream peer yet to forward them to. Custom notifications
+/// (`notifications/codanna/*`) are the exception: they are buffered in
+/// `state.pending` (bounded, drop-oldest) and flushed once `state.downstream`
+/// is set, so a custom notification emitted by the trusted backing server
+/// during the narrow pre-init window is not silently lost.
 #[derive(Clone, Default)]
 struct NotificationRelay {
-    downstream: Arc<Mutex<Option<Peer<RoleServer>>>>,
+    state: Arc<Mutex<DownstreamState>>,
 }
 
 impl ClientHandler for NotificationRelay {
@@ -110,7 +140,7 @@ impl ClientHandler for NotificationRelay {
         params: LoggingMessageNotificationParam,
         _context: NotificationContext<RoleClient>,
     ) {
-        let peer = { self.downstream.lock().await.as_ref().cloned() };
+        let peer = { self.state.lock().await.downstream.clone() };
         if let Some(peer) = peer {
             // Logging notifications are deprecated by SEP-2577; forward them
             // anyway for client compatibility, mirroring `CodeIntelligenceServer`.
@@ -124,28 +154,28 @@ impl ClientHandler for NotificationRelay {
         params: ResourceUpdatedNotificationParam,
         _context: NotificationContext<RoleClient>,
     ) {
-        let peer = { self.downstream.lock().await.as_ref().cloned() };
+        let peer = { self.state.lock().await.downstream.clone() };
         if let Some(peer) = peer {
             let _ = peer.notify_resource_updated(params).await;
         }
     }
 
     async fn on_resource_list_changed(&self, _context: NotificationContext<RoleClient>) {
-        let peer = { self.downstream.lock().await.as_ref().cloned() };
+        let peer = { self.state.lock().await.downstream.clone() };
         if let Some(peer) = peer {
             let _ = peer.notify_resource_list_changed().await;
         }
     }
 
     async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
-        let peer = { self.downstream.lock().await.as_ref().cloned() };
+        let peer = { self.state.lock().await.downstream.clone() };
         if let Some(peer) = peer {
             let _ = peer.notify_tool_list_changed().await;
         }
     }
 
     async fn on_prompt_list_changed(&self, _context: NotificationContext<RoleClient>) {
-        let peer = { self.downstream.lock().await.as_ref().cloned() };
+        let peer = { self.state.lock().await.downstream.clone() };
         if let Some(peer) = peer {
             let _ = peer.notify_prompt_list_changed().await;
         }
@@ -156,9 +186,42 @@ impl ClientHandler for NotificationRelay {
         params: ProgressNotificationParam,
         _context: NotificationContext<RoleClient>,
     ) {
-        let peer = { self.downstream.lock().await.as_ref().cloned() };
+        let peer = { self.state.lock().await.downstream.clone() };
         if let Some(peer) = peer {
             let _ = peer.notify_progress(params).await;
+        }
+    }
+
+    /// Forwards custom notifications (`notifications/codanna/*`) verbatim to
+    /// the downstream stdio client, matching the emission pattern in
+    /// `notifications.rs`. All custom notifications originate from the
+    /// trusted backing HTTP server, so no per-method dispatch or filtering
+    /// is applied -- everything is forwarded as-is. If `state.downstream` is
+    /// not yet populated (the narrow pre-`initialize` window), the
+    /// notification is buffered in `state.pending` instead of being dropped,
+    /// and is flushed once `DelegatingProxyHandler::initialize` sets
+    /// `state.downstream`.
+    ///
+    /// The downstream check and the pending push happen under a single
+    /// `state` lock acquisition, so this can never race with `initialize`'s
+    /// set-then-drain: whichever of the two critical sections runs first is
+    /// fully visible to the other (see [`DownstreamState`]).
+    async fn on_custom_notification(
+        &self,
+        notification: CustomNotification,
+        _context: NotificationContext<RoleClient>,
+    ) {
+        let mut state = self.state.lock().await;
+        if let Some(peer) = state.downstream.clone() {
+            drop(state);
+            let _ = peer
+                .send_notification(ServerNotification::CustomNotification(notification))
+                .await;
+        } else {
+            if state.pending.len() >= PENDING_CUSTOM_NOTIFICATIONS_CAP {
+                state.pending.pop_front();
+            }
+            state.pending.push_back(notification);
         }
     }
 }
@@ -169,7 +232,11 @@ impl ClientHandler for NotificationRelay {
 #[derive(Clone)]
 struct DelegatingProxyHandler {
     upstream: Arc<RunningService<RoleClient, NotificationRelay>>,
-    downstream: Arc<Mutex<Option<Peer<RoleServer>>>>,
+    /// Shared with the `NotificationRelay` driving `upstream`; custom
+    /// notifications received before `state.downstream` is populated are
+    /// buffered in `state.pending` and drained atomically with setting
+    /// `state.downstream` in `initialize` (see [`DownstreamState`]).
+    state: Arc<Mutex<DownstreamState>>,
 }
 
 /// Maximum time to wait for a single delegated upstream call. A hung
@@ -222,7 +289,21 @@ impl ServerHandler for DelegatingProxyHandler {
             context.peer.set_peer_info(request);
         }
 
-        *self.downstream.lock().await = Some(context.peer.clone());
+        // Set `downstream` and drain `pending` under one lock acquisition so
+        // no custom notification pushed by `NotificationRelay::on_custom_notification`
+        // can land in `pending` after it has already been drained here (see
+        // [`DownstreamState`]).
+        let drained: Vec<CustomNotification> = {
+            let mut state = self.state.lock().await;
+            state.downstream = Some(context.peer.clone());
+            state.pending.drain(..).collect()
+        };
+        for notification in drained {
+            let _ = context
+                .peer
+                .send_notification(ServerNotification::CustomNotification(notification))
+                .await;
+        }
 
         Ok(self.get_info())
     }
@@ -380,9 +461,9 @@ pub async fn serve_proxy(
     ))
     .auth_header(DUMMY_BEARER_TOKEN);
 
-    let downstream: Arc<Mutex<Option<Peer<RoleServer>>>> = Arc::new(Mutex::new(None));
+    let state: Arc<Mutex<DownstreamState>> = Arc::new(Mutex::new(DownstreamState::default()));
     let relay = NotificationRelay {
-        downstream: downstream.clone(),
+        state: state.clone(),
     };
 
     let upstream = match record.scheme {
@@ -414,7 +495,7 @@ pub async fn serve_proxy(
 
     let handler = DelegatingProxyHandler {
         upstream: Arc::new(upstream),
-        downstream,
+        state,
     };
 
     use rmcp::transport::stdio;
@@ -429,4 +510,127 @@ pub async fn serve_proxy(
         .map_err(|e| ProxyError::Stdio(e.to_string()))?;
 
     Ok(())
+}
+
+// `NotificationContext<RoleClient>`/`Peer<RoleServer>` can only be
+// constructed via rmcp's own (crate-private) `Peer::new`, so a live
+// `NotificationRelay::on_custom_notification` call or a real
+// `initialize`-time drain-and-forward can't be driven from outside rmcp.
+// These tests instead exercise the buffering/draining semantics -- push
+// while no downstream peer is available, bounded drop-oldest overflow, and
+// FIFO drain order -- directly against a `pending` queue built the same way
+// `DownstreamState` holds one. End-to-end custom-notification forwarding
+// (relay -> downstream peer, including the `initialize`-time flush) is
+// covered by manual MCP smoke test; a full transport harness is out of
+// scope here.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn notification(method: &str) -> CustomNotification {
+        CustomNotification::new(method.to_string(), None)
+    }
+
+    /// Pushes `notification` onto `pending`, dropping the oldest entry once
+    /// `PENDING_CUSTOM_NOTIFICATIONS_CAP` is reached -- the same bounding
+    /// behavior `NotificationRelay::on_custom_notification` applies when
+    /// `downstream` is `None`.
+    async fn push_pending(
+        pending: &Mutex<VecDeque<CustomNotification>>,
+        notification: CustomNotification,
+    ) {
+        let mut pending = pending.lock().await;
+        if pending.len() >= PENDING_CUSTOM_NOTIFICATIONS_CAP {
+            pending.pop_front();
+        }
+        pending.push_back(notification);
+    }
+
+    #[tokio::test]
+    async fn buffers_custom_notifications_while_downstream_is_none() {
+        let pending: Mutex<VecDeque<CustomNotification>> = Mutex::new(VecDeque::new());
+        let evt = notification("notifications/codanna/file-reindexed");
+
+        push_pending(&pending, evt.clone()).await;
+
+        let pending = pending.lock().await;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].method, evt.method);
+    }
+
+    #[tokio::test]
+    async fn overflow_drops_oldest_entry() {
+        let pending: Mutex<VecDeque<CustomNotification>> = Mutex::new(VecDeque::new());
+
+        for i in 0..(PENDING_CUSTOM_NOTIFICATIONS_CAP + 5) {
+            push_pending(
+                &pending,
+                notification(&format!("notifications/codanna/evt-{i}")),
+            )
+            .await;
+        }
+
+        let pending = pending.lock().await;
+        assert_eq!(pending.len(), PENDING_CUSTOM_NOTIFICATIONS_CAP);
+        // The first 5 pushed (evt-0..evt-4) must have been dropped; the
+        // oldest surviving entry is evt-5.
+        assert_eq!(
+            pending.front().unwrap().method,
+            "notifications/codanna/evt-5"
+        );
+        assert_eq!(
+            pending.back().unwrap().method,
+            format!(
+                "notifications/codanna/evt-{}",
+                PENDING_CUSTOM_NOTIFICATIONS_CAP + 4
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_preserves_fifo_order() {
+        let pending: Mutex<VecDeque<CustomNotification>> = Mutex::new(VecDeque::new());
+        for i in 0..10 {
+            push_pending(
+                &pending,
+                notification(&format!("notifications/codanna/evt-{i}")),
+            )
+            .await;
+        }
+
+        // Mirrors the drain step inlined into `DelegatingProxyHandler::initialize`
+        // (minus the actual `peer.send_notification` call, which needs a live
+        // `Peer<RoleServer>` -- see module doc comment above).
+        let drained: Vec<CustomNotification> = {
+            let mut pending = pending.lock().await;
+            pending.drain(..).collect()
+        };
+
+        let methods: Vec<String> = drained.into_iter().map(|n| n.method).collect();
+        let expected: Vec<String> = (0..10)
+            .map(|i| format!("notifications/codanna/evt-{i}"))
+            .collect();
+        assert_eq!(methods, expected);
+
+        // Buffer is empty after drain -- nothing left to re-flush.
+        assert!(pending.lock().await.is_empty());
+    }
+
+    #[test]
+    fn notification_relay_and_proxy_handler_share_one_downstream_state() {
+        // Construction wiring: `NotificationRelay::state` and
+        // `DelegatingProxyHandler::state` must be clones of the same
+        // `Arc<Mutex<DownstreamState>>` (as done in `serve_proxy`), or the
+        // downstream-check and pending-drain in `on_custom_notification` and
+        // `initialize` would no longer share a single lock -- reopening the
+        // TOCTOU window this type exists to close. This compiles only if
+        // both fields are the same type.
+        fn assert_same_type(_relay: &NotificationRelay, _state: &Arc<Mutex<DownstreamState>>) {}
+        let state: Arc<Mutex<DownstreamState>> = Arc::new(Mutex::new(DownstreamState::default()));
+        let relay = NotificationRelay {
+            state: state.clone(),
+        };
+        assert_same_type(&relay, &state);
+        assert!(Arc::ptr_eq(&relay.state, &state));
+    }
 }

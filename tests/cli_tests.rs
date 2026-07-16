@@ -11,3 +11,6 @@ mod test_mcp_index_info_remote_status;
 
 #[path = "cli/test_serve_proxy_discovery.rs"]
 mod test_serve_proxy_discovery;
+
+#[path = "cli/test_idle_shutdown.rs"]
+mod test_idle_shutdown;

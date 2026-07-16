@@ -80,6 +80,9 @@ pub(super) fn default_spawn_timeout_ms() -> u64 {
 pub(super) fn default_health_poll_ms() -> u64 {
     100
 }
+pub(super) fn default_idle_shutdown_minutes() -> u64 {
+    0
+}
 pub(super) fn default_test_path_patterns() -> Vec<String> {
     vec![
         "tests/".to_string(),

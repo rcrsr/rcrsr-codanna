@@ -240,6 +240,10 @@ impl Settings {
                 result.push_str("\n# HTTP server bind address (only used when mode = \"http\" or --http flag)\n");
             } else if line.starts_with("watch_interval = ") {
                 result.push_str("\n# Watch interval for stdio mode in seconds (how often to check for file changes)\n");
+            } else if line.starts_with("idle_shutdown_minutes = ") {
+                result.push_str(
+                    "\n# Idle shutdown timeout for the backing server, in minutes (0 = never)\n",
+                );
             } else if line == "[logging]" {
                 result.push_str("\n[logging]\n");
                 result.push_str("# Logging configuration\n");
