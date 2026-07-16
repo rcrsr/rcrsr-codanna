@@ -126,6 +126,48 @@ Reindexing does not block reads: the walk-and-parse work runs without holding th
 index write lock, so concurrent read-only tools (`find_symbol`, `search_symbols`,
 `semantic_search_docs`, and the rest) keep serving while a reindex is in flight.
 
+## Catch-up reindex on watch-queue overflow
+
+When you run a watching server (`codanna serve --watch`, in any serve mode), the
+OS file-watch backend has a bounded event queue. A bulk operation — `git rebase`,
+`git checkout` across many files, a branch switch, a large `git pull` — can change
+more files at once than the queue holds, and the backend drops events (an inotify
+`IN_Q_OVERFLOW`, or the equivalent on macOS/Windows). Upstream codanna silently
+misses those changes: the index stays out of sync with disk until you reindex by
+hand.
+
+The fork detects the overflow signal and, once file activity settles, fires a
+single catch-up reindex automatically so the index re-converges with disk without
+any manual step. Behavior details:
+
+- It waits for a quiet window after the overflow before reindexing, and coalesces
+  a burst of overflow signals (a rebase with hook pauses, say) into one catch-up
+  rather than firing mid-operation.
+- The catch-up runs off the watcher's event loop, so incoming file events keep
+  draining while it works — a long reindex can't cause a second overflow.
+- If a catch-up fails (transient lock/IO error), staleness is kept and retried on
+  the next quiet window (bounded) instead of being silently dropped.
+- Successive catch-ups are throttled by a short cooldown, so sustained bursty git
+  activity can't thrash repeated full rebuilds.
+
+### Configuration
+
+It is **on by default**. Controlled by the `[file_watch]` section of
+`.codanna/settings.toml`:
+
+```toml
+[file_watch]
+refresh_on_overflow = true  # catch-up reindex on watch-queue overflow (default: true)
+                            # set false to restore upstream behavior (missed changes stay missed)
+```
+
+The `churn_threshold` key is parsed and accepted but **reserved** — it is not yet
+consumed by the watcher and has no effect (setting it to a non-zero value logs a
+one-time startup warning).
+
+If you don't run with `--watch`, this feature is inert; the `reindex` tool above
+is the way to re-sync on demand.
+
 ## Identifying the fork
 
 Fork builds carry a `+rcrsr.N` suffix on the upstream version, so you can tell a
