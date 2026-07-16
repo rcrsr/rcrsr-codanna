@@ -492,6 +492,18 @@ impl Settings {
                     settings.workspace_root = Self::workspace_root();
                 }
                 settings.sync_indexed_path_cache();
+
+                // `churn_threshold` is reserved for a future churn-based
+                // refresh trigger and is not yet consumed by the watcher;
+                // warn so a user who configures it isn't met with silent
+                // no-op behavior.
+                if settings.file_watch.churn_threshold != 0 {
+                    tracing::warn!(
+                        "file_watch.churn_threshold is set to {} but is not yet consumed by the watcher; it has no effect",
+                        settings.file_watch.churn_threshold
+                    );
+                }
+
                 settings
             })
     }

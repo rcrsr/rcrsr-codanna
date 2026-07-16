@@ -352,19 +352,18 @@ impl CodeIntelligenceServer {
         }
 
         // The 3-phase orchestration (brief write lock -> off-lock walk ->
-        // brief write lock) lives in `indexing::facade::reindex_locked` so
+        // brief write lock) lives in `indexing::reindex_locked` so
         // both this handler and the file-watcher's catch-up path share the
         // same phase-ordering guarantee.
-        let outcome =
-            crate::indexing::facade::reindex_locked(&self.facade, paths, force, phase2_started)
-                .await
-                .map_err(|e| {
-                    McpError::new(
-                        ErrorCode::INTERNAL_ERROR,
-                        format!("Reindex failed: {e}"),
-                        None,
-                    )
-                })?;
+        let outcome = crate::indexing::reindex_locked(&self.facade, paths, force, phase2_started)
+            .await
+            .map_err(|e| {
+                McpError::new(
+                    ErrorCode::INTERNAL_ERROR,
+                    format!("Reindex failed: {e}"),
+                    None,
+                )
+            })?;
 
         Ok(ReindexRunOutcome {
             reindexed: outcome.reindexed,
@@ -428,7 +427,7 @@ mod tests {
     /// test can reach it directly (tests/ integration cannot).
     ///
     /// The 3-phase orchestration under test here now lives in
-    /// `indexing::facade::reindex_locked`; this handler is a thin wrapper
+    /// `indexing::reindex_locked`; this handler is a thin wrapper
     /// around it, but the discriminating behavior (write lock released
     /// before the off-lock walk) is unchanged and still exercised via
     /// `run_reindex_for_test`.

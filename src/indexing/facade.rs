@@ -1466,27 +1466,51 @@ impl ReindexHandles {
 /// `phase2_started`, when provided, is signaled the instant phase 1's write
 /// guard has been dropped and before the off-lock walk begins; this exists
 /// for test synchronization and is `None` in production call sites.
-pub async fn reindex_locked(
+///
+/// Callers MUST validate that every entry in `paths` is contained within the
+/// workspace root before calling; this seam does not re-check path
+/// containment itself (the MCP handler validates before calling; the
+/// watcher's catch-up path always passes `paths: None`).
+pub(crate) async fn reindex_locked(
     facade: &Arc<tokio::sync::RwLock<IndexFacade>>,
     paths: Option<Vec<String>>,
     force: bool,
     phase2_started: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> FacadeResult<ReindexOutcome> {
-    // Phase 1: brief write lock to optionally clear the index and snapshot
-    // cloneable handles for the off-lock reindex walk.
-    let handles = {
-        let mut indexer = facade.write().await;
+    let should_clear = paths.is_none() && force;
 
-        if paths.is_none() && force {
-            indexer.clear_index()?;
+    // Phase 1: brief write lock to optionally clear the index and snapshot
+    // cloneable handles for the off-lock reindex walk. `clear_index()`
+    // performs blocking Tantivy IO (commit, reader reload), so the owned
+    // guard is moved into `spawn_blocking` rather than doing that work
+    // directly on the async worker while the write lock is held.
+    let owned_guard = Arc::clone(facade).write_owned().await;
+    let handles = tokio::task::spawn_blocking(move || -> FacadeResult<ReindexHandles> {
+        let mut indexer = owned_guard;
+
+        if should_clear {
+            // Log per-phase context for on-call readers, but propagate the
+            // original typed `IndexError` variant (e.g. `LockError`,
+            // `TantivyError`) unchanged rather than flattening it into a
+            // `General(String)`, so `status_code()`/`recovery_suggestions()`
+            // remain available to callers.
+            indexer.clear_index().inspect_err(|e| {
+                tracing::error!("Failed to clear index before force reindex: {e}");
+            })?;
         }
 
-        indexer.snapshot_reindex_handles()?
-    };
+        indexer.snapshot_reindex_handles().inspect_err(|e| {
+            tracing::error!("Failed to snapshot reindex handles: {e}");
+        })
+        // `indexer` (the owned write guard) is dropped here, releasing the
+        // lock before phase 2's off-lock walk begins.
+    })
+    .await
+    .map_err(map_reindex_join_error)??;
 
-    // The write guard above is dropped at the end of its block, strictly
-    // before this point. Signal test observers that phase 2 (the off-lock
-    // walk) is about to begin.
+    // The write guard above is dropped at the end of the blocking closure,
+    // strictly before this point. Signal test observers that phase 2 (the
+    // off-lock walk) is about to begin.
     if let Some(tx) = phase2_started {
         let _ = tx.send(());
     }
@@ -1494,7 +1518,7 @@ pub async fn reindex_locked(
     // Phase 2: run the heavy reindex walk with no facade lock held.
     let outcome = tokio::task::spawn_blocking(move || handles.run(paths, force))
         .await
-        .map_err(|e| IndexError::General(format!("reindex task panicked: {e}")))??;
+        .map_err(map_reindex_join_error)??;
 
     // Phase 3: brief write lock to record any newly indexed directories.
     {
@@ -1505,6 +1529,17 @@ pub async fn reindex_locked(
     }
 
     Ok(outcome)
+}
+
+/// Maps a `tokio::task::JoinError` from a `reindex_locked` blocking stage to
+/// an `IndexError`, distinguishing cancellation (e.g. runtime shutdown) from
+/// an actual panic inside the task.
+fn map_reindex_join_error(e: tokio::task::JoinError) -> IndexError {
+    if e.is_cancelled() {
+        IndexError::General("reindex task was cancelled".to_string())
+    } else {
+        IndexError::General(format!("reindex task panicked: {e}"))
+    }
 }
 
 // ── Embedding backend factory ──────────────────────────────────────────────
