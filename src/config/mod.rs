@@ -243,6 +243,17 @@ pub struct FileWatchConfig {
     /// Debounce interval in milliseconds (default: 500ms)
     #[serde(default = "default_debounce_ms")]
     pub debounce_ms: u64,
+
+    /// Force a full refresh when the OS watch event queue overflows
+    /// (default: true)
+    #[serde(default = "default_true")]
+    pub refresh_on_overflow: bool,
+
+    /// Reserved: number of changes within the debounce window that would
+    /// trigger a churn-based refresh. Not yet consumed by the watcher.
+    /// (default: 0, disabled)
+    #[serde(default)]
+    pub churn_threshold: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -408,6 +419,8 @@ impl Default for FileWatchConfig {
         Self {
             enabled: true, // Default to enabled for better user experience
             debounce_ms: default_debounce_ms(),
+            refresh_on_overflow: default_true(),
+            churn_threshold: 0,
         }
     }
 }
@@ -479,6 +492,18 @@ impl Settings {
                     settings.workspace_root = Self::workspace_root();
                 }
                 settings.sync_indexed_path_cache();
+
+                // `churn_threshold` is reserved for a future churn-based
+                // refresh trigger and is not yet consumed by the watcher;
+                // warn so a user who configures it isn't met with silent
+                // no-op behavior.
+                if settings.file_watch.churn_threshold != 0 {
+                    tracing::warn!(
+                        "file_watch.churn_threshold is set to {} but is not yet consumed by the watcher; it has no effect",
+                        settings.file_watch.churn_threshold
+                    );
+                }
+
                 settings
             })
     }
@@ -789,10 +814,12 @@ default = "info"
         let config = FileWatchConfig::default();
         assert!(config.enabled); // Now defaults to true
         assert_eq!(config.debounce_ms, 500);
+        assert!(config.refresh_on_overflow);
+        assert_eq!(config.churn_threshold, 0);
 
         println!(
-            "  ✓ Default config: enabled={}, debounce_ms={}",
-            config.enabled, config.debounce_ms
+            "  ✓ Default config: enabled={}, debounce_ms={}, refresh_on_overflow={}, churn_threshold={}",
+            config.enabled, config.debounce_ms, config.refresh_on_overflow, config.churn_threshold
         );
         println!("=== TEST PASSED ===");
     }
@@ -809,6 +836,7 @@ default = "info"
 [file_watch]
 enabled = true
 debounce_ms = 1000
+refresh_on_overflow = false
 "#;
         fs::write(&config_path, config_content).unwrap();
         println!("  Created test config: {}", config_path.display());
@@ -822,10 +850,13 @@ debounce_ms = 1000
 
         assert!(settings.file_watch.enabled);
         assert_eq!(settings.file_watch.debounce_ms, 1000);
+        assert!(!settings.file_watch.refresh_on_overflow);
 
         println!(
-            "  ✓ Loaded config: enabled={}, debounce_ms={}",
-            settings.file_watch.enabled, settings.file_watch.debounce_ms
+            "  ✓ Loaded config: enabled={}, debounce_ms={}, refresh_on_overflow={}",
+            settings.file_watch.enabled,
+            settings.file_watch.debounce_ms,
+            settings.file_watch.refresh_on_overflow
         );
         println!("=== TEST PASSED ===");
     }

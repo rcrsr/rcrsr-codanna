@@ -351,47 +351,12 @@ impl CodeIntelligenceServer {
             }
         }
 
-        // Phase 1: brief write lock to optionally clear the index and snapshot
-        // cloneable handles for the off-lock reindex walk.
-        let handles = {
-            let mut indexer = self.facade.write().await;
-
-            if paths.is_none() && force {
-                indexer.clear_index().map_err(|e| {
-                    McpError::new(
-                        ErrorCode::INTERNAL_ERROR,
-                        format!("Failed to clear index before force reindex: {e}"),
-                        None,
-                    )
-                })?;
-            }
-
-            indexer.snapshot_reindex_handles().map_err(|e| {
-                McpError::new(
-                    ErrorCode::INTERNAL_ERROR,
-                    format!("Failed to snapshot reindex handles: {e}"),
-                    None,
-                )
-            })?
-        };
-
-        // The write guard above is dropped at the end of its block, strictly
-        // before this point. Signal test observers that phase 2 (the
-        // off-lock walk) is about to begin.
-        if let Some(tx) = phase2_started {
-            let _ = tx.send(());
-        }
-
-        // Phase 2: run the heavy reindex walk with no facade lock held.
-        let outcome = tokio::task::spawn_blocking(move || handles.run(paths, force))
+        // The 3-phase orchestration (brief write lock -> off-lock walk ->
+        // brief write lock) lives in `indexing::reindex_locked` so
+        // both this handler and the file-watcher's catch-up path share the
+        // same phase-ordering guarantee.
+        let outcome = crate::indexing::reindex_locked(&self.facade, paths, force, phase2_started)
             .await
-            .map_err(|e| {
-                McpError::new(
-                    ErrorCode::INTERNAL_ERROR,
-                    format!("reindex task panicked: {e}"),
-                    None,
-                )
-            })?
             .map_err(|e| {
                 McpError::new(
                     ErrorCode::INTERNAL_ERROR,
@@ -399,14 +364,6 @@ impl CodeIntelligenceServer {
                     None,
                 )
             })?;
-
-        // Phase 3: brief write lock to record any newly indexed directories.
-        {
-            let mut indexer = self.facade.write().await;
-            for dir in &outcome.indexed_dirs {
-                indexer.add_indexed_path(dir);
-            }
-        }
 
         Ok(ReindexRunOutcome {
             reindexed: outcome.reindexed,
@@ -468,6 +425,12 @@ mod tests {
     /// phase 2 walk. `run_reindex` is `pub(crate)` and the facade lives
     /// behind `Arc<RwLock<IndexFacade>>` on the server, so only an in-module
     /// test can reach it directly (tests/ integration cannot).
+    ///
+    /// The 3-phase orchestration under test here now lives in
+    /// `indexing::reindex_locked`; this handler is a thin wrapper
+    /// around it, but the discriminating behavior (write lock released
+    /// before the off-lock walk) is unchanged and still exercised via
+    /// `run_reindex_for_test`.
     ///
     /// Drives a force reindex over a non-trivial fixture (many source
     /// files) and asserts a read guard is repeatedly acquirable via
