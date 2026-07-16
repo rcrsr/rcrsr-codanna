@@ -476,7 +476,13 @@ impl ConcurrentVectorStorage {
         }
     }
 
-    /// Reads a vector by ID with shared access.
+    /// Reads a vector by ID.
+    ///
+    /// Despite `&self`, this takes the inner lock **exclusively**
+    /// (`self.inner.write()`), not for shared access: `MmapVectorStorage::read_vector`
+    /// needs `&mut self` for its one-time lazy `ensure_mapped()` mmap setup, so every
+    /// call — even after the mapping is warm — serializes on the same write guard.
+    /// Concurrent callers of `read_vector` do not make progress against each other.
     #[must_use]
     pub fn read_vector(&self, id: VectorId) -> Option<Vec<f32>> {
         self.inner.write().read_vector(id)

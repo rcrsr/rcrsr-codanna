@@ -212,6 +212,25 @@ pub(crate) struct ReindexRunOutcome {
     pub reindexed: usize,
     pub symbols: usize,
     pub duration_ms: u128,
+    pub documents: Option<DocReindexTotals>,
+}
+
+/// Aggregated document-collection reindex totals, produced by
+/// `CodeIntelligenceServer::run_document_reindex` when a reindex request
+/// asks for `documents: true`. All-`usize` and `Copy` so it can live inline
+/// inside `ReindexRunOutcome` without breaking that type's `Copy` bound
+/// (`Option<T>` is `Copy` iff `T` is `Copy`).
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct DocReindexTotals {
+    /// Number of configured document collections processed.
+    pub collections: usize,
+    /// Number of files processed across all processed collections.
+    pub files_processed: usize,
+    /// Number of chunks created across all processed collections.
+    pub chunks_created: usize,
+    /// Number of chunks removed (from changed/deleted files) across all
+    /// processed collections.
+    pub chunks_removed: usize,
 }
 
 // Custom request handlers
@@ -219,15 +238,16 @@ impl CodeIntelligenceServer {
     /// Handle force-reindex request
     async fn handle_force_reindex(&self, request: CustomRequest) -> Result<CustomResult, McpError> {
         let params = request.params.as_ref().and_then(|p| p.as_object());
-        let (paths, force) = crate::mcp::requests::ReindexRequest::parse_args(params)
+        let (paths, force, documents) = crate::mcp::requests::ReindexRequest::parse_args(params)
             .map_err(|e| McpError::new(ErrorCode::INVALID_PARAMS, e.to_string(), None))?;
 
-        let outcome = self.run_reindex(paths, force).await?;
+        let outcome = self.run_reindex(paths, force, documents).await?;
 
         Ok(CustomResult(serde_json::json!({
             "reindexed": outcome.reindexed,
             "symbols": outcome.symbols,
-            "duration_ms": outcome.duration_ms
+            "duration_ms": outcome.duration_ms,
+            "documents": outcome.documents
         })))
     }
 
@@ -241,8 +261,9 @@ impl CodeIntelligenceServer {
         &self,
         paths: Option<Vec<String>>,
         force: bool,
+        documents: bool,
     ) -> Result<ReindexRunOutcome, McpError> {
-        self.run_reindex_with_phase2_signal(paths, force, None)
+        self.run_reindex_with_phase2_signal(paths, force, documents, None)
             .await
     }
 
@@ -260,7 +281,7 @@ impl CodeIntelligenceServer {
         force: bool,
         phase2_started: tokio::sync::oneshot::Sender<()>,
     ) -> Result<ReindexRunOutcome, McpError> {
-        self.run_reindex_with_phase2_signal(paths, force, Some(phase2_started))
+        self.run_reindex_with_phase2_signal(paths, force, false, Some(phase2_started))
             .await
     }
 
@@ -268,6 +289,7 @@ impl CodeIntelligenceServer {
         &self,
         paths: Option<Vec<String>>,
         force: bool,
+        documents: bool,
         #[cfg_attr(not(test), allow(unused_variables))] phase2_started: Option<
             tokio::sync::oneshot::Sender<()>,
         >,
@@ -370,11 +392,85 @@ impl CodeIntelligenceServer {
                 )
             })?;
 
+        let documents = if documents {
+            Some(self.run_document_reindex().await?)
+        } else {
+            None
+        };
+
         Ok(ReindexRunOutcome {
             reindexed: outcome.reindexed,
             symbols: outcome.symbol_count,
             duration_ms: start.elapsed().as_millis(),
+            documents,
         })
+    }
+
+    /// Reindex every document collection configured in `settings.documents`,
+    /// discovering new/changed/removed files per collection (the same
+    /// change-detection `DocumentStore::index_collection` uses for
+    /// `codanna documents index`), and aggregate the resulting
+    /// [`crate::documents::IndexStats`] into a single [`DocReindexTotals`].
+    ///
+    /// Requires a document store to already be configured on this server
+    /// (`self.document_store`, populated from `settings.documents` at server
+    /// construction -- see `crate::documents::load_from_settings`). A
+    /// collection sync failure is surfaced as an error naming the failing
+    /// collection rather than logged and skipped: silently dropping a
+    /// document-sync failure would let a `reindex documents:true` caller
+    /// believe every collection is up to date when one silently isn't.
+    async fn run_document_reindex(&self) -> Result<DocReindexTotals, McpError> {
+        let Some(store_arc) = &self.document_store else {
+            return Err(McpError::new(
+                ErrorCode::INVALID_PARAMS,
+                "Document reindex requested but no document store is configured. \
+                Enable `[documents] enabled = true` and configure a collection, \
+                then restart the MCP server."
+                    .to_string(),
+                None,
+            ));
+        };
+
+        let settings = {
+            let indexer = self.facade.read().await;
+            std::sync::Arc::clone(indexer.settings())
+        };
+
+        let mut totals = DocReindexTotals {
+            collections: 0,
+            files_processed: 0,
+            chunks_created: 0,
+            chunks_removed: 0,
+        };
+
+        // The write guard is scoped per-collection (acquired and dropped
+        // inside the loop body) rather than held once across the whole loop,
+        // so a slow collection (file I/O, tantivy commit, embedding
+        // generation) does not hold the exclusive lock for the other
+        // collections' worth of work too -- readers get a chance to
+        // interleave between collections instead of being blocked for the
+        // entire reindex.
+        for (name, config) in &settings.documents.collections {
+            let stats = {
+                let mut store = store_arc.write().await;
+                store
+                    .index_collection(name, config, &settings.documents.defaults)
+                    .map_err(|e| {
+                        McpError::new(
+                            ErrorCode::INTERNAL_ERROR,
+                            format!("Document reindex failed for collection '{name}': {e}"),
+                            None,
+                        )
+                    })?
+            };
+
+            totals.collections += 1;
+            totals.files_processed += stats.files_processed;
+            totals.chunks_created += stats.chunks_created;
+            totals.chunks_removed += stats.chunks_removed;
+        }
+
+        Ok(totals)
     }
 
     /// Handle index-stats request
@@ -627,7 +723,9 @@ mod tests {
         // (a) An explicit path OUTSIDE the workspace root must be rejected
         // with INVALID_PARAMS, not silently walked/parsed into the index.
         let outside_path = outside_dir.to_str().expect("utf8 path").to_string();
-        let outside_result = server.run_reindex(Some(vec![outside_path]), false).await;
+        let outside_result = server
+            .run_reindex(Some(vec![outside_path]), false, false)
+            .await;
         let outside_err =
             outside_result.expect_err("reindex path outside the workspace root must be rejected");
         assert_eq!(
@@ -644,7 +742,7 @@ mod tests {
             .expect("utf8 path")
             .to_string();
         let inside_outcome = server
-            .run_reindex(Some(vec![inside_path]), false)
+            .run_reindex(Some(vec![inside_path]), false, false)
             .await
             .expect("reindex path inside the workspace root must succeed");
         assert_eq!(
@@ -660,7 +758,7 @@ mod tests {
             .expect("utf8 path")
             .to_string();
         let nonexistent_result = server
-            .run_reindex(Some(vec![nonexistent_path]), false)
+            .run_reindex(Some(vec![nonexistent_path]), false, false)
             .await;
         let nonexistent_err = nonexistent_result
             .expect_err("reindex over a nonexistent explicit path must error, not silently no-op");

@@ -42,8 +42,32 @@ and the rest attach to it.
 
 The backing server is started as a detached background process and keeps running
 after the clients disconnect, so the next client reattaches to the warm index
-instead of paying startup again. It is not shut down automatically — stop it
-yourself when you're done with the workspace (or leave it running).
+instead of paying startup again. By default it stays up until you stop it (or the
+host reboots); set `idle_shutdown_minutes` (see below) to have it exit on its own
+after a spell of inactivity — the next tool call transparently respawns it.
+
+### Idle shutdown
+
+**Scope: `--http` backing servers only.** The idle timer (activity tracking,
+the poll loop, and the shutdown trigger) is implemented in `serve_http`; a
+backing server started with `--https` has none of this plumbing, so
+`idle_shutdown_minutes` is silently inert for it. If you auto-spawn backing
+servers through the proxy (the common case), they are started with `--http`
+and this section applies as written. If you manually start a backing server
+with `codanna serve --https`, `idle_shutdown_minutes` has no effect on it.
+
+By default a backing server runs indefinitely, so every workspace you touch
+accumulates a resident process. Set `idle_shutdown_minutes` in `[server]` to a
+non-zero value and the (`--http`) server exits cleanly after that many minutes
+with no MCP request activity, removing its `.codanna/serve.json` record exactly
+as a Ctrl+C shutdown does. The next tool call through the proxy finds no record
+and auto-spawns a fresh server (paying only startup latency), so idle shutdown
+is transparent to clients.
+
+Only real inbound MCP requests count as activity — SSE keep-alive pings do not
+reset the idle clock, so a merely *connected* client does not keep the server
+alive forever. The default is `0` (never shut down), preserving upstream
+behavior.
 
 ### Configuration
 
@@ -53,10 +77,11 @@ Proxy behavior is controlled by the `[server]` section of that file:
 
 ```toml
 [server]
-auto_spawn = true       # let the proxy start a backing server when none is found;
-                        # set false to require starting `codanna serve --http --watch` yourself
-spawn_timeout_ms = 8000 # how long to wait for a spawned server to become ready
-health_poll_ms = 100    # how often to poll for readiness while waiting
+auto_spawn = true          # let the proxy start a backing server when none is found;
+                           # set false to require starting `codanna serve --http --watch` yourself
+spawn_timeout_ms = 8000    # how long to wait for a spawned server to become ready
+health_poll_ms = 100       # how often to poll for readiness while waiting
+idle_shutdown_minutes = 0  # exit the backing server after N idle minutes (0 = never)
 ```
 
 The defaults shown above apply when the keys are absent, so an initialized
@@ -73,6 +98,9 @@ If you start a backing server yourself instead (`codanna serve --http` /
 `--https`), it uses the normal bind address — `--bind`, or `[server] bind` in
 `settings.toml`, defaulting to `127.0.0.1:8080` for HTTP and `127.0.0.1:8443` for
 HTTPS. All backing servers listen on loopback only; nothing is exposed off-host.
+Note that `idle_shutdown_minutes` (above) only applies to `--http` backing
+servers — a manually-started `--https` server runs indefinitely regardless of
+that setting.
 
 ```bash
 codanna serve --proxy
@@ -82,6 +110,16 @@ Use it when more than one tool or editor talks to codanna for the same project
 and you don't want a separate index loaded into memory for each. Both HTTP and
 HTTPS backing servers are supported; with `--https` the connection is verified
 against codanna's own certificate.
+
+### Hot-reload notifications through the proxy
+
+Codanna's custom hot-reload notifications (`notifications/codanna/file-reindexed`,
+`file-created`, `file-deleted`, `index-reloaded`) are forwarded verbatim from the
+backing server to each stdio client, so a client behind the proxy stays as
+hot-reload-aware as one connected directly. Notifications the backing server
+emits before a client finishes its `initialize` handshake are buffered (up to the
+last 100, oldest dropped on overflow) and flushed once the client is ready,
+rather than being lost in the connection window.
 
 If you only ever run a single client, you don't need this — plain `codanna serve`
 is unchanged.
@@ -105,6 +143,9 @@ A client calls it like any other tool:
 
 // force a full clear-and-rebuild
 { "name": "reindex", "arguments": { "force": true } }
+
+// also refresh every configured document collection (discovers new markdown files)
+{ "name": "reindex", "arguments": { "documents": true } }
 ```
 
 It is also reachable from the CLI as `codanna mcp reindex`.
@@ -118,14 +159,67 @@ It is also reachable from the CLI as `codanna mcp reindex`.
   clears the entire index before rebuilding it. For **scoped** `paths`, re-indexes
   just those paths without a global clear: files are re-parsed even when their
   content hash is unchanged, and directories bypass the incremental hash-skip.
+- `documents` (optional bool, default `false`) — in addition to the code index,
+  reindex every configured document collection, discovering markdown files added
+  since the last run (upstream reindexing and the watcher only refresh files
+  already in a collection). The code index is always reindexed; this flag adds the
+  document pass on top. Returned totals report the two separately, and a failing
+  collection surfaces as an error naming it rather than being silently skipped.
 
 The call returns a short summary — files reindexed, symbols, and elapsed
-milliseconds. Like every other tool, `reindex` accepts `output_format: "json"`
-for a structured `Envelope` response instead of the default text summary.
+milliseconds (plus per-collection document totals when `documents: true`). Like
+every other tool, `reindex` accepts `output_format: "json"` for a structured
+`Envelope` response instead of the default text summary.
 
 Reindexing does not block reads: the walk-and-parse work runs without holding the
 index write lock, so concurrent read-only tools (`find_symbol`, `search_symbols`,
 `semantic_search_docs`, and the rest) keep serving while a reindex is in flight.
+
+### Concurrency contract
+
+Read-only MCP tools — including `search_documents` — are safe to call in
+parallel from multiple clients, in every `serve` mode (stdio, `--http`,
+`--https`, `--proxy`). Only two operations briefly take an exclusive write
+guard, and both scope it as narrowly as possible:
+
+- **`search_documents`'s collection auto-sync.** Every call first checks
+  configured document collections for file changes under a brief write
+  guard, scoped to just that scan, then drops it before searching.
+  `DocumentStore::search` itself only needs read access, so the search step
+  runs under a read guard and concurrent `search_documents` calls make
+  progress against each other at the `DocumentStore` level instead of
+  serializing there.
+- **A force reindex's brief write-lock phases** (see above): phase 1 and
+  phase 3 each hold the index write lock briefly; the walk in between runs
+  off-lock. While the walk is in flight, readers may transiently observe a
+  repopulating index (some symbols reindexed, others not yet) until phase 3
+  completes.
+
+**Known limitation — vector-layer read lock.** The "make progress against
+each other" claim above is scoped to `DocumentStore`'s own locking; it does
+not extend through the vector storage layer underneath. When an embedding
+generator is configured (the production default), `DocumentStore`'s
+similarity scoring reads vectors via `ConcurrentVectorStorage::read_vector`,
+which takes an *exclusive* lock per call (see that method's doc comment in
+`src/vector/storage.rs`) rather than a shared one, so concurrent
+`search_documents` calls serialize on that lock while scoring candidates.
+Separately, `FastEmbedGenerator::generate_embeddings` runs blocking ONNX
+inference under a `std::sync::Mutex` with no `spawn_blocking`, so concurrent
+embedding generation also serializes and can block the async runtime worker
+thread while it runs. Both are known limitations of the current vector layer,
+tracked for a future fix rather than addressed in this change.
+
+**Known limitation — `reindex documents:true` runs synchronously per
+collection.** The `reindex` tool's document pass takes the same exclusive
+write guard as the auto-sync above, scoped per collection (acquired and
+dropped once per collection rather than once for the whole reindex), but each
+collection's own work — reading files from disk, committing to Tantivy, and
+generating embeddings — still runs synchronously on the async task, without
+`spawn_blocking`. A large collection can therefore hold the write guard for
+that collection's full duration and block the async runtime worker thread
+while doing so. This is bounded to one collection at a time rather than the
+entire reindex, but is not "brief" in the same sense as the two operations
+above; tracked for a future fix.
 
 ## Catch-up reindex on watch-queue overflow
 

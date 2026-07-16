@@ -923,6 +923,46 @@ impl CodeIntelligenceServer {
             output_format,
         }): Parameters<SearchDocumentsRequest>,
     ) -> Result<CallToolResult, McpError> {
+        self.search_documents_inner(query, collection, limit, output_format, None)
+            .await
+    }
+
+    /// Test-only entry point into [`Self::search_documents_inner`] that
+    /// signals via `search_phase_started` the instant the auto-sync write
+    /// guard has been dropped and the read-guarded `search` call is about
+    /// to begin, so tests can observe the read-guarded phase deterministically
+    /// instead of racing on wall-clock timing.
+    #[cfg(test)]
+    pub(crate) async fn search_documents_for_test(
+        &self,
+        query: String,
+        collection: Option<String>,
+        limit: u32,
+        search_phase_started: tokio::sync::oneshot::Sender<()>,
+    ) -> Result<CallToolResult, McpError> {
+        self.search_documents_inner(
+            query,
+            collection,
+            limit,
+            OutputFormat::Text,
+            Some(search_phase_started),
+        )
+        .await
+    }
+
+    /// Shared implementation behind [`Self::search_documents`] and the
+    /// test-only [`Self::search_documents_for_test`]. `search_phase_started`
+    /// is `None` in production and fires (test-only) the instant the
+    /// auto-sync write guard is dropped, before the read-guarded `search`
+    /// call begins.
+    async fn search_documents_inner(
+        &self,
+        query: String,
+        collection: Option<String>,
+        limit: u32,
+        output_format: OutputFormat,
+        search_phase_started: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> Result<CallToolResult, McpError> {
         let store = match &self.document_store {
             Some(s) => s,
             None => {
@@ -946,13 +986,34 @@ impl CodeIntelligenceServer {
             }
         };
 
-        let mut store = store.write().await;
         let indexer = self.facade.read().await;
 
+        // Auto-sync: check for file changes in all collections before
+        // searching. This is the only step that needs exclusive access to
+        // the document store, so the write guard is scoped to this loop
+        // only and dropped before searching (see the concurrency contract
+        // documented in RCSR-README.md).
+        {
+            let mut sync_guard = store.write().await;
+            let settings = indexer.settings();
+            for (name, config) in &settings.documents.collections {
+                if let Err(e) =
+                    sync_guard.index_collection(name, config, &settings.documents.defaults)
+                {
+                    tracing::warn!(target: "rag", "auto-sync failed for collection '{}': {}", name, e);
+                }
+            }
+        }
+
+        if let Some(tx) = search_phase_started {
+            let _ = tx.send(());
+        }
+
         if output_format == OutputFormat::Json {
+            let store = store.read().await;
             return Ok(
                 match service::search_documents_data(
-                    &mut store,
+                    &store,
                     indexer.settings(),
                     &query,
                     collection,
@@ -991,14 +1052,10 @@ impl CodeIntelligenceServer {
             );
         }
 
-        // Auto-sync: check for file changes in all collections before searching
-        let settings = indexer.settings();
-        for (name, config) in &settings.documents.collections {
-            if let Err(e) = store.index_collection(name, config, &settings.documents.defaults) {
-                tracing::warn!(target: "rag", "auto-sync failed for collection '{}': {}", name, e);
-            }
-        }
-
+        // Auto-sync already ran above (write guard scoped to the sync loop
+        // and already dropped). `DocumentStore::search` only needs `&self`,
+        // so the search itself runs under a read guard, letting concurrent
+        // `search_documents` calls make progress against each other.
         let search_query = DocSearchQuery {
             text: query.clone(),
             collection,
@@ -1007,12 +1064,19 @@ impl CodeIntelligenceServer {
             preview_config: Some(indexer.settings().documents.search.clone()),
         };
 
+        let store = store.read().await;
         match store.search(search_query) {
             Ok(results) => {
                 if results.is_empty() {
-                    return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                        "No documents found for: {query}"
-                    ))]));
+                    let mut output = format!("No documents found for: {query}");
+                    if let Some(guidance) =
+                        generate_mcp_guidance(indexer.settings(), "search_documents", 0)
+                    {
+                        output.push_str("\n\n---\nGuidance: ");
+                        output.push_str(&guidance);
+                        output.push('\n');
+                    }
+                    return Ok(CallToolResult::success(vec![ContentBlock::text(output)]));
                 }
 
                 let mut output = format!(
@@ -1040,11 +1104,361 @@ impl CodeIntelligenceServer {
                     output.push_str(&format!("   Preview: {}\n\n", result.content_preview));
                 }
 
+                if let Some(guidance) =
+                    generate_mcp_guidance(indexer.settings(), "search_documents", results.len())
+                {
+                    output.push_str("\n---\nGuidance: ");
+                    output.push_str(&guidance);
+                    output.push('\n');
+                }
+
                 Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
             }
             Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                 "Document search failed: {e}"
             ))])),
         }
+    }
+}
+
+#[cfg(test)]
+mod search_documents_concurrency_tests {
+    use super::*;
+    use crate::config::Settings;
+    use crate::documents::{CollectionConfig, DocumentStore};
+    use crate::indexing::facade::IndexFacade;
+    use crate::mcp::server::CodeIntelligenceServer;
+    use crate::vector::VectorDimension;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    fn text_of(result: &CallToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|block| block.as_text())
+            .map(|t| t.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Builds fixture settings for a single `docs` collection.
+    ///
+    /// `file_count` stays small so the auto-sync file-walk/hash step (which
+    /// runs on every `search_documents` call, even when nothing changed,
+    /// and whose cost scales with total file content) is cheap and does not
+    /// dominate the timing signal used below. Each file is one giant single
+    /// paragraph (no blank lines, so the chunker never splits on paragraph
+    /// boundaries); a very tight `max_chunk_chars` override then makes the
+    /// chunker's sliding-window split produce many chunks from that small
+    /// amount of content, so `chunks_per_file` mostly controls the cost of
+    /// `search`'s per-chunk KWIC-enrichment step (one tantivy lookup per
+    /// candidate) rather than the cost of auto-sync's file hashing.
+    /// Returns the fixture `Settings` together with the backing `TempDir`.
+    /// The settings hold paths into the temp dir, so callers must keep the
+    /// returned `TempDir` alive (bound to a variable) for as long as the
+    /// settings/server are in use -- dropping it removes the temp dir from
+    /// disk. Returning it here (instead of leaking it) keeps fixture temp
+    /// dirs from accumulating across test runs.
+    fn fixture_settings(file_count: usize, chunks_per_file: usize) -> (Settings, TempDir) {
+        let temp = tempfile::tempdir().expect("create temp root");
+        let docs_dir = temp.path().join("docs");
+        std::fs::create_dir_all(&docs_dir).expect("create docs dir");
+
+        const CHUNK_CHARS: usize = 20;
+        let sentence = "lorem ipsum ";
+        let body = sentence.repeat((chunks_per_file * CHUNK_CHARS / sentence.len()) + 4);
+        for i in 0..file_count {
+            std::fs::write(docs_dir.join(format!("doc_{i}.md")), &body)
+                .unwrap_or_else(|e| panic!("write doc_{i}.md fixture: {e}"));
+        }
+
+        let index_dir = temp.path().join("index");
+        let mut settings = Settings {
+            index_path: index_dir,
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.documents.collections.insert(
+            "docs".to_string(),
+            CollectionConfig {
+                paths: vec![docs_dir],
+                patterns: vec!["**/*.md".to_string()],
+                min_chunk_chars: Some(5),
+                max_chunk_chars: Some(CHUNK_CHARS),
+                overlap_chars: Some(2),
+                ..Default::default()
+            },
+        );
+
+        (settings, temp)
+    }
+
+    /// Builds a `CodeIntelligenceServer` over the given settings, with a
+    /// real `DocumentStore` backing the settings' `docs` collection,
+    /// pre-synced once outside the timed test phase so the auto-sync loop
+    /// inside `search_documents` is a fast no-op for every call made during
+    /// a test -- isolating any timing signal to the `search` step itself,
+    /// not collection scanning. No embedding generator is configured (keeps
+    /// tests hermetic -- no network/model download), so `search` exercises
+    /// the non-vector `enrich_results` path.
+    fn build_server(settings: Settings) -> CodeIntelligenceServer {
+        let index_path = settings.index_path.clone();
+        let collection_config = settings.documents.collections["docs"].clone();
+        let chunking_defaults = settings.documents.defaults.clone();
+
+        let facade = IndexFacade::new(Arc::new(settings)).expect("create facade over temp index");
+
+        let mut store = DocumentStore::new(
+            index_path.join("documents"),
+            VectorDimension::dimension_384(),
+        )
+        .expect("create document store");
+
+        store
+            .index_collection("docs", &collection_config, &chunking_defaults)
+            .expect("pre-sync docs collection");
+
+        CodeIntelligenceServer::new(facade).with_document_store(store)
+    }
+
+    fn search_request(limit: usize) -> Parameters<SearchDocumentsRequest> {
+        Parameters(SearchDocumentsRequest {
+            query: "lorem".to_string(),
+            collection: None,
+            limit: limit as u32,
+            output_format: OutputFormat::Text,
+        })
+    }
+
+    /// Terminal-state / provenance regression for `search_documents`'s
+    /// lock scoping, mirroring
+    /// `run_reindex_releases_write_lock_during_off_lock_walk`
+    /// (mcp/server.rs): the write guard used for collection auto-sync must
+    /// be dropped before `DocumentStore::search` runs, and `search` itself
+    /// must run under a read guard so concurrent `search_documents` calls
+    /// can make progress against each other instead of serializing.
+    ///
+    /// This is the discriminating check against a regression that instead
+    /// moves `.search()` back inside the same write guard used for
+    /// auto-sync: under that regression, a fresh `try_read()` on the
+    /// document-store lock would fail for the entire duration a first call
+    /// spends inside `search`, since the write guard would still be held.
+    /// Under the correct fix, `search` runs under a read guard, so a fresh
+    /// `try_read()` succeeds -- concurrently -- while the first call's
+    /// `search` step is still in flight, exactly like a second
+    /// `search_documents` call would be able to.
+    ///
+    /// Uses [`CodeIntelligenceServer::search_documents_for_test`]'s
+    /// phase-started signal (fired the instant the auto-sync write guard is
+    /// dropped) rather than wall-clock racing between two spawned tasks:
+    /// `DocumentStore::search` is synchronous CPU-bound code with no
+    /// internal `.await`, so tokio's scheduler is not guaranteed to run two
+    /// freshly spawned short-lived tasks on genuinely separate OS threads,
+    /// making a raw wall-clock-overlap comparison an unreliable
+    /// (scheduler-dependent) discriminator.
+    ///
+    /// Requires a multi-thread runtime: `search`'s synchronous CPU-bound
+    /// work has no internal `.await`, so on a current-thread runtime the
+    /// polling loop below would never be scheduled while `search_task` is
+    /// mid-`search` -- it would only ever observe the state before
+    /// `search_task` starts or after it finishes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn search_documents_search_phase_runs_under_read_guard() {
+        // Enough chunks that `search`'s KWIC-enrichment step takes long
+        // enough to reliably sample `try_read()` multiple times while it is
+        // still in flight.
+        const FILE_COUNT: usize = 3;
+        const CHUNKS_PER_FILE: usize = 6000;
+        const TOTAL_CHUNKS: usize = FILE_COUNT * CHUNKS_PER_FILE;
+
+        let (settings, _temp) = fixture_settings(FILE_COUNT, CHUNKS_PER_FILE);
+        let server = build_server(settings);
+        let store_arc = server
+            .document_store
+            .clone()
+            .expect("server must have a document store configured");
+
+        let (search_phase_started_tx, search_phase_started_rx) = tokio::sync::oneshot::channel();
+
+        let search_server = server.clone();
+        let search_task = tokio::spawn(async move {
+            search_server
+                .search_documents_for_test(
+                    "lorem".to_string(),
+                    None,
+                    TOTAL_CHUNKS as u32,
+                    search_phase_started_tx,
+                )
+                .await
+        });
+
+        // Wait for the auto-sync write guard to be dropped and the
+        // read-guarded `search` call to be about to start, ruling out the
+        // pre-start window where `try_read()` would trivially succeed
+        // simply because the spawned task had not yet been polled.
+        search_phase_started_rx
+            .await
+            .expect("search_documents_for_test must signal before the search phase starts");
+
+        // Sample `try_read()` while the search task is still in flight.
+        // Require several consecutive successes (rather than a single one)
+        // so a regression that re-holds the write guard across `.search()`
+        // -- which would still fire the phase-started signal, since that
+        // send is unconditional, but would keep the write guard alive
+        // during `search` -- reliably fails this assertion instead of
+        // getting lucky on a single sample.
+        const REQUIRED_CONSECUTIVE_SUCCESSES: u32 = 5;
+        let mut consecutive_successes = 0u32;
+        let mut attempts = 0;
+        while !search_task.is_finished() && attempts < 200_000 {
+            if store_arc.try_read().is_ok() {
+                consecutive_successes += 1;
+                if consecutive_successes >= REQUIRED_CONSECUTIVE_SUCCESSES {
+                    break;
+                }
+            } else {
+                consecutive_successes = 0;
+            }
+            attempts += 1;
+            if attempts % 100 == 0 {
+                tokio::time::sleep(std::time::Duration::from_micros(50)).await;
+            } else {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        let acquired_while_in_flight = consecutive_successes >= REQUIRED_CONSECUTIVE_SUCCESSES;
+
+        let result = search_task
+            .await
+            .expect("search task must not panic")
+            .expect("search_documents_for_test must succeed");
+
+        assert!(
+            acquired_while_in_flight,
+            "expected try_read() on the document store to succeed {REQUIRED_CONSECUTIVE_SUCCESSES} \
+             times in a row while search_documents's `search` step was still in flight; a \
+             regression that re-holds the write guard across `.search()` would fail try_read() \
+             for the search step's entire in-flight duration"
+        );
+        assert!(
+            !result.is_error.unwrap_or(false),
+            "search_documents_for_test result must not be an error"
+        );
+        assert!(
+            text_of(&result).contains("Found"),
+            "search_documents_for_test must find matching documents, got: {}",
+            text_of(&result)
+        );
+    }
+
+    /// Two concurrent `search_documents` calls against the same server both
+    /// make progress and both succeed -- neither one is starved or blocked
+    /// on the other's error path. This exercises the two-call-site
+    /// hoisting of the auto-sync write step (text path and JSON path) end
+    /// to end, complementing the single-call lock-scoping check above.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn search_documents_concurrent_calls_both_succeed() {
+        const FILE_COUNT: usize = 3;
+        const CHUNKS_PER_FILE: usize = 50;
+        const TOTAL_CHUNKS: usize = FILE_COUNT * CHUNKS_PER_FILE;
+
+        let (settings, _temp) = fixture_settings(FILE_COUNT, CHUNKS_PER_FILE);
+        let server = build_server(settings);
+
+        let server_a = server.clone();
+        let server_b = server.clone();
+
+        let task_a = tokio::spawn(async move {
+            server_a
+                .search_documents(search_request(TOTAL_CHUNKS))
+                .await
+        });
+        let task_b = tokio::spawn(async move {
+            server_b
+                .search_documents(search_request(TOTAL_CHUNKS))
+                .await
+        });
+
+        let (result_a, result_b) = tokio::join!(task_a, task_b);
+
+        let result_a = result_a
+            .expect("task a must not panic")
+            .expect("search_documents call a must succeed");
+        let result_b = result_b
+            .expect("task b must not panic")
+            .expect("search_documents call b must succeed");
+
+        for (label, result) in [("a", &result_a), ("b", &result_b)] {
+            assert!(
+                !result.is_error.unwrap_or(false),
+                "concurrent search_documents call {label} must not be an error result"
+            );
+            assert!(
+                text_of(result).contains("Found"),
+                "concurrent search_documents call {label} must find matching documents"
+            );
+        }
+    }
+
+    /// `search_documents`'s text output must append the same
+    /// `generate_mcp_guidance` block as `search_symbols` (search.rs, the
+    /// `search_symbols` handler) in both the empty-result and
+    /// non-empty-result branches, once a guidance template is configured
+    /// for the tool.
+    #[tokio::test]
+    async fn search_documents_text_output_includes_configured_guidance() {
+        use crate::config::{GuidanceRange, GuidanceTemplate};
+
+        let (mut settings, _temp) = fixture_settings(3, 1);
+        settings.guidance.enabled = true;
+        settings.guidance.templates.insert(
+            "search_documents".to_string(),
+            GuidanceTemplate {
+                no_results: Some("no-results-guidance-marker".to_string()),
+                single_result: None,
+                multiple_results: None,
+                custom: vec![GuidanceRange {
+                    min: 1,
+                    max: None,
+                    template: "found-results-guidance-marker".to_string(),
+                }],
+            },
+        );
+
+        let server = build_server(settings);
+
+        // Empty-result branch: `DocumentStore::search` filters by exact
+        // collection match (query text only ranks/relevance-scores when an
+        // embedding generator is configured, which this fixture
+        // deliberately omits), so a nonexistent collection is the reliable
+        // way to force zero candidates here.
+        let empty_result = server
+            .search_documents(Parameters(SearchDocumentsRequest {
+                query: "lorem".to_string(),
+                collection: Some("no-such-collection".to_string()),
+                limit: 10,
+                output_format: OutputFormat::Text,
+            }))
+            .await
+            .expect("empty-result search_documents call must succeed");
+        assert!(
+            text_of(&empty_result).contains("no-results-guidance-marker"),
+            "expected the configured no-results guidance template in the empty-result branch, \
+             got: {}",
+            text_of(&empty_result)
+        );
+
+        // Non-empty-result branch.
+        let non_empty_result = server
+            .search_documents(search_request(10))
+            .await
+            .expect("non-empty search_documents call must succeed");
+        assert!(
+            text_of(&non_empty_result).contains("found-results-guidance-marker"),
+            "expected the configured guidance template in the non-empty-result branch, got: {}",
+            text_of(&non_empty_result)
+        );
     }
 }

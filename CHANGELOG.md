@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **MCP reindex tool:** server-driven in-place force-reindex exposed as a first-class tool in list_tools across all serve modes. ([#3](https://github.com/rcrsr/rcrsr-codanna/pull/3))
 - **Watcher overflow catch-up:** Detects OS watch-queue overflow during bulk git operations and debounces reindex until changes settle. ([#4](https://github.com/rcrsr/rcrsr-codanna/pull/4))
 - **MCP agent-workflow tooling:** Structured JSON envelopes, batch lookups, scoped reads, canonical name parameters, and find_callers role classification. ([#19](https://github.com/rcrsr/rcrsr-codanna/pull/19))
+- **Release 1 batch:** Document-collection indexing, proxy hot-reload notifications with idle shutdown, and parallel-safe search_documents. ([#20](https://github.com/rcrsr/rcrsr-codanna/pull/20))
 
 ## [0.9.23] - 2026-07-03
 

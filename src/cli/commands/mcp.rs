@@ -556,9 +556,16 @@ pub async fn run(
     // Check semantic search status before moving indexer
     let has_semantic_search = facade.has_semantic_search();
 
-    // Only load document store for tools that need it (search_documents)
-    // This is expensive (~1s to load ML model) so we skip it for other tools
-    let needs_document_store = tool == "search_documents";
+    // Only load document store for tools that need it (search_documents, or
+    // reindex when it was requested with documents:true). This is expensive
+    // (~1s to load ML model) so we skip it for other tools.
+    let needs_document_store = tool == "search_documents"
+        || (tool == "reindex"
+            && arguments
+                .as_ref()
+                .and_then(|m| m.get("documents"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false));
     let document_store = if needs_document_store {
         crate::documents::load_from_settings(config)
     } else {
@@ -588,9 +595,23 @@ pub async fn run(
                 .and_then(|v| v.as_u64())
                 .unwrap_or(5) as usize;
 
-            let mut store = store_arc.write().await;
+            // Auto-sync: brief write guard scoped to the collection scan
+            // only, dropped before searching (mirrors the MCP tool call
+            // sites in mcp/tools/search.rs).
+            {
+                let mut sync_guard = store_arc.write().await;
+                for (name, coll_config) in &config.documents.collections {
+                    if let Err(e) =
+                        sync_guard.index_collection(name, coll_config, &config.documents.defaults)
+                    {
+                        tracing::warn!(target: "rag", "auto-sync failed for collection '{}': {}", name, e);
+                    }
+                }
+            }
+
+            let store = store_arc.read().await;
             match crate::mcp::service::search_documents_data(
-                &mut store, config, &query, collection, limit,
+                &store, config, &query, collection, limit,
             ) {
                 Ok(results) => Some((query, results)),
                 Err(e) => exit_index_error(EntityType::Document, &query, e),
@@ -618,7 +639,7 @@ pub async fn run(
     // json mode's dispatch match below is a text-only no-op (see below), so
     // this cannot wait for the shared dispatch path used by read-only tools.
     let reindex_data = if json && tool == "reindex" {
-        let (paths, force) =
+        let (paths, force, documents) =
             match crate::mcp::requests::ReindexRequest::parse_args(arguments.as_ref()) {
                 Ok(v) => v,
                 Err(e) => {
@@ -632,7 +653,7 @@ pub async fn run(
                 }
             };
 
-        match server.run_reindex(paths, force).await {
+        match server.run_reindex(paths, force, documents).await {
             Ok(outcome) => Some(outcome),
             Err(e) => {
                 use crate::io::envelope::{Envelope, ResultCode};
@@ -966,7 +987,7 @@ pub async fn run(
                     .await
             }
             "reindex" => {
-                let (paths, force) =
+                let (paths, force, documents) =
                     crate::mcp::requests::ReindexRequest::parse_args(arguments.as_ref())
                         .unwrap_or_else(|e| {
                             eprintln!("Error: invalid reindex arguments: {e}");
@@ -977,6 +998,7 @@ pub async fn run(
                         paths,
                         force,
                         output_format: crate::mcp::requests::OutputFormat::Text,
+                        documents,
                     }))
                     .await
             }

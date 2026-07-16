@@ -708,22 +708,23 @@ pub fn semantic_search_with_context_data(
     }
 }
 
-/// Build the `search_documents` JSON data payload. Runs the same
-/// collection-auto-sync policy as the MCP handler before searching: JSON
-/// output must not return stale chunks.
+/// Build the `search_documents` JSON data payload.
+///
+/// Search-only: collection auto-sync is the caller's responsibility (see the
+/// two `search_documents` tool call sites in `mcp/tools/search.rs`), which
+/// run it under a brief write guard scoped to the sync loop only, dropped
+/// before calling this function. `DocumentStore::search` only needs `&self`
+/// (vector reads go through `ConcurrentVectorStorage`'s interior locking),
+/// so callers can hold only a read guard on the document store here,
+/// letting concurrent `search_documents` calls make progress against each
+/// other instead of serializing behind one write guard for sync + search.
 pub fn search_documents_data(
-    store: &mut crate::documents::DocumentStore,
+    store: &crate::documents::DocumentStore,
     settings: &crate::config::Settings,
     query: &str,
     collection: Option<String>,
     limit: usize,
 ) -> crate::documents::store::StoreResult<Vec<crate::documents::SearchResult>> {
-    for (name, coll_config) in &settings.documents.collections {
-        if let Err(e) = store.index_collection(name, coll_config, &settings.documents.defaults) {
-            tracing::warn!(target: "rag", "auto-sync failed for collection '{}': {}", name, e);
-        }
-    }
-
     let search_query = crate::documents::SearchQuery {
         text: query.to_string(),
         collection,
@@ -1342,6 +1343,8 @@ pub struct ReindexInfo {
     pub reindexed: usize,
     pub symbols: usize,
     pub duration_ms: u128,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub documents: Option<crate::mcp::server::DocReindexTotals>,
 }
 
 /// Build the `reindex` envelope data payload from a [`crate::mcp::server::ReindexRunOutcome`].
@@ -1350,6 +1353,7 @@ pub(crate) fn reindex_info_data(outcome: &crate::mcp::server::ReindexRunOutcome)
         reindexed: outcome.reindexed,
         symbols: outcome.symbols,
         duration_ms: outcome.duration_ms,
+        documents: outcome.documents,
     }
 }
 

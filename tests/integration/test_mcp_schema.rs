@@ -174,6 +174,40 @@ fn test_reindex_request_schema_has_paths_and_force() {
     println!("[OK] ReindexRequest schema exposes documented 'paths' and 'force' properties.");
 }
 
+/// Schema regression test for `ReindexRequest`'s `documents` field: proves it
+/// is present as a boolean property carrying a non-empty description,
+/// mirroring [`test_reindex_request_schema_has_paths_and_force`] above.
+#[test]
+fn test_reindex_request_schema_has_documents() {
+    let schema = rmcp::schemars::schema_for!(ReindexRequest);
+    let json = serde_json::to_string_pretty(&schema).unwrap();
+
+    let root: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let properties = root
+        .get("properties")
+        .and_then(|v| v.as_object())
+        .unwrap_or_else(|| panic!("schema must contain 'properties'\nGot:\n{json}"));
+
+    let documents_schema = properties
+        .get("documents")
+        .unwrap_or_else(|| panic!("schema must contain a 'documents' property\nGot:\n{json}"));
+    assert_eq!(
+        documents_schema.get("type").and_then(|v| v.as_str()),
+        Some("boolean"),
+        "'documents' should be a boolean schema\nGot:\n{json}"
+    );
+    let documents_description = documents_schema
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    assert!(
+        !documents_description.is_empty(),
+        "'documents' property must carry a non-empty description\nGot:\n{json}"
+    );
+
+    println!("[OK] ReindexRequest schema exposes documented 'documents' property.");
+}
+
 /// Build a minimal, real (not mocked) `IndexFacade` rooted at a fresh temp
 /// workspace, with semantic search disabled so this stays fast and CI-safe.
 /// No files need to be indexed: every assertion below only inspects the
@@ -281,4 +315,147 @@ async fn test_reindex_tool_present_in_list_tools_for_all_constructors() {
     println!(
         "[OK] 'reindex' tool present in list_tools() for new, from_facade, and new_with_facade."
     );
+}
+
+/// `reindex documents:true` discovers new files added to a configured
+/// markdown collection since the document store was last synced, and
+/// aggregates non-zero totals across the collection; `documents:false`
+/// (the default) leaves the document store untouched and reports
+/// `documents: None`, proving the flag actually gates document reindexing
+/// rather than always running it.
+#[tokio::test]
+async fn test_reindex_documents_flag_discovers_new_files() {
+    use codanna::documents::{CollectionConfig, DocumentStore};
+    use codanna::mcp::requests::OutputFormat;
+    use codanna::vector::VectorDimension;
+    use rmcp::handler::server::wrapper::Parameters;
+
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let docs_dir = temp_dir.path().join("docs");
+    std::fs::create_dir_all(&docs_dir).expect("create docs dir");
+    std::fs::write(docs_dir.join("first.md"), "# First\n\nSome content.\n")
+        .expect("write first.md fixture");
+
+    let index_path = temp_dir.path().join(".codanna-index");
+    std::fs::create_dir_all(&index_path).expect("create index directory");
+
+    let mut collections = std::collections::HashMap::new();
+    collections.insert(
+        "docs".to_string(),
+        CollectionConfig {
+            paths: vec![docs_dir.clone()],
+            ..Default::default()
+        },
+    );
+
+    let settings = Settings {
+        workspace_root: Some(temp_dir.path().to_path_buf()),
+        index_path: index_path.clone(),
+        documents: codanna::documents::DocumentsConfig {
+            enabled: true,
+            collections,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let collection_config = settings.documents.collections["docs"].clone();
+    let chunking_defaults = settings.documents.defaults.clone();
+
+    let facade = IndexFacade::new(Arc::new(settings)).expect("create facade over temp index");
+
+    // Pre-sync the document store once (mirrors a prior `codanna documents
+    // index` run) so the server starts with a document store already
+    // configured, matching `document_store: Option<...>` being populated at
+    // server construction in every real serving mode.
+    let mut store = DocumentStore::new(
+        index_path.join("documents"),
+        VectorDimension::dimension_384(),
+    )
+    .expect("create document store");
+    store
+        .index_collection("docs", &collection_config, &chunking_defaults)
+        .expect("pre-sync docs collection");
+
+    let server = CodeIntelligenceServer::new(facade).with_document_store(store);
+
+    // `documents:false` (the default): the reindex must not touch the
+    // document store at all.
+    let result_no_documents = server
+        .reindex(Parameters(ReindexRequest {
+            paths: None,
+            force: false,
+            output_format: OutputFormat::Json,
+            documents: false,
+        }))
+        .await
+        .expect("reindex with documents:false should succeed");
+    let json_no_documents = call_tool_result_json(&result_no_documents);
+    assert_eq!(
+        json_no_documents
+            .get("data")
+            .and_then(|d| d.get("documents")),
+        None,
+        "documents:false must report documents: None (omitted), got: {json_no_documents:?}"
+    );
+
+    // Add a new file to the collection, then reindex with documents:true.
+    std::fs::write(docs_dir.join("second.md"), "# Second\n\nMore content.\n")
+        .expect("write second.md fixture");
+
+    let result_with_documents = server
+        .reindex(Parameters(ReindexRequest {
+            paths: None,
+            force: false,
+            output_format: OutputFormat::Json,
+            documents: true,
+        }))
+        .await
+        .expect("reindex with documents:true should succeed");
+    let json_with_documents = call_tool_result_json(&result_with_documents);
+    let documents_data = json_with_documents
+        .get("data")
+        .and_then(|d| d.get("documents"))
+        .unwrap_or_else(|| {
+            panic!(
+                "documents:true must report a non-null 'documents' totals object, got: {json_with_documents:?}"
+            )
+        });
+
+    assert_eq!(
+        documents_data.get("collections").and_then(|v| v.as_u64()),
+        Some(1),
+        "expected exactly the one configured 'docs' collection to be processed, got: {documents_data:?}"
+    );
+    let files_processed = documents_data
+        .get("files_processed")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    assert!(
+        files_processed >= 1,
+        "expected the newly added second.md to be discovered and processed, got: {documents_data:?}"
+    );
+    let chunks_created = documents_data
+        .get("chunks_created")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    assert!(
+        chunks_created >= 1,
+        "expected at least one new chunk from second.md, got: {documents_data:?}"
+    );
+
+    println!(
+        "[OK] reindex documents:true discovers new collection files; documents:false reports documents: None."
+    );
+}
+
+/// Extract and parse the single JSON text content block out of a
+/// `CallToolResult` produced by `output_format: Json` tool calls.
+fn call_tool_result_json(result: &rmcp::model::CallToolResult) -> serde_json::Value {
+    let text = result
+        .content
+        .iter()
+        .find_map(|block| block.as_text().map(|t| t.text.clone()))
+        .expect("CallToolResult must contain a text content block");
+    serde_json::from_str(&text).expect("tool JSON output must parse as valid JSON")
 }
