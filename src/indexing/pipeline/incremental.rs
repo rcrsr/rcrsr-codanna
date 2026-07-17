@@ -368,7 +368,8 @@ impl Pipeline {
             // Incremental mode: discover first, then create bar with actual count
             let discover_stage = DiscoverStage::new(root, self.config.discover_threads)
                 .with_index(Arc::clone(&index))
-                .with_workspace_root(self.settings.workspace_root.clone());
+                .with_workspace_root(self.settings.workspace_root.clone())
+                .with_settings(Arc::clone(&self.settings));
             let discover_result = discover_stage.run_incremental()?;
 
             if discover_result.is_empty() {
@@ -515,7 +516,8 @@ impl Pipeline {
         // Incremental mode: detect changes
         let discover_stage = DiscoverStage::new(root, self.config.discover_threads)
             .with_index(Arc::clone(&index))
-            .with_workspace_root(self.settings.workspace_root.clone());
+            .with_workspace_root(self.settings.workspace_root.clone())
+            .with_settings(Arc::clone(&self.settings));
         let discover_result = discover_stage.run_incremental()?;
 
         tracing::info!(

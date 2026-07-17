@@ -4,10 +4,22 @@
 //! All actual data is stored in Tantivy.
 
 use crate::indexing::facade::IndexFacade;
+use crate::indexing::walk_config;
 use crate::storage::{DataSource, IndexMetadata};
 use crate::{IndexError, IndexResult, Settings};
 use std::path::PathBuf;
 use std::sync::Arc;
+
+/// Root used for ignore-fingerprint file lookups (`.gitignore`,
+/// `.codannaignore`, `.git/info/exclude`): the workspace root when known,
+/// falling back to the current directory. Mirrors the fallback
+/// [`walk_config::ignore_fingerprint`] itself applies for `ignore_patterns`.
+fn ignore_fingerprint_root(settings: &Settings) -> PathBuf {
+    settings
+        .workspace_root
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("."))
+}
 
 /// Manages persistence of the index
 #[derive(Debug)]
@@ -65,6 +77,26 @@ impl IndexPersistence {
     ) -> IndexResult<IndexFacade> {
         // Load metadata to understand data sources
         let metadata = IndexMetadata::load(&self.base_path).ok();
+
+        // Detect-and-report only (issue #28): compare the ignore-rule
+        // fingerprint recorded at the last index build against one computed
+        // fresh from the current settings/ignore files, and warn once if
+        // they differ. Metadata written before this field existed (or any
+        // fingerprint computation failure) reports as unknown, never as
+        // "changed" -- a false staleness alarm for every user on first
+        // upgrade would train them to ignore the signal. No reconciliation
+        // or auto-invalidation happens here; that is explicitly out of
+        // scope for #28.
+        if let Some(ref meta) = metadata {
+            if let Some(ref stored_fingerprint) = meta.ignore_fingerprint {
+                let root = ignore_fingerprint_root(&settings);
+                if let Ok(current_fingerprint) = walk_config::ignore_fingerprint(&settings, &root) {
+                    if &current_fingerprint != stored_fingerprint {
+                        tracing::warn!("index may be stale: ignore rules changed since last index");
+                    }
+                }
+            }
+        }
 
         // Check if Tantivy index exists
         let tantivy_path = self.base_path.join("tantivy");
@@ -186,6 +218,20 @@ impl IndexPersistence {
             indexed_paths.len()
         );
         metadata.update_indexed_paths(indexed_paths);
+
+        // Record the ignore-rule fingerprint for staleness detection on next
+        // load (issue #28, detect-and-report only). A computation failure
+        // (e.g. an unreadable ignore file) is logged and otherwise
+        // non-fatal: the save still succeeds, and the field is simply left
+        // at its previous value, which loaders already treat as "unknown"
+        // rather than "changed" when absent.
+        let root = ignore_fingerprint_root(facade.settings());
+        match walk_config::ignore_fingerprint(facade.settings(), &root) {
+            Ok(fingerprint) => metadata.update_ignore_fingerprint(fingerprint),
+            Err(e) => {
+                tracing::warn!("[persistence] failed to compute ignore fingerprint: {e}");
+            }
+        }
 
         // Update metadata to reflect Tantivy
         metadata.data_source = DataSource::Tantivy {

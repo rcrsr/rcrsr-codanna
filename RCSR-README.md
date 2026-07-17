@@ -261,6 +261,36 @@ one-time startup warning).
 If you don't run with `--watch`, this feature is inert; the `reindex` tool above
 is the way to re-sync on demand.
 
+## `ignore_patterns` now excludes files during indexing
+
+`indexing.ignore_patterns` in `.codanna/settings.toml` previously deserialized
+but was never consulted by any walk — upstream, setting it had no effect on
+what got indexed ([issue #22](https://github.com/rcrsr/rcrsr-codanna/issues/22)).
+The fork wires it into every walk (`codanna index`, `--dry-run`, incremental
+reindex, and watch-triggered reindex).
+
+`ignore_patterns` uses the **same gitignore dialect as `.codannaignore`**:
+`!` negation, trailing `/` for directory-only matches, `**`, and the usual
+anchoring rules all apply. Patterns are additive to `.gitignore`/`.codannaignore`
+and are applied after them, so a leading `!` in `ignore_patterns` can only
+re-include a file excluded by an *earlier* `ignore_patterns` entry — it cannot
+re-include a file already excluded by `.gitignore` or `.codannaignore`. If you
+need to re-include something a gitignore file excludes, do it in that
+gitignore file (a custom `.codannaignore` outranks `.gitignore` there).
+
+```toml
+[indexing]
+ignore_patterns = ["fixtures/**", "!fixtures/keep.rs"]
+```
+
+The four patterns codanna used to hard-code as the default (`target/**`,
+`node_modules/**`, `.git/**`, `*.generated.*`) are no longer part of the
+`Default` for `IndexingConfig` — new `settings.toml` files ship
+`ignore_patterns = []`. This is a no-op in practice: those four patterns are
+already excluded by the default `.codannaignore` that `codanna init` writes.
+Existing `settings.toml` files are left untouched; any patterns already on
+disk in `ignore_patterns` now take effect.
+
 ## MCP tool enhancements for agent workflows
 
 The fork extends the MCP tool surface so agents can machine-parse results, batch

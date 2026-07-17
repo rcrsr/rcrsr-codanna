@@ -133,6 +133,13 @@ pub struct IndexingConfig {
     /// Show progress bars during indexing (default: true)
     #[serde(default = "default_true")]
     pub show_progress: bool,
+
+    /// Follow symlinked directories during indexing (default: false)
+    /// When false, symlinked directories are not descended into; a
+    /// warning is logged for each one encountered so the exclusion is
+    /// never silent.
+    #[serde(default = "default_false")]
+    pub follow_links: bool,
 }
 
 /// Source layout for project resolution
@@ -399,17 +406,17 @@ impl Default for IndexingConfig {
             parallelism: default_parallelism(),
             tantivy_heap_mb: default_tantivy_heap_mb(),
             max_retry_attempts: default_max_retry_attempts(),
-            ignore_patterns: vec![
-                "target/**".to_string(),
-                "node_modules/**".to_string(),
-                ".git/**".to_string(),
-                "*.generated.*".to_string(),
-            ],
+            // No default patterns: `target/**`, `node_modules/**`, `.git/**`,
+            // and `*.generated.*` are already excluded by the default
+            // `.codannaignore` shipped by `codanna init`, so duplicating
+            // them here is redundant now that `ignore_patterns` is live.
+            ignore_patterns: Vec::new(),
             indexed_paths: Vec::new(),
             batch_size: default_batch_size(),
             batches_per_commit: default_batches_per_commit(),
             pipeline_tracing: false,
             show_progress: true,
+            follow_links: false,
         }
     }
 }
@@ -789,8 +796,10 @@ enabled = true
         // Default values should still be present
         assert_eq!(settings.version, 1);
         assert_eq!(settings.mcp.max_context_size, 100_000);
-        // Default ignore patterns should be present
-        assert!(!settings.indexing.ignore_patterns.is_empty());
+        // Default ignore_patterns is empty; the four historically
+        // hard-coded patterns are already covered by the default
+        // `.codannaignore` shipped by `codanna init`.
+        assert!(settings.indexing.ignore_patterns.is_empty());
     }
 
     #[test]
@@ -832,8 +841,8 @@ default = "info"
         assert_eq!(settings.mcp.max_context_size, 50000);
         // Env var overrides logging default
         assert_eq!(settings.logging.default, "debug");
-        // Default ignore patterns should be present
-        assert!(!settings.indexing.ignore_patterns.is_empty());
+        // Default ignore_patterns is empty (see test_partial_config)
+        assert!(settings.indexing.ignore_patterns.is_empty());
 
         // Clean up
         unsafe {

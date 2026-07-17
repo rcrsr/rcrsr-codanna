@@ -153,6 +153,16 @@ pub enum Commands {
         #[arg(long)]
         dry_run: bool,
 
+        /// With --dry-run, list every path (no truncation) instead of the
+        /// default 5-line summary
+        #[arg(long, requires = "dry_run")]
+        list_all: bool,
+
+        /// With --dry-run, print a JSON array of paths to stdout and nothing
+        /// else. Never truncates. Takes precedence over --list-all
+        #[arg(long, requires = "dry_run")]
+        json: bool,
+
         /// Maximum number of files to index
         #[arg(long)]
         max_files: Option<usize>,

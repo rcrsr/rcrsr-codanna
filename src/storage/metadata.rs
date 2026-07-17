@@ -27,6 +27,16 @@ pub struct IndexMetadata {
     /// Used to detect config changes and auto-sync on load
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub indexed_paths: Option<Vec<PathBuf>>,
+
+    /// Fingerprint of the ignore-rule inputs (`.codannaignore`, `.gitignore`,
+    /// `.git/info/exclude`, `indexing.ignore_patterns`, `indexing.follow_links`)
+    /// as of the last index build. Compared against a freshly computed
+    /// fingerprint on load to detect-and-report staleness (never reconciled
+    /// automatically). `None` on metadata written before this field existed,
+    /// or when the fingerprint could not be computed — both report as
+    /// "unknown", not "changed".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore_fingerprint: Option<String>,
 }
 
 /// Describes where the index data came from
@@ -52,6 +62,7 @@ impl Default for IndexMetadata {
             file_count: 0,
             last_modified: crate::indexing::get_utc_timestamp(),
             indexed_paths: None,
+            ignore_fingerprint: None,
         }
     }
 }
@@ -73,6 +84,11 @@ impl IndexMetadata {
     pub fn update_indexed_paths(&mut self, paths: Vec<PathBuf>) {
         self.indexed_paths = Some(paths);
         self.last_modified = crate::indexing::get_utc_timestamp();
+    }
+
+    /// Record the ignore-rule fingerprint computed for the index just built.
+    pub fn update_ignore_fingerprint(&mut self, fingerprint: String) {
+        self.ignore_fingerprint = Some(fingerprint);
     }
 
     /// Save metadata to file

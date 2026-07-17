@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use crate::cli::commands::directories::{SkipReason, add_paths_to_settings};
 use crate::config::Settings;
+use crate::indexing::DryRunOutput;
 use crate::indexing::facade::IndexFacade;
 use crate::storage::IndexPersistence;
 use crate::types::SymbolKind;
@@ -16,6 +17,9 @@ pub struct IndexArgs {
     pub dry_run: bool,
     pub max_files: Option<usize>,
     pub cli_config: Option<PathBuf>,
+    /// `--dry-run` output verbosity (`--list-all` / `--json`). Ignored unless
+    /// `dry_run` is set.
+    pub dry_run_output: DryRunOutput,
 }
 
 /// Run the index command.
@@ -36,6 +40,7 @@ pub fn run(
         dry_run,
         max_files,
         cli_config,
+        dry_run_output,
     } = args;
 
     // Determine paths to index
@@ -55,18 +60,22 @@ pub fn run(
                 if !added_paths.is_empty() {
                     eprintln!("Added {} path(s) to settings.toml", added_paths.len());
                 }
+                // These are informational settings-sync notices, not indexing
+                // results, so they always go to stderr. This keeps `--json`
+                // stdout free of contamination even when a CLI-supplied path
+                // is already covered by (or present in) settings.toml.
                 for skipped in &skipped_paths {
                     match &skipped.reason {
-                        SkipReason::CoveredBy(parent) => println!(
+                        SkipReason::CoveredBy(parent) => eprintln!(
                             "{}: Included in indexed directory {}",
                             skipped.path.display(),
                             parent.display()
                         ),
                         SkipReason::AlreadyPresent if !force => {
-                            println!("{}: Already indexed", skipped.path.display())
+                            eprintln!("{}: Already indexed", skipped.path.display())
                         }
                         SkipReason::AlreadyPresent => {}
-                        SkipReason::FileNotPersisted => println!(
+                        SkipReason::FileNotPersisted => eprintln!(
                             "{}: Ad-hoc indexed (not in settings.toml)",
                             skipped.path.display()
                         ),
@@ -123,7 +132,15 @@ pub fn run(
                 total_indexed += 1;
             }
         } else if path.is_dir() {
-            total_indexed += index_directory(indexer, path, progress, dry_run, force, max_files);
+            total_indexed += index_directory(
+                indexer,
+                path,
+                progress,
+                dry_run,
+                force,
+                max_files,
+                dry_run_output,
+            );
         } else {
             eprintln!("Error: Path does not exist: {}", path.display());
             std::process::exit(1);
@@ -225,6 +242,7 @@ fn index_directory(
     dry_run: bool,
     force: bool,
     max_files: Option<usize>,
+    dry_run_output: DryRunOutput,
 ) -> usize {
     // Visual separator between directory cycles (use stderr to sync with progress bars)
     eprintln!();
@@ -241,7 +259,14 @@ fn index_directory(
     // Track this directory as indexed
     indexer.add_indexed_path(path);
 
-    match indexer.index_directory_with_options(path, progress, dry_run, force, max_files) {
+    match indexer.index_directory_with_options(
+        path,
+        progress,
+        dry_run,
+        force,
+        max_files,
+        dry_run_output,
+    ) {
         Ok(stats) => {
             // Deletions leave the progress trace at zero width; report them
             // explicitly so a cleanup-only run does not read as a no-op.

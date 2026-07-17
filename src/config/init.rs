@@ -128,7 +128,21 @@ impl Settings {
                 result.push_str("\n# Retry attempts for transient file system errors\n");
                 result.push_str("# Exponential backoff: 100ms, 200ms, 400ms delays\n");
             } else if line.starts_with("ignore_patterns = ") {
-                result.push_str("\n# Additional patterns to ignore during indexing\n");
+                result.push_str(
+                    "\n# Additional patterns to ignore during indexing, using the same\n",
+                );
+                result.push_str(
+                    "# gitignore dialect as .codannaignore (supports !, dir/, **, anchoring).\n",
+                );
+                result.push_str(
+                    "# These patterns are additive to .gitignore/.codannaignore, applied\n",
+                );
+                result.push_str(
+                    "# after them: a leading '!' here can re-include a file excluded by an\n",
+                );
+                result
+                    .push_str("# earlier ignore_patterns entry, but NOT one already excluded by\n");
+                result.push_str("# .gitignore or .codannaignore.\n");
             } else if line.starts_with("indexed_paths = ") {
                 result.push_str("\n# List of directories to index\n");
                 result.push_str("# Add folders using: codanna add-dir <path>\n");
@@ -145,6 +159,14 @@ impl Settings {
             } else if line.starts_with("show_progress = ") {
                 result.push_str("\n# Show progress bars during indexing (default: true)\n");
                 result.push_str("# Use --no-progress CLI flag to override\n");
+            } else if line.starts_with("follow_links = ") {
+                result.push_str(
+                    "\n# Follow symlinked directories during indexing (default: false)\n",
+                );
+                result.push_str(
+                    "# When false, symlinked directories are skipped and a warning is logged\n",
+                );
+                result.push_str("# for each one encountered (never silent)\n");
             } else if line == "[mcp]" {
                 result.push_str("\n[mcp]\n");
                 prev_line_was_section = true;
@@ -502,9 +524,11 @@ __pycache__/
 .svn/
 .hg/
 
-# Example of including specific files from ignored directories:
-# !target/doc/
-# !vendor/specific-file.rs
+# Re-including specific files from an ignored directory:
+# gitignore cannot re-include a file whose parent directory is excluded, so
+# exclude the directory's *contents* (dir/*) rather than the directory (dir/).
+# To index target/doc/, change the "target/" line above to "target/*" and add:
+#   !target/doc/
 "#;
 
         std::fs::write(&ignore_path, default_content)?;

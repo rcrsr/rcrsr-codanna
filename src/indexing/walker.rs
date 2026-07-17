@@ -7,8 +7,9 @@
 //! - Hidden file handling
 
 use crate::Settings;
+use crate::error::IndexResult;
+use crate::indexing::walk_config::{build_walker, warn_if_skipped_symlink_dir};
 use crate::parsing::get_registry;
-use ignore::WalkBuilder;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -25,37 +26,19 @@ impl FileWalker {
     }
 
     /// Walk a directory and return an iterator of files to index
-    pub fn walk(&self, root: &Path) -> impl Iterator<Item = PathBuf> {
-        let mut builder = WalkBuilder::new(root);
-
-        // Configure the walker
-        builder
-            .hidden(false) // Don't traverse hidden directories by default
-            .git_ignore(true) // Respect .gitignore files
-            .git_global(true) // Respect global gitignore
-            .git_exclude(true) // Respect .git/info/exclude
-            .follow_links(false) // Don't follow symlinks by default
-            .max_depth(None) // No depth limit
-            .require_git(false); // Allow gitignore to work in non-git directories
-
-        // Always support .codannaignore files for custom ignore patterns (follows .gitignore pattern)
-        builder.add_custom_ignore_filename(".codannaignore");
-
-        // The ignore crate's override feature is for INCLUDING files, not excluding them.
-        // To add custom ignore patterns, we need to use a different approach.
-        // For now, we'll rely on .gitignore and .codannaignore files.
-
-        // TODO: Add support for custom ignore patterns from settings
-        // One approach would be to create a temporary .codanna-ignore file
-        // or use the glob filtering in the iterator below
+    pub fn walk(&self, root: &Path) -> IndexResult<impl Iterator<Item = PathBuf>> {
+        let mut builder = build_walker(&self.settings, root)?;
+        builder.max_depth(None); // No depth limit
 
         // Get enabled extensions from the registry
         let enabled_extensions = self.get_enabled_extensions();
+        let follow_links = self.settings.indexing.follow_links;
 
         // Build and filter the walker
-        builder
+        Ok(builder
             .build()
             .filter_map(Result::ok) // Skip files we can't access
+            .inspect(move |entry| warn_if_skipped_symlink_dir(entry, follow_links))
             .filter(|entry| entry.file_type().is_some_and(|ft| ft.is_file()))
             .filter_map(move |entry| {
                 let path = entry.path();
@@ -79,7 +62,7 @@ impl FileWalker {
                 }
 
                 None
-            })
+            }))
     }
 
     /// Get list of enabled file extensions from the registry
@@ -97,8 +80,8 @@ impl FileWalker {
     }
 
     /// Count files that would be indexed (useful for dry runs)
-    pub fn count_files(&self, root: &Path) -> usize {
-        self.walk(root).count()
+    pub fn count_files(&self, root: &Path) -> IndexResult<usize> {
+        Ok(self.walk(root)?.count())
     }
 }
 
@@ -131,7 +114,7 @@ mod tests {
         let settings = create_test_settings();
         let walker = FileWalker::new(settings);
 
-        let files: Vec<_> = walker.walk(root).collect();
+        let files: Vec<_> = walker.walk(root).unwrap().collect();
 
         // Should find only Rust files (Python and PHP disabled in test settings)
         assert_eq!(files.len(), 2);
@@ -151,7 +134,7 @@ mod tests {
         let settings = create_test_settings();
         let walker = FileWalker::new(settings);
 
-        let files: Vec<_> = walker.walk(root).collect();
+        let files: Vec<_> = walker.walk(root).unwrap().collect();
 
         // Should only find the visible file (hidden files are filtered out)
         assert_eq!(files.len(), 1);
@@ -173,7 +156,7 @@ mod tests {
         let settings = create_test_settings();
         let walker = FileWalker::new(settings);
 
-        let files: Vec<_> = walker.walk(root).collect();
+        let files: Vec<_> = walker.walk(root).unwrap().collect();
 
         // Should only find the included file
         assert_eq!(files.len(), 1);

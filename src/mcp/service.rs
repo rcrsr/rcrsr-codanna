@@ -764,6 +764,34 @@ pub struct IndexInfo {
     pub relationship_count: usize,
     pub symbol_kinds: SymbolKindBreakdown,
     pub semantic_search: SemanticSearchInfo,
+    /// Whether the ignore-rule inputs (`.codannaignore`, `.gitignore`,
+    /// `.git/info/exclude`, `indexing.ignore_patterns`,
+    /// `indexing.follow_links`) have changed since the index was last
+    /// built. `None` means unknown -- either the index predates this field,
+    /// or the fingerprint could not be recomputed -- and must never be
+    /// reported as `Some(true)` ("changed"). Detect-and-report only: this
+    /// does not trigger reindexing or reconciliation (issue #28).
+    pub ignore_rules_changed: Option<bool>,
+}
+
+/// Compares the ignore-rule fingerprint stored at the last index build
+/// against one computed fresh from the facade's current settings/ignore
+/// files. Returns `None` (unknown) rather than `Some(true)` (changed) when
+/// metadata predates this field or the fingerprint cannot be recomputed --
+/// see [`IndexInfo::ignore_rules_changed`].
+pub(crate) fn ignore_rules_changed(facade: &IndexFacade) -> Option<bool> {
+    let metadata = crate::storage::IndexMetadata::load(facade.index_base()).ok()?;
+    let stored_fingerprint = metadata.ignore_fingerprint?;
+
+    let settings = facade.settings();
+    let root = settings
+        .workspace_root
+        .as_deref()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let current_fingerprint =
+        crate::indexing::walk_config::ignore_fingerprint(settings, root).ok()?;
+
+    Some(current_fingerprint != stored_fingerprint)
 }
 
 /// Build the `get_index_info` JSON data payload.
@@ -813,6 +841,7 @@ pub fn index_info_data(facade: &IndexFacade) -> IndexInfo {
             traits,
         },
         semantic_search,
+        ignore_rules_changed: ignore_rules_changed(facade),
     }
 }
 

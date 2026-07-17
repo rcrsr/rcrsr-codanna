@@ -52,6 +52,23 @@ pub struct IndexingStats {
     pub symbols_removed: usize,
 }
 
+/// Output verbosity for `index --dry-run`.
+///
+/// A dedicated enum instead of two more bool parameters on
+/// `index_directory_with_options`: `list_all` and `json` are not independent
+/// (`--json` wins over `--list-all`), so a bool pair would admit an
+/// unrepresentable/ambiguous combination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DryRunOutput {
+    /// Default: human-readable summary, truncated at 5 paths.
+    #[default]
+    Summary,
+    /// `--list-all`: every path, one per line, no truncation.
+    ListAll,
+    /// `--json`: a JSON array of path strings to stdout, nothing else.
+    Json,
+}
+
 /// Statistics for sync operations
 #[derive(Debug, Clone, Default)]
 pub struct SyncStats {
@@ -1138,13 +1155,14 @@ impl IndexFacade {
         dry_run: bool,
         force: bool,
         max_files: Option<usize>,
+        dry_run_output: DryRunOutput,
     ) -> crate::IndexResult<crate::indexing::progress::IndexStats> {
         use crate::indexing::FileWalker;
         use crate::indexing::progress::IndexStats;
 
         let dir = dir.as_ref();
         let walker = FileWalker::new(Arc::clone(&self.settings));
-        let files: Vec<_> = walker.walk(dir).collect();
+        let files: Vec<_> = walker.walk(dir)?.collect();
 
         // Apply max_files limit if specified
         let files = if let Some(max) = max_files {
@@ -1157,13 +1175,38 @@ impl IndexFacade {
 
         // Handle dry-run mode
         if dry_run {
-            println!("Would index {total_files} files:");
-            for (i, file_path) in files.iter().enumerate() {
-                if i < 5 {
-                    println!("  {}", file_path.display());
-                } else if i == 5 && total_files > 5 {
-                    println!("  ... and {} more files", total_files - 5);
-                    break;
+            match dry_run_output {
+                DryRunOutput::Json => {
+                    // `--json` prints nothing but the array itself: a truncated
+                    // JSON array would repeat the very bug this flag exists to fix.
+                    let paths: Vec<String> =
+                        files.iter().map(|p| p.display().to_string()).collect();
+                    // Never substitute an empty array on failure: printing "no
+                    // files" when the walk found some is the class of silent lie
+                    // this flag exists to eliminate.
+                    let json = serde_json::to_string(&paths).map_err(|e| {
+                        IndexError::General(format!(
+                            "failed to serialize dry-run file list as JSON: {e}"
+                        ))
+                    })?;
+                    println!("{json}");
+                }
+                DryRunOutput::ListAll => {
+                    println!("Would index {total_files} files:");
+                    for file_path in &files {
+                        println!("  {}", file_path.display());
+                    }
+                }
+                DryRunOutput::Summary => {
+                    println!("Would index {total_files} files:");
+                    for (i, file_path) in files.iter().enumerate() {
+                        if i < 5 {
+                            println!("  {}", file_path.display());
+                        } else if i == 5 && total_files > 5 {
+                            println!("  ... and {} more files", total_files - 5);
+                            break;
+                        }
+                    }
                 }
             }
 
@@ -1243,7 +1286,7 @@ impl IndexFacade {
             let file_count = if progress {
                 use crate::indexing::FileWalker;
                 let walker = FileWalker::new(Arc::clone(&self.settings));
-                walker.walk(path).count()
+                walker.walk(path)?.count()
             } else {
                 0
             };
