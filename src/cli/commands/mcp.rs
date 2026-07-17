@@ -595,6 +595,13 @@ pub async fn run(
                 .and_then(|v| v.as_u64())
                 .unwrap_or(5) as usize;
 
+            // Both the auto-sync loop and the search below read collection
+            // definitions from this single `Arc<Settings>` (rather than the
+            // separately-passed `config` parameter), so the two steps can
+            // never observe different collection definitions even if
+            // `facade` and `config` diverge in the future.
+            let settings = std::sync::Arc::clone(facade.settings());
+
             // Auto-sync: brief write guard scoped to the collection scan
             // only, dropped before searching (mirrors the MCP tool call
             // sites in mcp/tools/search.rs). `index_collection` performs
@@ -604,7 +611,6 @@ pub async fn run(
             // than doing that work directly on the async worker while the
             // write lock is held.
             {
-                let settings = std::sync::Arc::clone(facade.settings());
                 for (name, coll_config) in &settings.documents.collections {
                     let owned_guard = std::sync::Arc::clone(store_arc).write_owned().await;
                     let coll_config = coll_config.clone();
@@ -621,7 +627,7 @@ pub async fn run(
                             tracing::warn!(target: "rag", "auto-sync failed for collection '{}': {}", name, e);
                         }
                         Err(e) => {
-                            tracing::warn!(target: "rag", "auto-sync failed for collection '{}': blocking task join error: {}", name, e);
+                            tracing::warn!(target: "rag", "auto-sync failed for collection '{}': {}", name, crate::utils::describe_join_error(&e));
                         }
                         Ok(Ok(_)) => {}
                     }
@@ -633,12 +639,12 @@ pub async fn run(
             // candidate vector against it, so — like the auto-sync loop
             // above — it must not run directly on the async worker. The
             // owned read guard is moved into `spawn_blocking` (mirroring
-            // `reindex_locked` in `indexing/facade.rs`). `config` is cloned
-            // (rather than an `Arc<Settings>` clone as in
-            // `server.rs:434-437`) because this function only has a plain
-            // `&Settings` reference, not a lock guard, to release first.
+            // `reindex_locked` in `indexing/facade.rs`). `settings` is the
+            // same `Arc<Settings>` used by the auto-sync loop above, so
+            // search always observes the collection definitions it just
+            // synced against.
             let owned_guard = std::sync::Arc::clone(store_arc).read_owned().await;
-            let settings = config.clone();
+            let settings = std::sync::Arc::clone(&settings);
             let query_owned = query.clone();
             let join_result = tokio::task::spawn_blocking(move || {
                 let store = owned_guard;
@@ -658,7 +664,10 @@ pub async fn run(
                 Err(e) => exit_index_error(
                     EntityType::Document,
                     &query,
-                    format!("blocking task join error: {e}. Retry 'codanna mcp search_documents'."),
+                    format!(
+                        "{}. Retry 'codanna mcp search_documents'.",
+                        crate::utils::describe_join_error(&e)
+                    ),
                 ),
             }
         } else {

@@ -1548,11 +1548,7 @@ pub(crate) async fn reindex_locked(
 /// an `IndexError`, distinguishing cancellation (e.g. runtime shutdown) from
 /// an actual panic inside the task.
 fn map_reindex_join_error(e: tokio::task::JoinError) -> IndexError {
-    if e.is_cancelled() {
-        IndexError::General("reindex task was cancelled".to_string())
-    } else {
-        IndexError::General(format!("reindex task panicked: {e}"))
-    }
+    IndexError::General(format!("reindex {}", crate::utils::describe_join_error(&e)))
 }
 
 // ── Embedding backend factory ──────────────────────────────────────────────

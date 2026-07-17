@@ -469,7 +469,8 @@ impl CodeIntelligenceServer {
                 McpError::new(
                     ErrorCode::INTERNAL_ERROR,
                     format!(
-                        "Document reindex failed for collection '{name}': blocking task join error: {e}"
+                        "Document reindex failed for collection '{name}': {}",
+                        crate::utils::describe_join_error(&e)
                     ),
                     None,
                 )

@@ -986,7 +986,16 @@ impl CodeIntelligenceServer {
             }
         };
 
-        let indexer = self.facade.read().await;
+        // Only `Arc<Settings>` is needed for auto-sync and search below, so
+        // clone it and drop the facade read guard immediately rather than
+        // holding it across the auto-sync loop's `spawn_blocking` awaits.
+        // That would otherwise unnecessarily block any operation needing a
+        // facade write lock (e.g. reindex) for the duration of document
+        // sync.
+        let settings = {
+            let indexer = self.facade.read().await;
+            std::sync::Arc::clone(indexer.settings())
+        };
 
         // Auto-sync: check for file changes in all collections before
         // searching. This is the only step that needs exclusive access to
@@ -994,7 +1003,6 @@ impl CodeIntelligenceServer {
         // only and dropped before searching (see the concurrency contract
         // documented in RCSR-README.md).
         {
-            let settings = std::sync::Arc::clone(indexer.settings());
             for (name, config) in &settings.documents.collections {
                 // `index_collection` performs blocking file I/O, tantivy
                 // commits, and embedding generation, so the owned write
@@ -1017,7 +1025,7 @@ impl CodeIntelligenceServer {
                         tracing::warn!(target: "rag", "auto-sync failed for collection '{}': {}", name, e);
                     }
                     Err(e) => {
-                        tracing::warn!(target: "rag", "auto-sync failed for collection '{}': blocking task join error: {}", name, e);
+                        tracing::warn!(target: "rag", "auto-sync failed for collection '{}': {}", name, crate::utils::describe_join_error(&e));
                     }
                     Ok(Ok(_)) => {}
                 }
@@ -1027,12 +1035,6 @@ impl CodeIntelligenceServer {
         if let Some(tx) = search_phase_started {
             let _ = tx.send(());
         }
-
-        // Clone the `Arc<Settings>` and drop the facade read guard here
-        // (mirroring `run_document_reindex` at `server.rs:434-437`), so the
-        // facade lock is not held across the blocking search below.
-        let settings = std::sync::Arc::clone(indexer.settings());
-        drop(indexer);
 
         let search_query = DocSearchQuery {
             text: query.clone(),
@@ -1058,7 +1060,8 @@ impl CodeIntelligenceServer {
             Ok(result) => result,
             Err(e) => {
                 let message = format!(
-                    "Document search failed: blocking task join error: {e}. Retry 'search_documents'."
+                    "Document search failed: {}. Retry 'search_documents'.",
+                    crate::utils::describe_join_error(&e)
                 );
                 if output_format == OutputFormat::Json {
                     let envelope: Envelope<()> = Envelope::error(ResultCode::IndexError, message)
@@ -1478,12 +1481,14 @@ mod search_documents_concurrency_tests {
     ///
     /// Uses [`build_server_with_generator`] (a `MockEmbeddingGenerator`,
     /// production-shaped configuration) rather than the generator-less
-    /// [`build_server`): with a generator configured, `search` runs
+    /// [`build_server`]: with a generator configured, `search` runs
     /// `generate_embeddings` -> `score_by_similarity` -> `read_vector`
-    /// instead of short-circuiting into `enrich_results`, so this is also a
-    /// provenance check for the vector-layer read lock -- on unfixed code,
-    /// the concurrent `try_read()` sampling below contends with the
-    /// vector-layer's own exclusive lock during that scoring step.
+    /// instead of short-circuiting into `enrich_results`, exercising the
+    /// production-shaped `search` path. The discrimination for the
+    /// vector-layer's own exclusive lock lives in
+    /// `test_concurrent_read_vector_progresses_under_shared_lock`
+    /// (`src/vector/storage.rs`), which holds the shared guard directly and
+    /// would deadlock on unfixed code; this test does not observe that lock.
     ///
     /// Uses [`fixture_settings_with_varied_embeddings`] (16 files, one per
     /// keyword-presence combination `MockEmbeddingGenerator` recognizes)
