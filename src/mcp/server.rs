@@ -451,18 +451,37 @@ impl CodeIntelligenceServer {
         // interleave between collections instead of being blocked for the
         // entire reindex.
         for (name, config) in &settings.documents.collections {
-            let stats = {
-                let mut store = store_arc.write().await;
-                store
-                    .index_collection(name, config, &settings.documents.defaults)
-                    .map_err(|e| {
-                        McpError::new(
-                            ErrorCode::INTERNAL_ERROR,
-                            format!("Document reindex failed for collection '{name}': {e}"),
-                            None,
-                        )
-                    })?
-            };
+            // `index_collection` performs blocking file I/O, tantivy commits,
+            // and embedding generation, so the owned write guard is moved
+            // into `spawn_blocking` (mirroring `reindex_locked` in
+            // `indexing/facade.rs`) rather than doing that work directly on
+            // the async worker while the write lock is held.
+            let owned_guard = Arc::clone(store_arc).write_owned().await;
+            let config = config.clone();
+            let defaults = settings.documents.defaults.clone();
+            let name_owned = name.clone();
+            let stats = tokio::task::spawn_blocking(move || {
+                let mut store = owned_guard;
+                store.index_collection(&name_owned, &config, &defaults)
+            })
+            .await
+            .map_err(|e| {
+                McpError::new(
+                    ErrorCode::INTERNAL_ERROR,
+                    format!(
+                        "Document reindex failed for collection '{name}': {}",
+                        crate::utils::describe_join_error(&e)
+                    ),
+                    None,
+                )
+            })?
+            .map_err(|e| {
+                McpError::new(
+                    ErrorCode::INTERNAL_ERROR,
+                    format!("Document reindex failed for collection '{name}': {e}"),
+                    None,
+                )
+            })?;
 
             totals.collections += 1;
             totals.files_processed += stats.files_processed;

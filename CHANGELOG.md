@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **MCP agent-workflow tooling:** Structured JSON envelopes, batch lookups, scoped reads, canonical name parameters, and find_callers role classification. ([#19](https://github.com/rcrsr/rcrsr-codanna/pull/19))
 - **Release 1 batch:** Document-collection indexing, proxy hot-reload notifications with idle shutdown, and parallel-safe search_documents. ([#20](https://github.com/rcrsr/rcrsr-codanna/pull/20))
 
+### Fixed
+
+- **Vector read-path concurrency:** Concurrent document searches no longer serialize on exclusive locks; blocking work runs off the async runtime. ([#32](https://github.com/rcrsr/rcrsr-codanna/pull/32))
+
 ## [0.9.23] - 2026-07-03
 
 Resolver precision release. Resolved-relationship counts drop across the board, and the drop is the fix: method-call edges that resolve now target the call site's actual receiver, method calls whose receiver type cannot be named return nothing instead of a guess, and resolution output is deterministic run to run. On the recall side, Python imports resolve across package boundaries and re-exports, and `super()` calls resolve to the parent's method instead of the caller's own override.

@@ -595,26 +595,80 @@ pub async fn run(
                 .and_then(|v| v.as_u64())
                 .unwrap_or(5) as usize;
 
+            // Both the auto-sync loop and the search below read collection
+            // definitions from this single `Arc<Settings>` (rather than the
+            // separately-passed `config` parameter), so the two steps can
+            // never observe different collection definitions even if
+            // `facade` and `config` diverge in the future.
+            let settings = std::sync::Arc::clone(facade.settings());
+
             // Auto-sync: brief write guard scoped to the collection scan
             // only, dropped before searching (mirrors the MCP tool call
-            // sites in mcp/tools/search.rs).
+            // sites in mcp/tools/search.rs). `index_collection` performs
+            // blocking file I/O, tantivy commits, and embedding generation,
+            // so the owned write guard is moved into `spawn_blocking`
+            // (mirroring `reindex_locked` in `indexing/facade.rs`) rather
+            // than doing that work directly on the async worker while the
+            // write lock is held.
             {
-                let mut sync_guard = store_arc.write().await;
-                for (name, coll_config) in &config.documents.collections {
-                    if let Err(e) =
-                        sync_guard.index_collection(name, coll_config, &config.documents.defaults)
-                    {
-                        tracing::warn!(target: "rag", "auto-sync failed for collection '{}': {}", name, e);
+                for (name, coll_config) in &settings.documents.collections {
+                    let owned_guard = std::sync::Arc::clone(store_arc).write_owned().await;
+                    let coll_config = coll_config.clone();
+                    let defaults = settings.documents.defaults.clone();
+                    let name_owned = name.clone();
+                    let join_result = tokio::task::spawn_blocking(move || {
+                        let mut store = owned_guard;
+                        store.index_collection(&name_owned, &coll_config, &defaults)
+                    })
+                    .await;
+
+                    match join_result {
+                        Ok(Err(e)) => {
+                            tracing::warn!(target: "rag", "auto-sync failed for collection '{}': {}", name, e);
+                        }
+                        Err(e) => {
+                            tracing::warn!(target: "rag", "auto-sync failed for collection '{}': {}", name, crate::utils::describe_join_error(&e));
+                        }
+                        Ok(Ok(_)) => {}
                     }
                 }
             }
 
-            let store = store_arc.read().await;
-            match crate::mcp::service::search_documents_data(
-                &store, config, &query, collection, limit,
-            ) {
-                Ok(results) => Some((query, results)),
-                Err(e) => exit_index_error(EntityType::Document, &query, e),
+            // `search_documents_data` embeds the query text (an ONNX
+            // forward pass through `generate_embeddings`) and scores every
+            // candidate vector against it, so — like the auto-sync loop
+            // above — it must not run directly on the async worker. The
+            // owned read guard is moved into `spawn_blocking` (mirroring
+            // `reindex_locked` in `indexing/facade.rs`). `settings` is the
+            // same `Arc<Settings>` used by the auto-sync loop above, so
+            // search always observes the collection definitions it just
+            // synced against.
+            let owned_guard = std::sync::Arc::clone(store_arc).read_owned().await;
+            let settings = std::sync::Arc::clone(&settings);
+            let query_owned = query.clone();
+            let join_result = tokio::task::spawn_blocking(move || {
+                let store = owned_guard;
+                crate::mcp::service::search_documents_data(
+                    &store,
+                    &settings,
+                    &query_owned,
+                    collection,
+                    limit,
+                )
+            })
+            .await;
+
+            match join_result {
+                Ok(Ok(results)) => Some((query, results)),
+                Ok(Err(e)) => exit_index_error(EntityType::Document, &query, e),
+                Err(e) => exit_index_error(
+                    EntityType::Document,
+                    &query,
+                    format!(
+                        "{}. Retry 'codanna mcp search_documents'.",
+                        crate::utils::describe_join_error(&e)
+                    ),
+                ),
             }
         } else {
             None

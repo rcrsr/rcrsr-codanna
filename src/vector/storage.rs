@@ -247,6 +247,27 @@ impl MmapVectorStorage {
     #[must_use]
     pub fn read_vector(&mut self, id: VectorId) -> Option<Vec<f32>> {
         self.ensure_mapped().ok()?;
+        self.read_vector_mapped(id)
+    }
+
+    /// Returns `true` if the storage currently has a live memory map.
+    ///
+    /// The map is absent after [`Self::new`]/[`Self::open_or_create`] (on a
+    /// fresh file), after [`Clone`], and after every [`Self::write_batch`]
+    /// (which invalidates the map before touching the file). It becomes
+    /// present again on the next successful read.
+    #[must_use]
+    pub(crate) fn is_mapped(&self) -> bool {
+        self.mmap.is_some()
+    }
+
+    /// Reads a vector by its ID using the existing memory map only.
+    ///
+    /// Returns `None` if the storage is not currently mapped or the vector
+    /// is not found. Callers that need the mapping to be lazily established
+    /// must use [`Self::read_vector`] instead.
+    #[must_use]
+    pub(crate) fn read_vector_mapped(&self, id: VectorId) -> Option<Vec<f32>> {
         let mmap = self.mmap.as_ref()?;
 
         let dimension = self.dimension.get();
@@ -478,13 +499,24 @@ impl ConcurrentVectorStorage {
 
     /// Reads a vector by ID.
     ///
-    /// Despite `&self`, this takes the inner lock **exclusively**
-    /// (`self.inner.write()`), not for shared access: `MmapVectorStorage::read_vector`
-    /// needs `&mut self` for its one-time lazy `ensure_mapped()` mmap setup, so every
-    /// call — even after the mapping is warm — serializes on the same write guard.
-    /// Concurrent callers of `read_vector` do not make progress against each other.
+    /// Takes the inner lock **shared** (`self.inner.read()`) in the common
+    /// case: once the storage is mapped, concurrent readers make progress
+    /// against each other without serializing. The exclusive path is only
+    /// taken once per map lifetime, to lazily establish (or re-establish,
+    /// after a write invalidates it) the memory map.
     #[must_use]
     pub fn read_vector(&self, id: VectorId) -> Option<Vec<f32>> {
+        {
+            let guard = self.inner.read();
+            if guard.is_mapped() {
+                return guard.read_vector_mapped(id);
+            }
+        }
+
+        // Not mapped: fall back to an exclusive guard to establish the map.
+        // Another thread may have won the race and already mapped it by the
+        // time we acquire the write lock; `read_vector` handles that case
+        // idempotently (`ensure_mapped` is a no-op when already mapped).
         self.inner.write().read_vector(id)
     }
 
@@ -743,6 +775,131 @@ mod tests {
         assert!(
             median_nanos < 100_000,
             "Read performance should be <100μs in test environment"
+        );
+    }
+
+    #[test]
+    fn test_is_mapped_false_after_write_batch() {
+        let temp_dir = TempDir::new().unwrap();
+        let segment = SegmentOrdinal::new(0);
+        let dimension = VectorDimension::new(4).unwrap();
+
+        let mut storage = MmapVectorStorage::open_or_create(&temp_dir, segment, dimension).unwrap();
+        assert!(!storage.is_mapped());
+
+        let first = [(VectorId::new(1).unwrap(), vec![1.0f32, 2.0, 3.0, 4.0])];
+        let batch: Vec<(VectorId, &[f32])> =
+            first.iter().map(|(id, v)| (*id, v.as_slice())).collect();
+        storage.write_batch(&batch).unwrap();
+
+        // Warm the map.
+        assert!(storage.read_vector(VectorId::new(1).unwrap()).is_some());
+        assert!(storage.is_mapped());
+
+        // write_batch must invalidate the map before touching the file.
+        let second = [(VectorId::new(2).unwrap(), vec![5.0f32, 6.0, 7.0, 8.0])];
+        let batch: Vec<(VectorId, &[f32])> =
+            second.iter().map(|(id, v)| (*id, v.as_slice())).collect();
+        storage.write_batch(&batch).unwrap();
+        assert!(!storage.is_mapped());
+
+        // Completing the chain: reading the vector written while unmapped
+        // proves the next read re-established the map rather than serving a
+        // stale one. Asserting invalidation alone would also hold for a map
+        // that was dropped and never rebuilt.
+        assert_eq!(
+            storage.read_vector(VectorId::new(2).unwrap()),
+            Some(vec![5.0f32, 6.0, 7.0, 8.0]),
+            "post-write read must return the newly written vector, proving a re-map"
+        );
+        assert!(storage.is_mapped());
+    }
+
+    #[test]
+    fn test_concurrent_read_vector_progresses_under_shared_lock() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let temp_dir = TempDir::new().unwrap();
+        let segment = SegmentOrdinal::new(0);
+        let dimension = VectorDimension::new(4).unwrap();
+
+        let mut storage = MmapVectorStorage::open_or_create(&temp_dir, segment, dimension).unwrap();
+        let test_data = [(VectorId::new(1).unwrap(), vec![1.0f32, 2.0, 3.0, 4.0])];
+        let batch: Vec<(VectorId, &[f32])> = test_data
+            .iter()
+            .map(|(id, v)| (*id, v.as_slice()))
+            .collect();
+        storage.write_batch(&batch).unwrap();
+        // Warm the map so the shared-lock fast path is taken below.
+        assert!(storage.read_vector(VectorId::new(1).unwrap()).is_some());
+        // Anti-shadow: prove the concurrent read below is served by the
+        // shared-guard path and not by the cold `inner.write()` fallback,
+        // which would make the assertion pass for the wrong reason.
+        assert!(
+            storage.is_mapped(),
+            "storage must be mapped before the concurrent read, so the shared-lock path is the one under test"
+        );
+
+        let concurrent = ConcurrentVectorStorage::new(storage);
+
+        // Hold a shared (read) guard on the inner lock for the duration of
+        // the concurrent read below. If `read_vector` still required the
+        // exclusive guard, this would deadlock and the join would time out.
+        let _held_read_guard = concurrent.inner.read();
+
+        let (tx, rx) = mpsc::channel();
+        let concurrent_clone = ConcurrentVectorStorage {
+            inner: concurrent.inner.clone(),
+        };
+        let handle = std::thread::spawn(move || {
+            let start = Instant::now();
+            let result = concurrent_clone.read_vector(VectorId::new(1).unwrap());
+            tx.send((result, start.elapsed())).unwrap();
+        });
+
+        let (result, elapsed) = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("concurrent read_vector did not complete before the 2s deadline");
+        handle.join().unwrap();
+
+        assert_eq!(result, Some(vec![1.0, 2.0, 3.0, 4.0]));
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "concurrent read took too long: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn test_concurrent_read_vector_sees_updated_data_after_remap() {
+        let temp_dir = TempDir::new().unwrap();
+        let segment = SegmentOrdinal::new(0);
+        let dimension = VectorDimension::new(4).unwrap();
+
+        let mut storage = MmapVectorStorage::open_or_create(&temp_dir, segment, dimension).unwrap();
+        let first = [(VectorId::new(1).unwrap(), vec![1.0f32, 2.0, 3.0, 4.0])];
+        let batch: Vec<(VectorId, &[f32])> =
+            first.iter().map(|(id, v)| (*id, v.as_slice())).collect();
+        storage.write_batch(&batch).unwrap();
+
+        let concurrent = ConcurrentVectorStorage::new(storage);
+
+        // Warm the map via the shared-lock path.
+        assert_eq!(
+            concurrent.read_vector(VectorId::new(1).unwrap()),
+            Some(vec![1.0, 2.0, 3.0, 4.0])
+        );
+
+        // A write invalidates the map; the next read must re-establish it
+        // and observe the newly written vector, not stale mapped data.
+        let second = [(VectorId::new(2).unwrap(), vec![9.0f32, 10.0, 11.0, 12.0])];
+        let batch: Vec<(VectorId, &[f32])> =
+            second.iter().map(|(id, v)| (*id, v.as_slice())).collect();
+        concurrent.write_batch(&batch).unwrap();
+
+        assert_eq!(
+            concurrent.read_vector(VectorId::new(2).unwrap()),
+            Some(vec![9.0, 10.0, 11.0, 12.0])
         );
     }
 }

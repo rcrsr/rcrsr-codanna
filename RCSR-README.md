@@ -188,38 +188,36 @@ guard, and both scope it as narrowly as possible:
   `DocumentStore::search` itself only needs read access, so the search step
   runs under a read guard and concurrent `search_documents` calls make
   progress against each other at the `DocumentStore` level instead of
-  serializing there.
+  serializing there. This holds through the vector storage layer underneath
+  too: `ConcurrentVectorStorage::read_vector` takes its inner lock shared in
+  the common (already-mapped) case, so concurrent similarity scoring no
+  longer serializes on an exclusive vector-storage lock, and the embedding
+  call ahead of it runs inside `spawn_blocking` rather than directly on the
+  async task, so it no longer blocks the runtime worker thread while it
+  runs. Concurrent embedding generation itself still serializes — one
+  `FastEmbedGenerator` holds a single `TextEmbedding` behind one `Mutex`
+  (`src/vector/embedding.rs`), so only one caller can run inference at a
+  time — but callers now queue on a blocking-pool thread instead of stalling
+  the async runtime.
 - **A force reindex's brief write-lock phases** (see above): phase 1 and
   phase 3 each hold the index write lock briefly; the walk in between runs
   off-lock. While the walk is in flight, readers may transiently observe a
   repopulating index (some symbols reindexed, others not yet) until phase 3
   completes.
 
-**Known limitation — vector-layer read lock.** The "make progress against
-each other" claim above is scoped to `DocumentStore`'s own locking; it does
-not extend through the vector storage layer underneath. When an embedding
-generator is configured (the production default), `DocumentStore`'s
-similarity scoring reads vectors via `ConcurrentVectorStorage::read_vector`,
-which takes an *exclusive* lock per call (see that method's doc comment in
-`src/vector/storage.rs`) rather than a shared one, so concurrent
-`search_documents` calls serialize on that lock while scoring candidates.
-Separately, `FastEmbedGenerator::generate_embeddings` runs blocking ONNX
-inference under a `std::sync::Mutex` with no `spawn_blocking`, so concurrent
-embedding generation also serializes and can block the async runtime worker
-thread while it runs. Both are known limitations of the current vector layer,
-tracked for a future fix rather than addressed in this change.
-
-**Known limitation — `reindex documents:true` runs synchronously per
+**Known limitation — `reindex documents:true` holds a write guard per
 collection.** The `reindex` tool's document pass takes the same exclusive
 write guard as the auto-sync above, scoped per collection (acquired and
-dropped once per collection rather than once for the whole reindex), but each
+dropped once per collection rather than once for the whole reindex). Each
 collection's own work — reading files from disk, committing to Tantivy, and
-generating embeddings — still runs synchronously on the async task, without
-`spawn_blocking`. A large collection can therefore hold the write guard for
-that collection's full duration and block the async runtime worker thread
-while doing so. This is bounded to one collection at a time rather than the
-entire reindex, but is not "brief" in the same sense as the two operations
-above; tracked for a future fix.
+generating embeddings — runs inside `spawn_blocking`, so it no longer blocks
+an async runtime worker thread; unrelated async work continues to make
+progress while a reindex is in flight. The write guard itself, however, is
+still held for that collection's full duration (`index_collection` needs
+`&mut DocumentStore`), so document searches against *that* collection wait
+until it finishes. This is bounded to one collection at a time rather than
+the entire reindex, but is not "brief" in the same sense as the two
+operations above.
 
 ## Catch-up reindex on watch-queue overflow
 
