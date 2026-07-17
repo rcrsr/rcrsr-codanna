@@ -994,13 +994,32 @@ impl CodeIntelligenceServer {
         // only and dropped before searching (see the concurrency contract
         // documented in RCSR-README.md).
         {
-            let mut sync_guard = store.write().await;
-            let settings = indexer.settings();
+            let settings = std::sync::Arc::clone(indexer.settings());
             for (name, config) in &settings.documents.collections {
-                if let Err(e) =
-                    sync_guard.index_collection(name, config, &settings.documents.defaults)
-                {
-                    tracing::warn!(target: "rag", "auto-sync failed for collection '{}': {}", name, e);
+                // `index_collection` performs blocking file I/O, tantivy
+                // commits, and embedding generation, so the owned write
+                // guard is moved into `spawn_blocking` (mirroring
+                // `reindex_locked` in `indexing/facade.rs`) rather than
+                // doing that work directly on the async worker while the
+                // write lock is held.
+                let owned_guard = std::sync::Arc::clone(store).write_owned().await;
+                let config = config.clone();
+                let defaults = settings.documents.defaults.clone();
+                let name_owned = name.clone();
+                let join_result = tokio::task::spawn_blocking(move || {
+                    let mut store = owned_guard;
+                    store.index_collection(&name_owned, &config, &defaults)
+                })
+                .await;
+
+                match join_result {
+                    Ok(Err(e)) => {
+                        tracing::warn!(target: "rag", "auto-sync failed for collection '{}': {}", name, e);
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "rag", "auto-sync failed for collection '{}': blocking task join error: {}", name, e);
+                    }
+                    Ok(Ok(_)) => {}
                 }
             }
         }
@@ -1009,68 +1028,87 @@ impl CodeIntelligenceServer {
             let _ = tx.send(());
         }
 
-        if output_format == OutputFormat::Json {
-            let store = store.read().await;
-            return Ok(
-                match service::search_documents_data(
-                    &store,
-                    indexer.settings(),
-                    &query,
-                    collection,
-                    limit as usize,
-                ) {
-                    Ok(results) => {
-                        let count = results.len();
-                        let envelope = if count == 0 {
-                            Envelope::<Vec<crate::documents::SearchResult>>::not_found(format!(
-                                "No documents found for '{query}'"
-                            ))
-                            .with_entity_type(EntityType::Document)
-                            .with_query(&query)
-                        } else {
-                            Envelope::success(results)
-                                .with_entity_type(EntityType::Document)
-                                .with_count(count)
-                                .with_query(&query)
-                                .with_message(format!("Found {count} matching documents"))
-                                .with_hint(
-                                    "Use the file paths and byte ranges to read specific sections",
-                                )
-                        };
-                        json_result(envelope)
-                    }
-                    Err(e) => {
-                        let envelope: Envelope<()> = Envelope::error(
-                            ResultCode::IndexError,
-                            format!("Document search failed: {e}"),
-                        )
-                        .with_entity_type(EntityType::Document)
-                        .with_query(&query);
-                        json_result(envelope)
-                    }
-                },
-            );
-        }
+        // Clone the `Arc<Settings>` and drop the facade read guard here
+        // (mirroring `run_document_reindex` at `server.rs:434-437`), so the
+        // facade lock is not held across the blocking search below.
+        let settings = std::sync::Arc::clone(indexer.settings());
+        drop(indexer);
 
-        // Auto-sync already ran above (write guard scoped to the sync loop
-        // and already dropped). `DocumentStore::search` only needs `&self`,
-        // so the search itself runs under a read guard, letting concurrent
-        // `search_documents` calls make progress against each other.
         let search_query = DocSearchQuery {
             text: query.clone(),
             collection,
             document: None,
             limit: limit as usize,
-            preview_config: Some(indexer.settings().documents.search.clone()),
+            preview_config: Some(settings.documents.search.clone()),
         };
 
-        let store = store.read().await;
-        match store.search(search_query) {
+        // `DocumentStore::search` embeds the query text (an ONNX forward
+        // pass through `generate_embeddings`) and scores every candidate
+        // vector against it, so — like the auto-sync loop above — it must
+        // not run directly on the async worker. The owned read guard is
+        // moved into `spawn_blocking` (mirroring `reindex_locked` in
+        // `indexing/facade.rs`), letting concurrent `search_documents`
+        // calls still make progress against each other via the shared
+        // read lock while this one runs on a blocking thread.
+        let owned_guard = std::sync::Arc::clone(store).read_owned().await;
+        let join_result =
+            tokio::task::spawn_blocking(move || owned_guard.search(search_query)).await;
+
+        let results = match join_result {
+            Ok(result) => result,
+            Err(e) => {
+                let message = format!(
+                    "Document search failed: blocking task join error: {e}. Retry 'search_documents'."
+                );
+                if output_format == OutputFormat::Json {
+                    let envelope: Envelope<()> = Envelope::error(ResultCode::IndexError, message)
+                        .with_entity_type(EntityType::Document)
+                        .with_query(&query);
+                    return Ok(json_result(envelope));
+                }
+                return Ok(CallToolResult::error(vec![ContentBlock::text(message)]));
+            }
+        };
+
+        if output_format == OutputFormat::Json {
+            return Ok(match results {
+                Ok(results) => {
+                    let count = results.len();
+                    let envelope = if count == 0 {
+                        Envelope::<Vec<crate::documents::SearchResult>>::not_found(format!(
+                            "No documents found for '{query}'"
+                        ))
+                        .with_entity_type(EntityType::Document)
+                        .with_query(&query)
+                    } else {
+                        Envelope::success(results)
+                            .with_entity_type(EntityType::Document)
+                            .with_count(count)
+                            .with_query(&query)
+                            .with_message(format!("Found {count} matching documents"))
+                            .with_hint(
+                                "Use the file paths and byte ranges to read specific sections",
+                            )
+                    };
+                    json_result(envelope)
+                }
+                Err(e) => {
+                    let envelope: Envelope<()> = Envelope::error(
+                        ResultCode::IndexError,
+                        format!("Document search failed: {e}"),
+                    )
+                    .with_entity_type(EntityType::Document)
+                    .with_query(&query);
+                    json_result(envelope)
+                }
+            });
+        }
+
+        match results {
             Ok(results) => {
                 if results.is_empty() {
                     let mut output = format!("No documents found for: {query}");
-                    if let Some(guidance) =
-                        generate_mcp_guidance(indexer.settings(), "search_documents", 0)
+                    if let Some(guidance) = generate_mcp_guidance(&settings, "search_documents", 0)
                     {
                         output.push_str("\n\n---\nGuidance: ");
                         output.push_str(&guidance);
@@ -1105,7 +1143,7 @@ impl CodeIntelligenceServer {
                 }
 
                 if let Some(guidance) =
-                    generate_mcp_guidance(indexer.settings(), "search_documents", results.len())
+                    generate_mcp_guidance(&settings, "search_documents", results.len())
                 {
                     output.push_str("\n---\nGuidance: ");
                     output.push_str(&guidance);
@@ -1127,9 +1165,12 @@ mod search_documents_concurrency_tests {
     use crate::config::Settings;
     use crate::documents::{CollectionConfig, DocumentStore};
     use crate::indexing::facade::IndexFacade;
+    use crate::mcp::requests::ReindexRequest;
     use crate::mcp::server::CodeIntelligenceServer;
-    use crate::vector::VectorDimension;
+    use crate::vector::{EmbeddingGenerator, MockEmbeddingGenerator, VectorDimension, VectorError};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
     use tempfile::TempDir;
 
     fn text_of(result: &CallToolResult) -> String {
@@ -1194,14 +1235,92 @@ mod search_documents_concurrency_tests {
         (settings, temp)
     }
 
+    /// Like [`fixture_settings`], but for embedding-generator-backed tests:
+    /// cycles each file's body through one of the 16 distinct
+    /// keyword-presence combinations `MockEmbeddingGenerator`
+    /// (vector/embedding.rs) recognizes (`parse`/`json`/`error`/`async`),
+    /// rather than repeating a single uniform "lorem ipsum" sentence.
+    ///
+    /// `fixture_settings`'s uniform body produces byte-identical mock
+    /// embeddings for every chunk, which is fine for the non-vector
+    /// `enrich_results` path [`build_server`] exercises, but fatal once
+    /// vector clustering (`DocumentStore::index_collection` ->
+    /// `update_clustering` -> `kmeans_clustering`, store.rs/clustering.rs)
+    /// is in play: k-means++'s furthest-point sampling needs distance signal
+    /// to work with, and with every vector identical, `total_distance`
+    /// collapses to 0 immediately after the first centroid is chosen, so
+    /// `initialize_centroids_kmeans_plus_plus` returns fewer centroids than
+    /// `k` and clustering fails (`ClusteringError::InitializationFailed`) as
+    /// soon as `k` (which scales with total chunk count) exceeds 1 -- true
+    /// for any realistic fixture size. Fixed at 16 files (one per
+    /// keyword-presence combination) so up to 16 distinct mock embeddings
+    /// are available, comfortably above the `k` this fixture's total chunk
+    /// count produces.
+    fn fixture_settings_with_varied_embeddings(chunks_per_file: usize) -> (Settings, TempDir) {
+        const FILE_COUNT: usize = 16;
+        const CHUNK_CHARS: usize = 20;
+
+        let temp = tempfile::tempdir().expect("create temp root");
+        let docs_dir = temp.path().join("docs");
+        std::fs::create_dir_all(&docs_dir).expect("create docs dir");
+
+        for i in 0..FILE_COUNT {
+            let mut keywords = String::new();
+            if i & 1 != 0 {
+                keywords.push_str("parse");
+            }
+            if i & 2 != 0 {
+                keywords.push_str("json");
+            }
+            if i & 4 != 0 {
+                keywords.push_str("error");
+            }
+            if i & 8 != 0 {
+                keywords.push_str("async");
+            }
+            let unit = format!("lorem ipsum {keywords} ");
+            let body = unit.repeat((chunks_per_file * CHUNK_CHARS / unit.len()) + 4);
+            std::fs::write(docs_dir.join(format!("doc_{i}.md")), &body)
+                .unwrap_or_else(|e| panic!("write doc_{i}.md fixture: {e}"));
+        }
+
+        let index_dir = temp.path().join("index");
+        let mut settings = Settings {
+            index_path: index_dir,
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.documents.collections.insert(
+            "docs".to_string(),
+            CollectionConfig {
+                paths: vec![docs_dir],
+                patterns: vec!["**/*.md".to_string()],
+                min_chunk_chars: Some(5),
+                max_chunk_chars: Some(CHUNK_CHARS),
+                overlap_chars: Some(2),
+                ..Default::default()
+            },
+        );
+
+        (settings, temp)
+    }
+
     /// Builds a `CodeIntelligenceServer` over the given settings, with a
     /// real `DocumentStore` backing the settings' `docs` collection,
     /// pre-synced once outside the timed test phase so the auto-sync loop
     /// inside `search_documents` is a fast no-op for every call made during
     /// a test -- isolating any timing signal to the `search` step itself,
-    /// not collection scanning. No embedding generator is configured (keeps
-    /// tests hermetic -- no network/model download), so `search` exercises
-    /// the non-vector `enrich_results` path.
+    /// not collection scanning. No embedding generator is configured here,
+    /// so `search` exercises the non-vector `enrich_results` path
+    /// (`DocumentStore::search`, store.rs) -- this variant exists only for
+    /// tests whose assertions are about that path specifically (e.g. the
+    /// empty-result/non-empty-result guidance branches below, which rely on
+    /// exact-match filtering rather than similarity ranking). Production
+    /// deployments virtually always have an embedding generator configured,
+    /// so lock-scoping/concurrency assertions must use
+    /// [`build_server_with_generator`] instead, which exercises
+    /// `generate_embeddings` -> `score_by_similarity` -> `read_vector` --
+    /// the vector path the non-generator variant here never reaches.
     fn build_server(settings: Settings) -> CodeIntelligenceServer {
         let index_path = settings.index_path.clone();
         let collection_config = settings.documents.collections["docs"].clone();
@@ -1220,6 +1339,99 @@ mod search_documents_concurrency_tests {
             .expect("pre-sync docs collection");
 
         CodeIntelligenceServer::new(facade).with_document_store(store)
+    }
+
+    /// Builds a `CodeIntelligenceServer` like [`build_server`], but with
+    /// `generator` configured on the `DocumentStore` via
+    /// [`DocumentStore::with_embeddings`] and pre-synced (so the "docs"
+    /// collection's chunks already have vectors on disk before the timed
+    /// test phase). This is the production configuration: with a generator
+    /// configured, `DocumentStore::search` runs
+    /// `generate_embeddings` -> `score_by_similarity` -> `read_vector`
+    /// (store.rs) instead of short-circuiting into the non-vector
+    /// `enrich_results` path that [`build_server`] exercises.
+    fn build_server_with_generator(
+        settings: Settings,
+        generator: Box<dyn EmbeddingGenerator>,
+    ) -> CodeIntelligenceServer {
+        let index_path = settings.index_path.clone();
+        let collection_config = settings.documents.collections["docs"].clone();
+        let chunking_defaults = settings.documents.defaults.clone();
+
+        let facade = IndexFacade::new(Arc::new(settings)).expect("create facade over temp index");
+
+        let mut store = DocumentStore::new(
+            index_path.join("documents"),
+            VectorDimension::dimension_384(),
+        )
+        .expect("create document store")
+        .with_embeddings(generator)
+        .expect("configure embedding generator on document store");
+
+        store
+            .index_collection("docs", &collection_config, &chunking_defaults)
+            .expect("pre-sync docs collection");
+
+        CodeIntelligenceServer::new(facade).with_document_store(store)
+    }
+
+    /// Builds a server like [`build_server_with_generator`], but deliberately
+    /// skips the pre-sync `index_collection` call, leaving the "docs"
+    /// collection entirely unindexed. Used by the reindex-liveness test
+    /// below, which needs the *first* `reindex(documents: true)` call to be
+    /// the one that performs (blocking) embedding generation, rather than
+    /// having that work already done during fixture setup and reduced to a
+    /// no-op change-detection pass by the handler under test.
+    fn build_server_with_generator_unsynced(
+        settings: Settings,
+        generator: Box<dyn EmbeddingGenerator>,
+    ) -> CodeIntelligenceServer {
+        let index_path = settings.index_path.clone();
+
+        let facade = IndexFacade::new(Arc::new(settings)).expect("create facade over temp index");
+
+        let store = DocumentStore::new(
+            index_path.join("documents"),
+            VectorDimension::dimension_384(),
+        )
+        .expect("create document store")
+        .with_embeddings(generator)
+        .expect("configure embedding generator on document store");
+
+        CodeIntelligenceServer::new(facade).with_document_store(store)
+    }
+
+    /// Test-local embedding generator that blocks the calling thread for a
+    /// bounded interval on every call, via `std::thread::sleep` (never
+    /// `tokio::time::sleep`, which yields instead of blocking).
+    ///
+    /// The existing `MockEmbeddingGenerator` (vector/embedding.rs,
+    /// `#[cfg(test)]`-gated) is reused for [`build_server_with_generator`]
+    /// call sites where the timing signal comes from chunk volume rather
+    /// than the generator itself, per the reuse-over-rebuild guidance
+    /// (existing test facilities first). It is zero-cost and returns
+    /// instantly, though, so it cannot demonstrate blocking on a
+    /// current-thread runtime: the runtime's single worker would never
+    /// actually be starved by it, making it insufficient for the
+    /// runtime-liveness tests below, which is why this bounded-sleep
+    /// generator exists as a test-local addition instead.
+    struct SleepingEmbeddingGenerator {
+        dimension: VectorDimension,
+        sleep: std::time::Duration,
+    }
+
+    impl EmbeddingGenerator for SleepingEmbeddingGenerator {
+        fn generate_embeddings(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, VectorError> {
+            std::thread::sleep(self.sleep);
+            Ok(texts
+                .iter()
+                .map(|_| vec![0.1_f32; self.dimension.get()])
+                .collect())
+        }
+
+        fn dimension(&self) -> VectorDimension {
+            self.dimension
+        }
     }
 
     fn search_request(limit: usize) -> Parameters<SearchDocumentsRequest> {
@@ -1263,17 +1475,33 @@ mod search_documents_concurrency_tests {
     /// polling loop below would never be scheduled while `search_task` is
     /// mid-`search` -- it would only ever observe the state before
     /// `search_task` starts or after it finishes.
+    ///
+    /// Uses [`build_server_with_generator`] (a `MockEmbeddingGenerator`,
+    /// production-shaped configuration) rather than the generator-less
+    /// [`build_server`): with a generator configured, `search` runs
+    /// `generate_embeddings` -> `score_by_similarity` -> `read_vector`
+    /// instead of short-circuiting into `enrich_results`, so this is also a
+    /// provenance check for the vector-layer read lock -- on unfixed code,
+    /// the concurrent `try_read()` sampling below contends with the
+    /// vector-layer's own exclusive lock during that scoring step.
+    ///
+    /// Uses [`fixture_settings_with_varied_embeddings`] (16 files, one per
+    /// keyword-presence combination `MockEmbeddingGenerator` recognizes)
+    /// rather than [`fixture_settings`]'s uniform "lorem ipsum" body: see
+    /// that fixture's doc comment for why identical mock embeddings make
+    /// `DocumentStore::index_collection`'s vector clustering step fail once
+    /// chunk count grows past a handful.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn search_documents_search_phase_runs_under_read_guard() {
-        // Enough chunks that `search`'s KWIC-enrichment step takes long
-        // enough to reliably sample `try_read()` multiple times while it is
-        // still in flight.
-        const FILE_COUNT: usize = 3;
-        const CHUNKS_PER_FILE: usize = 6000;
-        const TOTAL_CHUNKS: usize = FILE_COUNT * CHUNKS_PER_FILE;
+        // Enough chunks that `search`'s vector-scoring + KWIC-enrichment
+        // steps take long enough to reliably sample `try_read()` multiple
+        // times while they are still in flight, while staying within the
+        // 16 distinct mock embeddings available (see fixture doc comment).
+        const CHUNKS_PER_FILE: usize = 12;
+        const TOTAL_CHUNKS: usize = 16 * CHUNKS_PER_FILE;
 
-        let (settings, _temp) = fixture_settings(FILE_COUNT, CHUNKS_PER_FILE);
-        let server = build_server(settings);
+        let (settings, _temp) = fixture_settings_with_varied_embeddings(CHUNKS_PER_FILE);
+        let server = build_server_with_generator(settings, Box::new(MockEmbeddingGenerator::new()));
         let store_arc = server
             .document_store
             .clone()
@@ -1459,6 +1687,168 @@ mod search_documents_concurrency_tests {
             text_of(&non_empty_result).contains("found-results-guidance-marker"),
             "expected the configured guidance template in the non-empty-result branch, got: {}",
             text_of(&non_empty_result)
+        );
+    }
+
+    /// Spawns a task that increments `counter` and yields via
+    /// `tokio::time::sleep` in a loop, returning a handle that must be
+    /// `.abort()`-ed by the caller once the surrounding assertion is done.
+    /// On a current-thread runtime, this ticker can only advance while the
+    /// single worker thread is free to poll it -- so it stalls for the
+    /// entire duration any blocking work runs directly on that worker,
+    /// making it a sharp discriminator between "blocking work moved off the
+    /// async worker" (ticker keeps advancing) and "blocking work still runs
+    /// inline" (ticker is frozen).
+    fn spawn_ticker(counter: Arc<AtomicU64>) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                counter.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+    }
+
+    /// Minimum ticks the ticker must accumulate across a call for the blocking
+    /// hand-off to count as real.
+    ///
+    /// A bare `after > before` does NOT discriminate: the handler awaits at
+    /// several points outside the blocking window (acquiring the owned guard,
+    /// the auto-sync step), and those yields let the ticker advance a little
+    /// even when the blocking work runs inline on the async worker. Measured
+    /// on this fixture with `SLEEP` = 200ms and a 2ms ticker period: the
+    /// `spawn_blocking` hand-off yields a delta of ~64, while running the same
+    /// work inline yields ~2. This threshold sits an order of magnitude above
+    /// the inline case and well below the handed-off case, so it fails hard on
+    /// a regression while tolerating a loaded machine.
+    const MIN_TICKS_DURING_BLOCKING_WINDOW: u64 = 20;
+
+    /// Runtime-liveness discriminator for `search_documents`'s vector-scoring
+    /// step, using a **current-thread** runtime (`#[tokio::test]` default
+    /// flavor) deliberately -- the opposite of
+    /// `search_documents_search_phase_runs_under_read_guard`'s
+    /// `multi_thread` flavor above. A current-thread runtime has exactly one
+    /// worker thread, so any blocking work executed directly on the async
+    /// task (rather than handed off via `spawn_blocking`) starves every other
+    /// task on that runtime, including the ticker spawned below.
+    ///
+    /// Uses [`SleepingEmbeddingGenerator`] rather than the zero-cost
+    /// `MockEmbeddingGenerator`: a generator that returns instantly cannot
+    /// demonstrate blocking (the worker would never actually be busy long
+    /// enough to matter), so a bounded `std::thread::sleep` is needed to
+    /// give a deterministic window wide enough to reliably sample the
+    /// ticker against.
+    ///
+    /// On today's code (`search`'s embedding + scoring step running inline
+    /// on the async worker instead of via `spawn_blocking`), this assertion
+    /// fails because the ticker cannot advance during that window; if the
+    /// blocking hand-off exists but is never actually wired into the
+    /// handler (dead code), the ticker still stalls and this test still
+    /// fails.
+    #[tokio::test]
+    async fn search_documents_generate_embeddings_runs_off_the_async_worker() {
+        const SLEEP: Duration = Duration::from_millis(200);
+
+        let (settings, _temp) = fixture_settings(1, 1);
+        let generator = SleepingEmbeddingGenerator {
+            dimension: VectorDimension::dimension_384(),
+            sleep: SLEEP,
+        };
+        let server = build_server_with_generator(settings, Box::new(generator));
+
+        let ticker_count = Arc::new(AtomicU64::new(0));
+        let ticker_task = spawn_ticker(ticker_count.clone());
+
+        // Let the ticker tick at least once before the timed call, so the
+        // "before" sample isn't just the initial 0.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let before = ticker_count.load(Ordering::Relaxed);
+
+        let result = server
+            .search_documents(search_request(10))
+            .await
+            .expect("search_documents call must succeed");
+
+        let after = ticker_count.load(Ordering::Relaxed);
+        ticker_task.abort();
+
+        assert!(
+            !result.is_error.unwrap_or(false),
+            "search_documents result must not be an error"
+        );
+        assert!(
+            after - before >= MIN_TICKS_DURING_BLOCKING_WINDOW,
+            "expected the ticker task to advance by at least \
+             {MIN_TICKS_DURING_BLOCKING_WINDOW} ticks (before={before}, after={after}, \
+             delta={delta}) while `search_documents`'s embedding generation was in flight; on a \
+             current-thread runtime, blocking work executed directly on the async worker starves \
+             every other task on that runtime, including this ticker -- only handing the blocking \
+             work off via `spawn_blocking` lets the ticker keep advancing through the window",
+            delta = after - before
+        );
+    }
+
+    /// Runtime-liveness discriminator for `reindex(documents: true)`'s
+    /// document-collection indexing step (`run_document_reindex`,
+    /// mcp/server.rs), mirroring
+    /// `search_documents_generate_embeddings_runs_off_the_async_worker`
+    /// above but driving the reindex handler instead of `search_documents`.
+    ///
+    /// Drives the production `reindex` tool handler directly (never a
+    /// parallel test-only entry point), with `documents: true` so it
+    /// exercises `run_document_reindex`'s embedding-generation step against
+    /// [`SleepingEmbeddingGenerator`], and no `paths` (the code-indexing side
+    /// walks zero configured source paths for this fixture, so it is not
+    /// the timing signal here).
+    ///
+    /// Uses [`build_server_with_generator_unsynced`] so the "docs" collection
+    /// has not already been indexed: the first `reindex` call is the one
+    /// that must actually chunk the fixture files and generate embeddings,
+    /// rather than finding nothing changed and skipping embedding generation
+    /// entirely.
+    #[tokio::test]
+    async fn reindex_documents_true_runs_document_indexing_off_the_async_worker() {
+        const SLEEP: Duration = Duration::from_millis(200);
+
+        let (settings, _temp) = fixture_settings(1, 1);
+        let generator = SleepingEmbeddingGenerator {
+            dimension: VectorDimension::dimension_384(),
+            sleep: SLEEP,
+        };
+        let server = build_server_with_generator_unsynced(settings, Box::new(generator));
+
+        let ticker_count = Arc::new(AtomicU64::new(0));
+        let ticker_task = spawn_ticker(ticker_count.clone());
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let before = ticker_count.load(Ordering::Relaxed);
+
+        let result = server
+            .reindex(Parameters(ReindexRequest {
+                paths: None,
+                force: false,
+                output_format: OutputFormat::Text,
+                documents: true,
+            }))
+            .await
+            .expect("reindex call must succeed");
+
+        let after = ticker_count.load(Ordering::Relaxed);
+        ticker_task.abort();
+
+        assert!(
+            !result.is_error.unwrap_or(false),
+            "reindex result must not be an error"
+        );
+        assert!(
+            after - before >= MIN_TICKS_DURING_BLOCKING_WINDOW,
+            "expected the ticker task to advance by at least \
+             {MIN_TICKS_DURING_BLOCKING_WINDOW} ticks (before={before}, after={after}, \
+             delta={delta}) while \
+             `reindex(documents: true)`'s document indexing was in flight; on a current-thread \
+             runtime, blocking work executed directly on the async worker starves every other \
+             task on that runtime, including this ticker -- only handing the blocking work off \
+             via `spawn_blocking` lets the ticker keep advancing through the window",
+            delta = after - before
         );
     }
 }
