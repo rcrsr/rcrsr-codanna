@@ -7,6 +7,35 @@ upstream base. For the how, see the commit history.
 - **Upstream base:** the latest `codanna` release the fork is built on
 - **Fork build:** the upstream version with a `+rcrsr.N` suffix (see [Identifying the fork](#identifying-the-fork))
 
+## Contents
+
+- [Installing the fork](#installing-the-fork)
+- [Improvements](#improvements)
+  - [Proxy mode: one backing server per workspace](#proxy-mode-one-backing-server-per-workspace)
+    - [Idle shutdown](#idle-shutdown)
+    - [Configuration](#configuration)
+    - [Ports](#ports)
+    - [Hot-reload notifications through the proxy](#hot-reload-notifications-through-the-proxy)
+  - [Reindexing on demand (`reindex` MCP tool)](#reindexing-on-demand-reindex-mcp-tool)
+    - [Arguments](#arguments)
+    - [Concurrency contract](#concurrency-contract)
+  - [Catch-up reindex on watch-queue overflow](#catch-up-reindex-on-watch-queue-overflow)
+    - [Configuration](#configuration-1)
+  - [`ignore_patterns` now excludes files during indexing](#ignore_patterns-now-excludes-files-during-indexing)
+  - [Document collection controls (`search_documents`)](#document-collection-controls-search_documents)
+    - [Per-collection default visibility (`default` / `--no-default`)](#per-collection-default-visibility-default----no-default)
+    - [Negated glob patterns in collection `patterns`](#negated-glob-patterns-in-collection-patterns)
+    - [Multi-select `--collection` / `--exclude-collection`](#multi-select---collection----exclude-collection)
+    - [Clarified tool descriptions: `semantic_search_docs` vs `search_documents`](#clarified-tool-descriptions-semantic_search_docs-vs-search_documents)
+  - [MCP tool enhancements for agent workflows](#mcp-tool-enhancements-for-agent-workflows)
+    - [Structured JSON output (`output_format`)](#structured-json-output-output_format)
+    - [Batch symbol lookup (`find_symbols`)](#batch-symbol-lookup-find_symbols)
+    - [Canonical `name` parameter across symbol tools](#canonical-name-parameter-across-symbol-tools)
+    - [Test/production classification on `find_callers`](#testproduction-classification-on-find_callers)
+    - [Symbol-scoped reads (`get_file_outline`, `read_symbol`)](#symbol-scoped-reads-get_file_outline-read_symbol)
+    - [Slimmer `analyze_impact`](#slimmer-analyze_impact)
+- [Identifying the fork](#identifying-the-fork)
+
 ## Installing the fork
 
 The fork is distributed through its own [GitHub Releases](https://github.com/rcrsr/rcrsr-codanna/releases),
@@ -32,6 +61,11 @@ cargo install --git https://github.com/rcrsr/rcrsr-codanna --all-features codann
 Or download a platform archive directly from the [releases page](https://github.com/rcrsr/rcrsr-codanna/releases)
 and put the `codanna` binary on your `PATH`. The binary is named `codanna` (same as
 upstream), so it will shadow an upstream install on the same `PATH`.
+
+# Improvements
+
+The sections below are the fork's additions over upstream codanna — new
+capabilities and behavior changes you get on top of the upstream base.
 
 ## Proxy mode: one backing server per workspace
 

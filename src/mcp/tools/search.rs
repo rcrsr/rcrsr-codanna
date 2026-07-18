@@ -1024,7 +1024,7 @@ impl CodeIntelligenceServer {
         // searching. This is the only step that needs exclusive access to
         // the document store, so the write guard is scoped to this loop
         // only and dropped before searching (see the concurrency contract
-        // documented in RCSR-README.md).
+        // documented in RCRSR-README.md).
         {
             for (name, config) in &settings.documents.collections {
                 // `index_collection` performs blocking file I/O, tantivy
