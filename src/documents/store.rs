@@ -24,56 +24,27 @@ const EMBEDDING_BATCH_SIZE: usize = 64;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use ignore::Match;
+use ignore::overrides::{Override, OverrideBuilder};
 use tantivy::collector::TopDocs;
 use tantivy::directory::MmapDirectory;
-use tantivy::directory::error::OpenDirectoryError;
 use tantivy::query::{BooleanQuery, Occur, Query, TermQuery};
 use tantivy::schema::Value;
 use tantivy::{
     Index, IndexReader, IndexSettings, IndexWriter, ReloadPolicy, TantivyDocument as Document, Term,
 };
-use thiserror::Error;
 
 use super::chunker::{Chunker, HybridChunker, RawChunk};
 use super::config::{ChunkingConfig, CollectionConfig};
 use super::schema::DocumentSchema;
 use super::types::{ChunkId, CollectionId, FileState};
+use crate::error::DocumentStoreError;
+pub use crate::error::StoreResult;
 use crate::indexing::file_info::{calculate_hash, get_utc_timestamp};
 use crate::vector::{
     ClusterId, ConcurrentVectorStorage, EmbeddingGenerator, MmapVectorStorage, SegmentOrdinal,
-    VectorDimension, VectorId, VectorStorageError, cosine_similarity, kmeans_clustering,
+    VectorDimension, VectorId, cosine_similarity, kmeans_clustering,
 };
-
-/// Errors from document storage operations.
-#[derive(Error, Debug)]
-pub enum DocumentStoreError {
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-
-    #[error("Tantivy error: {0}")]
-    Tantivy(#[from] tantivy::TantivyError),
-
-    #[error("Directory error: {0}")]
-    Directory(#[from] OpenDirectoryError),
-
-    #[error("Vector storage error: {0}")]
-    VectorStorage(#[from] VectorStorageError),
-
-    #[error("Collection not found: {0}")]
-    CollectionNotFound(String),
-
-    #[error("Index error: {0}")]
-    Index(String),
-
-    #[error("Embedding error: {0}")]
-    Embedding(String),
-
-    #[error("Lock poisoned")]
-    LockPoisoned,
-}
-
-/// Result type for document store operations.
-pub type StoreResult<T> = Result<T, DocumentStoreError>;
 
 /// Statistics from an indexing operation.
 #[derive(Debug, Clone, Default)]
@@ -93,8 +64,12 @@ pub struct IndexStats {
 pub struct SearchQuery {
     /// Search text to embed and match.
     pub text: String,
-    /// Filter by collection name.
-    pub collection: Option<String>,
+    /// Restrict results to these collection names (allowlist). Empty means
+    /// no restriction, preserving the previous single-`collection` behavior.
+    pub collections: Vec<String>,
+    /// Exclude results from these collection names (denylist), applied on
+    /// top of `collections`.
+    pub exclude_collections: Vec<String>,
     /// Filter by source document path.
     pub document: Option<PathBuf>,
     /// Maximum results to return.
@@ -107,7 +82,8 @@ impl Default for SearchQuery {
     fn default() -> Self {
         Self {
             text: String::new(),
-            collection: None,
+            collections: Vec::new(),
+            exclude_collections: Vec::new(),
             document: None,
             limit: 10,
             preview_config: None,
@@ -715,6 +691,22 @@ impl DocumentStore {
             return Ok(Vec::new());
         }
 
+        // A collection named in both the allowlist and the denylist makes
+        // the underlying boolean query unsatisfiable (Must(Should(name)) AND
+        // MustNot(name)), which would otherwise silently return zero
+        // results. Reject it here so both the CLI and MCP callers of
+        // `search` get an actionable error instead of a confusing empty
+        // result set.
+        if let Some(name) = query
+            .collections
+            .iter()
+            .find(|name| query.exclude_collections.contains(name))
+        {
+            return Err(DocumentStoreError::ConflictingCollectionFilter(
+                name.clone(),
+            ));
+        }
+
         // Get candidate chunks based on filters
         let candidates = self.get_filtered_candidates(&query)?;
 
@@ -856,20 +848,40 @@ impl DocumentStore {
                 continue;
             }
 
-            // Use glob patterns
+            // Build a whitelist-style override set rooted at this base path.
+            // Bare patterns (e.g. "**/*.md") whitelist matching files; `!`-prefixed
+            // patterns (e.g. "!internal/**") negate that whitelist and are actually
+            // excluded (not merely flagged), matching ignore::overrides semantics.
+            let mut builder = OverrideBuilder::new(base_path);
             for pattern in &patterns {
-                let full_pattern = base_path.join(pattern);
-                let pattern_str = full_pattern.to_string_lossy();
-
-                for path in glob::glob(&pattern_str)
-                    .map_err(|e| DocumentStoreError::Index(format!("Invalid glob pattern: {e}")))?
-                    .flatten()
-                {
-                    if path.is_file() {
-                        files.push(path);
-                    }
-                }
+                builder
+                    .add(pattern)
+                    .map_err(|e| DocumentStoreError::InvalidGlobPattern {
+                        pattern: pattern.clone(),
+                        reason: e.to_string(),
+                    })?;
             }
+            // `OverrideBuilder::build()` validates the whole pattern set at once
+            // and its error doesn't identify which glob failed, so we fall back
+            // to naming the full joined pattern list here; the per-pattern
+            // `add()` error path above still names the single offending pattern.
+            let overrides =
+                builder
+                    .build()
+                    .map_err(|e| DocumentStoreError::InvalidGlobPattern {
+                        pattern: patterns.join(", "),
+                        reason: e.to_string(),
+                    })?;
+
+            // `indexing::walk_config::build_walker` is the crate's sole
+            // `ignore::WalkBuilder::new` call site (enforced by an
+            // architecture test) and is tuned for gitignore/.codannaignore
+            // semantics over `Settings`, not the override-based whitelist
+            // this collection-pattern walk needs. Recurse manually instead,
+            // consulting the same `ignore::overrides::Override::matched`
+            // used by `WalkBuilder::overrides()` internally, so `!`-negated
+            // patterns still exclude rather than merely flag.
+            collect_override_matches(base_path, &overrides, &mut files)?;
         }
 
         Ok(files)
@@ -1149,11 +1161,30 @@ impl DocumentStore {
             )),
         ));
 
-        // Collection filter
-        if let Some(ref collection) = query.collection {
-            let term = Term::from_field_text(self.schema.collection_name, collection);
+        // Collection allowlist: any of the named collections may match, but
+        // at least one must (Occur::Should terms nested under a single
+        // Occur::Must subclause).
+        if !query.collections.is_empty() {
+            let should_terms: Vec<(Occur, Box<dyn Query>)> = query
+                .collections
+                .iter()
+                .map(|name| {
+                    let term = Term::from_field_text(self.schema.collection_name, name);
+                    let term_query: Box<dyn Query> = Box::new(TermQuery::new(
+                        term,
+                        tantivy::schema::IndexRecordOption::Basic,
+                    ));
+                    (Occur::Should, term_query)
+                })
+                .collect();
+            subqueries.push((Occur::Must, Box::new(BooleanQuery::new(should_terms))));
+        }
+
+        // Collection denylist: none of the excluded collections may match.
+        for name in &query.exclude_collections {
+            let term = Term::from_field_text(self.schema.collection_name, name);
             subqueries.push((
-                Occur::Must,
+                Occur::MustNot,
                 Box::new(TermQuery::new(
                     term,
                     tantivy::schema::IndexRecordOption::Basic,
@@ -1407,6 +1438,54 @@ impl DocumentStore {
     }
 }
 
+/// Recursively walks `dir`, appending every regular file whose path is
+/// whitelist-matched by `overrides` to `files`. `!`-negated patterns
+/// (`Match::Ignore`) drop the entry entirely rather than merely flagging it.
+/// Non-directory entries are only pushed when `Path::is_file()` confirms
+/// they're a regular file (following symlinks), so broken symlinks and
+/// special files (FIFOs, sockets, device nodes) are silently dropped, same
+/// as the pre-`ignore`-crate implementation.
+/// Directories are always descended into regardless of their own match
+/// state (`Match::None`/`Match::Whitelist`) so that patterns like
+/// `"**/*.md"` still reach files nested under directories that don't
+/// themselves match a whitelist entry; only an explicit `Match::Ignore`
+/// prunes a subtree early.
+fn collect_override_matches(
+    dir: &Path,
+    overrides: &Override,
+    files: &mut Vec<PathBuf>,
+) -> StoreResult<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        // `DirEntry::file_type()` reports the entry's own type without
+        // following symlinks (unlike `Path::is_dir()`), so a symlinked
+        // directory is treated as a non-directory here rather than being
+        // recursed into (avoiding escaping the collection root or cycles).
+        // Symlinked files still fall through to the `path.is_file()` check
+        // below, which does follow symlinks, so they remain includable.
+        let is_dir = entry.file_type()?.is_dir();
+
+        match overrides.matched(&path, is_dir) {
+            Match::Ignore(_) => continue,
+            Match::Whitelist(_) => {
+                if is_dir {
+                    collect_override_matches(&path, overrides, files)?;
+                } else if path.is_file() {
+                    files.push(path);
+                }
+            }
+            Match::None => {
+                if is_dir {
+                    collect_override_matches(&path, overrides, files)?;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Statistics about a collection.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CollectionStats {
@@ -1622,5 +1701,313 @@ mod tests {
         let beta = store.collection_stats("beta").unwrap();
         assert_eq!(alpha.file_count, 2, "alpha file_count not scoped");
         assert_eq!(beta.file_count, 2, "beta file_count not scoped");
+    }
+
+    /// Builds a store with three collections ("alpha", "beta", "gamma"),
+    /// each with one indexed markdown file containing a shared keyword, for
+    /// exercising `SearchQuery::collections`/`exclude_collections` filtering.
+    fn build_three_collection_store() -> (TempDir, TempDir, TempDir, TempDir, DocumentStore) {
+        use crate::documents::config::{ChunkingConfig, CollectionConfig};
+
+        let store_dir = TempDir::new().unwrap();
+        let alpha_dir = TempDir::new().unwrap();
+        let beta_dir = TempDir::new().unwrap();
+        let gamma_dir = TempDir::new().unwrap();
+
+        let body = "# Heading\n\n".to_string()
+            + &"This document discusses lorem ipsum content padded above the minimum chunk size threshold. "
+                .repeat(8);
+        std::fs::write(alpha_dir.path().join("a1.md"), &body).unwrap();
+        std::fs::write(beta_dir.path().join("b1.md"), &body).unwrap();
+        std::fs::write(gamma_dir.path().join("g1.md"), &body).unwrap();
+
+        let chunking = ChunkingConfig::default();
+        let mut store = DocumentStore::new(store_dir.path(), test_dimension()).unwrap();
+
+        for (name, dir) in [
+            ("alpha", &alpha_dir),
+            ("beta", &beta_dir),
+            ("gamma", &gamma_dir),
+        ] {
+            let cfg = CollectionConfig {
+                paths: vec![dir.path().to_path_buf()],
+                patterns: vec!["**/*.md".to_string()],
+                ..Default::default()
+            };
+            store.index_collection(name, &cfg, &chunking).unwrap();
+        }
+
+        (store_dir, alpha_dir, beta_dir, gamma_dir, store)
+    }
+
+    #[test]
+    fn test_search_collections_allowlist_returns_hits_from_both() {
+        let (_store_dir, _alpha_dir, _beta_dir, _gamma_dir, store) = build_three_collection_store();
+
+        let query = SearchQuery {
+            text: "lorem".to_string(),
+            collections: vec!["alpha".to_string(), "beta".to_string()],
+            limit: 100,
+            ..Default::default()
+        };
+
+        let results = store.search(query).unwrap();
+        let hit_collections: std::collections::HashSet<String> =
+            results.iter().map(|r| r.collection.clone()).collect();
+
+        assert!(
+            hit_collections.contains("alpha"),
+            "expected a hit from 'alpha', got collections: {hit_collections:?}"
+        );
+        assert!(
+            hit_collections.contains("beta"),
+            "expected a hit from 'beta', got collections: {hit_collections:?}"
+        );
+        assert!(
+            !hit_collections.contains("gamma"),
+            "'gamma' must be excluded by the allowlist, got collections: {hit_collections:?}"
+        );
+    }
+
+    #[test]
+    fn test_search_exclude_collections_removes_matching_hits() {
+        let (_store_dir, _alpha_dir, _beta_dir, _gamma_dir, store) = build_three_collection_store();
+
+        let query = SearchQuery {
+            text: "lorem".to_string(),
+            exclude_collections: vec!["beta".to_string()],
+            limit: 100,
+            ..Default::default()
+        };
+
+        let results = store.search(query).unwrap();
+        let hit_collections: std::collections::HashSet<String> =
+            results.iter().map(|r| r.collection.clone()).collect();
+
+        assert!(
+            !hit_collections.contains("beta"),
+            "'beta' must be removed by exclude_collections, got collections: {hit_collections:?}"
+        );
+        assert!(
+            hit_collections.contains("alpha"),
+            "expected 'alpha' to remain, got collections: {hit_collections:?}"
+        );
+        assert!(
+            hit_collections.contains("gamma"),
+            "expected 'gamma' to remain, got collections: {hit_collections:?}"
+        );
+    }
+
+    #[test]
+    fn test_search_rejects_collection_named_in_both_allowlist_and_denylist() {
+        let (_store_dir, _alpha_dir, _beta_dir, _gamma_dir, store) = build_three_collection_store();
+
+        let query = SearchQuery {
+            text: "lorem".to_string(),
+            collections: vec!["alpha".to_string()],
+            exclude_collections: vec!["alpha".to_string()],
+            limit: 100,
+            ..Default::default()
+        };
+
+        let err = store
+            .search(query)
+            .expect_err("a collection in both the allowlist and denylist must be rejected");
+
+        assert!(
+            matches!(
+                err,
+                DocumentStoreError::ConflictingCollectionFilter(ref name) if name == "alpha"
+            ),
+            "expected ConflictingCollectionFilter(\"alpha\"), got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_search_empty_collections_is_unrestricted() {
+        let (_store_dir, _alpha_dir, _beta_dir, _gamma_dir, store) = build_three_collection_store();
+
+        let query = SearchQuery {
+            text: "lorem".to_string(),
+            limit: 100,
+            ..Default::default()
+        };
+
+        let results = store.search(query).unwrap();
+        let hit_collections: std::collections::HashSet<String> =
+            results.iter().map(|r| r.collection.clone()).collect();
+
+        assert_eq!(
+            hit_collections,
+            std::collections::HashSet::from([
+                "alpha".to_string(),
+                "beta".to_string(),
+                "gamma".to_string(),
+            ]),
+            "empty collections/exclude_collections must not restrict results"
+        );
+    }
+
+    /// Control test: a plain (non-negated) pattern set must return the same
+    /// file inventory the old `glob::glob` union loop returned — i.e. every
+    /// matching file under the base path, including nested directories.
+    #[test]
+    fn test_collect_files_plain_pattern_matches_old_glob_behavior() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = DocumentStore::new(temp_dir.path(), test_dimension()).unwrap();
+
+        let base = TempDir::new().unwrap();
+        std::fs::write(base.path().join("a.md"), "top level").unwrap();
+        std::fs::create_dir_all(base.path().join("internal")).unwrap();
+        std::fs::write(base.path().join("internal/secret.md"), "nested").unwrap();
+        std::fs::write(base.path().join("notes.txt"), "ignored extension").unwrap();
+
+        let config = CollectionConfig {
+            paths: vec![base.path().to_path_buf()],
+            patterns: vec!["**/*.md".to_string()],
+            ..Default::default()
+        };
+
+        let files = store.collect_files(&config).unwrap();
+        let names: std::collections::HashSet<String> = files
+            .iter()
+            .map(|p| {
+                p.strip_prefix(base.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+
+        assert_eq!(
+            names,
+            std::collections::HashSet::from(
+                ["a.md".to_string(), "internal/secret.md".to_string(),]
+            ),
+            "plain pattern must match every file the old glob union matched, no more no less"
+        );
+    }
+
+    /// A `!`-prefixed pattern must actually exclude matching files, not just
+    /// warn about them.
+    #[test]
+    fn test_collect_files_negated_pattern_excludes_matches() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = DocumentStore::new(temp_dir.path(), test_dimension()).unwrap();
+
+        let base = TempDir::new().unwrap();
+        std::fs::write(base.path().join("a.md"), "top level").unwrap();
+        std::fs::create_dir_all(base.path().join("internal")).unwrap();
+        std::fs::write(base.path().join("internal/secret.md"), "nested").unwrap();
+
+        let config = CollectionConfig {
+            paths: vec![base.path().to_path_buf()],
+            patterns: vec!["**/*.md".to_string(), "!internal/**".to_string()],
+            ..Default::default()
+        };
+
+        let files = store.collect_files(&config).unwrap();
+        let names: std::collections::HashSet<String> = files
+            .iter()
+            .map(|p| {
+                p.strip_prefix(base.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+
+        assert_eq!(
+            names,
+            std::collections::HashSet::from(["a.md".to_string()]),
+            "!internal/** must exclude internal/secret.md, not merely flag it"
+        );
+    }
+
+    /// Broken symlinks and other non-regular entries must be filtered out,
+    /// matching the pre-`ignore`-crate `path.is_file()` gate.
+    #[test]
+    #[cfg(unix)]
+    fn test_collect_files_skips_broken_symlink() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = DocumentStore::new(temp_dir.path(), test_dimension()).unwrap();
+
+        let base = TempDir::new().unwrap();
+        std::fs::write(base.path().join("a.md"), "top level").unwrap();
+        std::os::unix::fs::symlink(
+            base.path().join("does-not-exist.md"),
+            base.path().join("broken.md"),
+        )
+        .unwrap();
+
+        let config = CollectionConfig {
+            paths: vec![base.path().to_path_buf()],
+            patterns: vec!["**/*.md".to_string()],
+            ..Default::default()
+        };
+
+        let files = store.collect_files(&config).unwrap();
+        let names: std::collections::HashSet<String> = files
+            .iter()
+            .map(|p| {
+                p.strip_prefix(base.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+
+        assert_eq!(
+            names,
+            std::collections::HashSet::from(["a.md".to_string()]),
+            "broken symlinks must be silently dropped, not leaked into results"
+        );
+    }
+
+    /// A symlinked directory must not be recursed into (avoiding escaping the
+    /// collection root or an infinite cycle if the symlink points back at an
+    /// ancestor), matching `DirEntry::file_type()`'s non-following behavior
+    /// documented on `collect_override_matches`.
+    #[test]
+    #[cfg(unix)]
+    fn test_collect_files_does_not_recurse_into_symlinked_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = DocumentStore::new(temp_dir.path(), test_dimension()).unwrap();
+
+        let base = TempDir::new().unwrap();
+        std::fs::write(base.path().join("a.md"), "top level").unwrap();
+
+        let outside = TempDir::new().unwrap();
+        std::fs::write(
+            outside.path().join("outside.md"),
+            "outside the collection root",
+        )
+        .unwrap();
+
+        std::os::unix::fs::symlink(outside.path(), base.path().join("linked")).unwrap();
+
+        let config = CollectionConfig {
+            paths: vec![base.path().to_path_buf()],
+            patterns: vec!["**/*.md".to_string()],
+            ..Default::default()
+        };
+
+        let files = store.collect_files(&config).unwrap();
+        let names: std::collections::HashSet<String> = files
+            .iter()
+            .map(|p| {
+                p.strip_prefix(base.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+
+        assert_eq!(
+            names,
+            std::collections::HashSet::from(["a.md".to_string()]),
+            "a symlinked directory must not be recursed into, so 'linked/outside.md' \
+             must not appear in results"
+        );
     }
 }

@@ -7,6 +7,35 @@ upstream base. For the how, see the commit history.
 - **Upstream base:** the latest `codanna` release the fork is built on
 - **Fork build:** the upstream version with a `+rcrsr.N` suffix (see [Identifying the fork](#identifying-the-fork))
 
+## Contents
+
+- [Installing the fork](#installing-the-fork)
+- [Improvements](#improvements)
+  - [Proxy mode: one backing server per workspace](#proxy-mode-one-backing-server-per-workspace)
+    - [Idle shutdown](#idle-shutdown)
+    - [Configuration](#configuration)
+    - [Ports](#ports)
+    - [Hot-reload notifications through the proxy](#hot-reload-notifications-through-the-proxy)
+  - [Reindexing on demand (`reindex` MCP tool)](#reindexing-on-demand-reindex-mcp-tool)
+    - [Arguments](#arguments)
+    - [Concurrency contract](#concurrency-contract)
+  - [Catch-up reindex on watch-queue overflow](#catch-up-reindex-on-watch-queue-overflow)
+    - [Configuration](#configuration-1)
+  - [`ignore_patterns` now excludes files during indexing](#ignore_patterns-now-excludes-files-during-indexing)
+  - [Document collection controls (`search_documents`)](#document-collection-controls-search_documents)
+    - [Per-collection default visibility (`default` / `--no-default`)](#per-collection-default-visibility-default----no-default)
+    - [Negated glob patterns in collection `patterns`](#negated-glob-patterns-in-collection-patterns)
+    - [Multi-select `--collection` / `--exclude-collection`](#multi-select---collection----exclude-collection)
+    - [Clarified tool descriptions: `semantic_search_docs` vs `search_documents`](#clarified-tool-descriptions-semantic_search_docs-vs-search_documents)
+  - [MCP tool enhancements for agent workflows](#mcp-tool-enhancements-for-agent-workflows)
+    - [Structured JSON output (`output_format`)](#structured-json-output-output_format)
+    - [Batch symbol lookup (`find_symbols`)](#batch-symbol-lookup-find_symbols)
+    - [Canonical `name` parameter across symbol tools](#canonical-name-parameter-across-symbol-tools)
+    - [Test/production classification on `find_callers`](#testproduction-classification-on-find_callers)
+    - [Symbol-scoped reads (`get_file_outline`, `read_symbol`)](#symbol-scoped-reads-get_file_outline-read_symbol)
+    - [Slimmer `analyze_impact`](#slimmer-analyze_impact)
+- [Identifying the fork](#identifying-the-fork)
+
 ## Installing the fork
 
 The fork is distributed through its own [GitHub Releases](https://github.com/rcrsr/rcrsr-codanna/releases),
@@ -32,6 +61,11 @@ cargo install --git https://github.com/rcrsr/rcrsr-codanna --all-features codann
 Or download a platform archive directly from the [releases page](https://github.com/rcrsr/rcrsr-codanna/releases)
 and put the `codanna` binary on your `PATH`. The binary is named `codanna` (same as
 upstream), so it will shadow an upstream install on the same `PATH`.
+
+# Improvements
+
+The sections below are the fork's additions over upstream codanna — new
+capabilities and behavior changes you get on top of the upstream base.
 
 ## Proxy mode: one backing server per workspace
 
@@ -290,6 +324,92 @@ The four patterns codanna used to hard-code as the default (`target/**`,
 already excluded by the default `.codannaignore` that `codanna init` writes.
 Existing `settings.toml` files are left untouched; any patterns already on
 disk in `ignore_patterns` now take effect.
+
+## Document collection controls (`search_documents`)
+
+The fork adds per-collection default-visibility, negated glob patterns for
+collection file selection, and multi-select filtering to `search_documents`
+and `codanna documents search`.
+
+### Per-collection default visibility (`default` / `--no-default`)
+
+Each collection in `[documents.collections.<name>]` (`.codanna/settings.toml`)
+now takes an optional `default` key:
+
+```toml
+[documents.collections.internal-notes]
+paths = ["docs/internal"]
+patterns = ["**/*.md"]
+default = false   # opt this collection out of unscoped searches
+```
+
+`default` defaults to `true`, so existing collections (and any `settings.toml`
+written before this key existed) keep the prior always-searched behavior with
+no changes required. When it is set to `false`, the collection is skipped by a
+`search_documents` call that names no `collection` at all — but it is still
+searched if you name it explicitly. This lets you keep, say, an internal-only
+or scratch collection out of an agent's general-purpose queries while still
+letting a caller reach it on demand.
+
+Set it from the CLI when creating a collection with `codanna documents
+add-collection --no-default`; the human-readable `codanna documents list`
+output annotates non-default collections with `(non-default)`. The `list
+--json` output is a plain array of collection names and does not currently
+carry default/non-default information.
+
+### Negated glob patterns in collection `patterns`
+
+`patterns` entries for a collection now support gitignore-style `!`-prefixed
+negation, resolved with the same `ignore` crate machinery (`ignore::overrides`)
+used elsewhere in codanna, instead of a plain `glob::glob` union:
+
+```toml
+[documents.collections.docs]
+paths = ["docs"]
+patterns = ["**/*.md", "!docs/internal/**", "!**/DRAFT-*.md"]
+```
+
+A later `!`-prefixed pattern actually excludes files matched by an earlier
+pattern (not merely flags them) — the same negation semantics as
+`.codannaignore`/`ignore_patterns`. Non-negated pattern sets behave exactly as
+before: every file under the collection's `paths` matching any pattern is
+indexed.
+
+### Multi-select `--collection` / `--exclude-collection`
+
+`search_documents` and `codanna documents search` accept more than one
+collection at once:
+
+- `codanna documents search --collection docs --collection api-notes "query"`
+  searches the union of the named collections (allowlist).
+- `codanna documents search --exclude-collection scratch "query"` searches
+  every collection except the named one(s) (denylist), on top of whatever the
+  allowlist and default-visibility resolve to.
+- Both flags are repeatable. Naming a collection explicitly with `--collection`
+  always searches it, even if its `default` key is `false`.
+
+Over MCP, `search_documents`'s `collection` argument now accepts either a bare
+string (unchanged, for existing clients) or a JSON array of strings for
+multi-select; a new `exclude_collections` argument (array of strings) is the
+MCP equivalent of `--exclude-collection`. `codanna mcp search_documents` on the
+CLI accepts the same `collection:`/`exclude_collections:` forms, including a
+JSON array value.
+
+### Clarified tool descriptions: `semantic_search_docs` vs `search_documents`
+
+The two tools search different corpora and were easy to confuse from their
+descriptions alone:
+
+- `semantic_search_docs` searches **doc comments extracted from code
+  symbols** (the same corpus as upstream) — its description now says so
+  explicitly and points to `search_documents` for markdown files.
+- `search_documents` searches **indexed markdown document collections**
+  (`[documents.collections.*]`) — its description now says so explicitly and
+  points back to `semantic_search_docs` for doc comments.
+
+This is a documentation-only change (tool names, arguments, and behavior are
+unchanged); it exists so an agent choosing between the two tools from
+`list_tools` output alone picks the right one on the first try.
 
 ## MCP tool enhancements for agent workflows
 

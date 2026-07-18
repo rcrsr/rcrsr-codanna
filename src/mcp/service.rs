@@ -722,12 +722,14 @@ pub fn search_documents_data(
     store: &crate::documents::DocumentStore,
     settings: &crate::config::Settings,
     query: &str,
-    collection: Option<String>,
+    collections: Vec<String>,
+    exclude_collections: Vec<String>,
     limit: usize,
 ) -> crate::documents::store::StoreResult<Vec<crate::documents::SearchResult>> {
     let search_query = crate::documents::SearchQuery {
         text: query.to_string(),
-        collection,
+        collections,
+        exclude_collections,
         document: None,
         limit,
         preview_config: Some(settings.documents.search.clone()),

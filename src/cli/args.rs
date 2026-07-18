@@ -510,9 +510,13 @@ pub enum DocumentAction {
         #[arg(num_args = 0..)]
         args: Vec<String>,
 
-        /// Filter by collection name
-        #[arg(long)]
-        collection: Option<String>,
+        /// Filter by collection name (repeatable for multi-select)
+        #[arg(long, action = clap::ArgAction::Append)]
+        collection: Vec<String>,
+
+        /// Exclude a collection name from results (repeatable)
+        #[arg(long, action = clap::ArgAction::Append)]
+        exclude_collection: Vec<String>,
 
         /// Maximum results to return
         #[arg(short, long)]
@@ -567,6 +571,11 @@ pub enum DocumentAction {
         /// Glob pattern for file matching (default: **/*.md)
         #[arg(short, long)]
         pattern: Option<String>,
+
+        /// Exclude this collection from unscoped searches by default
+        /// (still searchable by naming it explicitly).
+        #[arg(long)]
+        no_default: bool,
     },
 
     /// Remove a collection from settings.toml

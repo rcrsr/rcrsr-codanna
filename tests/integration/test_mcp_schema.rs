@@ -6,7 +6,7 @@ use codanna::config::Settings;
 use codanna::indexing::facade::IndexFacade;
 use codanna::mcp::{
     AnalyzeImpactRequest, CodeIntelligenceServer, GetIndexInfoRequest, ReindexRequest,
-    SearchSymbolsRequest, SemanticSearchRequest,
+    SearchDocumentsRequest, SearchSymbolsRequest, SemanticSearchRequest,
 };
 use tempfile::TempDir;
 use tokio::sync::RwLock;
@@ -446,6 +446,51 @@ async fn test_reindex_documents_flag_discovers_new_files() {
 
     println!(
         "[OK] reindex documents:true discovers new collection files; documents:false reports documents: None."
+    );
+}
+
+/// `SearchDocumentsRequest.collection` accepts both a bare string (backward
+/// compatible with existing clients) and an array of strings (multi-select),
+/// deserializing the same JSON key `"collection"` in both shapes, and the
+/// schema still renders successfully for either representation.
+#[test]
+fn test_search_documents_request_collection_accepts_string_or_array() {
+    let single: SearchDocumentsRequest =
+        serde_json::from_value(serde_json::json!({"query": "auth", "collection": "docs"}))
+            .expect("collection as a bare string must deserialize");
+    let single_vec = single
+        .collection
+        .expect("collection must be present")
+        .into_vec();
+    assert_eq!(single_vec, vec!["docs".to_string()]);
+
+    let many: SearchDocumentsRequest = serde_json::from_value(serde_json::json!({
+        "query": "auth",
+        "collection": ["a", "b"],
+    }))
+    .expect("collection as an array must deserialize");
+    let many_vec = many
+        .collection
+        .expect("collection must be present")
+        .into_vec();
+    assert_eq!(many_vec, vec!["a".to_string(), "b".to_string()]);
+
+    // No collection at all must still deserialize (field is optional).
+    let none: SearchDocumentsRequest = serde_json::from_value(serde_json::json!({"query": "auth"}))
+        .expect("omitted collection must deserialize");
+    assert!(none.collection.is_none());
+
+    // Schema generation must still succeed for the untagged one-or-many shape.
+    let schema = rmcp::schemars::schema_for!(SearchDocumentsRequest);
+    let json = serde_json::to_string_pretty(&schema).unwrap();
+    let root: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert!(
+        root.get("properties").is_some(),
+        "SearchDocumentsRequest schema must render properties\nGot:\n{json}"
+    );
+
+    println!(
+        "[OK] SearchDocumentsRequest.collection deserializes from both a bare string and an array."
     );
 }
 

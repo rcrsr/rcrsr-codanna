@@ -29,7 +29,7 @@ Built for rapid R&D and pair programming—instant answers when LSP is too slow.
 
 ## Fork Notice
 
-This is **rcrsr-codanna**, a fork of [`bartolli/codanna`](https://github.com/bartolli/codanna). It carries fork-private additions (including `serve --proxy` mode) and reports its build with a `+rcrsr.N` suffix. See **[RCSR-README.md](RCSR-README.md)** for the list of changes and the versioning convention.
+This is **rcrsr-codanna**, a fork of [`bartolli/codanna`](https://github.com/bartolli/codanna). It carries fork-private additions (including `serve --proxy` mode) and reports its build with a `+rcrsr.N` suffix. See **[RCRSR-README.md](RCRSR-README.md)** for the list of changes and the versioning convention.
 
 ## Quick Start
 
@@ -84,7 +84,7 @@ from multiple clients in every `serve` mode: `search_documents` only takes a
 brief exclusive lock to check document collections for changes, then releases
 it before searching. A force reindex takes a similarly brief write lock around
 the walk, so readers may transiently observe a repopulating index while it's
-in flight — see RCSR-README.md's "Concurrency contract" section for the full
+in flight — see RCRSR-README.md's "Concurrency contract" section for the full
 picture.
 
 ## What It Does

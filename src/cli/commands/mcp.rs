@@ -36,6 +36,25 @@ fn exit_index_error(entity: EntityType, query: &str, error: impl std::fmt::Displ
     std::process::exit(2);
 }
 
+/// Parse a JSON argument value that may be a bare string or an array of
+/// strings into a flat `Vec<String>`, so `codanna mcp search_documents`
+/// accepts both `collection:docs` (single string) and a JSON array for
+/// multi-select. Missing or non-matching values yield an empty vec.
+fn parse_string_or_array(value: Option<&serde_json::Value>) -> Vec<String> {
+    let raw: Vec<String> = match value {
+        Some(serde_json::Value::String(s)) => vec![s.clone()],
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    };
+    // Empty/whitespace-only tokens (e.g. `collection: ""`) must not count as
+    // an explicit collection selection, or they silently bypass
+    // `DocumentsConfig::default_visibility_exclusions`'s emptiness check.
+    raw.into_iter().filter(|s| !s.trim().is_empty()).collect()
+}
+
 // MCP tool JSON output structures.
 //
 // The typed data payloads themselves (IndexInfo, CallRelation,
@@ -584,11 +603,13 @@ pub async fn run(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let collection = arguments
-                .as_ref()
-                .and_then(|m| m.get("collection"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
+            let collections =
+                parse_string_or_array(arguments.as_ref().and_then(|m| m.get("collection")));
+            let mut exclude_collections = parse_string_or_array(
+                arguments
+                    .as_ref()
+                    .and_then(|m| m.get("exclude_collections")),
+            );
             let limit = arguments
                 .as_ref()
                 .and_then(|m| m.get("limit"))
@@ -601,6 +622,16 @@ pub async fn run(
             // never observe different collection definitions even if
             // `facade` and `config` diverge in the future.
             let settings = std::sync::Arc::clone(facade.settings());
+
+            // When the caller named no collections, merge in every collection
+            // whose `default` flag opts it out of unscoped search (mirrors
+            // the MCP tool call site in mcp/tools/search.rs). Explicitly
+            // named collections are always searched regardless of the flag.
+            exclude_collections.extend(
+                settings
+                    .documents
+                    .default_visibility_exclusions(&collections),
+            );
 
             // Auto-sync: brief write guard scoped to the collection scan
             // only, dropped before searching (mirrors the MCP tool call
@@ -652,7 +683,8 @@ pub async fn run(
                     &store,
                     &settings,
                     &query_owned,
-                    collection,
+                    collections,
+                    exclude_collections,
                     limit,
                 )
             })
@@ -1024,8 +1056,11 @@ pub async fn run(
                 let collection = arguments
                     .as_ref()
                     .and_then(|m| m.get("collection"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
+                    .map(|v| crate::mcp::requests::OneOrMany::Many(parse_string_or_array(Some(v))));
+                let exclude_collections = arguments
+                    .as_ref()
+                    .and_then(|m| m.get("exclude_collections"))
+                    .map(|v| parse_string_or_array(Some(v)));
                 let limit = arguments
                     .as_ref()
                     .and_then(|m| m.get("limit"))
@@ -1035,6 +1070,7 @@ pub async fn run(
                     .search_documents(Parameters(SearchDocumentsRequest {
                         query,
                         collection,
+                        exclude_collections,
                         limit,
                         output_format: crate::mcp::requests::OutputFormat::Text,
                     }))

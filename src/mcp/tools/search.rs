@@ -79,7 +79,9 @@ impl CodeIntelligenceServer {
         Ok(CallToolResult::success(vec![ContentBlock::text(result)]))
     }
 
-    #[tool(description = "Search documentation using natural language semantic search")]
+    #[tool(
+        description = "Semantic search over documentation comments extracted from code symbols. For markdown files, use search_documents."
+    )]
     pub async fn semantic_search_docs(
         &self,
         Parameters(SemanticSearchRequest {
@@ -921,19 +923,45 @@ impl CodeIntelligenceServer {
     }
 
     #[tool(
-        description = "Search indexed documents (markdown, text files) using natural language queries. Returns relevant chunks with context and highlighted keywords."
+        description = "Search indexed markdown document collections. For doc-comments on code symbols, use semantic_search_docs. Returns relevant chunks with context and highlighted keywords."
     )]
     pub async fn search_documents(
         &self,
         Parameters(SearchDocumentsRequest {
             query,
             collection,
+            exclude_collections,
             limit,
             output_format,
         }): Parameters<SearchDocumentsRequest>,
     ) -> Result<CallToolResult, McpError> {
-        self.search_documents_inner(query, collection, limit, output_format, None)
-            .await
+        // Empty/whitespace-only tokens (e.g. a client sending `collection: [""]`
+        // or `collection: ""`) must not count as an explicit collection
+        // selection, or they silently bypass
+        // `DocumentsConfig::default_visibility_exclusions`'s emptiness check,
+        // leaking non-default collections into unscoped results. Mirrors the
+        // same normalization applied to the `codanna mcp search_documents`
+        // CLI wrapper's `parse_string_or_array`.
+        let collections: Vec<String> = collection
+            .map(|c| c.into_vec())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| !s.trim().is_empty())
+            .collect();
+        let exclude_collections: Vec<String> = exclude_collections
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| !s.trim().is_empty())
+            .collect();
+        self.search_documents_inner(
+            query,
+            collections,
+            exclude_collections,
+            limit,
+            output_format,
+            None,
+        )
+        .await
     }
 
     /// Test-only entry point into [`Self::search_documents_inner`] that
@@ -945,13 +973,14 @@ impl CodeIntelligenceServer {
     pub(crate) async fn search_documents_for_test(
         &self,
         query: String,
-        collection: Option<String>,
+        collections: Vec<String>,
         limit: u32,
         search_phase_started: tokio::sync::oneshot::Sender<()>,
     ) -> Result<CallToolResult, McpError> {
         self.search_documents_inner(
             query,
-            collection,
+            collections,
+            Vec::new(),
             limit,
             OutputFormat::Text,
             Some(search_phase_started),
@@ -967,7 +996,8 @@ impl CodeIntelligenceServer {
     async fn search_documents_inner(
         &self,
         query: String,
-        collection: Option<String>,
+        collections: Vec<String>,
+        exclude_collections: Vec<String>,
         limit: u32,
         output_format: OutputFormat,
         search_phase_started: Option<tokio::sync::oneshot::Sender<()>>,
@@ -1010,7 +1040,7 @@ impl CodeIntelligenceServer {
         // searching. This is the only step that needs exclusive access to
         // the document store, so the write guard is scoped to this loop
         // only and dropped before searching (see the concurrency contract
-        // documented in RCSR-README.md).
+        // documented in RCRSR-README.md).
         {
             for (name, config) in &settings.documents.collections {
                 // `index_collection` performs blocking file I/O, tantivy
@@ -1045,9 +1075,20 @@ impl CodeIntelligenceServer {
             let _ = tx.send(());
         }
 
+        // When the caller named no collections, merge in every collection
+        // whose `default` flag opts it out of unscoped search. Explicitly
+        // named collections are always searched regardless of the flag.
+        let mut exclude_collections = exclude_collections;
+        exclude_collections.extend(
+            settings
+                .documents
+                .default_visibility_exclusions(&collections),
+        );
+
         let search_query = DocSearchQuery {
             text: query.clone(),
-            collection,
+            collections,
+            exclude_collections,
             document: None,
             limit: limit as usize,
             preview_config: Some(settings.documents.search.clone()),
@@ -1177,7 +1218,7 @@ mod search_documents_concurrency_tests {
     use crate::config::Settings;
     use crate::documents::{CollectionConfig, DocumentStore};
     use crate::indexing::facade::IndexFacade;
-    use crate::mcp::requests::ReindexRequest;
+    use crate::mcp::requests::{OneOrMany, ReindexRequest};
     use crate::mcp::server::CodeIntelligenceServer;
     use crate::vector::{EmbeddingGenerator, MockEmbeddingGenerator, VectorDimension, VectorError};
     use std::sync::Arc;
@@ -1317,6 +1358,89 @@ mod search_documents_concurrency_tests {
         (settings, temp)
     }
 
+    /// Builds a `Settings` with two collections -- "visible" (default
+    /// `default: true`, matching `CollectionConfig::default()`) and
+    /// "hidden" (`default: false`) -- each backed by one markdown file
+    /// containing the shared keyword "lorem", for exercising the
+    /// per-collection default-visibility resolver
+    /// (`DocumentsConfig::default_visibility_exclusions`) end-to-end through
+    /// `search_documents`. Returns the `Settings` together with the backing
+    /// `TempDir`, which callers must keep alive for the settings' paths to
+    /// remain valid.
+    fn fixture_settings_two_collections() -> (Settings, TempDir) {
+        let temp = tempfile::tempdir().expect("create temp root");
+        let visible_dir = temp.path().join("visible");
+        let hidden_dir = temp.path().join("hidden");
+        std::fs::create_dir_all(&visible_dir).expect("create visible dir");
+        std::fs::create_dir_all(&hidden_dir).expect("create hidden dir");
+
+        // Padded above the 200-char default min_chunk_chars so each file
+        // produces at least one chunk.
+        let body = "lorem ipsum ".repeat(60);
+        std::fs::write(visible_dir.join("doc.md"), &body).expect("write visible doc");
+        std::fs::write(hidden_dir.join("doc.md"), &body).expect("write hidden doc");
+
+        let index_dir = temp.path().join("index");
+        let mut settings = Settings {
+            index_path: index_dir,
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.documents.collections.insert(
+            "visible".to_string(),
+            CollectionConfig {
+                paths: vec![visible_dir],
+                patterns: vec!["**/*.md".to_string()],
+                ..Default::default()
+            },
+        );
+        settings.documents.collections.insert(
+            "hidden".to_string(),
+            CollectionConfig {
+                paths: vec![hidden_dir],
+                patterns: vec!["**/*.md".to_string()],
+                default: false,
+                ..Default::default()
+            },
+        );
+
+        (settings, temp)
+    }
+
+    /// Builds a `CodeIntelligenceServer` over the given settings, pre-syncing
+    /// every collection configured in `settings.documents.collections`
+    /// (unlike [`build_server`], which only pre-syncs a single "docs"
+    /// collection). No embedding generator is configured, exercising the
+    /// non-vector `enrich_results` search path -- see [`build_server`]'s doc
+    /// comment for why that is sufficient for exact-match-filtering
+    /// assertions.
+    fn build_server_multi(settings: Settings) -> CodeIntelligenceServer {
+        let index_path = settings.index_path.clone();
+        let collections: Vec<(String, CollectionConfig)> = settings
+            .documents
+            .collections
+            .iter()
+            .map(|(name, cfg)| (name.clone(), cfg.clone()))
+            .collect();
+        let chunking_defaults = settings.documents.defaults.clone();
+
+        let facade = IndexFacade::new(Arc::new(settings)).expect("create facade over temp index");
+
+        let mut store = DocumentStore::new(
+            index_path.join("documents"),
+            VectorDimension::dimension_384(),
+        )
+        .expect("create document store");
+
+        for (name, cfg) in &collections {
+            store
+                .index_collection(name, cfg, &chunking_defaults)
+                .unwrap_or_else(|e| panic!("pre-sync collection '{name}': {e}"));
+        }
+
+        CodeIntelligenceServer::new(facade).with_document_store(store)
+    }
+
     /// Builds a `CodeIntelligenceServer` over the given settings, with a
     /// real `DocumentStore` backing the settings' `docs` collection,
     /// pre-synced once outside the timed test phase so the auto-sync loop
@@ -1450,6 +1574,7 @@ mod search_documents_concurrency_tests {
         Parameters(SearchDocumentsRequest {
             query: "lorem".to_string(),
             collection: None,
+            exclude_collections: None,
             limit: limit as u32,
             output_format: OutputFormat::Text,
         })
@@ -1528,7 +1653,7 @@ mod search_documents_concurrency_tests {
             search_server
                 .search_documents_for_test(
                     "lorem".to_string(),
-                    None,
+                    Vec::new(),
                     TOTAL_CHUNKS as u32,
                     search_phase_started_tx,
                 )
@@ -1679,7 +1804,10 @@ mod search_documents_concurrency_tests {
         let empty_result = server
             .search_documents(Parameters(SearchDocumentsRequest {
                 query: "lorem".to_string(),
-                collection: Some("no-such-collection".to_string()),
+                collection: Some(crate::mcp::requests::OneOrMany::One(
+                    "no-such-collection".to_string(),
+                )),
+                exclude_collections: None,
                 limit: 10,
                 output_format: OutputFormat::Text,
             }))
@@ -1863,6 +1991,97 @@ mod search_documents_concurrency_tests {
              task on that runtime, including this ticker -- only handing the blocking work off \
              via `spawn_blocking` lets the ticker keep advancing through the window",
             delta = after - before
+        );
+    }
+
+    /// Discriminating check (1 of 2) for per-collection default-visibility:
+    /// an unspecified `search_documents` call (no `collection` named) must
+    /// exclude a collection whose `default` flag is `false`, via
+    /// `DocumentsConfig::default_visibility_exclusions` merged into
+    /// `SearchQuery::exclude_collections` in `search_documents_inner`. Paired
+    /// with `search_documents_explicit_collection_includes_non_default_collection`
+    /// below -- both assertions are required to actually discriminate the
+    /// resolver from a regression that either always excludes or never
+    /// excludes non-default collections.
+    #[tokio::test]
+    async fn search_documents_unspecified_excludes_non_default_collection() {
+        let (settings, _temp) = fixture_settings_two_collections();
+        let server = build_server_multi(settings);
+
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let result = server
+            .search_documents_for_test("lorem".to_string(), Vec::new(), 100, tx)
+            .await
+            .expect("search_documents_for_test must succeed");
+
+        let text = text_of(&result);
+        assert!(
+            text.contains("visible"),
+            "expected a hit from the default 'visible' collection, got: {text}"
+        );
+        assert!(
+            !text.contains("hidden"),
+            "'hidden' (default: false) must be excluded from an unspecified search, got: {text}"
+        );
+    }
+
+    /// Discriminating check (2 of 2) for per-collection default-visibility:
+    /// naming a `default: false` collection explicitly must still search it
+    /// -- `DocumentsConfig::default_visibility_exclusions` only excludes
+    /// non-default collections when the caller named none. See
+    /// `search_documents_unspecified_excludes_non_default_collection` above.
+    #[tokio::test]
+    async fn search_documents_explicit_collection_includes_non_default_collection() {
+        let (settings, _temp) = fixture_settings_two_collections();
+        let server = build_server_multi(settings);
+
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let result = server
+            .search_documents_for_test("lorem".to_string(), vec!["hidden".to_string()], 100, tx)
+            .await
+            .expect("search_documents_for_test must succeed");
+
+        let text = text_of(&result);
+        assert!(
+            text.contains("hidden"),
+            "explicitly naming 'hidden' must include it despite default: false, got: {text}"
+        );
+    }
+
+    /// A real MCP client sending `collection: [""]` (or a bare empty string)
+    /// must not count as an explicit collection selection -- otherwise
+    /// `DocumentsConfig::default_visibility_exclusions` sees a non-empty
+    /// `collections` list and skips merging in the `default: false`
+    /// exclusions, leaking the non-default collection into results. This
+    /// exercises the actual `search_documents` tool method (the path a real
+    /// MCP client hits), not the CLI's `parse_string_or_array` normalization
+    /// or the test-only `search_documents_for_test` shortcut, which both
+    /// bypass this filtering.
+    #[tokio::test]
+    async fn search_documents_ignores_empty_collection_token() {
+        let (settings, _temp) = fixture_settings_two_collections();
+        let server = build_server_multi(settings);
+
+        let result = server
+            .search_documents(Parameters(SearchDocumentsRequest {
+                query: "lorem".to_string(),
+                collection: Some(OneOrMany::Many(vec!["".to_string(), "  ".to_string()])),
+                exclude_collections: None,
+                limit: 100,
+                output_format: OutputFormat::Text,
+            }))
+            .await
+            .expect("search_documents must succeed");
+
+        let text = text_of(&result);
+        assert!(
+            text.contains("visible"),
+            "expected a hit from the default 'visible' collection, got: {text}"
+        );
+        assert!(
+            !text.contains("hidden"),
+            "empty/whitespace-only collection tokens must not count as an explicit \
+             selection, so 'hidden' (default: false) must still be excluded, got: {text}"
         );
     }
 }
