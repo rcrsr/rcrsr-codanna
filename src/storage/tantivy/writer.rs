@@ -9,19 +9,50 @@ use tantivy::{
 
 use super::DocumentIndex;
 
+/// Maximum backoff delay between writer-acquisition retries, in milliseconds.
+const MAX_RETRY_DELAY_MS: u64 = 30_000;
+
+/// Compute the exponential backoff delay (in milliseconds) before the given
+/// retry attempt (0-indexed). Uses a checked shift and caps the result at
+/// `MAX_RETRY_DELAY_MS` so a large `attempt` (e.g. from a misconfigured
+/// `max_retry_attempts >= 32`) can neither overflow the shift nor produce an
+/// absurdly long sleep.
+fn retry_backoff_delay_ms(attempt: u32) -> u64 {
+    // Clamp the shift amount well below `u64::BITS` (64) first: a shift of
+    // e.g. 63 is a *valid* `checked_shl` (doesn't return `None`), but it
+    // discards all but the lowest bit of `100`, silently producing a tiny
+    // (even zero) result instead of a large one. Clamping to 20 keeps the
+    // shifted value (100 << 20 is ~105 million ms, well within u64 range)
+    // safely above `MAX_RETRY_DELAY_MS`, so the final `.min()` always applies
+    // the intended cap rather than an artifact of bit truncation.
+    let capped_attempt = attempt.min(20);
+    100u64
+        .checked_shl(capped_attempt)
+        .unwrap_or(MAX_RETRY_DELAY_MS)
+        .min(MAX_RETRY_DELAY_MS)
+}
+
 /// Classify a `TantivyError` as transient (worth retrying) or permanent.
 ///
 /// Transient cases:
 /// - `LockFailure(LockError::LockBusy, _)`: another writer currently holds the
 ///   directory lock. This is the primary case `create_writer_with_retry` exists
-///   to survive, and it carries no `io::Error` source, so it cannot be detected
-///   by downcasting `Error::source`.
-/// - `LockFailure(LockError::IoError(io_err), _)` or any other error whose
-///   `source()` downcasts to an `io::Error` with kind `PermissionDenied`,
+///   to survive.
+/// - `LockFailure(LockError::IoError(io_err), _)` with kind `PermissionDenied`,
 ///   `TimedOut`, or `WouldBlock`.
+/// - `TantivyError::IoError(io_err)` with the same transient kinds. This is
+///   reachable directly from `Index::writer()` (via `available_parallelism()`
+///   failures converted through `impl From<io::Error> for TantivyError`), not
+///   just through a lock failure.
+///
+/// Note: `TantivyError`'s `source()` does not downcast to `io::Error` for any
+/// variant in tantivy 0.26 (the `IoError` field is an unnamed, non-`#[source]`
+/// `Arc<io::Error>`, and the `#[from]` variants wrap directory-error structs,
+/// not `io::Error` itself), so classification must match on the concrete
+/// variants above rather than relying on a `source()` fallback.
 fn is_transient_writer_error(e: &tantivy::TantivyError) -> bool {
-    if let tantivy::TantivyError::LockFailure(lock_error, _) = e {
-        return match lock_error {
+    match e {
+        tantivy::TantivyError::LockFailure(lock_error, _) => match lock_error {
             LockError::LockBusy => true,
             LockError::IoError(io_err) => matches!(
                 io_err.kind(),
@@ -29,20 +60,15 @@ fn is_transient_writer_error(e: &tantivy::TantivyError) -> bool {
                     | std::io::ErrorKind::TimedOut
                     | std::io::ErrorKind::WouldBlock
             ),
-        };
+        },
+        tantivy::TantivyError::IoError(io_err) => matches!(
+            io_err.kind(),
+            std::io::ErrorKind::PermissionDenied
+                | std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::WouldBlock
+        ),
+        _ => false,
     }
-
-    std::error::Error::source(e)
-        .and_then(|s| s.downcast_ref::<std::io::Error>())
-        .map(|io_err| {
-            matches!(
-                io_err.kind(),
-                std::io::ErrorKind::PermissionDenied
-                    | std::io::ErrorKind::TimedOut
-                    | std::io::ErrorKind::WouldBlock
-            )
-        })
-        .unwrap_or(false)
 }
 
 impl DocumentIndex {
@@ -60,7 +86,7 @@ impl DocumentIndex {
                     let is_transient = is_transient_writer_error(&e);
 
                     if is_transient && attempt < max_attempts - 1 {
-                        let delay = 100 * (1 << attempt);
+                        let delay = retry_backoff_delay_ms(attempt);
                         eprintln!(
                             "Attempt {}/{}: Transient index-lock contention, retrying after {}ms",
                             attempt + 1,
@@ -148,11 +174,19 @@ impl DocumentIndex {
                     // Successful commit
                 }
                 Err(e) => {
-                    // Check for permission errors using ErrorKind
-                    let is_permission_error = std::error::Error::source(&e)
-                        .and_then(|s| s.downcast_ref::<std::io::Error>())
-                        .map(|io_err| matches!(io_err.kind(), std::io::ErrorKind::PermissionDenied))
-                        .unwrap_or(false);
+                    // Check for permission errors using ErrorKind. `source()`
+                    // does not downcast to `io::Error` for any `TantivyError`
+                    // variant in tantivy 0.26 (see `is_transient_writer_error`
+                    // above), so match the concrete variants directly.
+                    let is_permission_error = match &e {
+                        tantivy::TantivyError::IoError(io_err) => {
+                            io_err.kind() == std::io::ErrorKind::PermissionDenied
+                        }
+                        tantivy::TantivyError::LockFailure(LockError::IoError(io_err), _) => {
+                            io_err.kind() == std::io::ErrorKind::PermissionDenied
+                        }
+                        _ => false,
+                    };
 
                     if is_permission_error {
                         return Err(StorageError::General(format!(
@@ -500,6 +534,31 @@ mod tests {
     }
 
     #[test]
+    fn test_top_level_io_error_with_transient_kind_is_classified_as_transient() {
+        let io_err = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "simulated transient io error",
+        );
+        let err = tantivy::TantivyError::IoError(StdArc::new(io_err));
+        assert!(
+            is_transient_writer_error(&err),
+            "TantivyError::IoError with a transient kind (e.g. from \
+             Index::writer()'s available_parallelism() conversion) must be \
+             classified as transient"
+        );
+    }
+
+    #[test]
+    fn test_top_level_io_error_with_non_transient_kind_is_not_classified_as_transient() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "simulated permanent error");
+        let err = tantivy::TantivyError::IoError(StdArc::new(io_err));
+        assert!(
+            !is_transient_writer_error(&err),
+            "TantivyError::IoError with a non-transient kind must not be retried"
+        );
+    }
+
+    #[test]
     fn test_non_transient_error_is_not_classified_as_transient() {
         let err = tantivy::TantivyError::SchemaError("field does not exist".to_string());
         assert!(
@@ -512,6 +571,25 @@ mod tests {
             !is_transient_writer_error(&err),
             "IndexAlreadyExists is a permanent failure and must not be retried"
         );
+    }
+
+    #[test]
+    fn test_retry_backoff_delay_caps_and_does_not_panic_on_large_attempts() {
+        // Small attempts still follow the exponential curve.
+        assert_eq!(retry_backoff_delay_ms(0), 100);
+        assert_eq!(retry_backoff_delay_ms(1), 200);
+        assert_eq!(retry_backoff_delay_ms(2), 400);
+
+        // Attempts large enough that `1 << attempt` would overflow a `u32`
+        // shift (>= 32) must not panic, and must be capped rather than
+        // producing an absurd sleep duration.
+        assert_eq!(retry_backoff_delay_ms(32), MAX_RETRY_DELAY_MS);
+        assert_eq!(retry_backoff_delay_ms(63), MAX_RETRY_DELAY_MS);
+        assert_eq!(retry_backoff_delay_ms(1_000), MAX_RETRY_DELAY_MS);
+
+        // Even attempts within u64's shiftable range but large enough to
+        // exceed the cap must still be clamped.
+        assert_eq!(retry_backoff_delay_ms(20), MAX_RETRY_DELAY_MS);
     }
 
     #[test]
@@ -540,9 +618,14 @@ mod tests {
         let held_writer = index.index.writer::<Document>(index.heap_size).unwrap();
 
         // Release the lock shortly after start_batch begins its attempts,
-        // comfortably inside the retry budget (100ms, 200ms, 400ms
-        // backoffs => ~700ms total before attempts are exhausted).
-        let release_after = Duration::from_millis(150);
+        // well inside the retry budget: with the default
+        // `max_retry_attempts = 3` there are two backoffs (100ms + 200ms =
+        // 300ms) before the final attempt gives up. Releasing at 50ms
+        // instead of closer to that 300ms ceiling leaves a wide margin
+        // against scheduling jitter under CI load, while the
+        // `elapsed >= 100ms` assertion below still requires the first
+        // attempt to observe LockBusy and retry at least once.
+        let release_after = Duration::from_millis(50);
         std::thread::spawn(move || {
             std::thread::sleep(release_after);
             drop(held_writer);
