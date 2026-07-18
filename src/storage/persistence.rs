@@ -4,10 +4,29 @@
 //! All actual data is stored in Tantivy.
 
 use crate::indexing::facade::IndexFacade;
+use crate::indexing::walk_config;
 use crate::storage::{DataSource, IndexMetadata};
 use crate::{IndexError, IndexResult, Settings};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// Root used for ignore-fingerprint file lookups (`.gitignore`,
+/// `.codannaignore`, `.git/info/exclude`): the workspace root when known,
+/// otherwise `fallback` (the actual indexed root, when the caller has one),
+/// otherwise the current directory.
+///
+/// [`walk_config::build_walker`]/[`walk_config::ignore_fingerprint`] fall
+/// back to the actual walk root (the directory being indexed) rather than
+/// the process CWD when `workspace_root` is unset; passing the caller's
+/// best-known indexed root as `fallback` keeps this in step with that,
+/// instead of confidently fingerprinting the wrong directory.
+fn ignore_fingerprint_root(settings: &Settings, fallback: Option<&Path>) -> PathBuf {
+    settings
+        .workspace_root
+        .clone()
+        .or_else(|| fallback.map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
 
 /// Manages persistence of the index
 #[derive(Debug)]
@@ -65,6 +84,13 @@ impl IndexPersistence {
     ) -> IndexResult<IndexFacade> {
         // Load metadata to understand data sources
         let metadata = IndexMetadata::load(&self.base_path).ok();
+
+        // Detect-and-report staleness (issue #28) is surfaced on demand via
+        // `mcp::service::ignore_rules_changed`/`get_index_info`, not here:
+        // computing the fingerprint at every load just to emit a log-only
+        // warning duplicated that work (an extra `index.meta` read plus
+        // SHA256-of-3-files) for no externally visible effect beyond a
+        // `tracing::warn!` line.
 
         // Check if Tantivy index exists
         let tantivy_path = self.base_path.join("tantivy");
@@ -185,7 +211,25 @@ impl IndexPersistence {
             "[persistence] saving {} indexed paths to metadata",
             indexed_paths.len()
         );
+        // The first indexed directory is the closest available stand-in for
+        // "the actual walk root" when `workspace_root` is unset, mirroring
+        // `build_walker`'s own fallback more closely than the process CWD.
+        let root_fallback = indexed_paths.first().cloned();
         metadata.update_indexed_paths(indexed_paths);
+
+        // Record the ignore-rule fingerprint for staleness detection on next
+        // load (issue #28, detect-and-report only). A computation failure
+        // (e.g. an unreadable ignore file) is logged and otherwise
+        // non-fatal: the save still succeeds, and the field is simply left
+        // at its previous value, which loaders already treat as "unknown"
+        // rather than "changed" when absent.
+        let root = ignore_fingerprint_root(facade.settings(), root_fallback.as_deref());
+        match walk_config::ignore_fingerprint(facade.settings(), &root) {
+            Ok(fingerprint) => metadata.update_ignore_fingerprint(fingerprint),
+            Err(e) => {
+                tracing::warn!("[persistence] failed to compute ignore fingerprint: {e}");
+            }
+        }
 
         // Update metadata to reflect Tantivy
         metadata.data_source = DataSource::Tantivy {

@@ -129,6 +129,7 @@ impl Pipeline {
 
         // Stage 1: SOURCE - directory walk or explicit file list
         type SourceJoinHandle = thread::JoinHandle<(PipelineResult<usize>, Option<StageMetrics>)>;
+        let discover_settings = Arc::clone(&settings);
         let source_handle: SourceJoinHandle = match source {
             FileSource::Walk(root) => thread::spawn(move || {
                 let tracker = if tracing_enabled {
@@ -137,7 +138,8 @@ impl Pipeline {
                     None
                 };
 
-                let stage = DiscoverStage::new(root, discover_threads);
+                let stage =
+                    DiscoverStage::new(root, discover_threads).with_settings(discover_settings);
                 let result = stage.run(path_tx);
 
                 // Record metrics

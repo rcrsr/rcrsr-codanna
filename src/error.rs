@@ -109,6 +109,10 @@ pub enum IndexError {
     /// Pipeline error (boxed to break recursive type cycle)
     #[error("Pipeline error: {0}")]
     Pipeline(Box<crate::indexing::pipeline::PipelineError>),
+
+    /// A configured ignore pattern failed to parse as a gitignore line
+    #[error("Invalid ignore pattern '{pattern}': {reason}")]
+    InvalidIgnorePattern { pattern: String, reason: String },
 }
 
 impl IndexError {
@@ -158,6 +162,7 @@ impl IndexError {
             Self::Storage(_) => "STORAGE_ERROR",
             Self::SemanticSearch(_) => "SEMANTIC_SEARCH_ERROR",
             Self::Pipeline(_) => "PIPELINE_ERROR",
+            Self::InvalidIgnorePattern { .. } => "INVALID_IGNORE_PATTERN",
         }
         .to_string()
     }
@@ -192,6 +197,9 @@ impl IndexError {
             Self::UnsupportedFileType { .. } => vec![
                 "Currently only Rust files (.rs) are supported",
                 "Support for other languages is coming soon",
+            ],
+            Self::InvalidIgnorePattern { .. } => vec![
+                "Check the 'indexing.ignore_patterns' entries in settings.toml for valid gitignore-style globs",
             ],
             _ => vec![],
         }

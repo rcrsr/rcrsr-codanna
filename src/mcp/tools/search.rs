@@ -63,8 +63,17 @@ impl CodeIntelligenceServer {
             "\n\nSemantic Search:\n  - Status: Disabled".to_string()
         };
 
+        // Detect-and-report only (issue #28): never fabricates "changed"
+        // from unknown state (index predates this field, or the fingerprint
+        // could not be recomputed).
+        let staleness_warning = if service::ignore_rules_changed(&indexer) == Some(true) {
+            "\n\nWarning: index may be stale: ignore rules changed since last index"
+        } else {
+            ""
+        };
+
         let result = format!(
-            "Index contains {symbol_count} symbols across {file_count} files.\n\nBreakdown:\n  - Symbols: {symbol_count}\n  - Relationships: {relationship_count}\n\nSymbol Kinds:{kinds_display}{semantic_info}"
+            "Index contains {symbol_count} symbols across {file_count} files.\n\nBreakdown:\n  - Symbols: {symbol_count}\n  - Relationships: {relationship_count}\n\nSymbol Kinds:{kinds_display}{semantic_info}{staleness_warning}"
         );
 
         Ok(CallToolResult::success(vec![ContentBlock::text(result)]))

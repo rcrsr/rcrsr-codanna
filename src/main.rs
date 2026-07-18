@@ -747,15 +747,27 @@ async fn main() {
 
         Commands::Index {
             paths,
+            threads: _,
             force,
             no_progress,
             dry_run,
+            list_all,
+            json,
             max_files,
-            ..
         } => {
             use codanna::cli::commands::index::{IndexArgs, run as run_index};
+            use codanna::indexing::DryRunOutput;
             // Progress enabled by default from settings, --no-progress overrides
             let progress = config.indexing.show_progress && !no_progress;
+            // `--json` wins over `--list-all`; both are clap `requires =
+            // "dry_run"` so this only matters when dry_run is set.
+            let dry_run_output = if json {
+                DryRunOutput::Json
+            } else if list_all {
+                DryRunOutput::ListAll
+            } else {
+                DryRunOutput::Summary
+            };
             run_index(
                 IndexArgs {
                     paths,
@@ -764,6 +776,7 @@ async fn main() {
                     dry_run,
                     max_files,
                     cli_config: cli.config.clone(),
+                    dry_run_output,
                 },
                 &mut config,
                 indexer.as_mut().expect("index requires indexer"),
@@ -811,10 +824,12 @@ async fn main() {
                         if path.is_dir() {
                             // Run incremental indexing (force=false)
                             match indexer.index_directory_with_options(
-                                path, false, // no progress bars for watch mode
+                                path,
+                                false, // no progress bars for watch mode
                                 false, // not dry run
                                 false, // not force (incremental)
                                 None,  // no max_files limit
+                                codanna::indexing::DryRunOutput::default(),
                             ) {
                                 Ok(stats) => total_indexed += stats.files_indexed,
                                 Err(e) => {

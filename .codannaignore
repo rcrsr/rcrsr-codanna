@@ -65,6 +65,8 @@ __pycache__/
 .svn/
 .hg/
 
-# Example of including specific files from ignored directories:
-# !target/doc/
-# !vendor/specific-file.rs
+# Re-including specific files from an ignored directory:
+# gitignore cannot re-include a file whose parent directory is excluded, so
+# exclude the directory's *contents* (dir/*) rather than the directory (dir/).
+# To index target/doc/, change the "target/" line above to "target/*" and add:
+#   !target/doc/

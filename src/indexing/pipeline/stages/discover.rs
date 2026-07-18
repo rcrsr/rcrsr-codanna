@@ -7,12 +7,13 @@
 //! - Full: Discovers all files (for initial indexing or force re-index)
 //! - Incremental: Compares disk state to index, returns new/modified/deleted
 
+use crate::Settings;
 use crate::indexing::file_info::calculate_hash;
 use crate::indexing::pipeline::types::{DiscoverResult, PipelineError, PipelineResult};
+use crate::indexing::walk_config::{build_walker, warn_if_skipped_symlink_dir};
 use crate::parsing::get_registry;
 use crate::storage::DocumentIndex;
 use crossbeam_channel::Sender;
-use ignore::WalkBuilder;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -27,6 +28,8 @@ pub struct DiscoverStage {
     index: Option<Arc<DocumentIndex>>,
     /// Workspace root for path normalization.
     workspace_root: Option<PathBuf>,
+    /// Settings used to build the canonical WalkBuilder.
+    settings: Option<Arc<Settings>>,
 }
 
 impl DiscoverStage {
@@ -37,6 +40,7 @@ impl DiscoverStage {
             threads: threads.max(1),
             index: None,
             workspace_root: None,
+            settings: None,
         }
     }
 
@@ -50,6 +54,21 @@ impl DiscoverStage {
     pub fn with_workspace_root(mut self, root: Option<PathBuf>) -> Self {
         self.workspace_root = root;
         self
+    }
+
+    /// Set settings used to build the canonical WalkBuilder (see
+    /// `crate::indexing::walk_config::build_walker`).
+    pub fn with_settings(mut self, settings: Arc<Settings>) -> Self {
+        self.settings = Some(settings);
+        self
+    }
+
+    /// Resolve the settings to use for the walk, falling back to defaults
+    /// when none were configured via `with_settings`.
+    fn settings_or_default(&self) -> Arc<Settings> {
+        self.settings
+            .clone()
+            .unwrap_or_else(|| Arc::new(Settings::default()))
     }
 
     /// Normalize a path relative to workspace_root.
@@ -74,18 +93,10 @@ impl DiscoverStage {
         let extensions = get_supported_extensions()?;
         let count = Arc::new(AtomicUsize::new(0));
 
-        let mut builder = WalkBuilder::new(&self.root);
-        builder
-            .hidden(false) // Don't auto-skip hidden directories
-            .git_ignore(true) // Respect .gitignore
-            .git_global(true) // Respect global gitignore
-            .git_exclude(true) // Respect .git/info/exclude
-            .follow_links(false) // Don't follow symlinks
-            .require_git(false) // Allow gitignore to work in non-git directories
-            .threads(self.threads);
-
-        // Support .codannaignore files (matches FileWalker behavior)
-        builder.add_custom_ignore_filename(".codannaignore");
+        let settings = self.settings_or_default();
+        let follow_links = settings.indexing.follow_links;
+        let mut builder = build_walker(&settings, &self.root)?;
+        builder.threads(self.threads);
 
         let walker = builder.build_parallel();
 
@@ -102,6 +113,8 @@ impl DiscoverStage {
                     Ok(e) => e,
                     Err(_) => return ignore::WalkState::Continue,
                 };
+
+                warn_if_skipped_symlink_dir(&entry, follow_links);
 
                 // Skip directories
                 if entry.file_type().is_some_and(|ft| ft.is_dir()) {
@@ -214,21 +227,15 @@ impl DiscoverStage {
         let mut files = Vec::new();
 
         // Use sequential walker for simplicity in incremental mode
-        let mut builder = WalkBuilder::new(&self.root);
-        builder
-            .hidden(false) // Don't auto-skip hidden directories
-            .git_ignore(true) // Respect .gitignore
-            .git_global(true) // Respect global gitignore
-            .git_exclude(true) // Respect .git/info/exclude
-            .follow_links(false) // Don't follow symlinks
-            .require_git(false); // Allow gitignore to work in non-git directories
-
-        // Support .codannaignore files (matches FileWalker behavior)
-        builder.add_custom_ignore_filename(".codannaignore");
+        let settings = self.settings_or_default();
+        let follow_links = settings.indexing.follow_links;
+        let builder = build_walker(&settings, &self.root)?;
 
         let walker = builder.build();
 
         for entry in walker.flatten() {
+            warn_if_skipped_symlink_dir(&entry, follow_links);
+
             if entry.file_type().is_some_and(|ft| ft.is_dir()) {
                 continue;
             }
@@ -329,7 +336,7 @@ mod tests {
     fn test_discover_examples_directory() {
         let (sender, receiver) = bounded(1000);
 
-        let stage = DiscoverStage::new("examples", 4);
+        let stage = DiscoverStage::new("examples", 4).with_settings(Arc::new(Settings::default()));
         let result = stage.run(sender);
 
         assert!(result.is_ok(), "Discover should succeed");
@@ -364,7 +371,7 @@ mod tests {
     fn test_discover_respects_gitignore() {
         let (sender, receiver) = bounded(1000);
 
-        let stage = DiscoverStage::new(".", 4);
+        let stage = DiscoverStage::new(".", 4).with_settings(Arc::new(Settings::default()));
         let _count = stage.run(sender);
 
         let paths: Vec<PathBuf> = receiver.iter().collect();
