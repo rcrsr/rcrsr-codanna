@@ -25,8 +25,29 @@ impl FileWalker {
         Self { settings }
     }
 
-    /// Walk a directory and return an iterator of files to index
+    /// Walk a directory and return an iterator of files to index.
+    ///
+    /// Warns once per skipped symlinked directory (see
+    /// [`warn_if_skipped_symlink_dir`]). Use [`Self::walk_quiet`] for a
+    /// count-only pass that shares a walk site with a caller that will also
+    /// walk (and warn on) the same directory, to avoid a duplicate warning.
     pub fn walk(&self, root: &Path) -> IndexResult<impl Iterator<Item = PathBuf>> {
+        self.walk_impl(root, true)
+    }
+
+    /// Same as [`Self::walk`], but suppresses the skipped-symlinked-directory
+    /// warning. Intended for a count-only walk (e.g. sizing a progress bar)
+    /// that runs immediately before another walk site walks the same
+    /// directory for real and would otherwise warn a second time.
+    pub fn walk_quiet(&self, root: &Path) -> IndexResult<impl Iterator<Item = PathBuf>> {
+        self.walk_impl(root, false)
+    }
+
+    fn walk_impl(
+        &self,
+        root: &Path,
+        warn_on_skip: bool,
+    ) -> IndexResult<impl Iterator<Item = PathBuf>> {
         let mut builder = build_walker(&self.settings, root)?;
         builder.max_depth(None); // No depth limit
 
@@ -38,7 +59,11 @@ impl FileWalker {
         Ok(builder
             .build()
             .filter_map(Result::ok) // Skip files we can't access
-            .inspect(move |entry| warn_if_skipped_symlink_dir(entry, follow_links))
+            .inspect(move |entry| {
+                if warn_on_skip {
+                    warn_if_skipped_symlink_dir(entry, follow_links);
+                }
+            })
             .filter(|entry| entry.file_type().is_some_and(|ft| ft.is_file()))
             .filter_map(move |entry| {
                 let path = entry.path();

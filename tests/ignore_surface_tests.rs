@@ -688,6 +688,56 @@ mod follow_links_tests {
         );
     }
 
+    /// Regression for the symlink-escape containment check: unlike
+    /// `prepare_symlink_workspace` (whose symlink target lives under the
+    /// same workspace, inside `outside/`, so it never exercises an escape),
+    /// this points `src/escape_link` at a directory in an entirely separate
+    /// `TempDir`. With `follow_links = true`, a malicious repo could ship a
+    /// symlink like this pointing at `~/.ssh` or similar; the walker must
+    /// refuse to follow it even though `follow_links` is on, and must not
+    /// index anything reachable only through it.
+    #[test]
+    fn symlinked_directory_outside_workspace_root_is_not_followed_even_when_enabled() {
+        let workspace = init_ignore_workspace("follow_links = true");
+
+        let outside = TempDir::new().expect("create outside-workspace temp dir");
+        let escape_target = outside.path().join("escape_target");
+        std::fs::create_dir_all(&escape_target).expect("create escape_target dir");
+        std::fs::write(
+            escape_target.join("marker.py"),
+            "def w5_marker_via_escaping_symlink():\n    pass\n",
+        )
+        .expect("write marker.py");
+
+        let src_dir = workspace.path().join("src");
+        std::fs::create_dir_all(&src_dir).expect("create src dir");
+        symlink(&escape_target, src_dir.join("escape_link")).expect("create escaping symlink");
+
+        let (code, stdout, stderr) = run_cli(workspace.path(), &["index", "src", "--no-progress"]);
+        assert_eq!(
+            code, 0,
+            "index should succeed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+
+        let (found, sym_stdout, sym_stderr) =
+            symbol_is_indexed(workspace.path(), "w5_marker_via_escaping_symlink");
+        assert!(
+            !found,
+            "a symbol reachable only via a symlink that escapes the workspace root \
+             must never be indexed, even with follow_links enabled\
+             \nstdout:\n{sym_stdout}\nstderr:\n{sym_stderr}"
+        );
+
+        assert!(
+            stderr.contains("skipping symlink") && stderr.contains("escapes the workspace root"),
+            "must warn when a symlink escaping the workspace root is skipped\nstderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("escape_link"),
+            "warning must name the skipped symlink\nstderr:\n{stderr}"
+        );
+    }
+
     #[test]
     fn root_symlink_is_walked_even_when_follow_links_disabled() {
         let workspace = prepare_symlink_workspace(false);

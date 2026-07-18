@@ -1282,11 +1282,16 @@ impl IndexFacade {
             eprintln!();
             eprintln!("Indexing directory: {}", path.display());
 
-            // Count files first for accurate progress bar
+            // Count files first for accurate progress bar. Uses `walk_quiet`
+            // rather than `walk` because `index_incremental_with_progress_flag`
+            // below performs its own full walk of the same directory via
+            // `DiscoverStage`; both walk sites call
+            // `warn_if_skipped_symlink_dir` per entry, so warning here too
+            // would log a symlinked-directory skip twice per run.
             let file_count = if progress {
                 use crate::indexing::FileWalker;
                 let walker = FileWalker::new(Arc::clone(&self.settings));
-                walker.walk(path)?.count()
+                walker.walk_quiet(path)?.count()
             } else {
                 0
             };
@@ -1397,6 +1402,14 @@ impl ReindexHandles {
             semantic_search,
             embedding_pool,
         } = self;
+
+        // A malformed `ignore_patterns` entry is a deterministic misconfig,
+        // not a transient per-path failure: it fails identically on every
+        // path in the loop below. Validate once, up front, and propagate a
+        // hard error rather than letting the per-path catch-and-warn below
+        // reduce it to `tracing::warn!` while still reporting "reindexed 0
+        // files" as if nothing were wrong.
+        crate::indexing::walk_config::validate_ignore_patterns(pipeline.settings())?;
 
         let mut indexed_dirs = Vec::new();
 

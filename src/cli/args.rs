@@ -159,7 +159,10 @@ pub enum Commands {
         list_all: bool,
 
         /// With --dry-run, print a JSON array of paths to stdout and nothing
-        /// else. Never truncates. Takes precedence over --list-all
+        /// else, one array per path argument (indexing runs once per
+        /// positional path, so multiple path arguments print multiple
+        /// concatenated arrays). Never truncates. Takes precedence over
+        /// --list-all
         #[arg(long, requires = "dry_run")]
         json: bool,
 

@@ -1,6 +1,6 @@
 //! Index command - index source code files and directories.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::cli::commands::directories::{SkipReason, add_paths_to_settings};
 use crate::config::Settings;
@@ -128,7 +128,9 @@ pub fn run(
     let mut total_indexed = 0usize;
     for path in &paths_to_index {
         if path.is_file() {
-            if index_single_file(indexer, path, force) {
+            if dry_run {
+                dry_run_single_file(path, dry_run_output);
+            } else if index_single_file(indexer, path, force) {
                 total_indexed += 1;
             }
         } else if path.is_dir() {
@@ -152,6 +154,30 @@ pub fn run(
         save_index(indexer, persistence, config);
     } else if !dry_run && total_indexed == 0 {
         tracing::debug!(target: "indexing", "no changes detected, skipping save");
+    }
+}
+
+/// Preview a single explicit file path under `--dry-run`, mirroring the
+/// directory branch's `dry_run_output` rendering so `codanna index
+/// somefile.rs --dry-run --json` does not silently run the real indexing
+/// routine (an explicit file path is never filtered by the walker, so
+/// previewing it is always exactly the one path given).
+fn dry_run_single_file(path: &Path, dry_run_output: DryRunOutput) {
+    match dry_run_output {
+        DryRunOutput::Json => {
+            let paths = [path.display().to_string()];
+            match serde_json::to_string(&paths) {
+                Ok(json) => println!("{json}"),
+                Err(e) => {
+                    eprintln!("Error: failed to serialize dry-run file list as JSON: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        DryRunOutput::ListAll | DryRunOutput::Summary => {
+            println!("Would index 1 files:");
+            println!("  {}", path.display());
+        }
     }
 }
 
