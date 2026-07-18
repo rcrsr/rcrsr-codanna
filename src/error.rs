@@ -3,6 +3,7 @@
 //! This module provides structured error types using thiserror for better
 //! error handling and actionable error messages.
 
+use crate::vector::VectorStorageError;
 use crate::{FileId, SymbolId};
 use std::path::PathBuf;
 use thiserror::Error;
@@ -250,6 +251,39 @@ pub enum McpError {
     InvalidArguments { reason: String },
 }
 
+/// Errors from document storage operations.
+#[derive(Error, Debug)]
+pub enum DocumentStoreError {
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("Tantivy error: {0}")]
+    Tantivy(#[from] tantivy::TantivyError),
+
+    #[error("Directory error: {0}")]
+    Directory(#[from] tantivy::directory::error::OpenDirectoryError),
+
+    #[error("Vector storage error: {0}")]
+    VectorStorage(#[from] VectorStorageError),
+
+    #[error("Collection not found: {0}")]
+    CollectionNotFound(String),
+
+    #[error("Index error: {0}")]
+    Index(String),
+
+    #[error("Embedding error: {0}")]
+    Embedding(String),
+
+    #[error("Lock poisoned")]
+    LockPoisoned,
+
+    /// A collection's glob override pattern (positive or `!`-negated) failed
+    /// to compile via `ignore::overrides::OverrideBuilder`.
+    #[error("Invalid glob override pattern '{pattern}': {reason}")]
+    InvalidGlobPattern { pattern: String, reason: String },
+}
+
 /// Result type alias for index operations
 pub type IndexResult<T> = Result<T, IndexError>;
 
@@ -261,6 +295,9 @@ pub type StorageResult<T> = Result<T, StorageError>;
 
 /// Result type alias for MCP operations
 pub type McpResult<T> = Result<T, McpError>;
+
+/// Result type alias for document store operations
+pub type StoreResult<T> = Result<T, DocumentStoreError>;
 
 /// Helper trait for adding context to errors
 pub trait ErrorContext<T> {

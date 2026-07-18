@@ -36,6 +36,21 @@ fn exit_index_error(entity: EntityType, query: &str, error: impl std::fmt::Displ
     std::process::exit(2);
 }
 
+/// Parse a JSON argument value that may be a bare string or an array of
+/// strings into a flat `Vec<String>`, so `codanna mcp search_documents`
+/// accepts both `collection:docs` (single string) and a JSON array for
+/// multi-select. Missing or non-matching values yield an empty vec.
+fn parse_string_or_array(value: Option<&serde_json::Value>) -> Vec<String> {
+    match value {
+        Some(serde_json::Value::String(s)) => vec![s.clone()],
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 // MCP tool JSON output structures.
 //
 // The typed data payloads themselves (IndexInfo, CallRelation,
@@ -584,11 +599,13 @@ pub async fn run(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let collection = arguments
-                .as_ref()
-                .and_then(|m| m.get("collection"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
+            let collections =
+                parse_string_or_array(arguments.as_ref().and_then(|m| m.get("collection")));
+            let exclude_collections = parse_string_or_array(
+                arguments
+                    .as_ref()
+                    .and_then(|m| m.get("exclude_collections")),
+            );
             let limit = arguments
                 .as_ref()
                 .and_then(|m| m.get("limit"))
@@ -652,7 +669,8 @@ pub async fn run(
                     &store,
                     &settings,
                     &query_owned,
-                    collection,
+                    collections,
+                    exclude_collections,
                     limit,
                 )
             })
@@ -1024,8 +1042,11 @@ pub async fn run(
                 let collection = arguments
                     .as_ref()
                     .and_then(|m| m.get("collection"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
+                    .map(|v| crate::mcp::requests::OneOrMany::Many(parse_string_or_array(Some(v))));
+                let exclude_collections = arguments
+                    .as_ref()
+                    .and_then(|m| m.get("exclude_collections"))
+                    .map(|v| parse_string_or_array(Some(v)));
                 let limit = arguments
                     .as_ref()
                     .and_then(|m| m.get("limit"))
@@ -1035,6 +1056,7 @@ pub async fn run(
                     .search_documents(Parameters(SearchDocumentsRequest {
                         query,
                         collection,
+                        exclude_collections,
                         limit,
                         output_format: crate::mcp::requests::OutputFormat::Text,
                     }))

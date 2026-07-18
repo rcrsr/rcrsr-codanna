@@ -66,6 +66,7 @@ pub fn run(action: DocumentAction, config: &Settings, cli_config: Option<&PathBu
         DocumentAction::Search {
             args,
             collection,
+            exclude_collection,
             limit,
             json,
             fields,
@@ -93,8 +94,17 @@ pub fn run(action: DocumentAction, config: &Settings, cli_config: Option<&PathBu
                     .unwrap_or(10)
             });
 
-            // Collection can come from --collection flag or collection:name
-            let final_collection = collection.or_else(|| params.get("collection").cloned());
+            // Collection can come from repeatable --collection flags or a
+            // single collection:name key:value pair.
+            let final_collections = if !collection.is_empty() {
+                collection
+            } else {
+                params
+                    .get("collection")
+                    .cloned()
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            };
 
             let store = match create_store_with_embeddings() {
                 Ok(s) => s,
@@ -110,10 +120,21 @@ pub fn run(action: DocumentAction, config: &Settings, cli_config: Option<&PathBu
                 }
             };
 
+            // When the caller named no collections, merge in every collection
+            // whose `default` flag opts it out of unscoped search. Explicitly
+            // named collections are always searched regardless of the flag.
+            let mut final_exclude_collections = exclude_collection;
+            final_exclude_collections.extend(
+                config
+                    .documents
+                    .default_visibility_exclusions(&final_collections),
+            );
+
             let query_text = final_query.clone();
             let search_query = SearchQuery {
                 text: final_query,
-                collection: final_collection,
+                collections: final_collections,
+                exclude_collections: final_exclude_collections,
                 document: None,
                 limit: final_limit,
                 preview_config: Some(config.documents.search.clone()),
@@ -203,12 +224,26 @@ pub fn run(action: DocumentAction, config: &Settings, cli_config: Option<&PathBu
                 eprintln!("No collections indexed.");
                 eprintln!("\nConfigured collections in settings.toml:");
                 for name in config.documents.collections.keys() {
-                    eprintln!("  - {name}");
+                    let is_default = config
+                        .documents
+                        .collections
+                        .get(name)
+                        .map(|c| c.default)
+                        .unwrap_or(true);
+                    let suffix = if is_default { "" } else { " (non-default)" };
+                    eprintln!("  - {name}{suffix}");
                 }
             } else {
                 println!("Indexed collections:");
                 for name in collections {
-                    println!("  - {name}");
+                    let is_default = config
+                        .documents
+                        .collections
+                        .get(&name)
+                        .map(|c| c.default)
+                        .unwrap_or(true);
+                    let suffix = if is_default { "" } else { " (non-default)" };
+                    println!("  - {name}{suffix}");
                 }
             }
         }
@@ -243,8 +278,9 @@ pub fn run(action: DocumentAction, config: &Settings, cli_config: Option<&PathBu
             name,
             path,
             pattern,
+            no_default,
         } => {
-            run_add_collection(config, cli_config, name, path, pattern);
+            run_add_collection(config, cli_config, name, path, pattern, no_default);
         }
 
         DocumentAction::RemoveCollection { name } => {
@@ -453,6 +489,7 @@ fn run_add_collection(
     name: String,
     path: PathBuf,
     pattern: Option<String>,
+    no_default: bool,
 ) {
     // Find config file
     let config_path = if let Some(custom_path) = cli_config {
@@ -519,6 +556,7 @@ fn run_add_collection(
             min_chunk_chars: None,
             max_chunk_chars: None,
             overlap_chars: None,
+            default: !no_default,
         };
         settings
             .documents

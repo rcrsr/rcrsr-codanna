@@ -266,13 +266,37 @@ impl schemars::JsonSchema for GetIndexInfoRequest {
     }
 }
 
+/// Accepts either a single value or a list of values for the same JSON key.
+/// Used so multi-select request fields (e.g. `collection`) stay backward
+/// compatible with clients that send a bare string.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum OneOrMany<T> {
+    One(T),
+    Many(Vec<T>),
+}
+
+impl<T> OneOrMany<T> {
+    /// Normalize into a flat `Vec<T>`.
+    pub fn into_vec(self) -> Vec<T> {
+        match self {
+            OneOrMany::One(value) => vec![value],
+            OneOrMany::Many(values) => values,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct SearchDocumentsRequest {
     /// Natural language search query
     pub query: String,
-    /// Filter by collection name (optional)
+    /// Filter by collection name(s) (optional). Accepts either a single
+    /// string or an array of strings.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub collection: Option<String>,
+    pub collection: Option<OneOrMany<String>>,
+    /// Exclude these collection name(s) from results (optional).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude_collections: Option<Vec<String>>,
     /// Maximum number of results (default: 5)
     #[serde(default = "default_context_limit")]
     pub limit: u32,

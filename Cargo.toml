@@ -16,7 +16,7 @@ name = "codanna"
 # making a fork with strictly more code compare as older than the upstream it
 # was built from. The counter is informational, not orderable. Do not rely on
 # it for version-range gating.
-version = "0.9.23+rcrsr.1"
+version = "0.9.23+rcrsr.2"
 authors = ["Angel Bartolli <bartolli@gmail.com>"]
 edition = "2024"
 description = "Code Intelligence for Large Language Models"
@@ -122,7 +122,6 @@ serde_json5 = "0.2.1"
 tree-sitter-swift = "0.7.3"
 tree-sitter-lua = "0.5.0"
 tree-sitter-clojure-orchard = "0.2.5"
-glob = "0.3.3"
 async-trait = "0.1.89"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # rmcp's `impl StreamableHttpClient for reqwest::Client` is against reqwest 0.13

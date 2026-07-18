@@ -24,6 +24,31 @@ pub struct DocumentsConfig {
     pub collections: HashMap<String, CollectionConfig>,
 }
 
+impl DocumentsConfig {
+    /// Resolve the effective exclusion set for a search given the caller's
+    /// explicitly-selected collections.
+    ///
+    /// - When the caller named one or more collections, nothing extra is
+    ///   excluded: explicit names are searched regardless of `default`.
+    /// - When the caller named none, every collection whose `default` is
+    ///   `false` is excluded (opt-out collections stay hidden from
+    ///   unscoped searches).
+    ///
+    /// Callers merge this into `SearchQuery::exclude_collections` — this is
+    /// the only place default-visibility policy is decided; the store
+    /// remains a pure filter over the resulting exclusion set.
+    pub fn default_visibility_exclusions(&self, selected_collections: &[String]) -> Vec<String> {
+        if !selected_collections.is_empty() {
+            return Vec::new();
+        }
+        self.collections
+            .iter()
+            .filter(|(_, cfg)| !cfg.default)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+}
+
 /// Configuration for search result display.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchConfig {
@@ -91,6 +116,18 @@ pub struct CollectionConfig {
 
     /// Overlap between chunks in characters (overrides defaults).
     pub overlap_chars: Option<usize>,
+
+    /// Whether this collection is searched when the caller names no
+    /// collections explicitly. Explicitly-named collections are always
+    /// searched regardless of this flag. Defaults to `true` so collections
+    /// without this key in settings.toml keep their prior (always-searched)
+    /// behavior.
+    #[serde(default = "default_collection_default")]
+    pub default: bool,
+}
+
+fn default_collection_default() -> bool {
+    true
 }
 
 impl CollectionConfig {
@@ -123,6 +160,7 @@ impl Default for CollectionConfig {
             min_chunk_chars: None,
             max_chunk_chars: None,
             overlap_chars: None,
+            default: true,
         }
     }
 }
@@ -248,5 +286,73 @@ mod tests {
         let effective = collection.effective_chunking(&defaults);
         assert_eq!(effective.max_chunk_chars, 2000);
         assert_eq!(effective.min_chunk_chars, 200); // Still default
+    }
+
+    #[test]
+    fn test_collection_config_default_is_visible() {
+        assert!(CollectionConfig::default().default);
+    }
+
+    #[test]
+    fn test_collection_config_missing_default_field_deserializes_true() {
+        // A settings.toml fragment written before this flag existed must
+        // not silently flip existing collections to non-default (§RS.5).
+        let toml = r#"
+            paths = ["docs"]
+            patterns = ["**/*.md"]
+        "#;
+        let config: CollectionConfig = toml::from_str(toml).expect("deserialize");
+        assert!(
+            config.default,
+            "collection missing `default` in TOML must deserialize as default=true"
+        );
+    }
+
+    #[test]
+    fn test_default_visibility_exclusions_unspecified_excludes_opt_out() {
+        let mut collections = HashMap::new();
+        collections.insert(
+            "public".to_string(),
+            CollectionConfig {
+                default: true,
+                ..Default::default()
+            },
+        );
+        collections.insert(
+            "hidden".to_string(),
+            CollectionConfig {
+                default: false,
+                ..Default::default()
+            },
+        );
+        let config = DocumentsConfig {
+            collections,
+            ..Default::default()
+        };
+
+        let excluded = config.default_visibility_exclusions(&[]);
+        assert_eq!(excluded, vec!["hidden".to_string()]);
+    }
+
+    #[test]
+    fn test_default_visibility_exclusions_explicit_selection_excludes_nothing() {
+        let mut collections = HashMap::new();
+        collections.insert(
+            "hidden".to_string(),
+            CollectionConfig {
+                default: false,
+                ..Default::default()
+            },
+        );
+        let config = DocumentsConfig {
+            collections,
+            ..Default::default()
+        };
+
+        let excluded = config.default_visibility_exclusions(&["hidden".to_string()]);
+        assert!(
+            excluded.is_empty(),
+            "explicitly naming a non-default collection must not exclude it"
+        );
     }
 }
