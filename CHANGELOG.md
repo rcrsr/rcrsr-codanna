@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Ignore/exclusion config:** ignore patterns and follow_links now take effect; malformed patterns error instead of silently failing. ([#36](https://github.com/rcrsr/rcrsr-codanna/pull/36))
 - **Vector read-path concurrency:** Concurrent document searches no longer serialize on exclusive locks; blocking work runs off the async runtime. ([#32](https://github.com/rcrsr/rcrsr-codanna/pull/32))
+- **Index lock retry:** Tantivy writer acquisition now retries on lock contention instead of failing on the first attempt. ([#41](https://github.com/rcrsr/rcrsr-codanna/pull/41))
 
 ## [0.9.23] - 2026-07-03
 
