@@ -282,6 +282,16 @@ pub enum DocumentStoreError {
     /// to compile via `ignore::overrides::OverrideBuilder`.
     #[error("Invalid glob override pattern '{pattern}': {reason}")]
     InvalidGlobPattern { pattern: String, reason: String },
+
+    /// A collection name was passed in both the allowlist (`collections`)
+    /// and the denylist (`exclude_collections`) of the same search query,
+    /// which would otherwise silently return zero results with no
+    /// indication why. Surfaced from both the CLI (`--collection`/
+    /// `--exclude-collections`) and MCP tool params (`collection`/
+    /// `exclude_collections`), so the message stays neutral to either
+    /// surface's flag spelling.
+    #[error("Collection '{0}' cannot be both included and excluded in the same search")]
+    ConflictingCollectionFilter(String),
 }
 
 /// Result type alias for index operations

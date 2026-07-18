@@ -935,8 +935,24 @@ impl CodeIntelligenceServer {
             output_format,
         }): Parameters<SearchDocumentsRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let collections = collection.map(|c| c.into_vec()).unwrap_or_default();
-        let exclude_collections = exclude_collections.unwrap_or_default();
+        // Empty/whitespace-only tokens (e.g. a client sending `collection: [""]`
+        // or `collection: ""`) must not count as an explicit collection
+        // selection, or they silently bypass
+        // `DocumentsConfig::default_visibility_exclusions`'s emptiness check,
+        // leaking non-default collections into unscoped results. Mirrors the
+        // same normalization applied to the `codanna mcp search_documents`
+        // CLI wrapper's `parse_string_or_array`.
+        let collections: Vec<String> = collection
+            .map(|c| c.into_vec())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| !s.trim().is_empty())
+            .collect();
+        let exclude_collections: Vec<String> = exclude_collections
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| !s.trim().is_empty())
+            .collect();
         self.search_documents_inner(
             query,
             collections,
@@ -1202,7 +1218,7 @@ mod search_documents_concurrency_tests {
     use crate::config::Settings;
     use crate::documents::{CollectionConfig, DocumentStore};
     use crate::indexing::facade::IndexFacade;
-    use crate::mcp::requests::ReindexRequest;
+    use crate::mcp::requests::{OneOrMany, ReindexRequest};
     use crate::mcp::server::CodeIntelligenceServer;
     use crate::vector::{EmbeddingGenerator, MockEmbeddingGenerator, VectorDimension, VectorError};
     use std::sync::Arc;
@@ -2029,6 +2045,43 @@ mod search_documents_concurrency_tests {
         assert!(
             text.contains("hidden"),
             "explicitly naming 'hidden' must include it despite default: false, got: {text}"
+        );
+    }
+
+    /// A real MCP client sending `collection: [""]` (or a bare empty string)
+    /// must not count as an explicit collection selection -- otherwise
+    /// `DocumentsConfig::default_visibility_exclusions` sees a non-empty
+    /// `collections` list and skips merging in the `default: false`
+    /// exclusions, leaking the non-default collection into results. This
+    /// exercises the actual `search_documents` tool method (the path a real
+    /// MCP client hits), not the CLI's `parse_string_or_array` normalization
+    /// or the test-only `search_documents_for_test` shortcut, which both
+    /// bypass this filtering.
+    #[tokio::test]
+    async fn search_documents_ignores_empty_collection_token() {
+        let (settings, _temp) = fixture_settings_two_collections();
+        let server = build_server_multi(settings);
+
+        let result = server
+            .search_documents(Parameters(SearchDocumentsRequest {
+                query: "lorem".to_string(),
+                collection: Some(OneOrMany::Many(vec!["".to_string(), "  ".to_string()])),
+                exclude_collections: None,
+                limit: 100,
+                output_format: OutputFormat::Text,
+            }))
+            .await
+            .expect("search_documents must succeed");
+
+        let text = text_of(&result);
+        assert!(
+            text.contains("visible"),
+            "expected a hit from the default 'visible' collection, got: {text}"
+        );
+        assert!(
+            !text.contains("hidden"),
+            "empty/whitespace-only collection tokens must not count as an explicit \
+             selection, so 'hidden' (default: false) must still be excluded, got: {text}"
         );
     }
 }

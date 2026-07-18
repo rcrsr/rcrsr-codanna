@@ -691,6 +691,22 @@ impl DocumentStore {
             return Ok(Vec::new());
         }
 
+        // A collection named in both the allowlist and the denylist makes
+        // the underlying boolean query unsatisfiable (Must(Should(name)) AND
+        // MustNot(name)), which would otherwise silently return zero
+        // results. Reject it here so both the CLI and MCP callers of
+        // `search` get an actionable error instead of a confusing empty
+        // result set.
+        if let Some(name) = query
+            .collections
+            .iter()
+            .find(|name| query.exclude_collections.contains(name))
+        {
+            return Err(DocumentStoreError::ConflictingCollectionFilter(
+                name.clone(),
+            ));
+        }
+
         // Get candidate chunks based on filters
         let candidates = self.get_filtered_candidates(&query)?;
 
@@ -1442,7 +1458,13 @@ fn collect_override_matches(
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        let is_dir = path.is_dir();
+        // `DirEntry::file_type()` reports the entry's own type without
+        // following symlinks (unlike `Path::is_dir()`), so a symlinked
+        // directory is treated as a non-directory here rather than being
+        // recursed into (avoiding escaping the collection root or cycles).
+        // Symlinked files still fall through to the `path.is_file()` check
+        // below, which does follow symlinks, so they remain includable.
+        let is_dir = entry.file_type()?.is_dir();
 
         match overrides.matched(&path, is_dir) {
             Match::Ignore(_) => continue,
@@ -1777,6 +1799,31 @@ mod tests {
     }
 
     #[test]
+    fn test_search_rejects_collection_named_in_both_allowlist_and_denylist() {
+        let (_store_dir, _alpha_dir, _beta_dir, _gamma_dir, store) = build_three_collection_store();
+
+        let query = SearchQuery {
+            text: "lorem".to_string(),
+            collections: vec!["alpha".to_string()],
+            exclude_collections: vec!["alpha".to_string()],
+            limit: 100,
+            ..Default::default()
+        };
+
+        let err = store
+            .search(query)
+            .expect_err("a collection in both the allowlist and denylist must be rejected");
+
+        assert!(
+            matches!(
+                err,
+                DocumentStoreError::ConflictingCollectionFilter(ref name) if name == "alpha"
+            ),
+            "expected ConflictingCollectionFilter(\"alpha\"), got: {err:?}"
+        );
+    }
+
+    #[test]
     fn test_search_empty_collections_is_unrestricted() {
         let (_store_dir, _alpha_dir, _beta_dir, _gamma_dir, store) = build_three_collection_store();
 
@@ -1914,6 +1961,53 @@ mod tests {
             names,
             std::collections::HashSet::from(["a.md".to_string()]),
             "broken symlinks must be silently dropped, not leaked into results"
+        );
+    }
+
+    /// A symlinked directory must not be recursed into (avoiding escaping the
+    /// collection root or an infinite cycle if the symlink points back at an
+    /// ancestor), matching `DirEntry::file_type()`'s non-following behavior
+    /// documented on `collect_override_matches`.
+    #[test]
+    #[cfg(unix)]
+    fn test_collect_files_does_not_recurse_into_symlinked_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = DocumentStore::new(temp_dir.path(), test_dimension()).unwrap();
+
+        let base = TempDir::new().unwrap();
+        std::fs::write(base.path().join("a.md"), "top level").unwrap();
+
+        let outside = TempDir::new().unwrap();
+        std::fs::write(
+            outside.path().join("outside.md"),
+            "outside the collection root",
+        )
+        .unwrap();
+
+        std::os::unix::fs::symlink(outside.path(), base.path().join("linked")).unwrap();
+
+        let config = CollectionConfig {
+            paths: vec![base.path().to_path_buf()],
+            patterns: vec!["**/*.md".to_string()],
+            ..Default::default()
+        };
+
+        let files = store.collect_files(&config).unwrap();
+        let names: std::collections::HashSet<String> = files
+            .iter()
+            .map(|p| {
+                p.strip_prefix(base.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+
+        assert_eq!(
+            names,
+            std::collections::HashSet::from(["a.md".to_string()]),
+            "a symlinked directory must not be recursed into, so 'linked/outside.md' \
+             must not appear in results"
         );
     }
 }

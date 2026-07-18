@@ -12,6 +12,18 @@ use crate::io::status_line::StatusLine;
 use crate::io::{ProgressBar, ProgressBarOptions, ProgressBarStyle};
 use crate::vector::{FastEmbedGenerator, VectorDimension};
 
+/// Returns " (non-default)" for collections whose `default` flag is `false`
+/// in `config`, or "" for default (or unconfigured) collections.
+fn collection_suffix(config: &Settings, name: &str) -> &'static str {
+    let is_default = config
+        .documents
+        .collections
+        .get(name)
+        .map(|c| c.default)
+        .unwrap_or(true);
+    if is_default { "" } else { " (non-default)" }
+}
+
 /// Print JSON or error message if serialization fails.
 fn print_json<T: serde::Serialize>(value: &T) {
     match serde_json::to_string_pretty(value) {
@@ -73,6 +85,20 @@ pub fn run(action: DocumentAction, config: &Settings, cli_config: Option<&PathBu
         } => {
             use crate::io::args::parse_positional_args;
 
+            // Empty/whitespace-only tokens (e.g. an accidentally passed
+            // `--collection ""`) must not count as an explicit collection
+            // selection, or they silently bypass
+            // `DocumentsConfig::default_visibility_exclusions`'s emptiness
+            // check below.
+            let collection: Vec<String> = collection
+                .into_iter()
+                .filter(|s| !s.trim().is_empty())
+                .collect();
+            let exclude_collection: Vec<String> = exclude_collection
+                .into_iter()
+                .filter(|s| !s.trim().is_empty())
+                .collect();
+
             // Parse positional arguments for query and key:value pairs
             let (positional_query, params) = parse_positional_args(&args);
 
@@ -103,6 +129,7 @@ pub fn run(action: DocumentAction, config: &Settings, cli_config: Option<&PathBu
                     .get("collection")
                     .cloned()
                     .into_iter()
+                    .filter(|s| !s.trim().is_empty())
                     .collect::<Vec<_>>()
             };
 
@@ -224,25 +251,13 @@ pub fn run(action: DocumentAction, config: &Settings, cli_config: Option<&PathBu
                 eprintln!("No collections indexed.");
                 eprintln!("\nConfigured collections in settings.toml:");
                 for name in config.documents.collections.keys() {
-                    let is_default = config
-                        .documents
-                        .collections
-                        .get(name)
-                        .map(|c| c.default)
-                        .unwrap_or(true);
-                    let suffix = if is_default { "" } else { " (non-default)" };
+                    let suffix = collection_suffix(config, name);
                     eprintln!("  - {name}{suffix}");
                 }
             } else {
                 println!("Indexed collections:");
                 for name in collections {
-                    let is_default = config
-                        .documents
-                        .collections
-                        .get(&name)
-                        .map(|c| c.default)
-                        .unwrap_or(true);
-                    let suffix = if is_default { "" } else { " (non-default)" };
+                    let suffix = collection_suffix(config, &name);
                     println!("  - {name}{suffix}");
                 }
             }
