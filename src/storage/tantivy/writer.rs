@@ -2,38 +2,69 @@ use crate::storage::{MetadataKey, StorageError, StorageResult};
 use crate::{FileId, Relationship, SymbolId};
 use tantivy::{
     IndexWriter, TantivyDocument as Document, Term,
+    directory::error::LockError,
     query::{BooleanQuery, Occur, TermQuery},
     schema::IndexRecordOption,
 };
 
 use super::DocumentIndex;
 
+/// Classify a `TantivyError` as transient (worth retrying) or permanent.
+///
+/// Transient cases:
+/// - `LockFailure(LockError::LockBusy, _)`: another writer currently holds the
+///   directory lock. This is the primary case `create_writer_with_retry` exists
+///   to survive, and it carries no `io::Error` source, so it cannot be detected
+///   by downcasting `Error::source`.
+/// - `LockFailure(LockError::IoError(io_err), _)` or any other error whose
+///   `source()` downcasts to an `io::Error` with kind `PermissionDenied`,
+///   `TimedOut`, or `WouldBlock`.
+fn is_transient_writer_error(e: &tantivy::TantivyError) -> bool {
+    if let tantivy::TantivyError::LockFailure(lock_error, _) = e {
+        return match lock_error {
+            LockError::LockBusy => true,
+            LockError::IoError(io_err) => matches!(
+                io_err.kind(),
+                std::io::ErrorKind::PermissionDenied
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::WouldBlock
+            ),
+        };
+    }
+
+    std::error::Error::source(e)
+        .and_then(|s| s.downcast_ref::<std::io::Error>())
+        .map(|io_err| {
+            matches!(
+                io_err.kind(),
+                std::io::ErrorKind::PermissionDenied
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::WouldBlock
+            )
+        })
+        .unwrap_or(false)
+}
+
 impl DocumentIndex {
     /// Create index writer with retry logic for transient errors
     fn create_writer_with_retry(&self) -> Result<IndexWriter<Document>, tantivy::TantivyError> {
-        for attempt in 0..self.max_retry_attempts {
+        // `max_retry_attempts` is config-driven and could be set to 0; clamp to
+        // at least 1 so the loop body always runs at least once and the
+        // post-loop path is genuinely unreachable rather than panicking.
+        let max_attempts = self.max_retry_attempts.max(1);
+
+        for attempt in 0..max_attempts {
             match self.index.writer::<Document>(self.heap_size) {
                 Ok(writer) => return Ok(writer),
                 Err(e) => {
-                    // Check for transient I/O errors using ErrorKind
-                    let is_transient = std::error::Error::source(&e)
-                        .and_then(|s| s.downcast_ref::<std::io::Error>())
-                        .map(|io_err| {
-                            matches!(
-                                io_err.kind(),
-                                std::io::ErrorKind::PermissionDenied
-                                    | std::io::ErrorKind::TimedOut
-                                    | std::io::ErrorKind::WouldBlock
-                            )
-                        })
-                        .unwrap_or(false);
+                    let is_transient = is_transient_writer_error(&e);
 
-                    if is_transient && attempt < self.max_retry_attempts - 1 {
+                    if is_transient && attempt < max_attempts - 1 {
                         let delay = 100 * (1 << attempt);
                         eprintln!(
-                            "Attempt {}/{}: Transient permission error, retrying after {}ms",
+                            "Attempt {}/{}: Transient index-lock contention, retrying after {}ms",
                             attempt + 1,
-                            self.max_retry_attempts,
+                            max_attempts,
                             delay
                         );
                         std::thread::sleep(std::time::Duration::from_millis(delay));
@@ -43,7 +74,7 @@ impl DocumentIndex {
                 }
             }
         }
-        unreachable!()
+        unreachable!("max_attempts is clamped to at least 1, so the loop always returns")
     }
 
     /// Start a batch operation for adding multiple documents
@@ -437,7 +468,100 @@ impl DocumentIndex {
 mod tests {
     use super::*;
 
+    use std::sync::Arc as StdArc;
+    use std::time::{Duration, Instant};
+    use tantivy::directory::error::LockError;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_lock_busy_is_classified_as_transient() {
+        let err = tantivy::TantivyError::LockFailure(LockError::LockBusy, None);
+        assert!(
+            is_transient_writer_error(&err),
+            "LockBusy must be treated as transient so the retry loop actually retries"
+        );
+    }
+
+    #[test]
+    fn test_lock_io_error_with_transient_kinds_is_classified_as_transient() {
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::WouldBlock,
+        ] {
+            let io_err = std::io::Error::new(kind, "simulated transient io error");
+            let err =
+                tantivy::TantivyError::LockFailure(LockError::IoError(StdArc::new(io_err)), None);
+            assert!(
+                is_transient_writer_error(&err),
+                "io error kind {kind:?} wrapped in LockError::IoError must remain transient"
+            );
+        }
+    }
+
+    #[test]
+    fn test_non_transient_error_is_not_classified_as_transient() {
+        let err = tantivy::TantivyError::SchemaError("field does not exist".to_string());
+        assert!(
+            !is_transient_writer_error(&err),
+            "a schema error is a permanent failure and must not be retried"
+        );
+
+        let err = tantivy::TantivyError::IndexAlreadyExists;
+        assert!(
+            !is_transient_writer_error(&err),
+            "IndexAlreadyExists is a permanent failure and must not be retried"
+        );
+    }
+
+    #[test]
+    fn test_zero_max_retry_attempts_does_not_panic() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut settings = crate::config::Settings::default();
+        settings.indexing.max_retry_attempts = 0;
+        let index = DocumentIndex::new(temp_dir.path(), &settings).unwrap();
+
+        // With no contention this should simply succeed on the single
+        // (clamped-to-1) attempt, but the point of this test is that it
+        // must not panic via the old `unreachable!()` path.
+        let result = index.start_batch();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_start_batch_retries_through_real_lock_contention() {
+        let temp_dir = TempDir::new().unwrap();
+        let settings = crate::config::Settings::default();
+        let index = DocumentIndex::new(temp_dir.path(), &settings).unwrap();
+
+        // Hold a real writer lock on the same underlying tantivy Index,
+        // independent of `index.writer`, so `start_batch` must contend for
+        // the on-disk lock file exactly like a second process/thread would.
+        let held_writer = index.index.writer::<Document>(index.heap_size).unwrap();
+
+        // Release the lock shortly after start_batch begins its attempts,
+        // comfortably inside the retry budget (100ms, 200ms, 400ms
+        // backoffs => ~700ms total before attempts are exhausted).
+        let release_after = Duration::from_millis(150);
+        std::thread::spawn(move || {
+            std::thread::sleep(release_after);
+            drop(held_writer);
+        });
+
+        let start = Instant::now();
+        let result = index.start_batch();
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_ok(),
+            "start_batch should succeed once the contending writer is dropped"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "start_batch returned in {elapsed:?}, which is faster than the first backoff \
+             delay (100ms); it should have retried at least once instead of failing instantly"
+        );
+    }
 
     #[test]
     fn test_rollback_batch_discards_staged_deletes() {
