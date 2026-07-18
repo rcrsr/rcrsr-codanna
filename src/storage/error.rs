@@ -34,6 +34,9 @@ pub enum StorageError {
     #[error("No active batch. Call start_batch() first")]
     NoActiveBatch,
 
+    #[error("Batch already in progress. Call commit_batch() or rollback_batch() first")]
+    BatchInProgress,
+
     #[error("Lock poisoned")]
     LockPoisoned,
 
