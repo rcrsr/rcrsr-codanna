@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Watcher overflow catch-up:** Detects OS watch-queue overflow during bulk git operations and debounces reindex until changes settle. ([#4](https://github.com/rcrsr/rcrsr-codanna/pull/4))
 - **MCP agent-workflow tooling:** Structured JSON envelopes, batch lookups, scoped reads, canonical name parameters, and find_callers role classification. ([#19](https://github.com/rcrsr/rcrsr-codanna/pull/19))
 - **Release 1 batch:** Document-collection indexing, proxy hot-reload notifications with idle shutdown, and parallel-safe search_documents. ([#20](https://github.com/rcrsr/rcrsr-codanna/pull/20))
+- **Document-collection filtering:** Per-collection visibility defaults, negatable patterns, multi-select/exclude filters, and clarified tool descriptions. ([#37](https://github.com/rcrsr/rcrsr-codanna/pull/37))
 
 ### Fixed
 
