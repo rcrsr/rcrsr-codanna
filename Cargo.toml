@@ -136,6 +136,10 @@ criterion = { version = "0.8.2", features = ["html_reports"] }
 ort = { version = "=2.0.0-rc.10", default-features = false }
 testcontainers = "0.27.3"
 thread-id = "5.1.0"
+# test-util (paused/virtual clock: tokio::time::pause/advance) is only used
+# under #[cfg(test)]; kept as a dev-dependency addition rather than enabling
+# it on the main `tokio` dependency so it never ships in release builds.
+tokio = { version = "1.52.3", features = ["test-util"] }
 
 [features]
 default = ["http-server"]
