@@ -77,6 +77,14 @@ pub struct UnifiedWatcher {
     /// Consecutive catch-up failures for the current stale episode, used to
     /// bound retries so a permanent failure does not hot-loop forever.
     catch_up_attempts: u32,
+    /// Consecutive contention rejections (`IndexError::ReindexInProgress`),
+    /// tracked separately from `catch_up_attempts` since contention is not a
+    /// genuine failure and must never consume a bounded attempt. Reset on
+    /// any successful catch-up or genuine failure, so it measures a
+    /// continuous contention streak rather than a lifetime total; used to
+    /// escalate logging if the gate holder appears wedged (see
+    /// `CONSECUTIVE_CONTENTION_WARN_THRESHOLD`).
+    consecutive_contention: u32,
 }
 
 impl UnifiedWatcher {
@@ -270,6 +278,7 @@ impl UnifiedWatcher {
         );
         self.broadcaster.send(FileChangeEvent::IndexReloaded);
         self.catch_up_attempts = 0;
+        self.consecutive_contention = 0;
 
         if should_clear_stale_after_success(self.stale_since, started_at) {
             self.stale = false;
@@ -297,16 +306,34 @@ impl UnifiedWatcher {
     /// bounded attempt count has been exhausted, in which case staleness
     /// tracking is cleared to avoid an infinite hot-loop on a permanent
     /// failure.
+    ///
+    /// A long streak of *consecutive* contention rejections (tracked
+    /// separately from `catch_up_attempts`, which contention never
+    /// consumes) escalates to `tracing::warn!` once past
+    /// `CONSECUTIVE_CONTENTION_WARN_THRESHOLD`: normal reindex handoffs are
+    /// brief, so a sustained streak likely means the gate holder is wedged
+    /// and no signal above debug level would otherwise surface that.
     fn handle_catch_up_failure(&mut self, failure: CatchUpFailure) {
         if failure.is_contention() {
-            crate::debug_event!(
-                "watcher",
-                "catch-up reindex deferred",
-                "another full reindex is already in progress; will retry after cooldown"
-            );
+            self.consecutive_contention += 1;
+
+            if self.consecutive_contention > CONSECUTIVE_CONTENTION_WARN_THRESHOLD {
+                tracing::warn!(
+                    "[watcher] catch-up reindex has been rejected by reindex-gate contention {} times in a row; \
+                     another reindex may be wedged. A restart may be needed if this persists.",
+                    self.consecutive_contention
+                );
+            } else {
+                crate::debug_event!(
+                    "watcher",
+                    "catch-up reindex deferred",
+                    "another full reindex is already in progress; will retry after cooldown"
+                );
+            }
             return;
         }
 
+        self.consecutive_contention = 0;
         self.catch_up_attempts += 1;
 
         if self.catch_up_attempts >= MAX_CATCH_UP_ATTEMPTS {
@@ -711,6 +738,12 @@ const CATCH_UP_COOLDOWN: Duration = Duration::from_secs(5);
 /// forever on a permanent failure.
 const MAX_CATCH_UP_ATTEMPTS: u32 = 5;
 
+/// Threshold of *consecutive* reindex-gate contention rejections (each
+/// re-fired after `CATCH_UP_COOLDOWN`) past which `handle_catch_up_failure`
+/// escalates from `debug_event!` to `tracing::warn!`. 12 is roughly one
+/// minute at the 5s cooldown, far beyond any legitimate reindex handoff.
+const CONSECUTIVE_CONTENTION_WARN_THRESHOLD: u32 = 12;
+
 /// Pure decision predicate combining [`should_catch_up`] with the
 /// in-flight-task guard and the distinct catch-up cooldown, used by
 /// `maybe_start_catch_up`.
@@ -893,6 +926,7 @@ impl UnifiedWatcherBuilder {
             catch_up_started_at: None,
             last_catch_up_completed: None,
             catch_up_attempts: 0,
+            consecutive_contention: 0,
         })
     }
 }
@@ -1359,5 +1393,113 @@ mod tests {
             "repeated contention rejections must never abandon the episode"
         );
         assert_eq!(watcher.stale_since, Some(stale_since));
+    }
+
+    /// `consecutive_contention` must track contention rejections
+    /// independent of `catch_up_attempts`, incrementing on every contention
+    /// rejection regardless of the escalation threshold.
+    #[tokio::test]
+    async fn handle_catch_up_failure_contention_increments_consecutive_counter() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut watcher = test_watcher(&tempdir);
+        watcher.consecutive_contention = 0;
+        watcher.stale = true;
+        watcher.stale_since = Some(Instant::now());
+
+        watcher.handle_catch_up_failure(CatchUpFailure::Watch(WatchError::CatchUpReindexFailed {
+            source: IndexError::ReindexInProgress,
+        }));
+
+        assert_eq!(watcher.consecutive_contention, 1);
+    }
+
+    /// A genuine failure resets the consecutive contention streak, so an
+    /// isolated contention rejection followed by a real failure does not
+    /// carry stale contention count forward into a later streak.
+    #[tokio::test]
+    async fn handle_catch_up_failure_genuine_failure_resets_consecutive_contention() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut watcher = test_watcher(&tempdir);
+        watcher.consecutive_contention = 5;
+        watcher.stale = true;
+        watcher.stale_since = Some(Instant::now());
+
+        watcher.handle_catch_up_failure(CatchUpFailure::JoinFailed("boom".to_string()));
+
+        assert_eq!(
+            watcher.consecutive_contention, 0,
+            "a genuine failure must reset the consecutive contention streak"
+        );
+    }
+
+    /// A successful catch-up resets the consecutive contention streak, so a
+    /// contention streak that resolves once the other reindex releases the
+    /// gate does not carry over into a later, unrelated streak.
+    #[tokio::test]
+    async fn handle_catch_up_success_resets_consecutive_contention() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut watcher = test_watcher(&tempdir);
+        watcher.consecutive_contention = 7;
+        watcher.stale = true;
+        watcher.stale_since = Some(Instant::now());
+
+        let outcome = ReindexOutcome {
+            reindexed: 1,
+            symbol_count: 1,
+            indexed_dirs: Vec::new(),
+        };
+        watcher.handle_catch_up_success(outcome, Instant::now());
+
+        assert_eq!(
+            watcher.consecutive_contention, 0,
+            "a successful catch-up must reset the consecutive contention streak"
+        );
+    }
+
+    /// Below the escalation threshold, contention must never itself abandon
+    /// the episode or consume a bounded attempt (repeat of the existing
+    /// deliberate behavior, now with the consecutive-contention counter also
+    /// under test at the boundary).
+    #[tokio::test]
+    async fn handle_catch_up_failure_contention_at_threshold_stays_deferred() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut watcher = test_watcher(&tempdir);
+        watcher.consecutive_contention = CONSECUTIVE_CONTENTION_WARN_THRESHOLD - 1;
+        watcher.stale = true;
+        watcher.stale_since = Some(Instant::now());
+
+        watcher.handle_catch_up_failure(CatchUpFailure::Watch(WatchError::CatchUpReindexFailed {
+            source: IndexError::ReindexInProgress,
+        }));
+
+        assert_eq!(
+            watcher.consecutive_contention,
+            CONSECUTIVE_CONTENTION_WARN_THRESHOLD
+        );
+        assert_eq!(watcher.catch_up_attempts, 0);
+        assert!(watcher.stale);
+    }
+
+    /// Once consecutive contention exceeds the threshold, the counter keeps
+    /// incrementing and staleness/attempt bookkeeping must remain untouched
+    /// (the escalation is a logging change only, not a behavior change).
+    #[tokio::test]
+    async fn handle_catch_up_failure_contention_past_threshold_keeps_incrementing() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut watcher = test_watcher(&tempdir);
+        watcher.consecutive_contention = CONSECUTIVE_CONTENTION_WARN_THRESHOLD;
+        watcher.stale = true;
+        watcher.stale_since = Some(Instant::now());
+
+        watcher.handle_catch_up_failure(CatchUpFailure::Watch(WatchError::CatchUpReindexFailed {
+            source: IndexError::ReindexInProgress,
+        }));
+
+        assert_eq!(
+            watcher.consecutive_contention,
+            CONSECUTIVE_CONTENTION_WARN_THRESHOLD + 1
+        );
+        assert_eq!(watcher.catch_up_attempts, 0);
+        assert!(watcher.stale);
     }
 }

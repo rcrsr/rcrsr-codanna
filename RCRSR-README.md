@@ -298,6 +298,10 @@ any manual step. Behavior details:
   marker — it is not treated as a failure, since the index is already being
   brought up to date by the other reindex. The catch-up simply re-fires after
   the cooldown and finds the index current.
+- If that rejection repeats for many consecutive cooldowns (roughly a minute),
+  a `WARN`-level log is emitted noting that another reindex appears wedged and
+  a restart may be needed — normal handoffs resolve within a cooldown or two,
+  so a sustained streak is a signal worth surfacing above debug logging.
 
 ### Configuration
 

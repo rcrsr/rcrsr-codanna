@@ -115,9 +115,15 @@ impl HotReloadWatcher {
 
         // Load the new index as a facade
         match self.persistence.load_facade(self.settings.clone()) {
-            Ok(new_facade) => {
-                // Get write lock and replace the facade
+            Ok(mut new_facade) => {
+                // Get write lock and replace the facade. Carry the outgoing
+                // facade's reindex gate into the replacement BEFORE
+                // assigning it, so a permit held by an in-flight
+                // `reindex_locked` call is still respected by callers that
+                // read the gate handle after this swap (see the invariant
+                // documented on `IndexFacade::reindex_gate`).
                 let mut facade_guard = self.facade.write().await;
+                new_facade.adopt_reindex_gate(facade_guard.reindex_gate());
                 *facade_guard = new_facade;
 
                 // Update last modified time
@@ -237,4 +243,68 @@ pub struct IndexStats {
     pub symbol_count: usize,
     pub last_modified: Option<SystemTime>,
     pub index_path: PathBuf,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Settings;
+
+    fn test_settings(index_path: PathBuf) -> Arc<Settings> {
+        Arc::new(Settings {
+            index_path,
+            workspace_root: None,
+            ..Default::default()
+        })
+    }
+
+    // Regression for the hot-reload facade-swap race: this drives the real
+    // `HotReloadWatcher::check_and_reload` wiring end-to-end (real on-disk
+    // Tantivy index, real reload), not just the `adopt_reindex_gate`
+    // primitive in isolation. It fails against a build where the gate
+    // carry-over call above is missing or reordered after the assignment.
+    #[tokio::test]
+    async fn check_and_reload_preserves_permit_held_across_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = test_settings(dir.path().join("index"));
+
+        let facade = Arc::new(RwLock::new(IndexFacade::new(settings.clone()).unwrap()));
+        let mut watcher =
+            HotReloadWatcher::new(facade.clone(), settings.clone(), Duration::from_secs(3600));
+
+        // Simulate an in-flight `reindex_locked` call holding the permit
+        // against the facade that is about to be replaced by the reload.
+        let held_permit = {
+            let indexer = facade.read().await;
+            indexer.reindex_gate()
+        };
+        let _permit = held_permit.try_acquire_owned().unwrap();
+
+        // Advance the on-disk index (via a second facade over the same
+        // Tantivy directory) so `check_and_reload` observes a newer
+        // meta.json and actually performs the reload/swap below.
+        {
+            let mut writer_facade = IndexFacade::new(settings.clone()).unwrap();
+            let source_root = dir.path().join("src");
+            std::fs::create_dir_all(&source_root).unwrap();
+            std::fs::write(source_root.join("a.rs"), "fn a() {}\n").unwrap();
+            writer_facade.index_directory(&source_root, false).unwrap();
+        }
+
+        watcher
+            .check_and_reload()
+            .await
+            .expect("check_and_reload should reload the on-disk index");
+
+        // A concurrent caller reading the gate handle after the swap must
+        // still observe the permit as held.
+        let gate_after_swap = {
+            let indexer = facade.read().await;
+            indexer.reindex_gate()
+        };
+        assert!(
+            gate_after_swap.try_acquire_owned().is_err(),
+            "permit held before the hot-reload swap must still gate callers after it"
+        );
+    }
 }

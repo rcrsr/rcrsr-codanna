@@ -127,6 +127,13 @@ pub struct IndexFacade {
     /// `reindex_locked` invocation may hold this facade's Phase 2 off-lock
     /// walk at a time; a losing caller is rejected (see
     /// [`IndexError::ReindexInProgress`]) rather than queued.
+    ///
+    /// Invariant: any code that replaces an `IndexFacade` held in a shared
+    /// `Arc<RwLock<IndexFacade>>` (e.g. hot-reload swapping in a freshly
+    /// loaded facade) MUST carry this gate across into the replacement via
+    /// [`IndexFacade::adopt_reindex_gate`] before assigning it, or an
+    /// in-flight `reindex_locked` permit held against the outgoing facade
+    /// silently stops gating callers that read the handle after the swap.
     reindex_gate: Arc<tokio::sync::Semaphore>,
 }
 
@@ -214,6 +221,20 @@ impl IndexFacade {
     /// [`reindex_locked`] to serialize full-reindex runs.
     pub(crate) fn reindex_gate(&self) -> Arc<tokio::sync::Semaphore> {
         Arc::clone(&self.reindex_gate)
+    }
+
+    /// Adopt an existing reindex gate, replacing this facade's own.
+    ///
+    /// Used when a facade wholesale-replaces another facade instance behind
+    /// a shared `Arc<RwLock<IndexFacade>>` (e.g. hot-reload), so a permit
+    /// held by an in-flight [`reindex_locked`] call against the outgoing
+    /// facade continues to gate callers that read the handle after the
+    /// swap. Callers MUST read the outgoing facade's gate and call this on
+    /// the incoming facade strictly before assigning it into the shared
+    /// lock; see the invariant documented on [`IndexFacade::reindex_gate`]
+    /// (the field).
+    pub(crate) fn adopt_reindex_gate(&mut self, gate: Arc<tokio::sync::Semaphore>) {
+        self.reindex_gate = gate;
     }
 
     // =========================================================================
@@ -1868,5 +1889,57 @@ mod tests {
         let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
         let result = facade.index_file_with_force(&source, true);
         assert!(result.is_ok(), "force on unindexed file: {result:?}");
+    }
+
+    fn test_facade(dir: &tempfile::TempDir) -> IndexFacade {
+        let settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        IndexFacade::new(std::sync::Arc::new(settings)).unwrap()
+    }
+
+    // Covers `adopt_reindex_gate` as a primitive in isolation: it drives the
+    // gate carry-over call directly rather than through
+    // `HotReloadWatcher::check_and_reload`, so it does NOT exercise the
+    // production wiring that actually had the facade-swap race (the real
+    // wiring is covered by
+    // `watcher::hot_reload::tests::check_and_reload_preserves_permit_held_across_swap`,
+    // which drives `check_and_reload` end-to-end against a real on-disk
+    // index).
+    #[tokio::test]
+    async fn adopt_reindex_gate_replaces_the_gate_handle() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let facade = Arc::new(tokio::sync::RwLock::new(test_facade(&dir_a)));
+
+        // Simulate an in-flight `reindex_locked` call holding the permit.
+        let held_permit = {
+            let indexer = facade.read().await;
+            indexer.reindex_gate()
+        };
+        let _permit = held_permit.try_acquire_owned().unwrap();
+
+        // Simulate `HotReloadWatcher::check_and_reload`'s wholesale facade
+        // replacement, carrying the outgoing gate into the replacement
+        // BEFORE assigning it into the shared lock.
+        let mut new_facade = test_facade(&dir_b);
+        {
+            let mut guard = facade.write().await;
+            new_facade.adopt_reindex_gate(guard.reindex_gate());
+            *guard = new_facade;
+        }
+
+        // A concurrent caller reading the gate handle after the swap must
+        // still observe the permit as held.
+        let gate_after_swap = {
+            let indexer = facade.read().await;
+            indexer.reindex_gate()
+        };
+        assert!(
+            gate_after_swap.try_acquire_owned().is_err(),
+            "permit held before the swap must still gate callers after it"
+        );
     }
 }
