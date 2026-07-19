@@ -16,7 +16,7 @@ name = "codanna"
 # making a fork with strictly more code compare as older than the upstream it
 # was built from. The counter is informational, not orderable. Do not rely on
 # it for version-range gating.
-version = "0.9.23+rcrsr.2"
+version = "0.9.23+rcrsr.3"
 authors = ["Angel Bartolli <bartolli@gmail.com>"]
 edition = "2024"
 description = "Code Intelligence for Large Language Models"
