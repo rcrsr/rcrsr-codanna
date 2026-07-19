@@ -223,19 +223,26 @@ impl DocumentIndex {
     }
 
     /// Remove documents for a specific file
+    ///
+    /// This is a cold path (its only caller wraps it in an active batch), so
+    /// taking the write guard unconditionally for the whole function is
+    /// acceptable contention and closes the TOCTOU gap where a `start_batch()`
+    /// could land between checking for an in-flight batch and opening a
+    /// standalone writer.
     pub fn remove_file_documents(&self, file_path: &str) -> StorageResult<()> {
-        // Use existing batch writer if available, otherwise create temporary one
-        let writer_lock = self.writer.read().map_err(|_| StorageError::LockPoisoned)?;
+        let mut writer_lock = self
+            .writer
+            .write()
+            .map_err(|_| StorageError::LockPoisoned)?;
         let term = Term::from_field_text(self.schema.file_path, file_path);
 
-        if let Some(writer) = writer_lock.as_ref() {
+        if let Some(writer) = writer_lock.as_mut() {
             // Use existing batch writer
             writer.delete_term(term);
             // Note: We don't commit here - that happens at batch end
         } else {
             // Create temporary writer for single operation
-            drop(writer_lock); // Release lock before creating new writer
-            let mut writer = self.index.writer::<Document>(50_000_000)?;
+            let mut writer = self.create_writer_with_retry()?;
             writer.delete_term(term);
             writer.commit()?;
             self.reader.reload()?;
@@ -245,6 +252,20 @@ impl DocumentIndex {
     }
 
     /// Clear all documents from the index
+    ///
+    /// Invariant: `clear()` cannot run while a batch is in flight. It holds
+    /// `self.writer`'s write guard for the entire operation and errors out if
+    /// a batch writer is already present, rather than reusing it: tantivy
+    /// 0.26's `IndexWriter::delete_all_documents(&self)` calls
+    /// `segment_updater.remove_all_segments()` and
+    /// `stamper.revert(committed_opstamp)`, which would silently discard the
+    /// batch's staged adds and rewind its opstamp. A standalone writer isn't
+    /// an option either: the batch writer already owns the on-disk directory
+    /// lock, so a second writer would just retry into `LockBusy`. `clear()`
+    /// never touches `pending_symbol_counter`/`pending_file_counter` itself;
+    /// it leaves them exactly as it found them (commit_batch/rollback_batch
+    /// own resetting those on the batch-lifecycle path this function does
+    /// not participate in).
     pub fn clear(&self) -> StorageResult<()> {
         // Check if index has been initialized (has meta.json)
         // If not, there's nothing to clear
@@ -253,7 +274,15 @@ impl DocumentIndex {
             return Ok(());
         }
 
-        let mut writer = self.index.writer::<Document>(50_000_000)?;
+        let writer_lock = self
+            .writer
+            .write()
+            .map_err(|_| StorageError::LockPoisoned)?;
+        if writer_lock.is_some() {
+            return Err(StorageError::BatchInProgress);
+        }
+
+        let mut writer = self.create_writer_with_retry()?;
         writer.delete_all_documents()?;
         writer.commit()?;
         self.reader.reload()?;
@@ -643,6 +672,164 @@ mod tests {
             elapsed >= Duration::from_millis(100),
             "start_batch returned in {elapsed:?}, which is faster than the first backoff \
              delay (100ms); it should have retried at least once instead of failing instantly"
+        );
+    }
+
+    #[test]
+    fn test_clear_retries_through_real_lock_contention() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut settings = crate::config::Settings::default();
+        // Pin the retry budget explicitly rather than relying on
+        // `Settings::default()`: the elapsed-time assertion below only makes
+        // sense if at least 2 attempts (and the 100ms first backoff) are
+        // available, and this test should not silently pass vacuously if the
+        // default ever changes.
+        settings.indexing.max_retry_attempts = 3;
+        let index = DocumentIndex::new(temp_dir.path(), &settings).unwrap();
+
+        // `clear()` early-returns Ok(()) when meta.json does not exist. tantivy's
+        // `Index::create` writes meta.json synchronously in `DocumentIndex::new`
+        // (verified: it's present immediately after construction, with no batch
+        // needed), so `clear()` below genuinely exercises the retry path rather
+        // than passing vacuously via the early return.
+        assert!(
+            temp_dir.path().join("meta.json").exists(),
+            "meta.json must exist after DocumentIndex::new for this test to exercise clear()'s \
+             retry path rather than its early-return-on-uninitialized-index path"
+        );
+
+        // Hold a real writer lock on the same underlying tantivy Index,
+        // independent of `index.writer`, so `clear` must contend for the
+        // on-disk lock file exactly like a second process/thread would.
+        let held_writer = index.index.writer::<Document>(index.heap_size).unwrap();
+
+        // Release the lock shortly after clear begins its attempts, well
+        // inside the retry budget: with the default `max_retry_attempts = 3`
+        // there are two backoffs (100ms + 200ms = 300ms) before the final
+        // attempt gives up. Releasing at 50ms instead of closer to that
+        // 300ms ceiling leaves a wide margin against scheduling jitter under
+        // CI load, while the `elapsed >= 100ms` assertion below still
+        // requires the first attempt to observe LockBusy and retry at least
+        // once.
+        let release_after = Duration::from_millis(50);
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(release_after);
+            drop(held_writer);
+        });
+
+        let start = Instant::now();
+        let result = index.clear();
+        let elapsed = start.elapsed();
+
+        // Join before asserting: if an assertion below panics, an unjoined
+        // detached thread could outlive the test and race with `TempDir`'s
+        // drop-time cleanup, causing flaky failures.
+        releaser.join().expect("releaser thread should not panic");
+
+        assert!(
+            result.is_ok(),
+            "clear should succeed once the contending writer is dropped"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "clear returned in {elapsed:?}, which is faster than the first backoff delay \
+             (100ms); it should have retried at least once instead of failing instantly"
+        );
+    }
+
+    #[test]
+    fn test_clear_rejects_while_batch_in_flight() {
+        let temp_dir = TempDir::new().unwrap();
+        let settings = crate::config::Settings::default();
+        let index = DocumentIndex::new(temp_dir.path(), &settings).unwrap();
+
+        assert!(
+            temp_dir.path().join("meta.json").exists(),
+            "meta.json must exist after DocumentIndex::new for clear() to reach the \
+             in-flight-batch check instead of its early-return-on-uninitialized-index path"
+        );
+
+        index.start_batch().unwrap();
+
+        let result = index.clear();
+
+        assert!(
+            matches!(result, Err(StorageError::BatchInProgress)),
+            "clear() must reject with BatchInProgress rather than reusing or contending for \
+             the in-flight batch's writer, got: {result:?}"
+        );
+
+        index.rollback_batch().unwrap();
+    }
+
+    #[test]
+    fn test_remove_file_documents_without_active_batch_uses_standalone_writer() {
+        let temp_dir = TempDir::new().unwrap();
+        let settings = crate::config::Settings::default();
+        let index = DocumentIndex::new(temp_dir.path(), &settings).unwrap();
+
+        let registration = crate::indexing::pipeline::FileRegistration {
+            path: std::path::PathBuf::from("src/example.rs"),
+            file_id: FileId::new(1).unwrap(),
+            content_hash: "deadbeef".to_string(),
+            language_id: crate::parsing::LanguageId::new("rust"),
+            timestamp: 0,
+            mtime: 0,
+        };
+
+        index.start_batch().unwrap();
+        index.store_file_registration(&registration).unwrap();
+        index.commit_batch().unwrap();
+
+        assert!(
+            index.get_file_info("src/example.rs").unwrap().is_some(),
+            "file_info document must be present before removal"
+        );
+
+        // No batch is active here: this exercises the fallback path
+        // (standalone writer via `create_writer_with_retry` + immediate
+        // commit) rather than reusing an in-flight batch writer.
+        index.remove_file_documents("src/example.rs").unwrap();
+
+        assert!(
+            index.get_file_info("src/example.rs").unwrap().is_none(),
+            "remove_file_documents should delete the file_info document via the standalone writer path"
+        );
+    }
+
+    #[test]
+    fn test_remove_file_documents_with_active_batch_uses_batch_writer() {
+        let temp_dir = TempDir::new().unwrap();
+        let settings = crate::config::Settings::default();
+        let index = DocumentIndex::new(temp_dir.path(), &settings).unwrap();
+
+        let registration = crate::indexing::pipeline::FileRegistration {
+            path: std::path::PathBuf::from("src/other.rs"),
+            file_id: FileId::new(2).unwrap(),
+            content_hash: "cafef00d".to_string(),
+            language_id: crate::parsing::LanguageId::new("rust"),
+            timestamp: 0,
+            mtime: 0,
+        };
+
+        index.start_batch().unwrap();
+        index.store_file_registration(&registration).unwrap();
+        index.commit_batch().unwrap();
+
+        // With a batch active, remove_file_documents must stage the delete
+        // on the existing batch writer rather than opening a standalone one;
+        // the deletion is only visible after this batch commits.
+        index.start_batch().unwrap();
+        index.remove_file_documents("src/other.rs").unwrap();
+        assert!(
+            index.get_file_info("src/other.rs").unwrap().is_some(),
+            "delete staged on the batch writer must not be visible before commit"
+        );
+        index.commit_batch().unwrap();
+
+        assert!(
+            index.get_file_info("src/other.rs").unwrap().is_none(),
+            "remove_file_documents should delete the file_info document via the active batch writer"
         );
     }
 

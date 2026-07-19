@@ -34,6 +34,13 @@ pub enum StorageError {
     #[error("No active batch. Call start_batch() first")]
     NoActiveBatch,
 
+    /// Another operation already holds the internal write batch.
+    ///
+    /// In-crate callers can resolve this by calling `commit_batch()` or
+    /// `rollback_batch()` on the batch currently in flight before retrying.
+    #[error("Another indexing operation is already in progress; retry shortly")]
+    BatchInProgress,
+
     #[error("Lock poisoned")]
     LockPoisoned,
 
