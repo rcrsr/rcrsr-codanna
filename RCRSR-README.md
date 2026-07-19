@@ -239,6 +239,22 @@ guard, and both scope it as narrowly as possible:
   repopulating index (some symbols reindexed, others not yet) until phase 3
   completes.
 
+**Concurrent code reindexes are serialized, not queued.** Only one
+`reindex` run (any call that reaches the three-phase orchestration above —
+scoped `paths`, a full `force: true` rebuild, or the watcher's own catch-up
+reindex on queue overflow) may be in flight against an index at a time. A
+second call that arrives while one is still running is rejected immediately
+rather than being queued or allowed to race the first: it gets a
+`REINDEX_IN_PROGRESS` error —
+"Another full reindex is already in progress; retry shortly. Wait for the
+current reindex to finish, then retry. Avoid triggering concurrent full
+reindexes on the same index." — which is a client-visible, retryable
+condition, not an internal fault. Simply retry the call once the earlier
+reindex has finished ([issue #44](https://github.com/rcrsr/rcrsr-codanna/issues/44)).
+This also protects a `reindex(force: true)` call from racing the watcher's
+catch-up reindex below: whichever one starts second is rejected rather than
+one clearing the index out from under the other's in-flight work.
+
 **Known limitation — `reindex documents:true` holds a write guard per
 collection.** The `reindex` tool's document pass takes the same exclusive
 write guard as the auto-sync above, scoped per collection (acquired and
@@ -276,6 +292,12 @@ any manual step. Behavior details:
   the next quiet window (bounded) instead of being silently dropped.
 - Successive catch-ups are throttled by a short cooldown, so sustained bursty git
   activity can't thrash repeated full rebuilds.
+- If a catch-up loses the race to an in-flight `reindex` MCP call (see
+  [Concurrency contract](#concurrency-contract) above), that rejection does
+  not count against the bounded retry budget and does not clear the stale
+  marker — it is not treated as a failure, since the index is already being
+  brought up to date by the other reindex. The catch-up simply re-fires after
+  the cooldown and finds the index current.
 
 ### Configuration
 

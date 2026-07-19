@@ -12,6 +12,7 @@ use tokio::time::{Duration, sleep};
 
 use crate::documents::DocumentStore;
 use crate::documents::config::ChunkingConfig;
+use crate::error::IndexError;
 use crate::indexing::ReindexOutcome;
 use crate::indexing::facade::IndexFacade;
 use crate::mcp::notifications::{FileChangeEvent, NotificationBroadcaster};
@@ -244,10 +245,10 @@ impl UnifiedWatcher {
 
         match join_result {
             Ok(Ok(outcome)) => self.handle_catch_up_success(outcome, started_at),
-            Ok(Err(e)) => self.handle_catch_up_failure(&e.to_string()),
-            Err(join_err) => self.handle_catch_up_failure(&format!(
+            Ok(Err(e)) => self.handle_catch_up_failure(CatchUpFailure::Watch(e)),
+            Err(join_err) => self.handle_catch_up_failure(CatchUpFailure::JoinFailed(format!(
                 "catch-up reindex task did not complete cleanly: {join_err}"
-            )),
+            ))),
         }
     }
 
@@ -282,16 +283,35 @@ impl UnifiedWatcher {
         }
     }
 
-    /// Handle a failed (or non-cleanly-joined) catch-up reindex attempt:
-    /// re-arms the quiet window for a retry, unless the bounded attempt
-    /// count has been exhausted, in which case staleness tracking is
-    /// cleared to avoid an infinite hot-loop on a permanent failure.
-    fn handle_catch_up_failure(&mut self, reason: &str) {
+    /// Handle a failed (or non-cleanly-joined) catch-up reindex attempt.
+    ///
+    /// A contention rejection (another full reindex, e.g. an MCP
+    /// `reindex(force: true)`, is already holding the facade's reindex gate)
+    /// is not a genuine failure: the work is already being done elsewhere,
+    /// so this does not consume an attempt or abandon the stale episode.
+    /// `stale`/`stale_since` are left exactly as they are so
+    /// `should_start_catch_up` re-fires after `CATCH_UP_COOLDOWN` once the
+    /// other reindex releases the gate.
+    ///
+    /// A genuine failure re-arms the quiet window for a retry, unless the
+    /// bounded attempt count has been exhausted, in which case staleness
+    /// tracking is cleared to avoid an infinite hot-loop on a permanent
+    /// failure.
+    fn handle_catch_up_failure(&mut self, failure: CatchUpFailure) {
+        if failure.is_contention() {
+            crate::debug_event!(
+                "watcher",
+                "catch-up reindex deferred",
+                "another full reindex is already in progress; will retry after cooldown"
+            );
+            return;
+        }
+
         self.catch_up_attempts += 1;
 
         if self.catch_up_attempts >= MAX_CATCH_UP_ATTEMPTS {
             tracing::error!(
-                "[watcher] catch-up reindex failed after {} attempts, giving up for this episode: {reason}. A manual force-reindex may be needed.",
+                "[watcher] catch-up reindex failed after {} attempts, giving up for this episode: {failure}. A manual force-reindex may be needed.",
                 self.catch_up_attempts
             );
             self.stale = false;
@@ -299,7 +319,7 @@ impl UnifiedWatcher {
             self.catch_up_attempts = 0;
         } else {
             tracing::error!(
-                "[watcher] catch-up reindex failed (attempt {}/{MAX_CATCH_UP_ATTEMPTS}): {reason}. A manual force-reindex may be needed if this persists.",
+                "[watcher] catch-up reindex failed (attempt {}/{MAX_CATCH_UP_ATTEMPTS}): {failure}. A manual force-reindex may be needed if this persists.",
                 self.catch_up_attempts
             );
             self.stale = true;
@@ -630,6 +650,41 @@ impl UnifiedWatcher {
             self.registry.path_count(),
             self.registry.dir_count()
         );
+    }
+}
+
+/// Classifies why a catch-up reindex attempt did not produce a successful
+/// outcome, so [`UnifiedWatcher::handle_catch_up_failure`] can distinguish a
+/// benign contention rejection (another full reindex already holds the
+/// facade's reindex gate) from a genuine failure without string-matching
+/// the error message.
+enum CatchUpFailure {
+    /// The spawned task returned a typed [`WatchError`].
+    Watch(WatchError),
+    /// The spawned task itself did not join cleanly (e.g. it panicked).
+    JoinFailed(String),
+}
+
+impl CatchUpFailure {
+    /// True when this failure is a reindex-gate contention rejection
+    /// (`IndexError::ReindexInProgress`, as wrapped by
+    /// `WatchError::CatchUpReindexFailed`) rather than a genuine failure.
+    fn is_contention(&self) -> bool {
+        matches!(
+            self,
+            CatchUpFailure::Watch(WatchError::CatchUpReindexFailed {
+                source: IndexError::ReindexInProgress
+            })
+        )
+    }
+}
+
+impl std::fmt::Display for CatchUpFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CatchUpFailure::Watch(e) => write!(f, "{e}"),
+            CatchUpFailure::JoinFailed(reason) => write!(f, "{reason}"),
+        }
     }
 }
 
@@ -1194,7 +1249,7 @@ mod tests {
         watcher.stale = false;
         watcher.stale_since = None;
 
-        watcher.handle_catch_up_failure("boom");
+        watcher.handle_catch_up_failure(CatchUpFailure::JoinFailed("boom".to_string()));
 
         assert_eq!(watcher.catch_up_attempts, MAX_CATCH_UP_ATTEMPTS - 1);
         assert!(watcher.stale, "a failure must re-arm staleness for a retry");
@@ -1209,7 +1264,7 @@ mod tests {
         watcher.stale = true;
         watcher.stale_since = Some(Instant::now());
 
-        watcher.handle_catch_up_failure("boom");
+        watcher.handle_catch_up_failure(CatchUpFailure::JoinFailed("boom".to_string()));
 
         assert_eq!(
             watcher.catch_up_attempts, 0,
@@ -1220,5 +1275,89 @@ mod tests {
             "staleness tracking is cleared once attempts are exhausted, to avoid hot-looping forever"
         );
         assert!(watcher.stale_since.is_none());
+    }
+
+    /// A contention rejection (`ReindexInProgress`, wrapped by
+    /// `WatchError::CatchUpReindexFailed`) must not consume an attempt or
+    /// touch staleness tracking - another reindex is already doing the work.
+    #[tokio::test]
+    async fn handle_catch_up_failure_ignores_contention_rejection() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut watcher = test_watcher(&tempdir);
+        watcher.catch_up_attempts = 2;
+        watcher.stale = true;
+        let stale_since = Instant::now();
+        watcher.stale_since = Some(stale_since);
+
+        watcher.handle_catch_up_failure(CatchUpFailure::Watch(WatchError::CatchUpReindexFailed {
+            source: IndexError::ReindexInProgress,
+        }));
+
+        assert_eq!(
+            watcher.catch_up_attempts, 2,
+            "a contention rejection must not consume an attempt"
+        );
+        assert!(
+            watcher.stale,
+            "a contention rejection must leave staleness armed"
+        );
+        assert_eq!(
+            watcher.stale_since,
+            Some(stale_since),
+            "a contention rejection must not touch stale_since"
+        );
+    }
+
+    /// A genuine failure (not a contention rejection) must still increment
+    /// the attempt counter, even when carried as a typed `WatchError`.
+    #[tokio::test]
+    async fn handle_catch_up_failure_increments_on_genuine_watch_error() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut watcher = test_watcher(&tempdir);
+        watcher.catch_up_attempts = 0;
+        watcher.stale = false;
+        watcher.stale_since = None;
+
+        watcher.handle_catch_up_failure(CatchUpFailure::Watch(WatchError::EventError {
+            details: "boom".to_string(),
+        }));
+
+        assert_eq!(
+            watcher.catch_up_attempts, 1,
+            "a genuine failure must still increment the attempt counter"
+        );
+        assert!(watcher.stale, "a genuine failure must re-arm staleness");
+        assert!(watcher.stale_since.is_some());
+    }
+
+    /// A contention rejection repeated more than `MAX_CATCH_UP_ATTEMPTS`
+    /// times must never abandon the stale episode, since it never
+    /// increments `catch_up_attempts` in the first place.
+    #[tokio::test]
+    async fn handle_catch_up_failure_repeated_contention_never_abandons_episode() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut watcher = test_watcher(&tempdir);
+        watcher.catch_up_attempts = 0;
+        watcher.stale = true;
+        let stale_since = Instant::now();
+        watcher.stale_since = Some(stale_since);
+
+        for _ in 0..(MAX_CATCH_UP_ATTEMPTS + 1) {
+            watcher.handle_catch_up_failure(CatchUpFailure::Watch(
+                WatchError::CatchUpReindexFailed {
+                    source: IndexError::ReindexInProgress,
+                },
+            ));
+        }
+
+        assert_eq!(
+            watcher.catch_up_attempts, 0,
+            "repeated contention rejections must never consume attempts"
+        );
+        assert!(
+            watcher.stale,
+            "repeated contention rejections must never abandon the episode"
+        );
+        assert_eq!(watcher.stale_since, Some(stale_since));
     }
 }

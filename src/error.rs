@@ -114,6 +114,10 @@ pub enum IndexError {
     /// A configured ignore pattern failed to parse as a gitignore line
     #[error("Invalid ignore pattern '{pattern}': {reason}")]
     InvalidIgnorePattern { pattern: String, reason: String },
+
+    /// Another full reindex is already running on this facade
+    #[error("Another full reindex is already in progress; retry shortly")]
+    ReindexInProgress,
 }
 
 impl IndexError {
@@ -164,6 +168,7 @@ impl IndexError {
             Self::SemanticSearch(_) => "SEMANTIC_SEARCH_ERROR",
             Self::Pipeline(_) => "PIPELINE_ERROR",
             Self::InvalidIgnorePattern { .. } => "INVALID_IGNORE_PATTERN",
+            Self::ReindexInProgress => "REINDEX_IN_PROGRESS",
         }
         .to_string()
     }
@@ -201,6 +206,10 @@ impl IndexError {
             ],
             Self::InvalidIgnorePattern { .. } => vec![
                 "Check the 'indexing.ignore_patterns' entries in settings.toml for valid gitignore-style globs",
+            ],
+            Self::ReindexInProgress => vec![
+                "Wait for the current reindex to finish, then retry",
+                "Avoid triggering concurrent full reindexes on the same index",
             ],
             _ => vec![],
         }

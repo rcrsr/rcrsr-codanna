@@ -122,6 +122,12 @@ pub struct IndexFacade {
     /// Persisted semantic metadata for status/reporting when semantic search
     /// is not loaded into memory (for example, lite facade loads).
     semantic_metadata_snapshot: Option<crate::semantic::SemanticMetadata>,
+
+    /// Serializes full-reindex runs through [`reindex_locked`]. Only one
+    /// `reindex_locked` invocation may hold this facade's Phase 2 off-lock
+    /// walk at a time; a losing caller is rejected (see
+    /// [`IndexError::ReindexInProgress`]) rather than queued.
+    reindex_gate: Arc<tokio::sync::Semaphore>,
 }
 
 impl IndexFacade {
@@ -153,6 +159,7 @@ impl IndexFacade {
             index_base,
             semantic_incompatible: false,
             semantic_metadata_snapshot: None,
+            reindex_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         })
     }
 
@@ -179,6 +186,7 @@ impl IndexFacade {
             index_base,
             semantic_incompatible: false,
             semantic_metadata_snapshot: None,
+            reindex_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 
@@ -200,6 +208,12 @@ impl IndexFacade {
     /// Get the index base path.
     pub fn index_base(&self) -> &Path {
         &self.index_base
+    }
+
+    /// Clone the handle to this facade's reindex gate, used by
+    /// [`reindex_locked`] to serialize full-reindex runs.
+    pub(crate) fn reindex_gate(&self) -> Arc<tokio::sync::Semaphore> {
+        Arc::clone(&self.reindex_gate)
     }
 
     // =========================================================================
@@ -1540,6 +1554,19 @@ impl ReindexHandles {
 /// workspace root before calling; this seam does not re-check path
 /// containment itself (the MCP handler validates before calling; the
 /// watcher's catch-up path always passes `paths: None`).
+///
+/// A per-facade [`tokio::sync::Semaphore`] (see
+/// [`IndexFacade::reindex_gate`]) serializes full reindex runs: only one
+/// `reindex_locked` invocation may be in flight against a given facade at a
+/// time. The permit is acquired strictly before phase 1's write lock and
+/// held across all three phases, including the off-lock phase 2 walk, so a
+/// concurrent caller (e.g. an MCP `reindex(force: true)` racing the
+/// watcher's overflow catch-up reindex) cannot observe phase 1's
+/// `clear_index()` mid-way through another run's phase 2 batch. A caller
+/// that loses the race is rejected immediately with
+/// [`IndexError::ReindexInProgress`] rather than queued, since a queued
+/// duplicate force-reindex would be wasted work that pins the caller open
+/// for the duration of someone else's multi-minute run.
 pub(crate) async fn reindex_locked(
     facade: &Arc<tokio::sync::RwLock<IndexFacade>>,
     paths: Option<Vec<String>>,
@@ -1547,6 +1574,19 @@ pub(crate) async fn reindex_locked(
     phase2_started: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> FacadeResult<ReindexOutcome> {
     let should_clear = paths.is_none() && force;
+
+    // Take a brief read lock purely to clone the gate handle, then drop it
+    // before acquiring the write lock below (mirrors the brief-read-lock
+    // pattern in src/mcp/server.rs around the workspace-root containment
+    // check) so there is no deadlock between this read and phase 1's write.
+    let gate = {
+        let indexer = facade.read().await;
+        indexer.reindex_gate()
+    };
+    let _reindex_permit = gate.try_acquire_owned().map_err(|_| {
+        tracing::warn!("Rejecting reindex request: another full reindex is already in progress");
+        IndexError::ReindexInProgress
+    })?;
 
     // Phase 1: brief write lock to optionally clear the index and snapshot
     // cloneable handles for the off-lock reindex walk. `clear_index()`

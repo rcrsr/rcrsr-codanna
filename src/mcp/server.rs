@@ -384,12 +384,26 @@ impl CodeIntelligenceServer {
         // same phase-ordering guarantee.
         let outcome = crate::indexing::reindex_locked(&self.facade, paths, force, phase2_started)
             .await
-            .map_err(|e| {
-                McpError::new(
-                    ErrorCode::INTERNAL_ERROR,
-                    format!("Reindex failed: {e}"),
+            .map_err(|e| match e {
+                // Reindex contention is a client-visible, retryable
+                // condition (another full reindex is already holding the
+                // gate), not an internal fault -- surface it as
+                // INVALID_REQUEST with the recovery guidance attached
+                // rather than flattening it into INTERNAL_ERROR alongside
+                // genuine server-side failures.
+                crate::IndexError::ReindexInProgress => McpError::new(
+                    ErrorCode::INVALID_REQUEST,
+                    // `recovery_suggestions()` entries carry no trailing
+                    // punctuation, so join them as their own sentences
+                    // rather than a bare space that runs them together.
+                    format!("{e}. {}.", e.recovery_suggestions().join(". ")),
                     None,
-                )
+                ),
+                other => McpError::new(
+                    ErrorCode::INTERNAL_ERROR,
+                    format!("Reindex failed: {other}"),
+                    None,
+                ),
             })?;
 
         let documents = if documents {
@@ -785,6 +799,186 @@ mod tests {
             nonexistent_err.code,
             ErrorCode::INVALID_PARAMS,
             "expected INVALID_PARAMS for a nonexistent reindex path, got: {nonexistent_err:?}"
+        );
+    }
+
+    /// Writes `file_count` small Python source files (each with a couple of
+    /// functions and a class) into `dir`, for fixtures that need a phase 2
+    /// walk long enough to reliably observe in-flight behavior.
+    ///
+    /// `fn_{i}_a` calls `fn_{i}_b` so Phase 2's Pass 2 (Calls/other
+    /// relationships) is non-empty: `WriteStage::flush()` in
+    /// `indexing/pipeline/phase2.rs` only runs inside the `if
+    /// !others.is_empty()` branch, so a fixture with zero cross-symbol
+    /// relationships would leave the batch writer open past the end of
+    /// reindex, unrelated to (and pre-existing relative to) the gate
+    /// behavior under test here.
+    fn write_symbol_fixture(dir: &std::path::Path, file_count: usize) {
+        for i in 0..file_count {
+            std::fs::write(
+                dir.join(format!("mod_{i}.py")),
+                format!(
+                    "def fn_{i}_a():\n    fn_{i}_b()\n\n\ndef fn_{i}_b():\n    pass\n\n\nclass Cls{i}:\n    def method(self):\n        pass\n"
+                ),
+            )
+            .unwrap_or_else(|e| panic!("write mod_{i}.py fixture: {e}"));
+        }
+    }
+
+    /// Regression for the GH #44 fix: `reindex_locked`'s gate
+    /// (`IndexFacade::reindex_gate`) must reject a concurrent reindex
+    /// request while another one is in flight, AND the winning reindex must
+    /// still complete with the full, uncorrupted symbol count.
+    ///
+    /// The rejection-only half of this is not sufficient on its own: a gate
+    /// that is wired to reject concurrent callers but acquired/released at
+    /// the wrong point relative to phase 1's `clear_index()` and phase 2's
+    /// off-lock walk could still let a losing caller's side effects (or a
+    /// stray double `clear()`) truncate the winning reindex's result. Only
+    /// asserting the winning reindex's terminal symbol count against the
+    /// ground-truth oracle (mirroring
+    /// `run_reindex_releases_write_lock_during_off_lock_walk` above)
+    /// discriminates that corruption path from a merely-cosmetic rejection.
+    ///
+    /// Synchronization goes through `phase2_started`, not `sleep()`: the
+    /// signal fires after phase 1's write guard has dropped and the gate
+    /// permit is still held across the off-lock phase 2 walk, which is
+    /// exactly the window a naive implementation could get wrong by either
+    /// acquiring the permit after the write lock (letting a second caller's
+    /// phase 1 interleave) or dropping it before phase 2 (letting a second
+    /// caller's `clear_index()` run mid-walk).
+    #[tokio::test]
+    async fn run_reindex_rejects_concurrent_request_without_corrupting_the_completed_reindex() {
+        let temp = tempfile::tempdir().expect("create temp root");
+        let source_dir = temp.path().join("src");
+        std::fs::create_dir_all(&source_dir).expect("create source dir");
+
+        // Enough files that the off-lock phase 2 walk of reindex A is still
+        // in flight (gate permit still held) when reindex B is attempted
+        // immediately after the phase2_started signal fires.
+        const FILE_COUNT: usize = 300;
+        write_symbol_fixture(&source_dir, FILE_COUNT);
+
+        let mut settings = Settings {
+            index_path: temp.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.indexing.indexed_paths = vec![source_dir.clone()];
+
+        // Ground-truth oracle: index the same fixture directly via
+        // `index_directory` on an independent facade/index dir, rather than
+        // hand-deriving an expected count.
+        let expected_symbol_count = {
+            let expected_settings = Settings {
+                index_path: temp.path().join("expected_index"),
+                workspace_root: None,
+                ..Default::default()
+            };
+            let mut expected_facade =
+                IndexFacade::new(Arc::new(expected_settings)).expect("create ground-truth facade");
+            expected_facade
+                .index_directory(&source_dir, false)
+                .expect("index fixture directory for ground truth");
+            expected_facade.symbol_count()
+        };
+        assert!(
+            expected_symbol_count > 0,
+            "fixture must produce a non-zero ground-truth symbol count"
+        );
+
+        let facade =
+            IndexFacade::new(Arc::new(settings)).expect("create facade over temp index dir");
+        let server = CodeIntelligenceServer::new(facade);
+
+        let (phase2_started_tx, phase2_started_rx) = tokio::sync::oneshot::channel();
+
+        let reindex_a_server = server.clone();
+        let reindex_a_task = tokio::spawn(async move {
+            reindex_a_server
+                .run_reindex_for_test(None, true, phase2_started_tx)
+                .await
+        });
+
+        // Wait until reindex A has released phase 1's write lock and is
+        // about to enter the off-lock phase 2 walk. The gate permit is held
+        // across this entire window, so a concurrent request attempted now
+        // must be rejected rather than queued or allowed to interleave.
+        phase2_started_rx
+            .await
+            .expect("reindex A must signal phase 2 start before completing");
+
+        let reindex_b_server = server.clone();
+        let reindex_b_result = reindex_b_server.run_reindex(None, true, false).await;
+        let reindex_b_err = reindex_b_result.expect_err(
+            "a concurrent reindex request must be rejected while another reindex holds the gate",
+        );
+        assert_eq!(
+            reindex_b_err.code,
+            ErrorCode::INVALID_REQUEST,
+            "expected INVALID_REQUEST for a reindex rejected by gate contention, got: {reindex_b_err:?}"
+        );
+
+        let reindex_a_outcome = reindex_a_task
+            .await
+            .expect("reindex A task must not panic")
+            .expect(
+                "reindex A must still complete successfully despite the rejected concurrent request",
+            );
+
+        // The discriminating assertion: a rejection-only check would still
+        // pass against an implementation where the gate rejects concurrent
+        // callers correctly but the winning reindex's own result got
+        // truncated (e.g. by a permit acquired/released at the wrong phase
+        // boundary). Only the full ground-truth count catches that.
+        assert_eq!(
+            reindex_a_outcome.symbols, expected_symbol_count,
+            "expected reindex A to complete with the full ground-truth symbol count, not a \
+             corrupted/partial one, despite the concurrent request that was rejected"
+        );
+    }
+
+    /// Regression for the GH #44 fix: the reindex gate's permit must be
+    /// released once a reindex has fully completed, so a subsequent reindex
+    /// on the same facade succeeds rather than being permanently rejected
+    /// (a leaked permit -- e.g. dropped too early and never re-acquired, or
+    /// held past phase 3 -- would make every later reindex fail with
+    /// `ReindexInProgress` forever).
+    #[tokio::test]
+    async fn run_reindex_permit_is_released_after_completion_allowing_a_subsequent_reindex() {
+        let temp = tempfile::tempdir().expect("create temp root");
+        let source_dir = temp.path().join("src");
+        std::fs::create_dir_all(&source_dir).expect("create source dir");
+
+        write_symbol_fixture(&source_dir, 5);
+
+        let mut settings = Settings {
+            index_path: temp.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.indexing.indexed_paths = vec![source_dir.clone()];
+
+        let facade =
+            IndexFacade::new(Arc::new(settings)).expect("create facade over temp index dir");
+        let server = CodeIntelligenceServer::new(facade);
+
+        let first_outcome = server
+            .run_reindex(None, true, false)
+            .await
+            .expect("first reindex must succeed");
+        assert!(
+            first_outcome.symbols > 0,
+            "first reindex must produce a non-zero symbol count"
+        );
+
+        let second_outcome = server.run_reindex(None, true, false).await.expect(
+            "second reindex must succeed once the first has fully completed and released the \
+             gate permit",
+        );
+        assert_eq!(
+            second_outcome.symbols, first_outcome.symbols,
+            "expected the second reindex to reproduce the same symbol count as the first"
         );
     }
 }
