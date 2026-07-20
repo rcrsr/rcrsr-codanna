@@ -302,6 +302,18 @@ any manual step. Behavior details:
   a `WARN`-level log is emitted noting that another reindex appears wedged and
   a restart may be needed — normal handoffs resolve within a cooldown or two,
   so a sustained streak is a signal worth surfacing above debug logging.
+- That `WARN` only fires when the watcher is the one being rejected. A reindex
+  that wedges with no watcher running (or with no file activity to trigger a
+  catch-up) is covered separately by a watchdog on the reindex walk itself: if
+  the walk runs longer than ten minutes, an `ERROR` is logged naming the elapsed
+  time, noting that every further reindex is being rejected with
+  `REINDEX_IN_PROGRESS` meanwhile, and that a process restart is currently the
+  only recovery. The watchdog re-logs periodically while the walk stays stuck.
+  It is observability only — it does **not** cancel the walk or release the
+  serialization gate. The walk runs on a blocking thread that cannot be
+  interrupted, and releasing the gate while that thread is still writing would
+  re-open the very race the gate exists to prevent, so holding it is correct.
+  Recovering a genuinely wedged reindex still requires a restart.
 
 ### Configuration
 

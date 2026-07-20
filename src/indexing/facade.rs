@@ -1646,9 +1646,18 @@ pub(crate) async fn reindex_locked(
     }
 
     // Phase 2: run the heavy reindex walk with no facade lock held.
-    let outcome = tokio::task::spawn_blocking(move || handles.run(paths, force))
-        .await
-        .map_err(map_reindex_join_error)??;
+    //
+    // The watchdog is observability only — see its doc comment. It holds
+    // neither the facade lock nor the reindex permit, and its guard's Drop
+    // impl aborts it on every exit from this scope (success, `?`
+    // propagation below, or a panic unwinding through here), so it never
+    // outlives phase 2 regardless of how phase 2 finishes.
+    let outcome = {
+        let _watchdog = spawn_reindex_phase2_watchdog();
+        tokio::task::spawn_blocking(move || handles.run(paths, force))
+            .await
+            .map_err(map_reindex_join_error)??
+    };
 
     // Phase 3: brief write lock to record any newly indexed directories.
     {
@@ -1666,6 +1675,78 @@ pub(crate) async fn reindex_locked(
 /// an actual panic inside the task.
 fn map_reindex_join_error(e: tokio::task::JoinError) -> IndexError {
     IndexError::General(format!("reindex {}", crate::utils::describe_join_error(&e)))
+}
+
+// ── Phase 2 watchdog ────────────────────────────────────────────────────────
+//
+// Observability only: `reindex_locked`'s phase 2 walk runs on a
+// `spawn_blocking` thread, which is uncancellable — a timeout around the
+// `.await` would not stop that thread, only detach it while it keeps writing
+// through the `document_index`/`pipeline` handles it snapshotted in phase 1.
+// Releasing the reindex permit early would then let a second reindex acquire
+// the gate and call `clear_index()` concurrently with that still-running
+// thread. So the permit stays held for as long as phase 2 runs — that is
+// correct — and this watchdog exists solely to make an unusually long phase 2
+// loudly visible in logs instead of silent.
+
+/// How long phase 2 must run before the watchdog considers it possibly
+/// wedged and starts logging.
+///
+/// A legitimate full reindex of a large repository can take several minutes,
+/// so this must be comfortably clear of normal operation to avoid false
+/// alarms; 10 minutes is chosen as well beyond any observed legitimate run.
+const REINDEX_PHASE2_WATCHDOG_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Aborts the wrapped watchdog task when dropped.
+///
+/// This is the sole cancellation mechanism: there is no `.abort()` called on
+/// a success-only path, so every exit out of the scope holding this guard —
+/// normal return, `?`-propagated error, or a panic unwinding through the
+/// scope — stops the watchdog. A manual `.abort()` placed only after a
+/// fallible `.await` would be skipped on the error path, leaking the
+/// watchdog task; a drop guard cannot be skipped that way.
+struct ReindexWatchdogGuard(tokio::task::JoinHandle<()>);
+
+impl Drop for ReindexWatchdogGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Spawns a task that calls `on_fire` every `threshold` while it stays
+/// running, passing the number of thresholds elapsed (1, 2, 3, ...).
+///
+/// Kept separate from `spawn_reindex_phase2_watchdog` so the timing/repeat
+/// logic can be unit-tested with virtual time and a plain counter, without
+/// needing tracing output capture or a real multi-minute reindex.
+fn spawn_reindex_watchdog_with(
+    threshold: std::time::Duration,
+    on_fire: impl Fn(u64) + Send + 'static,
+) -> ReindexWatchdogGuard {
+    let handle = tokio::spawn(async move {
+        let mut elapsed_thresholds: u64 = 0;
+        loop {
+            tokio::time::sleep(threshold).await;
+            elapsed_thresholds += 1;
+            on_fire(elapsed_thresholds);
+        }
+    });
+    ReindexWatchdogGuard(handle)
+}
+
+/// Spawns the phase 2 watchdog: logs `tracing::error!` once phase 2 has run
+/// past [`REINDEX_PHASE2_WATCHDOG_THRESHOLD`], and re-logs every threshold
+/// interval thereafter so the condition stays visible in logs rather than
+/// scrolling away after a single line.
+fn spawn_reindex_phase2_watchdog() -> ReindexWatchdogGuard {
+    spawn_reindex_watchdog_with(REINDEX_PHASE2_WATCHDOG_THRESHOLD, |elapsed_thresholds| {
+        let minutes = elapsed_thresholds * (REINDEX_PHASE2_WATCHDOG_THRESHOLD.as_secs() / 60);
+        tracing::error!(
+            "[reindex] phase 2 walk has been running for {minutes} minute(s) and may be wedged; \
+             all further reindex requests are being rejected with ReindexInProgress while it runs. \
+             A process restart is currently the only recovery if this persists."
+        );
+    })
 }
 
 // ── Embedding backend factory ──────────────────────────────────────────────
@@ -1940,6 +2021,106 @@ mod tests {
         assert!(
             gate_after_swap.try_acquire_owned().is_err(),
             "permit held before the swap must still gate callers after it"
+        );
+    }
+
+    // ── Phase 2 watchdog ─────────────────────────────────────────────────
+
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    // The watchdog must fire, and keep re-firing, once the guarded work
+    // outruns the threshold. Uses tokio's paused virtual clock so the test
+    // does not actually sleep for minutes.
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_fires_repeatedly_past_threshold() {
+        let threshold = std::time::Duration::from_millis(10);
+        let count = Arc::new(AtomicU32::new(0));
+        let count_clone = Arc::clone(&count);
+
+        let _guard = spawn_reindex_watchdog_with(threshold, move |_elapsed| {
+            count_clone.fetch_add(1, Ordering::SeqCst);
+        });
+
+        for _ in 0..3 {
+            tokio::time::advance(threshold).await;
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            count.load(Ordering::SeqCst) >= 2,
+            "watchdog should have fired more than once past the threshold, got {}",
+            count.load(Ordering::SeqCst)
+        );
+    }
+
+    // The watchdog must NOT fire when the guarded work completes (guard
+    // dropped) before the threshold elapses, even if time is later advanced
+    // past the threshold.
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_does_not_fire_before_threshold() {
+        let threshold = std::time::Duration::from_millis(10);
+        let count = Arc::new(AtomicU32::new(0));
+        let count_clone = Arc::clone(&count);
+
+        {
+            let _guard = spawn_reindex_watchdog_with(threshold, move |_elapsed| {
+                count_clone.fetch_add(1, Ordering::SeqCst);
+            });
+            // "Work" finishes well inside the threshold; guard drops here.
+            tokio::time::advance(threshold / 2).await;
+            tokio::task::yield_now().await;
+        }
+
+        // Advance well past the threshold after the guard is already gone.
+        tokio::time::advance(threshold * 5).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            0,
+            "watchdog must not fire once the guarded work completed early"
+        );
+    }
+
+    // Discriminates the drop-guard requirement from a manual `.abort()`
+    // placed only on the success path: the guard is dropped by an early
+    // `?`/error-path return (scope exit), not by an explicit abort call
+    // after a successful await. A manual-abort-after-`??` implementation
+    // would skip cleanup here and leak the watchdog task.
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_cancelled_on_error_path() {
+        let threshold = std::time::Duration::from_millis(10);
+        let count = Arc::new(AtomicU32::new(0));
+        let count_clone = Arc::clone(&count);
+
+        fn fallible_scope(
+            threshold: std::time::Duration,
+            on_fire: impl Fn(u64) + Send + 'static,
+        ) -> Result<(), &'static str> {
+            let _guard = spawn_reindex_watchdog_with(threshold, on_fire);
+            // Simulate the `??` error-propagation exit out of phase 2:
+            // the guard must still be dropped (and the watchdog aborted)
+            // on this early return, not just on a success path.
+            Err("simulated phase 2 failure")?;
+            Ok(())
+        }
+
+        let result = fallible_scope(threshold, move |_elapsed| {
+            count_clone.fetch_add(1, Ordering::SeqCst);
+        });
+        assert!(result.is_err());
+
+        // Give the aborted task's cancellation a chance to land, then
+        // advance well past the threshold. If the guard had failed to
+        // cancel the task, this would fire.
+        tokio::task::yield_now().await;
+        tokio::time::advance(threshold * 5).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            0,
+            "watchdog must be cancelled on the error-path scope exit, not just on success"
         );
     }
 }
