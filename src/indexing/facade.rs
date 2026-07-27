@@ -1713,37 +1713,61 @@ impl Drop for ReindexWatchdogGuard {
     }
 }
 
-/// Spawns a task that calls `on_fire` every `threshold` while it stays
-/// running, passing the number of thresholds elapsed (1, 2, 3, ...).
+/// The interval between firings widens by this factor after each firing
+/// (10m -> 20m -> 40m -> ...), capped by [`watchdog_backoff_cap`].
+const REINDEX_WATCHDOG_BACKOFF_MULTIPLIER: u32 = 2;
+
+/// Caps the widening interval at 6x the base threshold. Expressed relative to
+/// the base rather than as a minute literal so the unit tests can drive the
+/// same logic with a millisecond base; at the sole production base of 10
+/// minutes ([`REINDEX_PHASE2_WATCHDOG_THRESHOLD`]) this yields the required
+/// 10m -> 20m -> 40m -> hourly-thereafter schedule.
+fn watchdog_backoff_cap(base_threshold: std::time::Duration) -> std::time::Duration {
+    base_threshold.saturating_mul(6)
+}
+
+/// Spawns a task that calls `on_fire` with the accumulated elapsed time once
+/// `threshold` has passed, then keeps calling it on a widening interval:
+/// `threshold`, `2 * threshold`, `4 * threshold`, ... capped at
+/// [`watchdog_backoff_cap`] (6x `threshold`), where it then stays fixed
+/// indefinitely. The task never stops on its own; only dropping the returned
+/// guard cancels it.
 ///
-/// Kept separate from `spawn_reindex_phase2_watchdog` so the timing/repeat
+/// Kept separate from `spawn_reindex_phase2_watchdog` so the timing/backoff
 /// logic can be unit-tested with virtual time and a plain counter, without
 /// needing tracing output capture or a real multi-minute reindex.
 fn spawn_reindex_watchdog_with(
     threshold: std::time::Duration,
-    on_fire: impl Fn(u64) + Send + 'static,
+    on_fire: impl Fn(std::time::Duration) + Send + 'static,
 ) -> ReindexWatchdogGuard {
     let handle = tokio::spawn(async move {
-        let mut elapsed_thresholds: u64 = 0;
+        let cap = watchdog_backoff_cap(threshold);
+        let mut interval = threshold;
+        let mut elapsed = std::time::Duration::ZERO;
         loop {
-            tokio::time::sleep(threshold).await;
-            elapsed_thresholds += 1;
-            on_fire(elapsed_thresholds);
+            tokio::time::sleep(interval).await;
+            elapsed += interval;
+            on_fire(elapsed);
+            interval = std::cmp::min(
+                interval.saturating_mul(REINDEX_WATCHDOG_BACKOFF_MULTIPLIER),
+                cap,
+            );
         }
     });
     ReindexWatchdogGuard(handle)
 }
 
 /// Spawns the phase 2 watchdog: logs `tracing::error!` once phase 2 has run
-/// past [`REINDEX_PHASE2_WATCHDOG_THRESHOLD`], and re-logs every threshold
-/// interval thereafter so the condition stays visible in logs rather than
-/// scrolling away after a single line.
+/// past [`REINDEX_PHASE2_WATCHDOG_THRESHOLD`] (10 minutes), then keeps
+/// re-logging on a widening interval — 10m, 20m, 40m, then capped at hourly
+/// — so a multi-day wedge stays visible without re-paging on a flat 10-minute
+/// cadence forever.
 fn spawn_reindex_phase2_watchdog() -> ReindexWatchdogGuard {
-    spawn_reindex_watchdog_with(REINDEX_PHASE2_WATCHDOG_THRESHOLD, |elapsed_thresholds| {
-        let minutes = elapsed_thresholds * (REINDEX_PHASE2_WATCHDOG_THRESHOLD.as_secs() / 60);
+    spawn_reindex_watchdog_with(REINDEX_PHASE2_WATCHDOG_THRESHOLD, |elapsed| {
+        let minutes = elapsed.as_secs() / 60;
         tracing::error!(
             "[reindex] phase 2 walk has been running for {minutes} minute(s) and may be wedged; \
-             all further reindex requests are being rejected with ReindexInProgress while it runs. \
+             all further reindex requests are being rejected with REINDEX_IN_PROGRESS while it runs. \
              A process restart is currently the only recovery if this persists."
         );
     })
@@ -2028,9 +2052,27 @@ mod tests {
 
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    // The watchdog must fire, and keep re-firing, once the guarded work
-    // outruns the threshold. Uses tokio's paused virtual clock so the test
-    // does not actually sleep for minutes.
+    // Advances virtual time in small steps so every intermediate `sleep`
+    // deadline is actually crossed (a single large `advance` can outrun
+    // deadlines the task hasn't rescheduled yet, since each `sleep` for the
+    // next interval is only set up once the task resumes and runs past the
+    // previous one).
+    async fn advance_steps(steps: u32, unit: std::time::Duration) {
+        for _ in 0..steps {
+            tokio::time::advance(unit).await;
+            tokio::task::yield_now().await;
+        }
+    }
+
+    // The watchdog must fire, and keep re-firing indefinitely, once the
+    // guarded work outruns the threshold — not just a bounded handful of
+    // times before going silent. Uses tokio's paused virtual clock so the
+    // test does not actually sleep for minutes.
+    //
+    // The backoff schedule (see `watchdog_backoff_widens_then_caps_hourly`)
+    // means firings are not evenly spaced, so this asserts a strict
+    // increase across two windows sized to the widest possible gap (the
+    // capped interval) rather than assuming one firing per threshold tick.
     #[tokio::test(start_paused = true)]
     async fn watchdog_fires_repeatedly_past_threshold() {
         let threshold = std::time::Duration::from_millis(10);
@@ -2041,15 +2083,69 @@ mod tests {
             count_clone.fetch_add(1, Ordering::SeqCst);
         });
 
-        for _ in 0..3 {
-            tokio::time::advance(threshold).await;
-            tokio::task::yield_now().await;
-        }
-
+        // Each window is 12 threshold-units (120ms), double the 6x-threshold
+        // backoff cap (60ms) — the widest possible gap between firings once
+        // the interval has widened — so each window is guaranteed to
+        // contain at least one firing regardless of schedule phase.
+        advance_steps(12, threshold).await;
+        let after_first_window = count.load(Ordering::SeqCst);
         assert!(
-            count.load(Ordering::SeqCst) >= 2,
-            "watchdog should have fired more than once past the threshold, got {}",
-            count.load(Ordering::SeqCst)
+            after_first_window >= 1,
+            "watchdog should have fired at least once past the threshold, got {after_first_window}"
+        );
+
+        advance_steps(12, threshold).await;
+        assert!(
+            count.load(Ordering::SeqCst) > after_first_window,
+            "watchdog must keep firing indefinitely, not a bounded number of times"
+        );
+    }
+
+    // The firing schedule must widen (10m -> 20m -> 40m) and then cap at
+    // hourly, scaled here to a 10ms base threshold, rather than firing on a
+    // flat cadence forever.
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_backoff_widens_then_caps_hourly() {
+        let threshold = std::time::Duration::from_millis(10);
+        let fire_times = Arc::new(Mutex::new(Vec::<std::time::Duration>::new()));
+        let fire_times_clone = Arc::clone(&fire_times);
+
+        let _guard = spawn_reindex_watchdog_with(threshold, move |elapsed| {
+            fire_times_clone.lock().unwrap().push(elapsed);
+        });
+
+        // Enough virtual time for 5 firings under the widening schedule:
+        // threshold, +2x, +4x, +cap, +cap (see arithmetic below).
+        advance_steps(20, threshold).await;
+
+        let times = fire_times.lock().unwrap().clone();
+        assert!(
+            times.len() >= 5,
+            "expected at least 5 firings within the advanced window, got {}",
+            times.len()
+        );
+
+        let cap = watchdog_backoff_cap(threshold);
+        assert_eq!(times[0], threshold, "first firing at the base threshold");
+        assert_eq!(
+            times[1],
+            threshold + threshold * 2,
+            "second interval widens to 2x threshold"
+        );
+        assert_eq!(
+            times[2],
+            threshold + threshold * 2 + threshold * 4,
+            "third interval widens to 4x threshold"
+        );
+        assert_eq!(
+            times[3],
+            times[2] + cap,
+            "fourth interval is capped at 6x threshold (hourly-equivalent)"
+        );
+        assert_eq!(
+            times[4],
+            times[3] + cap,
+            "subsequent intervals stay fixed at the cap, not uncapped"
         );
     }
 
@@ -2095,7 +2191,7 @@ mod tests {
 
         fn fallible_scope(
             threshold: std::time::Duration,
-            on_fire: impl Fn(u64) + Send + 'static,
+            on_fire: impl Fn(std::time::Duration) + Send + 'static,
         ) -> Result<(), &'static str> {
             let _guard = spawn_reindex_watchdog_with(threshold, on_fire);
             // Simulate the `??` error-propagation exit out of phase 2:
