@@ -145,6 +145,8 @@ impl Settings {
                 result.push_str("# .gitignore or .codannaignore.\n");
             } else if line.starts_with("indexed_paths = ") {
                 result.push_str("\n# List of directories to index\n");
+                result
+                    .push_str("# Ignore rules: .gitignore and .codannaignore (gitignore syntax)\n");
                 result.push_str("# Add folders using: codanna add-dir <path>\n");
                 result.push_str("# Remove folders using: codanna remove-dir <path>\n");
                 result.push_str("# List all folders using: codanna list-dirs\n");
@@ -437,6 +439,14 @@ impl Settings {
                     result.push_str("#     \"/path/to/project/tsconfig.json\",\n");
                     result.push_str("#     \"/path/to/project/packages/web/tsconfig.json\",\n");
                     result.push_str("# ]\n");
+                    result
+                        .push_str("# Register const bindings wrapped by higher-order functions\n");
+                    result.push_str(
+                        "# (const View = memo(() => {})) as functions and index their bodies.\n",
+                    );
+                    result.push_str("# Changing this list requires: codanna index --force\n");
+                    result.push_str("# [languages.typescript.parser_options]\n");
+                    result.push_str("# function_wrappers = [\"memo\", \"forwardRef\"]\n");
                     continue;
                 }
             }

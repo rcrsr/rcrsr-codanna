@@ -14,7 +14,7 @@ use codanna::project_resolver::{
     },
     registry::SimpleProviderRegistry,
 };
-use codanna::storage::IndexMetadata;
+use codanna::storage::{EMISSION_SEMANTICS_VERSION, IndexMetadata};
 use codanna::{IndexPersistence, Settings};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -382,14 +382,81 @@ async fn main() {
         _ => false,
     };
 
+    // Emission-semantics gate: an index stamped with a different (or no)
+    // emission version must not be read or incrementally extended -- a
+    // partial rewrite leaves a silent hybrid mixing row semantics.
+    // `codanna index` heals by full rebuild; everything else (including
+    // dry-run, whose pre-dispatch path sync can write) refuses with the
+    // heal command. `--force` clears unconditionally and needs no gate.
+    //
+    // `persistence.exists()` keys on `tantivy/meta.json`, which merely
+    // constructing an `IndexFacade` creates -- a dry run materializes it
+    // without ever saving. Such a directory holds no saved rows, so it has
+    // no emission semantics to be stale about, and `IndexMetadata::load`
+    // cannot tell it apart from a saved-but-unstamped index (both yield
+    // `emission_version: None`). Require `index.meta` on disk so the gate
+    // judges only indexes some binary actually wrote; otherwise a first dry
+    // run on a never-indexed workspace would refuse every command after it,
+    // against an index the user never built (tests/ignore_surface_tests.rs).
+    let mut emission_heal = false;
+    if needs_indexer
+        && persistence.exists()
+        && config.index_path.join("index.meta").exists()
+        && !matches!(cli.command, Commands::Index { force: true, .. })
+    {
+        let stored = IndexMetadata::load(&config.index_path)
+            .ok()
+            .and_then(|m| m.emission_version);
+        if stored != Some(EMISSION_SEMANTICS_VERSION) {
+            let stored_txt = stored.map_or_else(|| "none".to_string(), |v| format!("v{v}"));
+            let current = EMISSION_SEMANTICS_VERSION;
+            if matches!(cli.command, Commands::Index { dry_run: false, .. }) {
+                eprintln!(
+                    "Index emission semantics changed (index: {stored_txt}, binary: v{current}). Rebuilding from scratch."
+                );
+                emission_heal = true;
+            } else {
+                eprintln!(
+                    "Error: index emission semantics changed (index: {stored_txt}, binary: v{current})."
+                );
+                eprintln!(
+                    "Reading it would mix stale and current rows. Run 'codanna index' to rebuild."
+                );
+                // Client-spawned stdio servers lose stderr: a pre-handshake
+                // exit surfaces as an opaque connection failure. Serve a
+                // degraded handshake (zero tools, heal command in the
+                // instructions field), then exit with the gate code when the
+                // session ends. HTTP/HTTPS serve is terminal-launched, where
+                // stderr is already visible.
+                if matches!(
+                    cli.command,
+                    Commands::Serve {
+                        http: false,
+                        https: false,
+                        ..
+                    }
+                ) && config.server.mode != "http"
+                {
+                    codanna::cli::commands::serve::run_stale_stdio(stored, current).await;
+                }
+                std::process::exit(codanna::io::ExitCode::IndexCorrupted as i32);
+            }
+        }
+    }
+
     // Load existing index or create new one (only if command needs it)
     let settings = Arc::new(config.clone());
+    // Captured before facade creation: creating a facade manufactures the
+    // index directory, so persistence.exists() afterwards cannot tell a
+    // real index from one this process just created.
+    let index_preexisted = persistence.exists();
     let mut indexer: Option<IndexFacade> = if !needs_indexer {
         None
     } else {
         Some({
             // Force flag always means fresh index, regardless of path source (CLI or settings.toml)
-            let force_recreate_index = matches!(cli.command, Commands::Index { force: true, .. });
+            let force_recreate_index =
+                matches!(cli.command, Commands::Index { force: true, .. }) || emission_heal;
             if persistence.exists() && !force_recreate_index {
                 tracing::debug!(target: "cli", "found existing index at {}", config.index_path.display());
                 // Use lazy loading for simple commands to improve startup time
@@ -423,7 +490,7 @@ async fn main() {
                     }
                 }
             } else {
-                if force_recreate_index && persistence.exists() {
+                if force_recreate_index && persistence.exists() && !emission_heal {
                     eprintln!("Force re-indexing requested, creating new index");
                 } else if !persistence.exists() {
                     tracing::debug!(
@@ -476,7 +543,8 @@ async fn main() {
     // Sync indexed paths with config - auto-index new directories
     // This handles changes made while the index was not in use (e.g., add-dir command)
     // Skip sync if force flag is present (force means fresh start, not incremental)
-    let is_force_index = matches!(cli.command, Commands::Index { force: true, .. });
+    let is_force_index =
+        matches!(cli.command, Commands::Index { force: true, .. }) || emission_heal;
 
     // Progress is enabled by default from settings, can be disabled with --no-progress
     let no_progress_flag = matches!(
@@ -577,8 +645,18 @@ async fn main() {
     // Track whether sync made changes (for later check); None means sync did not run
     let mut sync_made_changes: Option<bool> = None;
 
+    // The index command owns indexing work. On a freshly created index
+    // (e.g. after `rm -rf .codanna/index`), stored_paths defaults empty
+    // and sync would read every configured root as a config change,
+    // running the full pass pre-dispatch and leaving the command phase
+    // to no-op ("Index up to date"). Removal sync after `remove-dir`
+    // needs a pre-existing index by definition, so this gate never
+    // skips it.
+    let index_command_fresh_index =
+        matches!(cli.command, Commands::Index { .. }) && !index_preexisted;
+
     if let Some(ref mut idx) = indexer {
-        if persistence.exists() && !is_force_index {
+        if persistence.exists() && !is_force_index && !index_command_fresh_index {
             // Load stored indexed_paths from metadata
             match IndexMetadata::load(&config.index_path) {
                 Ok(metadata) => {

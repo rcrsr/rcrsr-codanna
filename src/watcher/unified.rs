@@ -85,6 +85,10 @@ pub struct UnifiedWatcher {
     /// escalate logging if the gate holder appears wedged (see
     /// `CONSECUTIVE_CONTENTION_WARN_THRESHOLD`).
     consecutive_contention: u32,
+    /// Registered watch roots from handlers; scopes created-directory
+    /// handling and stays watched even when a root holds no indexed
+    /// file directly.
+    handler_roots: Vec<PathBuf>,
 }
 
 impl UnifiedWatcher {
@@ -136,6 +140,8 @@ impl UnifiedWatcher {
         for dir in new_dirs {
             self.watch_directory(&dir)?;
         }
+
+        self.register_handler_roots().await;
 
         // Subscribe to broadcaster for IndexReloaded events
         let mut broadcast_rx = self.broadcaster.subscribe();
@@ -409,23 +415,33 @@ impl UnifiedWatcher {
             self.mark_stale();
         }
 
+        // Bind `kind` before the loop below moves `event.paths` out of
+        // `event`; `EventKind` is `Copy`, so this avoids reading `event.kind`
+        // across the partial move and makes the per-path composition below
+        // explicit rather than relying on field-by-field partial-move rules.
+        let kind = event.kind;
+
         for path in event.paths {
-            // Check if any handler cares about this path
-            let matched = self.handlers.iter().any(|h| h.matches(&path));
-            if !matched {
-                crate::trace_event!(
-                    "watcher",
-                    "unmatched",
-                    "{:?} {}",
-                    event.kind,
-                    path.display()
-                );
+            // A created directory never matches a file handler (extension
+            // gate); it is the watcher's own concern: extend the watch set
+            // and catch up files that landed before the watch existed.
+            if matches!(kind, EventKind::Create(_)) && path.is_dir() {
+                self.handle_created_directory(&path).await;
                 continue;
             }
 
-            match event.kind {
-                EventKind::Modify(_) => {
-                    // Debounce modifications
+            // Check if any handler cares about this path
+            let matched = self.handlers.iter().any(|h| h.matches(&path));
+            if !matched {
+                crate::trace_event!("watcher", "unmatched", "{:?} {}", kind, path.display());
+                continue;
+            }
+
+            match kind {
+                EventKind::Create(_) | EventKind::Modify(_) => {
+                    // Debounce creations and modifications alike; the
+                    // exists() re-check in process_modification handles
+                    // paths that vanish before the debounce fires.
                     self.debouncer.record(path);
                 }
                 EventKind::Remove(_) => {
@@ -445,6 +461,95 @@ impl UnifiedWatcher {
         // (negligibly later) `now` again. Harmless, and simpler than
         // threading a "did mark_stale fire this call" flag through.
         self.bump_stale_clock();
+    }
+
+    /// Register handler watch roots: watched directly so directory
+    /// creation at the top of a root is visible even when the root
+    /// holds no indexed file itself.
+    async fn register_handler_roots(&mut self) {
+        let mut roots = Vec::new();
+        for handler in &self.handlers {
+            roots.extend(handler.watch_roots().await);
+        }
+        for root in &roots {
+            if self.registry.add_watch_dir(root.clone()) {
+                if let Err(e) = self.watch_directory(root) {
+                    tracing::warn!("[watcher] failed to watch root: {e}");
+                }
+            }
+        }
+        self.handler_roots = roots;
+    }
+
+    /// A directory appeared under a registered root: watch every
+    /// traversable directory of the new subtree (ignore chains anchored
+    /// at the root prune ignored trees), then route the files already
+    /// inside through the normal debounce -> eligibility -> reindex path.
+    async fn handle_created_directory(&mut self, path: &Path) {
+        if !self.handler_roots.iter().any(|r| path.starts_with(r)) {
+            return;
+        }
+
+        // Resolve the owning indexed root under a short read lock only --
+        // `discoverable_scope_root` is a settings lookup plus a single
+        // `canonicalize()`, not a directory walk. The actual walk runs
+        // below, off the lock and on a blocking-pool thread, so a large or
+        // bursty newly-materialized subtree cannot stall the tokio worker
+        // driving the watch loop.
+        let (scope_root, settings) = {
+            let facade = self.facade.read().await;
+            (
+                facade.discoverable_scope_root(path),
+                Arc::clone(facade.settings()),
+            )
+        };
+        let Some((scope, root)) = scope_root else {
+            return;
+        };
+
+        let path_owned = path.to_path_buf();
+        let walk_result = tokio::task::spawn_blocking(move || {
+            IndexFacade::discoverable_entries_for(&settings, &root, &scope)
+        })
+        .await;
+
+        let (dirs, files) = match walk_result {
+            Ok(Ok(entries)) => entries,
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    "[watcher] failed to discover entries under {}: {e}",
+                    path_owned.display()
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "[watcher] discovery task for {} panicked: {e}",
+                    path_owned.display()
+                );
+                return;
+            }
+        };
+
+        for dir in dirs {
+            if self.registry.add_watch_dir(dir.clone()) {
+                if let Err(e) = self.watch_directory(&dir) {
+                    tracing::warn!("[watcher] failed to watch created dir: {e}");
+                }
+            }
+        }
+        if !files.is_empty() {
+            crate::log_event!(
+                "watcher",
+                "created dir",
+                "{} ({} files to catch up)",
+                path.display(),
+                files.len()
+            );
+        }
+        for file in files {
+            self.debouncer.record(file);
+        }
     }
 
     /// Process a debounced file modification.
@@ -669,6 +774,9 @@ impl UnifiedWatcher {
                 tracing::warn!("[watcher] failed to watch new directory: {e}");
             }
         }
+
+        // Config reload can add or drop roots; re-register them.
+        self.register_handler_roots().await;
 
         crate::log_event!(
             "watcher",
@@ -927,6 +1035,7 @@ impl UnifiedWatcherBuilder {
             last_catch_up_completed: None,
             catch_up_attempts: 0,
             consecutive_contention: 0,
+            handler_roots: Vec::new(),
         })
     }
 }
@@ -961,18 +1070,27 @@ mod tests {
         );
     }
 
-    /// Build a minimal real `UnifiedWatcher` against a temp-dir-backed index,
-    /// so `handle_event` can be exercised directly instead of re-simulating
-    /// its branching logic.
-    fn test_watcher(tempdir: &tempfile::TempDir) -> UnifiedWatcher {
-        use crate::config::Settings;
+    /// Build a minimal real `UnifiedWatcher` against a temp-dir-backed index
+    /// using caller-supplied `Settings` (e.g. `indexing.ignore_patterns`), so
+    /// `handle_event`/`handle_created_directory` can be exercised directly
+    /// instead of re-simulating their branching logic. `debounce_ms(0)` so
+    /// `debouncer.take_ready()` returns everything recorded without waiting
+    /// out a real debounce window.
+    fn test_watcher_with_settings(
+        tempdir: &tempfile::TempDir,
+        mut settings: crate::config::Settings,
+    ) -> UnifiedWatcher {
         use crate::indexing::facade::IndexFacade;
 
-        let settings = Settings {
-            index_path: tempdir.path().to_path_buf(),
-            workspace_root: None,
-            ..Default::default()
-        };
+        settings.index_path = tempdir.path().to_path_buf();
+        settings.workspace_root = None;
+        if settings.indexed_paths_cache.is_empty() {
+            let root = tempdir
+                .path()
+                .canonicalize()
+                .unwrap_or_else(|_| tempdir.path().to_path_buf());
+            settings.indexed_paths_cache = vec![root];
+        }
         let facade = IndexFacade::new(std::sync::Arc::new(settings))
             .expect("facade construction against a fresh temp dir must succeed");
 
@@ -980,8 +1098,129 @@ mod tests {
             .broadcaster(Arc::new(NotificationBroadcaster::new(16)))
             .indexer(Arc::new(RwLock::new(facade)))
             .workspace_root(tempdir.path().to_path_buf())
+            .debounce_ms(0)
             .build()
             .expect("builder has all required fields")
+    }
+
+    /// Build a minimal real `UnifiedWatcher` against a temp-dir-backed index,
+    /// so `handle_event` can be exercised directly instead of re-simulating
+    /// its branching logic.
+    fn test_watcher(tempdir: &tempfile::TempDir) -> UnifiedWatcher {
+        use crate::config::Settings;
+
+        test_watcher_with_settings(tempdir, Settings::default())
+    }
+
+    /// A directory created inside a registered handler root must be
+    /// discovered and watched, and any files already inside it must be
+    /// routed through the normal debounce path - exercised via
+    /// `handle_event` (not `handle_created_directory` directly), so the
+    /// wiring from the event loop into the feature is itself under test.
+    #[tokio::test]
+    async fn created_directory_registers_watch_and_records_files() {
+        use crate::config::Settings;
+        use notify::event::CreateKind;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path().canonicalize().unwrap();
+        let mut watcher = test_watcher_with_settings(&tempdir, Settings::default());
+        watcher.handler_roots = vec![root.clone()];
+
+        let newdir = root.join("newdir");
+        std::fs::create_dir_all(&newdir).unwrap();
+        std::fs::write(newdir.join("a.rs"), "fn a() {}").unwrap();
+
+        let dirs_before = watcher.registry.dir_count();
+
+        let mut event = Event::new(EventKind::Create(CreateKind::Folder));
+        event.paths.push(newdir.clone());
+        watcher.handle_event(event).await;
+
+        assert!(
+            watcher.registry.dir_count() > dirs_before,
+            "the new directory must be registered for watching"
+        );
+
+        let ready = watcher.debouncer.take_ready();
+        assert!(
+            ready.iter().any(|p| p.ends_with("a.rs")),
+            "the file already inside the created directory must be debounced for catch-up: {ready:?}"
+        );
+    }
+
+    /// A subtree excluded by `ignore_patterns` must not be walked or watched
+    /// when a directory is created under a registered handler root - checked
+    /// at the watcher altitude (the live consumer of `discoverable_*`), not
+    /// just at the facade.
+    #[tokio::test]
+    async fn created_directory_skips_ignored_subtree() {
+        use crate::config::Settings;
+        use notify::event::CreateKind;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path().canonicalize().unwrap();
+
+        let mut settings = Settings {
+            index_path: tempdir.path().to_path_buf(),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.indexing.ignore_patterns = vec!["ignored/".into()];
+        settings.indexed_paths_cache = vec![root.clone()];
+        let mut watcher = test_watcher_with_settings(&tempdir, settings);
+        watcher.handler_roots = vec![root.clone()];
+
+        let newdir = root.join("newdir");
+        let ignored_dir = newdir.join("ignored");
+        std::fs::create_dir_all(&ignored_dir).unwrap();
+        std::fs::write(ignored_dir.join("b.rs"), "fn b() {}").unwrap();
+
+        let mut event = Event::new(EventKind::Create(CreateKind::Folder));
+        event.paths.push(newdir.clone());
+        watcher.handle_event(event).await;
+
+        let ready = watcher.debouncer.take_ready();
+        assert!(
+            !ready.iter().any(|p| p.ends_with("b.rs")),
+            "a file under an ignored subtree must not be debounced: {ready:?}"
+        );
+        assert!(
+            !watcher.registry.watch_dirs().contains(&ignored_dir),
+            "an ignored subtree must not be watch-registered"
+        );
+    }
+
+    /// A directory event outside every registered handler root must be
+    /// ignored entirely, preserving the upstream early-return guard.
+    #[tokio::test]
+    async fn created_directory_outside_handler_roots_is_ignored() {
+        use notify::event::CreateKind;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path().canonicalize().unwrap();
+        let mut watcher = test_watcher(&tempdir);
+        watcher.handler_roots = Vec::new();
+
+        let newdir = root.join("newdir");
+        std::fs::create_dir_all(&newdir).unwrap();
+        std::fs::write(newdir.join("a.rs"), "fn a() {}").unwrap();
+
+        let dirs_before = watcher.registry.dir_count();
+
+        let mut event = Event::new(EventKind::Create(CreateKind::Folder));
+        event.paths.push(newdir.clone());
+        watcher.handle_event(event).await;
+
+        assert_eq!(
+            watcher.registry.dir_count(),
+            dirs_before,
+            "no directory outside handler_roots may be registered for watching"
+        );
+        assert!(
+            watcher.debouncer.take_ready().is_empty(),
+            "no file outside handler_roots may be debounced"
+        );
     }
 
     #[tokio::test]
@@ -1501,5 +1740,105 @@ mod tests {
         );
         assert_eq!(watcher.catch_up_attempts, 0);
         assert!(watcher.stale);
+    }
+
+    /// End-to-end liveness proof for upstream v0.12.0's created-directory
+    /// handling, driven through the real `watch()` loop over a real kernel
+    /// watcher -- no hand-set state.
+    ///
+    /// Every other test of this feature populates `handler_roots` directly,
+    /// so all of them pass even if `register_handler_roots()` is never
+    /// called from `watch()`, or if `watch_roots()` returns empty because
+    /// `init_cache()` ran after it instead of before. In either case the
+    /// feature is dead in production and only this test notices: it asserts
+    /// on the indexed result, so it fails unless the whole chain is live --
+    /// refresh_paths -> init_cache -> eligibility.roots -> watch_roots ->
+    /// register_handler_roots -> handle_created_directory -> debouncer ->
+    /// on_modify -> reindex.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn created_directory_is_indexed_through_the_real_watch_loop() {
+        use crate::config::Settings;
+        use crate::indexing::facade::IndexFacade;
+        use crate::watcher::handlers::CodeFileHandler;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir
+            .path()
+            .canonicalize()
+            .expect("temp dir must canonicalize");
+
+        // Seed one indexed file so the watcher has something to watch and
+        // `tracked_paths()` is non-empty at startup.
+        std::fs::write(root.join("seed.py"), "def seed():\n    pass\n").unwrap();
+
+        let index_dir = tempfile::tempdir().unwrap();
+        // workspace_root set, as a real server's settings.toml has it, and
+        // identical to the value handed to the handler below: the handler
+        // relativizes paths against its own root while the facade resolves
+        // them against settings, so production keeps the two the same.
+        let mut settings = Settings {
+            index_path: index_dir.path().to_path_buf(),
+            workspace_root: Some(root.clone()),
+            ..Default::default()
+        };
+        // `add_indexed_path` populates `indexed_paths_cache` itself, which is
+        // what `init_cache` reads to build `eligibility.roots`.
+        settings
+            .add_indexed_path(root.clone())
+            .expect("register the indexed root");
+
+        let mut facade = IndexFacade::new(Arc::new(settings)).expect("facade over temp index");
+        facade.index_directory(&root, false).expect("seed index");
+        let facade = Arc::new(RwLock::new(facade));
+
+        let handler = CodeFileHandler::new(Arc::clone(&facade), root.clone());
+        let watcher = UnifiedWatcher::builder()
+            .broadcaster(Arc::new(NotificationBroadcaster::new(16)))
+            .indexer(Arc::clone(&facade))
+            .workspace_root(root.clone())
+            .handler(handler)
+            .debounce_ms(0)
+            .build()
+            .expect("builder has all required fields");
+
+        let watch_task = tokio::spawn(watcher.watch());
+
+        // Let watch() finish startup (refresh_paths, tracked_paths,
+        // watch_directory, register_handler_roots) before generating events.
+        tokio::time::sleep(Duration::from_millis(750)).await;
+
+        std::fs::create_dir_all(root.join("fresh")).unwrap();
+        std::fs::write(
+            root.join("fresh/arrival.py"),
+            "def arrival_marker():\n    pass\n",
+        )
+        .unwrap();
+
+        // Poll rather than sleep a fixed span: inotify delivery plus debounce
+        // plus reindex has no bounded latency worth hardcoding. A generous
+        // deadline keeps this from flaking on a loaded machine while still
+        // failing outright if the feature is dead.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut found = false;
+        while Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let f = facade.read().await;
+            if f.find_symbols_by_name("arrival_marker", None)
+                .iter()
+                .any(|s| s.name.as_ref() == "arrival_marker")
+            {
+                found = true;
+                break;
+            }
+        }
+
+        watch_task.abort();
+
+        assert!(
+            found,
+            "a source file created inside a NEW directory under a registered \
+             root must be indexed by the running watcher; not finding it means \
+             the created-directory chain is not wired end to end"
+        );
     }
 }

@@ -87,15 +87,38 @@ impl ReadStage {
                         input_wait_ns
                             .fetch_add(recv_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
-                        match read_file(&path) {
-                            Ok(mut content) => {
-                                // Normalize path to relative if workspace_root is set
+                        // Resolve against workspace_root before opening. The
+                        // two lanes feeding this stage disagree on path form:
+                        // a full run gets absolute paths from the walker,
+                        // while an incremental run gets paths DiscoverStage
+                        // already normalized to relative (it has to, to
+                        // compare them against the index's stored rows). A
+                        // relative path opened as-is resolves against the
+                        // process CWD, so an embedder whose CWD is not the
+                        // workspace root read nothing and got an empty index
+                        // with no error -- the CLI only escaped it by always
+                        // running from the workspace root.
+                        let read_result = match *workspace_root {
+                            Some(ref root) if path.is_relative() => read_file(&root.join(&path))
+                                .map(|mut content| {
+                                    content.path = path.clone();
+                                    content
+                                }),
+                            // Absolute lane: read_file returns an absolute
+                            // path, which must still be normalized to
+                            // workspace-relative when workspace_root is set.
+                            _ => read_file(&path).map(|mut content| {
                                 if let Some(ref root) = *workspace_root {
                                     if let Ok(relative) = content.path.strip_prefix(root) {
                                         content.path = relative.to_path_buf();
                                     }
                                 }
+                                content
+                            }),
+                        };
 
+                        match read_result {
+                            Ok(content) => {
                                 read_count.fetch_add(1, Ordering::Relaxed);
 
                                 // Track output wait (time blocked on send)

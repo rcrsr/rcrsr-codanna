@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ### Fork discipline (read before touching version or CI)
 
-- Version format is `<upstream>+rcrsr.N` (e.g. `0.9.23+rcrsr.1`) — see the header comment in `Cargo.toml`. `+rcrsr.N` is **semver build metadata**: it compares *equal* to the bare upstream version and is not orderable. Bump the upstream base only when rebasing onto a new upstream release (reset `N` to `.1`); increment `N` once per private addition landed on top.
+- Version format is `<upstream>+rcrsr.N` (e.g. `0.9.23+rcrsr.1`) — see the header comment in `Cargo.toml`. `+rcrsr.N` is **semver build metadata**: it compares *equal* to the bare upstream version and is not orderable. Bump the upstream base only when rebasing onto a new upstream release; moving the base does **not** touch `N`. `N` counts private additions across the fork's whole life and is **monotonic** — it only ever increments, never resets. It sits at `.1` because nothing has been released yet.
 - `publish = false` — the `codanna` crate name is owned by upstream. Distribution is via GitHub Releases + `cargo binstall --git`, not crates.io. Do not `cargo publish`.
 - **RCRSR-README.md** documents every fork-private change for users. When you add or change fork behavior, update it.
 - Fork-specific features currently live in: `serve --proxy` mode (`src/mcp/proxy.rs`, `src/serve_discovery.rs`, `src/serve_tls.rs`), the `reindex` MCP tool (`src/mcp/tools/admin.rs`), and catch-up reindex on watch-queue overflow (`src/watcher/`).

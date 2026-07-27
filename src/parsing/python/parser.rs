@@ -1229,14 +1229,14 @@ impl PythonParser {
         }
     }
 
-    /// Process assignment node with type annotation (x: int = 5 or x: int)
+    /// Process assignment node with a statically-known type: an annotation
+    /// (x: int = 5 or x: int) or a constructor call (x = ClassName(...)).
     fn process_assignment_with_type<'a>(
         &self,
         node: Node,
         code: &'a str,
         variable_types: &mut Vec<(&'a str, &'a str, Range)>,
     ) {
-        // Only process assignments that have type annotations
         if let Some(type_node) = node.child_by_field_name("type") {
             // Extract variable name from the left side
             if let Some(target_node) = node.child_by_field_name("left") {
@@ -1246,7 +1246,50 @@ impl PythonParser {
                     variable_types.push((var_name, type_annotation, range));
                 }
             }
+            return;
         }
+
+        // Constructor form: plain-identifier target only — attribute targets
+        // (self.x = ...) are field-type territory, and their bare tail would
+        // collide with same-named locals.
+        let Some(target_node) = node.child_by_field_name("left") else {
+            return;
+        };
+        if target_node.kind() != "identifier" {
+            return;
+        }
+        let Some(callee) = node
+            .child_by_field_name("right")
+            .filter(|right| right.kind() == "call")
+            .and_then(|call| call.child_by_field_name("function"))
+        else {
+            return;
+        };
+        // Dotted constructors bind the bare class name (`pkg.Model()` -> Model),
+        // matching the ClassMember evidence the compat check consults. Only
+        // constructor-shaped callees qualify: an identifier or a dotted chain
+        // of identifiers. A call anywhere in the chain (`super().__new__`)
+        // yields a method result, not a constructed type.
+        let type_name = match callee.kind() {
+            "identifier" => &code[callee.byte_range()],
+            "attribute" => {
+                let mut object = callee.child_by_field_name("object");
+                while let Some(obj) = object {
+                    match obj.kind() {
+                        "identifier" => break,
+                        "attribute" => object = obj.child_by_field_name("object"),
+                        _ => return,
+                    }
+                }
+                match callee.child_by_field_name("attribute") {
+                    Some(tail) => &code[tail.byte_range()],
+                    None => return,
+                }
+            }
+            _ => return,
+        };
+        let var_name = &code[target_node.byte_range()];
+        variable_types.push((var_name, type_name, self.node_to_range(node)));
     }
 
     /// Extract variable name from assignment target
@@ -1359,6 +1402,66 @@ impl LanguageParser for PythonParser {
 
     fn language(&self) -> Language {
         Language::Python
+    }
+
+    fn find_this_barrier_spans(&mut self, code: &str) -> Vec<Range> {
+        // A callable binding its own `self`/`cls` owns that name; a nested
+        // def or lambda without one captures the enclosing method's, so it
+        // stays transparent to the walk.
+        let mut spans = Vec::new();
+        let Some(tree) = self.parser.parse(code, None) else {
+            return spans;
+        };
+
+        fn binds_own_self(node: &Node, code: &str) -> bool {
+            let Some(params) = node.child_by_field_name("parameters") else {
+                return false;
+            };
+            let mut cursor = params.walk();
+            // A comment sits in the parameter list as a named child and can
+            // precede the first real parameter (`def f(  # noqa`).
+            let Some(first) = params
+                .named_children(&mut cursor)
+                .find(|n| n.kind() != "comment")
+            else {
+                return false;
+            };
+            // `self`, `self: Foo` and `self=None` nest the identifier one
+            // level down; a bare parameter is the identifier itself.
+            let ident = if first.kind() == "identifier" {
+                Some(first)
+            } else {
+                let mut inner = first.walk();
+                first
+                    .named_children(&mut inner)
+                    .find(|n| n.kind() == "identifier")
+            };
+            ident.is_some_and(|n| {
+                crate::parsing::python::SELF_ALIASES.contains(&&code[n.byte_range()])
+            })
+        }
+
+        fn walk(node: &Node, code: &str, spans: &mut Vec<Range>) {
+            // A lambda is transparent unless it rebinds the name itself
+            // (`lambda self: ...`), which makes it own its `self` the same
+            // way a def does.
+            if matches!(node.kind(), "function_definition" | "lambda") && binds_own_self(node, code)
+            {
+                spans.push(Range::new(
+                    node.start_position().row as u32,
+                    node.start_position().column as u16,
+                    node.end_position().row as u32,
+                    node.end_position().column as u16,
+                ));
+            }
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                walk(&child, code, spans);
+            }
+        }
+
+        walk(&tree.root_node(), code, &mut spans);
+        spans
     }
 
     fn extract_doc_comment(&self, node: &Node, code: &str) -> Option<String> {
@@ -2331,6 +2434,41 @@ def setup():
             println!("  → Found annotated_assignment \"{name}: {typ} = ...\"");
             println!("    Variable: \"{name}\", Type: \"{typ}\"");
         }
+    }
+
+    #[test]
+    fn test_constructor_assignment_binding_capture() {
+        let mut parser = PythonParser::new().unwrap();
+        let code = r#"
+def build():
+    m = Model()
+    n = pkg.mod.Model(x, y=2)
+    p: Declared = factory()
+    q = factory()
+    self.attr = Model()
+    a, b = Model(), Other()
+    cls = super().__new__(mcs)
+    r = obj.chain().Model()
+"#;
+        let var_types = parser.find_variable_types(code);
+
+        let has = |name: &str, typ: &str| var_types.iter().any(|(n, t, _)| *n == name && *t == typ);
+        // Constructor call binds the callee name; dotted callees bind the tail
+        assert!(has("m", "Model"));
+        assert!(has("n", "Model"));
+        // Annotation outranks the callee when both are present
+        assert!(has("p", "Declared"));
+        assert!(!has("p", "factory"));
+        // Callee name is captured verbatim; resolution fails closed on
+        // non-class names via the ClassMember compat check
+        assert!(has("q", "factory"));
+        // Attribute targets and tuple targets are not captured
+        assert!(!var_types.iter().any(|(n, _, _)| *n == "attr"));
+        assert!(!var_types.iter().any(|(n, _, _)| *n == "a" || *n == "b"));
+        // A call anywhere in the callee chain is a method result, not a
+        // constructor: no binding
+        assert!(!var_types.iter().any(|(n, _, _)| *n == "cls"));
+        assert!(!var_types.iter().any(|(n, _, _)| *n == "r"));
     }
 
     // Test additional variable type annotation cases

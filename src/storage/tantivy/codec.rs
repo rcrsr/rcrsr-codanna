@@ -116,11 +116,14 @@ impl DocumentIndex {
             doc.add_text(self.schema.signature, sig);
         }
 
-        // Add string fields for filtering
-        doc.add_text(
-            self.schema.module_path,
-            symbol.module_path.as_deref().unwrap_or(""),
-        );
+        // Add string fields for filtering. module_path None persists as
+        // field-absent, never as "": None means "no module evidence" and
+        // Some("") is a real module (kotlin default package); collapsing
+        // them made rehydrated caches disagree with run caches on tier-3
+        // same-module verdicts.
+        if let Some(module_path) = symbol.module_path.as_deref() {
+            doc.add_text(self.schema.module_path, module_path);
+        }
         doc.add_text(self.schema.kind, format!("{:?}", symbol.kind));
         doc.add_u64(self.schema.visibility, symbol.visibility as u64);
 
@@ -245,11 +248,16 @@ impl DocumentIndex {
                 end_line,
                 end_column: end_col,
             },
-            file_path: doc
-                .get_first(self.schema.file_path)
-                .and_then(|v| v.as_str())
-                .unwrap_or("<unknown>")
-                .into(),
+            file_path: {
+                let stored = doc
+                    .get_first(self.schema.file_path)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<unknown>");
+                match self.to_portable_file_path(stored) {
+                    Some(portable) => portable.into(),
+                    None => stored.into(),
+                }
+            },
             signature: signature.map(|s| s.into()),
             doc_comment: doc_comment.map(|s| s.into()),
             module_path: module_path.map(|s| s.into()),
@@ -326,6 +334,53 @@ mod tests {
     use crate::SymbolKind;
 
     use tempfile::TempDir;
+
+    #[test]
+    fn module_path_round_trips_none_empty_and_real() {
+        use crate::{FileId, Range, Symbol, SymbolId};
+
+        let temp_dir = TempDir::new().unwrap();
+        let settings = crate::config::Settings::default();
+        let index = DocumentIndex::new(temp_dir.path(), &settings).unwrap();
+
+        let sym = |id: u32, name: &str, module: Option<&str>| {
+            let mut s = Symbol::new(
+                SymbolId::new(id).unwrap(),
+                name,
+                SymbolKind::Function,
+                FileId::new(1).unwrap(),
+                Range::new(1, 0, 1, 10),
+            );
+            s.module_path = module.map(Into::into);
+            s
+        };
+
+        index.start_batch().unwrap();
+        index
+            .index_symbol(&sym(1, "no_module", None), "a.rs")
+            .unwrap();
+        index
+            .index_symbol(&sym(2, "empty_module", Some("")), "a.rs")
+            .unwrap();
+        index
+            .index_symbol(&sym(3, "real_module", Some("pkg.a")), "a.rs")
+            .unwrap();
+        index.commit_batch().unwrap();
+
+        let read = |name: &str| {
+            let found = index.find_symbols_by_name(name, None).unwrap();
+            assert_eq!(found.len(), 1, "{name} must round-trip");
+            found[0].module_path.clone()
+        };
+
+        assert_eq!(
+            read("no_module"),
+            None,
+            "None must not decode as Some(\"\")"
+        );
+        assert_eq!(read("empty_module").as_deref(), Some(""));
+        assert_eq!(read("real_module").as_deref(), Some("pkg.a"));
+    }
 
     #[test]
     fn test_three_reconstruction_paths_agree_on_context_only_metadata() {
@@ -594,5 +649,75 @@ mod tests {
             .unwrap()
             .expect("symbol stored by this test");
         assert_eq!(retrieved.scope_context, Some(scope));
+    }
+
+    fn portable_test_symbol(id: u32) -> crate::Symbol {
+        crate::Symbol::new(
+            SymbolId::new(id).unwrap(),
+            "portable_probe",
+            SymbolKind::Function,
+            FileId::new(1).unwrap(),
+            crate::Range::new(0, 0, 2, 1),
+        )
+    }
+
+    fn roundtrip_file_path(settings: &crate::config::Settings, stored: &str) -> String {
+        let index_dir = TempDir::new().unwrap();
+        let index = DocumentIndex::new(index_dir.path(), settings).unwrap();
+        index.start_batch().unwrap();
+        index
+            .index_symbol(&portable_test_symbol(11), stored)
+            .unwrap();
+        index.commit_batch().unwrap();
+        index
+            .find_symbol_by_id(SymbolId::new(11).unwrap())
+            .unwrap()
+            .expect("symbol stored by this test")
+            .file_path
+            .to_string()
+    }
+
+    #[test]
+    fn absolute_stored_path_under_indexed_root_emits_relative() {
+        let root = TempDir::new().unwrap();
+        let base = root.path().canonicalize().unwrap();
+        let mut settings = crate::config::Settings::default();
+        settings.indexing.indexed_paths = vec![base.clone()];
+        let stored = base.join("src/lib.rs");
+        assert_eq!(
+            roundtrip_file_path(&settings, &stored.to_string_lossy()),
+            "src/lib.rs"
+        );
+    }
+
+    #[test]
+    fn absolute_stored_path_under_workspace_root_emits_relative() {
+        let root = TempDir::new().unwrap();
+        let base = root.path().canonicalize().unwrap();
+        let settings = crate::config::Settings {
+            workspace_root: Some(base.clone()),
+            ..Default::default()
+        };
+        let stored = base.join("src/lib.rs");
+        assert_eq!(
+            roundtrip_file_path(&settings, &stored.to_string_lossy()),
+            "src/lib.rs"
+        );
+    }
+
+    #[test]
+    fn relative_stored_path_passes_through() {
+        let settings = crate::config::Settings::default();
+        assert_eq!(roundtrip_file_path(&settings, "src/lib.rs"), "src/lib.rs");
+    }
+
+    #[test]
+    fn absolute_stored_path_outside_bases_passes_through() {
+        let root = TempDir::new().unwrap();
+        let base = root.path().canonicalize().unwrap();
+        let mut settings = crate::config::Settings::default();
+        settings.indexing.indexed_paths = vec![base];
+        let stored = "/nonexistent-root/other/src/lib.rs";
+        assert_eq!(roundtrip_file_path(&settings, stored), stored);
     }
 }

@@ -67,8 +67,8 @@ impl FindSymbolsCandidate {
 
 /// Classify one name's lookup result into found/not_found/ambiguous.
 ///
-/// Deliberately lighter than [`service::find_symbol_data`]: it resolves via
-/// the plain `find_symbols_by_name`/`find_dotted_members` facade lookups
+/// Deliberately lighter than [`service::symbols_to_contexts`]: it resolves
+/// via the plain `find_symbols_by_name`/`find_dotted_members` facade lookups
 /// (the same resolution algorithm — exact match falling back to
 /// dotted-member lookup) instead of building each match's full
 /// symbol-card context (`get_symbol_context` with `SYMBOL_CARD`, ~8
@@ -76,8 +76,8 @@ impl FindSymbolsCandidate {
 /// name/kind/signature/location/line_range off the plain `Symbol`, so a
 /// batch of up to [`MAX_FIND_SYMBOLS_NAMES`] names would otherwise discard
 /// thousands of relationship lookups it never uses. `find_symbol`'s own
-/// JSON path still calls `service::find_symbol_data` for its full-context
-/// single-name result.
+/// JSON path still calls `service::resolve_find_symbol_target` +
+/// `service::symbols_to_contexts` for its full-context single-name result.
 ///
 /// `pub(crate)` so the CLI's `--json` pre-collection path (`cli/commands/mcp.rs`)
 /// can build the identical per-name results without a parallel implementation.
@@ -312,46 +312,29 @@ impl CodeIntelligenceServer {
 
         let indexer = self.facade.read().await;
 
-        if output_format == OutputFormat::Json {
-            let symbol_contexts = service::find_symbol_data_by_id_or_name(
-                &indexer,
-                symbol_id,
-                &name,
-                lang.as_deref(),
-            );
-            let envelope =
-                service::find_symbol_envelope(&indexer, &name, lang.as_deref(), symbol_contexts);
-            return Ok(json_result(envelope));
-        }
-
         // Prefer the typed symbol_id when present; otherwise fall back to
         // name-based lookup, including the legacy symbol_id:XXX prefix
-        // format (from semantic search results).
-        let symbols = if let Some(id) = symbol_id {
-            indexer
-                .get_symbol(crate::SymbolId(id))
-                .map(|s| vec![s])
-                .unwrap_or_default()
-        } else if let Some(id_str) = name.strip_prefix("symbol_id:") {
-            if let Ok(id) = id_str.parse::<u32>() {
-                indexer
-                    .get_symbol(crate::SymbolId(id))
-                    .map(|s| vec![s])
-                    .unwrap_or_default()
-            } else {
+        // format (from semantic search results and ambiguity hints).
+        let (symbols, label) = match service::resolve_find_symbol_target(
+            &indexer,
+            symbol_id,
+            &name,
+            lang.as_deref(),
+        ) {
+            service::FindSymbolTarget::Symbols { symbols, label } => (symbols, label),
+            service::FindSymbolTarget::InvalidId(id_str) => {
                 return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                     "Invalid symbol_id format: {id_str}"
                 ))]));
             }
-        } else {
-            // Shared resolution algorithm; see service::find_symbol_data —
-            // the JSON path above (find_symbol) and find_symbols both call
-            // the same builder so name resolution cannot drift apart.
-            service::find_symbol_data(&indexer, &name, lang.as_deref())
-                .into_iter()
-                .map(|ctx| ctx.symbol)
-                .collect()
         };
+
+        if output_format == OutputFormat::Json {
+            let symbol_contexts = service::symbols_to_contexts(&indexer, symbols);
+            let envelope =
+                service::find_symbol_envelope(&indexer, &name, lang.as_deref(), symbol_contexts);
+            return Ok(json_result(envelope));
+        }
 
         if symbols.is_empty() {
             let mut output = format!("No symbols found with name: {name}");
@@ -364,7 +347,7 @@ impl CodeIntelligenceServer {
             return Ok(CallToolResult::success(vec![ContentBlock::text(output)]));
         }
 
-        let mut result = format!("Found {} symbol(s) named '{}':\n\n", symbols.len(), name);
+        let mut result = format!("Found {} symbol(s) named '{label}':\n\n", symbols.len());
 
         for (idx, symbol) in symbols.iter().enumerate() {
             if idx > 0 {
@@ -443,14 +426,8 @@ impl CodeIntelligenceServer {
 
                 if let Some(defines) = &ctx.relationships.defines {
                     if !defines.is_empty() {
-                        let methods = defines
-                            .iter()
-                            .filter(|s| s.kind == crate::SymbolKind::Method)
-                            .count();
-                        if methods > 0 {
-                            result.push_str(&format!("Defines: {methods} method(s)\n"));
-                            has_relationships = true;
-                        }
+                        result.push_str(&format_defines_line(defines.iter().map(|s| s.kind)));
+                        has_relationships = true;
                     }
                 }
 
@@ -698,9 +675,11 @@ impl CodeIntelligenceServer {
                 )]));
             }
             SymbolResolution::MissingParam => {
-                return Ok(CallToolResult::success(vec![ContentBlock::text(
-                    "Error: Either name or symbol_id must be provided".to_string(),
-                )]));
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                    "{}\n{}",
+                    service::missing_param_message("get_calls"),
+                    service::accepted_params_line("get_calls"),
+                ))]));
             }
         };
 
@@ -722,28 +701,32 @@ impl CodeIntelligenceServer {
         let mut result = format!("{identifier} calls {result_count} function(s):\n");
         for (callee, metadata) in all_called_with_metadata {
             // Parse metadata to extract receiver info and call site location
-            let (call_display, call_line) = if let Some(ref meta) = metadata {
-                let display = meta
-                    .context
-                    .as_deref()
-                    .and_then(parse_receiver_context)
-                    .map(|(receiver, is_static)| qualified_call(receiver, is_static, &callee.name))
-                    .unwrap_or_else(|| callee.name.to_string());
+            let call_display = metadata
+                .as_ref()
+                .and_then(|meta| meta.context.as_deref())
+                .and_then(parse_receiver_context)
+                .map(|(receiver, is_static)| qualified_call(receiver, is_static, &callee.name))
+                .unwrap_or_else(|| callee.name.to_string());
 
-                // Use call site line if available, otherwise definition line
-                let line = meta
-                    .line
-                    .map(|l| l + 1)
-                    .unwrap_or(callee.range.start_line + 1);
-                (display, line)
-            } else {
-                (callee.name.to_string(), callee.range.start_line + 1)
-            };
-
+            // A location string names one real place: the callee's own
+            // definition. The call site lives in the CALLER's file — naming
+            // it with the callee's path composed a nonexistent location on
+            // every cross-file edge.
             result.push_str(&format!(
-                "  -> {:?} {} at {}:{}\n",
-                callee.kind, call_display, callee.file_path, call_line
+                "  -> {:?} {} at {}:{}",
+                callee.kind,
+                call_display,
+                callee.file_path,
+                callee.range.start_line + 1
             ));
+            if let Some(call_line) = metadata.as_ref().and_then(|m| m.line) {
+                result.push_str(&format!(
+                    " (called at {}:{})",
+                    symbol.file_path,
+                    call_line + 1
+                ));
+            }
+            result.push('\n');
             if let Some(ref sig) = callee.signature {
                 result.push_str(&format!("     Signature: {sig}\n"));
             }
@@ -835,9 +818,11 @@ impl CodeIntelligenceServer {
                 )]));
             }
             SymbolResolution::MissingParam => {
-                return Ok(CallToolResult::success(vec![ContentBlock::text(
-                    "Error: Either name or symbol_id must be provided".to_string(),
-                )]));
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                    "{}\n{}",
+                    service::missing_param_message("find_callers"),
+                    service::accepted_params_line("find_callers"),
+                ))]));
             }
         };
 
@@ -1035,9 +1020,11 @@ impl CodeIntelligenceServer {
                 )]));
             }
             SymbolResolution::MissingParam => {
-                return Ok(CallToolResult::success(vec![ContentBlock::text(
-                    "Error: Either name or symbol_id must be provided".to_string(),
-                )]));
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                    "{}\n{}",
+                    service::missing_param_message("analyze_impact"),
+                    service::accepted_params_line("analyze_impact"),
+                ))]));
             }
         };
 
@@ -1461,5 +1448,74 @@ impl CodeIntelligenceServer {
                 }
             }
         })
+    }
+}
+
+/// Member summary for the Defines card line, counted per kind.
+/// Methods sort first so method-only cards stay byte-identical to the
+/// prior `Defines: N method(s)` rendering; other kinds follow by name.
+fn format_defines_line(kinds: impl Iterator<Item = crate::SymbolKind>) -> String {
+    let mut kind_counts: Vec<(crate::SymbolKind, usize)> = Vec::new();
+    for kind in kinds {
+        match kind_counts.iter_mut().find(|(k, _)| *k == kind) {
+            Some((_, n)) => *n += 1,
+            None => kind_counts.push((kind, 1)),
+        }
+    }
+    kind_counts.sort_by_key(|&(k, _)| (k != crate::SymbolKind::Method, format!("{k:?}")));
+    let parts: Vec<String> = kind_counts
+        .iter()
+        .map(|(k, n)| {
+            let label = format!("{k:?}").to_lowercase();
+            format!("{n} {label}(s)")
+        })
+        .collect();
+    format!("Defines: {}\n", parts.join(", "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_defines_line;
+    use crate::SymbolKind;
+
+    #[test]
+    fn method_only_matches_prior_rendering() {
+        let kinds = vec![SymbolKind::Method; 5];
+        assert_eq!(
+            format_defines_line(kinds.into_iter()),
+            "Defines: 5 method(s)\n"
+        );
+    }
+
+    #[test]
+    fn mixed_kinds_render_methods_first() {
+        let kinds = vec![
+            SymbolKind::Constant,
+            SymbolKind::Method,
+            SymbolKind::Constant,
+            SymbolKind::Method,
+        ];
+        assert_eq!(
+            format_defines_line(kinds.into_iter()),
+            "Defines: 2 method(s), 2 constant(s)\n"
+        );
+    }
+
+    #[test]
+    fn non_method_members_render_without_methods() {
+        let kinds = vec![SymbolKind::Constant, SymbolKind::Constant];
+        assert_eq!(
+            format_defines_line(kinds.into_iter()),
+            "Defines: 2 constant(s)\n"
+        );
+    }
+
+    #[test]
+    fn non_method_kinds_sort_by_name() {
+        let kinds = vec![SymbolKind::Field, SymbolKind::Constant];
+        assert_eq!(
+            format_defines_line(kinds.into_iter()),
+            "Defines: 1 constant(s), 1 field(s)\n"
+        );
     }
 }

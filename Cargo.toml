@@ -2,30 +2,34 @@
 name = "codanna"
 # Fork version: <upstream base>+rcrsr.<private addition counter>
 #
-#   0.9.23   -- the upstream release this fork is built from. Bump ONLY when
-#               rebasing/merging onto a new upstream release, and reset the
-#               counter to .1 when you do.
-#   +rcrsr.N -- N increments once per private addition landed on top of that
-#               base. Surfaces in `codanna --version` and, via
-#               CARGO_PKG_VERSION, in the MCP `initialize` handshake, so a
+#   0.12.0   -- the upstream release this fork is built from. Bump ONLY when
+#               rebasing/merging onto a new upstream release. Moving the base
+#               does NOT touch the counter.
+#   +rcrsr.N -- N counts private additions across the fork's whole life, NOT
+#               per base. It is monotonic: it only ever increments, and never
+#               resets when the base moves. The fork keeps adding to one body
+#               of work, so a counter that went backwards would report that
+#               body as having shrunk. Surfaces in `codanna --version` and,
+#               via CARGO_PKG_VERSION, in the MCP `initialize` handshake, so a
 #               connected client reports exactly which build it is talking to.
+#               It is at .1 because nothing has been released yet.
 #
 # `+` is BUILD METADATA, which semver ignores in precedence: every +rcrsr.N
-# compares EQUAL to a bare 0.9.23, and +rcrsr.7 does NOT sort above +rcrsr.1.
-# That is deliberate -- a `-rcrsr` pre-release would instead sort BELOW 0.9.23,
+# compares EQUAL to a bare 0.12.0, and +rcrsr.7 does NOT sort above +rcrsr.1.
+# That is deliberate -- a `-rcrsr` pre-release would instead sort BELOW 0.12.0,
 # making a fork with strictly more code compare as older than the upstream it
 # was built from. The counter is informational, not orderable. Do not rely on
 # it for version-range gating.
-version = "0.9.23+rcrsr.3"
+version = "0.12.0+rcrsr.1"
 authors = ["Angel Bartolli <bartolli@gmail.com>"]
 edition = "2024"
-description = "Code Intelligence for Large Language Models"
-documentation = "https://docs.rs/codanna"
-homepage = "https://github.com/bartolli/codanna"
+description = "Local code intelligence MCP server and CLI for AI coding agents"
+documentation = "https://docs.codanna.sh"
+homepage = "https://docs.codanna.sh"
 repository = "https://github.com/bartolli/codanna"
 license = "Apache-2.0"
 readme = "README.md"
-keywords = ["mcp-server", "code-intelligence", "semantic-search", "llm", "rag"]
+keywords = ["code-indexing", "code-intelligence", "mcp-server", "semantic-search", "ai-agents"]
 categories = ["development-tools", "command-line-utilities", "parsing", "text-processing", "compilers"]
 autoexamples = false
 exclude = [".github/", "contributing/", "tests/", "docs/"]
@@ -55,14 +59,14 @@ pkg-fmt = "zip"
 bin-dir = "{ name }-{ version }-windows-x64/{ bin }{ binary-ext }"
 
 [dependencies]
-anyhow = "1.0.103"
-bitflags = "2.13.0"
-clap = { version = "4.6.1", features = ["derive", "color", "env"] }
-crossbeam-channel = "0.5.15"
+anyhow = "1.0.104"
+bitflags = "2.13.1"
+clap = { version = "4.6.4", features = ["derive", "color", "env"] }
+crossbeam-channel = "0.5.16"
 dashmap = "6.2.1"
 dirs = "6.0.0"
 figment = { version = "0.10.19", features = ["toml", "env"] }
-ignore = "0.4.27"
+ignore = "0.4.31"
 memmap2 = "0.9.11"
 notify = "8.2.0"
 num_cpus = "1.17.0"
@@ -71,18 +75,18 @@ rayon = "1.12.0"
 # transport-streamable-http-client-reqwest gives the stdio<->HTTP proxy (src/mcp/proxy.rs) a
 # reqwest::Client that implements rmcp's StreamableHttpClient trait, so it can dial the loopback
 # backing "codanna serve --http" without a hand-rolled HTTP client (pulls in rmcp's own reqwest dep).
-rmcp = { version = "2.1.0", features = ["server", "client", "transport-io", "transport-child-process", "transport-streamable-http-server", "transport-streamable-http-client", "transport-streamable-http-client-reqwest", "transport-worker"] }
-serde = { version = "1.0.228", features = ["derive", "rc"] }
-serde_json = "1.0.150"
+rmcp = { version = "2.2.0", features = ["server", "client", "transport-io", "transport-child-process", "transport-streamable-http-server", "transport-streamable-http-client", "transport-streamable-http-client-reqwest", "transport-worker"] }
+serde = { version = "1.0.229", features = ["derive", "rc"] }
+serde_json = "1.0.151"
 sha2 = "0.11.0"
 hex = "0.4"
 tantivy = "0.26.1"
-thiserror = "2.0.18"
-tokio = { version = "1.52.3", features = ["full"] }
-toml = { version = "1.1.2", features = ["preserve_order"] }
+thiserror = "2.0.19"
+tokio = { version = "1.53.1", features = ["full"] }
+toml = { version = "1.1.3", features = ["preserve_order"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-tree-sitter = "0.26.10"
+tree-sitter = "0.26.11"
 tree-sitter-go = "0.25.0"
 tree-sitter-gdscript = "6.1.0"
 tree-sitter-java = "0.23.5"
@@ -107,12 +111,12 @@ axum = { version = "0.8.9", optional = true }
 tower = { version = "0.5.3", optional = true }
 tower-http = { version = "0.7.0", features = ["cors"], optional = true }
 serde_urlencoded = "0.7"
-tokio-util = "0.7.18"
+tokio-util = "0.7.19"
 axum-server = { version = "0.8.0", features = ["tls-rustls-no-provider"], optional = true }
-rustls = { version = "0.23.41", default-features = false, features = ["ring"], optional = true }
+rustls = { version = "0.23.42", default-features = false, features = ["ring"], optional = true }
 rcgen = { version = "0.14.8", optional = true }
 is-terminal = "0.4.17"
-regex = "1.12.4"
+regex = "1.13.1"
 tree-sitter-c = "0.24.2"
 tree-sitter-c-sharp = "0.23.5"
 tree-sitter-cpp = "0.23.4"
@@ -121,14 +125,15 @@ tempfile = "3.27.0"
 serde_json5 = "0.2.1"
 tree-sitter-swift = "0.7.3"
 tree-sitter-lua = "0.5.0"
-tree-sitter-clojure-orchard = "0.2.5"
-async-trait = "0.1.89"
+tree-sitter-clojure-orchard = "0.2.8"
+glob = "0.3.4"
+async-trait = "0.1.91"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # rmcp's `impl StreamableHttpClient for reqwest::Client` is against reqwest 0.13
-# (rmcp 2.1.0 -> reqwest 0.13.4). The 0.12 dep above is a DIFFERENT crate instance
+# (rmcp 2.2.0 -> reqwest 0.13.2). The 0.12 dep above is a DIFFERENT crate instance
 # and its Client does not implement that trait. Renamed so both can coexist.
 rmcp_reqwest = { package = "reqwest", version = "0.13", default-features = false }
-sysinfo = "0.39.5"
+sysinfo = "0.39.6"
 indexmap = { version = "2.14.0", features = ["serde"] }
 
 [dev-dependencies]
@@ -190,6 +195,14 @@ path = "examples/dump_edges.rs"
 [[example]]
 name = "pipeline_metrics_demo"
 path = "examples/pipeline_metrics_demo.rs"
+
+[[example]]
+name = "parser_census"
+path = "examples/parser_census.rs"
+
+[[example]]
+name = "resolution_precision"
+path = "examples/resolution_precision.rs"
 
 [[bench]]
 name = "unified_output_bench"

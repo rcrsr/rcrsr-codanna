@@ -21,6 +21,7 @@ pub enum OutputFormat {
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct FindSymbolRequest {
     /// Name of the symbol to find. Ignored when `symbol_id` is present.
     #[serde(default)]
@@ -51,6 +52,7 @@ pub struct FindSymbolsRequest {
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetCallsRequest {
     /// Name of the function to analyze (use symbol_id for unambiguous lookup).
     /// Legacy key `function_name` is still accepted as an alias for `name`.
@@ -79,6 +81,7 @@ pub enum CallerFilter {
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct FindCallersRequest {
     /// Name of the function to find callers for (use symbol_id for unambiguous lookup).
     /// Legacy key `function_name` is still accepted as an alias for `name`.
@@ -112,6 +115,7 @@ pub enum GroupBy {
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AnalyzeImpactRequest {
     /// Name of the symbol to analyze impact for (use symbol_id for unambiguous lookup).
     /// Legacy key `symbol_name` is still accepted as an alias for `name`.
@@ -123,8 +127,9 @@ pub struct AnalyzeImpactRequest {
     /// Maximum depth to search. Defaults to 3 via `default_depth()` below;
     /// `IndexFacade::get_impact_radius`'s own `unwrap_or(2)` fallback
     /// (`facade.rs`) is unreachable from this request type, since this
-    /// field is always `Some`-wrapped before being passed down.
-    #[serde(default = "default_depth")]
+    /// field is always `Some`-wrapped before being passed down. Legacy key
+    /// `depth` is still accepted as an alias for `max_depth`.
+    #[serde(default = "default_depth", alias = "depth")]
     pub max_depth: u32,
     /// Return only the symbol count and distinct-file count instead of the
     /// full listing.
@@ -169,6 +174,7 @@ pub struct ReadSymbolRequest {
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SearchSymbolsRequest {
     /// Search query (supports fuzzy matching)
     pub query: String,
@@ -190,6 +196,7 @@ pub struct SearchSymbolsRequest {
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SemanticSearchRequest {
     /// Natural language search query
     pub query: String,
@@ -208,6 +215,7 @@ pub struct SemanticSearchRequest {
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SemanticSearchWithContextRequest {
     /// Natural language search query
     pub query: String,
@@ -226,6 +234,7 @@ pub struct SemanticSearchWithContextRequest {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct GetIndexInfoRequest {
     /// Output rendering: "text" (default) or "json"
     #[serde(default)]
@@ -287,6 +296,7 @@ impl<T> OneOrMany<T> {
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SearchDocumentsRequest {
     /// Natural language search query
     pub query: String,
@@ -380,4 +390,68 @@ fn default_limit() -> u32 {
 
 fn default_context_limit() -> u32 {
     5
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn unknown_keys_reject_across_request_structs() {
+        assert!(
+            serde_json::from_value::<FindSymbolRequest>(json!({"name": "x", "bogus": 1})).is_err()
+        );
+        assert!(serde_json::from_value::<GetCallsRequest>(json!({"bogus": 1})).is_err());
+        assert!(serde_json::from_value::<FindCallersRequest>(json!({"langg": "rust"})).is_err());
+        assert!(
+            serde_json::from_value::<AnalyzeImpactRequest>(
+                json!({"symbol_name": "x", "depths": 2})
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<SearchSymbolsRequest>(
+                json!({"query": "q", "kindd": "function"})
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<SemanticSearchRequest>(json!({"query": "q", "treshold": 0.5}))
+                .is_err()
+        );
+        assert!(
+            serde_json::from_value::<SemanticSearchWithContextRequest>(
+                json!({"query": "q", "x": 1})
+            )
+            .is_err()
+        );
+        assert!(serde_json::from_value::<GetIndexInfoRequest>(json!({"bogus": 1})).is_err());
+        assert!(
+            serde_json::from_value::<SearchDocumentsRequest>(
+                json!({"query": "q", "collections": "a"})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn depth_aliases_max_depth() {
+        let req: AnalyzeImpactRequest =
+            serde_json::from_value(json!({"symbol_name": "x", "depth": 2})).expect("alias applies");
+        assert_eq!(req.max_depth, 2);
+        let req: AnalyzeImpactRequest =
+            serde_json::from_value(json!({"symbol_name": "x"})).expect("default applies");
+        assert_eq!(req.max_depth, 3);
+    }
+
+    #[test]
+    fn rejection_names_the_field_and_accepted_keys() {
+        let err = serde_json::from_value::<GetCallsRequest>(json!({"bogus": 1})).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bogus") && msg.contains("function_name"),
+            "rejection must name the offending field and the accepted set: {msg}"
+        );
+    }
 }

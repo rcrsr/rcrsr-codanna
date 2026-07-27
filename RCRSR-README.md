@@ -62,6 +62,103 @@ Or download a platform archive directly from the [releases page](https://github.
 and put the `codanna` binary on your `PATH`. The binary is named `codanna` (same as
 upstream), so it will shadow an upstream install on the same `PATH`.
 
+## Upstream base
+
+The fork now tracks upstream **v0.12.0** (merged from the prior v0.11.1 base).
+Moving the upstream base does not touch the fork build counter, which only ever
+counts up (see [Identifying the fork](#identifying-the-fork)).
+
+One upstream v0.10.0 change is user-visible for existing MCP clients:
+**unknown `key:value` arguments on an MCP tool call now reject** instead of
+being silently ignored — this applies on every surface (positional CLI args,
+`--args`, and serve-mode `tools/call`, where the rejection surfaces as
+`isError: true`); tool schemas also now advertise `additionalProperties:
+false`. A misspelled or stale argument key that previously passed through
+unnoticed now fails the call. If you have automation or scripts calling
+codanna's MCP tools, check argument names against the current tool schemas
+after upgrading.
+
+Upstream v0.10.1 changes what a **stale index** looks like to an MCP client.
+When the index was built by a binary with different emission semantics,
+`codanna serve` (stdio) no longer fails to start — it completes the MCP
+handshake and advertises **zero tools**, with instructions beginning `INDEX
+STALE - ALL TOOLS DISABLED` that name `codanna index` as the fix and remind you
+to restart the MCP server afterwards. Clients that launch codanna themselves
+usually discard its error output, so the old behavior showed up as an opaque
+connection failure with no hint of the cause; now the reason arrives over the
+protocol. Nothing becomes readable — the refusal is still absolute, the process
+still exits with code 7 once the session ends, and running in a terminal still
+prints `index emission semantics changed`.
+
+**Fork note — this does not cover proxy mode.** `codanna serve --proxy` (and a
+bare `codanna serve` when `mode = "proxy"` is set in `settings.toml`) is exempt
+from the staleness check by design, because a proxy holds no index of its own.
+It delegates to a backing server started as `codanna serve --http`, which
+upstream's degraded-handshake path deliberately excludes, and the fork starts
+that backing process with its error output detached. So if a proxy has to start
+a *fresh* backing server against a stale index, you get a readiness timeout —
+`backing 'codanna serve --http' did not become healthy within …ms` — rather
+than the stale-index explanation. An already-running backing server is
+unaffected. Run `codanna index` in the workspace to heal it.
+
+Upstream v0.11.1 changes what happens when you ask for output fields that
+don't exist. `--fields` now **rejects** unknown field names instead of
+silently returning stripped-empty items, and it does so on every surface that
+accepts the flag — `codanna mcp <tool> --json --fields`, `codanna retrieve
+<query> --json --fields`, and `codanna documents search --json --fields`, all
+of which share one rejection path. A rejection is a JSON error envelope on stdout with
+`code: INVALID_QUERY` and exit code 2, carrying a hint that lists the
+available top-level fields. `--fields` also now understands dotted paths, so
+you can project into a nested field instead of only picking top-level keys.
+If you have scripts that pass `--fields`, check the field names you're
+asking for after upgrading — a misspelling that used to come back as an
+empty object now fails the command outright. Note that the accepted names
+are derived from the records a tool actually returns, so they differ between
+tools: `role` is a valid field on `find_callers`, for instance, but not on
+`analyze_impact`. The hint in the rejection always lists what the tool you
+called will accept.
+
+**Fork note.** The new rejection applies to the fork-only tools too —
+`find_symbols` and `reindex` reject an unknown `--fields` name exactly the
+same way. An ambiguous symbol name still exits **3** with `code: AMBIGUOUS`
+regardless of what you passed to `--fields`, because the fork decides
+ambiguity before it renders anything, so the new exit-2 rejection never
+swallows the fork's ambiguity handling.
+
+**Upstream v0.12.0 forces a one-time re-index of every existing index.**
+Upstream changed how symbol relationships are emitted, and bumped the
+emission-semantics version from 1 to 3 to say so. The gate that guards this is
+absolute, not advisory: any index written by an older binary is refused. In a
+terminal you get `index emission semantics changed (index: v1, binary: v3)` and
+exit code **7**; over stdio MCP you get the degraded zero-tool handshake
+described above, with `INDEX STALE - ALL TOOLS DISABLED` in the instructions.
+Run `codanna index` once per workspace to heal it, and restart any MCP server
+afterwards. This is upstream's intended behavior, not a fork decision — but it
+lands on upgrade with no warning beforehand, so re-index before you rely on a
+workspace. The proxy-mode caveat in the fork note above applies here too: a
+proxy forced to spawn a fresh backing server against a stale index reports a
+readiness timeout rather than the stale-index reason.
+
+The reason for the bump is worth knowing, because it changes result counts.
+Upstream made cross-file resolution **fail closed**: a call that cannot be tied
+to a definition by actual evidence is now left unresolved instead of being
+guessed from the first plausible candidate. Import bindings resolve only on an
+exact module match or an exactly-one survivor, and a symbol with no module
+identity no longer matches everything by accident. Expect relationship counts
+to *drop* on re-index — upstream measured -7.6% on one corpus and -48% on
+another — with the lost recall being mostly wrong answers. If you have tooling
+that asserts on caller or impact counts, re-baseline it against a freshly built
+index rather than assuming a regression.
+
+Upstream v0.12.0 also adds `builder_commit` to `index.meta` and to
+`get_index_info --json`: the commit the building binary came from, suffixed
+`-dirty` when built from a modified tree. It is descriptive only — nothing
+reads it back — and it is absent for tarball builds and for indexes written
+before the stamp existed. **Fork note:** upstream declares this field on its
+own `IndexInfo` in `cli/commands/mcp.rs`; the fork long ago relocated that
+struct to `mcp/service.rs`, so the field is carried there instead. The emitted
+JSON is the same either way.
+
 # Improvements
 
 The sections below are the fork's additions over upstream codanna — new
@@ -342,7 +439,12 @@ is the way to re-sync on demand.
 but was never consulted by any walk — upstream, setting it had no effect on
 what got indexed ([issue #22](https://github.com/rcrsr/rcrsr-codanna/issues/22)).
 The fork wires it into every walk (`codanna index`, `--dry-run`, incremental
-reindex, and watch-triggered reindex).
+reindex, and watch-triggered reindex). That now includes upstream v0.12.0's
+created-directory handling: when `serve --watch` sees a new directory appear
+under a watched root, the subtree it registers watches for and the files it
+catches up are decided by the same walk, so `ignore_patterns` prunes them
+exactly as it prunes a batch index. A directory you have excluded never gets
+watched.
 
 `ignore_patterns` uses the **same gitignore dialect as `.codannaignore`**:
 `!` negation, trailing `/` for directory-only matches, `**`, and the usual
@@ -365,6 +467,43 @@ The four patterns codanna used to hard-code as the default (`target/**`,
 already excluded by the default `.codannaignore` that `codanna init` writes.
 Existing `settings.toml` files are left untouched; any patterns already on
 disk in `ignore_patterns` now take effect.
+
+**As of upstream v0.12.0 this setting is fork-only.** Upstream resolved the
+same issue #22 in the opposite direction — it deleted `ignore_patterns`
+outright, on the grounds that nothing consumed it and the settings surface
+was promising an exclusion that never happened. That reasoning does not hold
+here, because the fork had already made it real. The fork keeps the setting
+and its behavior. The practical consequence: a `settings.toml` written for
+this fork is not portable to upstream codanna — upstream will load the file
+without complaint and silently ignore the key, so anything you exclude only
+via `ignore_patterns` would get indexed there. Move those patterns to
+`.codannaignore` if you need a config that behaves identically on both.
+
+## Indexing no longer depends on the working directory
+
+Two read paths opened workspace-relative paths as-is, which resolves them
+against the process working directory rather than `workspace_root`. The batch
+READ stage gets relative paths from the discovery stage, which has to normalize
+them to compare against the index's stored rows; single-file re-index gets them
+from the watch handler. Both now resolve against `workspace_root` before
+opening.
+
+Running `codanna` from the command line was never affected, because the CLI and
+the server are launched from the workspace root, where the two agree. It bit
+anything that did not do that:
+
+- **Embedding `IndexFacade` in another process.** With `workspace_root` set and
+  a different CWD, every file read failed and the run still reported success —
+  `index_directory` returned `Ok` with `files_indexed` counted and
+  `symbols_found` zero, producing a silently empty index with no error to
+  catch.
+- **`serve --watch` started from elsewhere.** Every re-index failed with
+  `No such file or directory` against a path that plainly existed.
+
+Both are covered by regression tests that fail on the pre-fix behavior: one
+asserting a non-empty index when CWD differs from `workspace_root`, and an
+end-to-end watcher test that creates a directory under a watched root and
+requires the file inside it to become retrievable through the real watch loop.
 
 ## Document collection controls (`search_documents`)
 
@@ -527,7 +666,11 @@ codanna --version        # e.g. codanna <upstream-version>+rcrsr.N
 MCP clients see the same string in the `initialize` handshake, so a connected
 client can confirm which build it is talking to. The `+rcrsr.N` suffix is build
 metadata — it does not change how the version compares, so a fork build counts as
-the same release as the upstream version it is built on. `N` is just a running
-count of fork additions on the current upstream base.
+the same release as the upstream version it is built on. `N` is a running count
+of fork additions over the whole life of the fork, not per upstream base: it only
+ever counts up, and moving to a newer upstream base does not reset it. So a
+higher `N` always means more fork work, and an unchanged `N` always means none
+was added — but `N` still says nothing about which upstream release you are on.
+Read the base version for that.
 
 Everything not listed here behaves as it does in upstream codanna.

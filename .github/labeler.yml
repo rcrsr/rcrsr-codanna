@@ -1,0 +1,109 @@
+# .github/labeler.yml
+#
+# Maps changed files to the repo's existing `area:*` labels. The taxonomy is
+# NOT defined here -- these labels already exist in the repository, and this
+# file only decides which paths imply which. Adding a label here that does not
+# exist in the repo is a silent no-op: both `actions/labeler` and `gh pr edit`
+# ignore unknown labels rather than failing, so create the label first.
+#
+# Format is actions/labeler v5 (`changed-files` / `any-glob-to-any-file`).
+#
+# Deliberately unmapped: `src/error.rs`, `src/lib.rs`, `src/types/**`,
+# `src/utils.rs`, `src/logging.rs`, `src/git.rs`. They are cross-cutting, so
+# mapping them would attach the same label to nearly every PR and the signal
+# would go flat. A PR touching only those carries no area label and gets
+# `needs-triage`, which is the correct outcome -- a human picks.
+#
+# Tests follow their subject where the path says it (`tests/parsers/**` is
+# parsing work). The rest of `tests/` is intentionally unmapped: most PRs touch
+# tests alongside the code they change, and that code already carries the area.
+
+"area:parsing":
+  - changed-files:
+      - any-glob-to-any-file:
+          # tree-sitter parsers, language behaviors, and the symbol/relationship
+          # model they produce. project_resolver answers "which tsconfig applies
+          # to this file" -- import-path resolution, not codanna's own settings.
+          - 'src/parsing/**'
+          - 'src/symbol/**'
+          - 'src/relationship/**'
+          - 'src/project_resolver/**'
+          - 'tests/parsers/**'
+
+"area:indexing":
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'src/indexing/**'
+
+"area:storage":
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'src/storage/**'
+
+"area:semantic":
+  - changed-files:
+      - any-glob-to-any-file:
+          # documents/ is chunking + embeddings for RAG, so it belongs with the
+          # vector/embedding surface rather than with the Tantivy symbol index.
+          - 'src/semantic/**'
+          - 'src/vector/**'
+          - 'src/documents/**'
+
+"area:mcp":
+  - changed-files:
+      - any-glob-to-any-file:
+          # serve_discovery/serve_tls are the proxy and HTTPS transports.
+          # guidance/ is template text that surfaces in MCP tool responses.
+          - 'src/mcp/**'
+          - 'src/serve_discovery.rs'
+          - 'src/serve_tls.rs'
+          - 'src/guidance/**'
+
+"area:cli":
+  - changed-files:
+      - any-glob-to-any-file:
+          # io/ is the envelope and exit-code surface: shared with MCP, but the
+          # CLI is where its shape is user-visible.
+          - 'src/cli/**'
+          - 'src/main.rs'
+          - 'src/display/**'
+          - 'src/io/**'
+          - 'src/retrieve.rs'
+          - 'tests/cli/**'
+
+"area:config":
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'src/config/**'
+          - 'src/profiles/**'
+          - 'src/plugins/**'
+          - 'src/init.rs'
+
+"area:watcher":
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'src/watcher/**'
+
+"area:docs":
+  - changed-files:
+      - any-glob-to-any-file:
+          - '**/*.md'
+          - 'LICENSE'
+          - 'NOTICE'
+
+"area:dx":
+  - changed-files:
+      - any-glob-to-any-file:
+          # CI, build, lint config, perf harness, and shared test scaffolding.
+          - '.github/**'
+          - 'scripts/**'
+          - 'contributing/scripts/**'
+          - 'benches/**'
+          - 'tests/common/**'
+          - 'build.rs'
+          - 'Cargo.toml'
+          - 'Cargo.lock'
+          - 'clippy.toml'
+          - 'markdownlint.toml'
+          - 'flake.nix'
+          - 'flake.lock'

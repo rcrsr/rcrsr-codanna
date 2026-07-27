@@ -336,6 +336,50 @@ pub trait LanguageBehavior: Send + Sync {
         &["self"]
     }
 
+    /// True when the parser emits a self-alias receiver ONLY for an
+    /// explicit source alias (a literal `this.x()` / `self.x()`). The
+    /// resolve stage then refuses to fall through to scope lookup for a
+    /// self-alias call whose caller has no ClassMember evidence — the
+    /// lexical-this walk recovers it or the row fails closed. Default
+    /// false: csharp emits `this` on every bare call and cpp on bare
+    /// calls inside member functions; their fall-through is the
+    /// legitimate free-function path.
+    fn self_alias_receiver_is_explicit(&self) -> bool {
+        false
+    }
+
+    /// True when the language's `private` members are invisible outside
+    /// their declaring FILE (kotlin `private fun`). The resolve stage then
+    /// refuses cross-file picks of Private Method/Field symbols. Default
+    /// false: rust privates are module-visible (ancestor privates resolve
+    /// from child modules), and Private is also the unconfigured
+    /// `Symbol::new` default, so the gate must be opt-in per language.
+    fn private_members_are_file_scoped(&self) -> bool {
+        false
+    }
+
+    /// True when a bare receiver-less call inside a class body can
+    /// dispatch to an instance member (implicit this) AND the parser
+    /// emits no receiver for it. The resolve stage then tries the
+    /// inheritance-witness walk for bare calls. Default false: python
+    /// bare calls never reach members (self is explicit), and csharp/cpp
+    /// parsers emit a `this` receiver for member dispatch, which routes
+    /// through the self-form arm instead.
+    fn implicit_this_dispatch(&self) -> bool {
+        false
+    }
+
+    /// True when one type's members may be DEFINED across multiple
+    /// files (rust impl blocks, cpp out-of-line member definitions,
+    /// csharp partial classes). Gates the cross-file named-ClassMember
+    /// self-form arm. Default false: in one-declaration-per-file
+    /// languages a same-named class in another file is a DIFFERENT
+    /// class, never a continuation — borrowing its member is a
+    /// wrong-class pick (witnessed: laravel namespace twins).
+    fn type_members_span_files(&self) -> bool {
+        false
+    }
+
     /// Consumed by `ResolveStage::resolve_static_call` pre-gate.
     fn static_class_keywords(&self) -> &'static [&'static str] {
         &[]
@@ -453,10 +497,13 @@ pub trait LanguageBehavior: Send + Sync {
                 imports,
             );
 
+            // Ambiguous stays unresolved: a bound import is identity-grade
+            // (receiver anchor, chain walk), and ids.first() is candidate
+            // order, not evidence.
             let resolved_symbol = match result {
                 crate::parsing::ResolveResult::Found(id) => Some(id),
-                crate::parsing::ResolveResult::Ambiguous(ids) => ids.first().copied(),
-                crate::parsing::ResolveResult::NotFound => None,
+                crate::parsing::ResolveResult::Ambiguous(_)
+                | crate::parsing::ResolveResult::NotFound => None,
             };
 
             // Determine origin (simplified without Tantivy access)

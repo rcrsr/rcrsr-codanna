@@ -2,13 +2,14 @@
 
 use super::stages::{CollectStage, DiscoverStage, IndexStage, ReadStage};
 use super::{
-    EmbedOptions, FileSource, ParseStage, Phase1Options, Pipeline, PipelineError, PipelineMetrics,
-    PipelineResult, ProgressSink, SemanticEmbedStage, StageMetrics, StageTracker,
-    SymbolLookupCache, UnresolvedRelationship, init_parser_cache,
+    EmbedOptions, FileBarriers, FileBindings, FileSource, ParseStage, Phase1Options, Pipeline,
+    PipelineError, PipelineMetrics, PipelineResult, ProgressSink, SemanticEmbedStage, StageMetrics,
+    StageTracker, SymbolLookupCache, UnresolvedRelationship, init_parser_cache,
 };
 use crate::indexing::IndexStats;
 use crate::storage::DocumentIndex;
 use crossbeam_channel::bounded;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::thread;
@@ -18,6 +19,8 @@ use std::time::{Duration, Instant};
 type Phase1Result = (
     IndexStats,
     Vec<UnresolvedRelationship>,
+    FileBindings,
+    FileBarriers,
     SymbolLookupCache,
     Option<Arc<PipelineMetrics>>,
 );
@@ -40,8 +43,21 @@ impl Pipeline {
         &self,
         root: &Path,
         index: Arc<DocumentIndex>,
-    ) -> PipelineResult<(IndexStats, Vec<UnresolvedRelationship>, SymbolLookupCache)> {
-        let (stats, pending_relationships, symbol_cache, metrics) = self.run_phase1(
+    ) -> PipelineResult<(
+        IndexStats,
+        Vec<UnresolvedRelationship>,
+        FileBindings,
+        FileBarriers,
+        SymbolLookupCache,
+    )> {
+        let (
+            stats,
+            pending_relationships,
+            pending_bindings,
+            pending_barriers,
+            symbol_cache,
+            metrics,
+        ) = self.run_phase1(
             FileSource::Walk(root.to_path_buf()),
             index,
             Phase1Options::default(),
@@ -52,7 +68,13 @@ impl Pipeline {
             m.log();
         }
 
-        Ok((stats, pending_relationships, symbol_cache))
+        Ok((
+            stats,
+            pending_relationships,
+            pending_bindings,
+            pending_barriers,
+            symbol_cache,
+        ))
     }
 
     /// Run the Phase 1 skeleton: source -> READ -> PARSE -> COLLECT -> INDEX (+ EMBED).
@@ -60,8 +82,9 @@ impl Pipeline {
     /// Sequencing contract lives in the architecture spec (Phase 1 orchestration):
     /// counters bracket the run, every stage handle joins before result
     /// inspection, results inspect source -> INDEX -> COLLECT -> counter save ->
-    /// EMBED (soft-fail), metrics return for deferred logging, and the
-    /// orchestrator ends at Phase 1 (no resolution, no embeddings save).
+    /// parser-construction check (fatal) -> EMBED (soft-fail), metrics return
+    /// for deferred logging, and the orchestrator ends at Phase 1 (no
+    /// resolution, no embeddings save).
     pub(super) fn run_phase1(
         &self,
         source: FileSource,
@@ -74,6 +97,8 @@ impl Pipeline {
                 return Ok((
                     IndexStats::new(),
                     Vec::new(),
+                    HashMap::new(),
+                    HashMap::new(),
                     SymbolLookupCache::with_capacity(0),
                     None,
                 ));
@@ -195,6 +220,12 @@ impl Pipeline {
                     let mut symbol_count = 0;
                     let mut input_wait = std::time::Duration::ZERO;
                     let mut output_wait = std::time::Duration::ZERO;
+                    // Construction failures are config errors, not file
+                    // errors: recorded here and failed after join so the
+                    // run cannot report success while a whole language
+                    // silently drops out. Draining continues so shutdown
+                    // and counter-save semantics stay unchanged.
+                    let mut construction_error: Option<PipelineError> = None;
 
                     loop {
                         // Track input wait (time blocked on recv)
@@ -217,9 +248,14 @@ impl Pipeline {
                                 }
                                 output_wait += send_start.elapsed();
                             }
-                            Err(_e) => {
+                            Err(e) => {
                                 error_count += 1;
-                                // Continue on parse errors - don't fail the whole batch
+                                // Continue on per-file parse errors - don't fail the whole batch
+                                if construction_error.is_none()
+                                    && matches!(e, PipelineError::ParserConstruction { .. })
+                                {
+                                    construction_error = Some(e);
+                                }
                             }
                         }
                     }
@@ -231,6 +267,7 @@ impl Pipeline {
                         input_wait,
                         output_wait,
                         start.elapsed(),
+                        construction_error,
                     )
                 })
             })
@@ -343,7 +380,7 @@ impl Pipeline {
                 }
 
                 // Record items and wait times before finalizing
-                if let (Some(t), Ok((stats, _, _, input_wait))) = (&tracker, &result) {
+                if let (Some(t), Ok((stats, _, _, _, _, input_wait))) = (&tracker, &result) {
                     t.record_items(stats.symbols_found);
                     t.record_input_wait(*input_wait);
                 }
@@ -365,6 +402,7 @@ impl Pipeline {
             parse_input_wait,
             parse_output_wait,
             parse_wall_time,
+            parse_construction_error,
         ) = self.join_parse_workers(parse_handles);
         let collect_join = collect_handle.join();
         let embed_join = embed_handle.map(|h| h.join());
@@ -418,7 +456,8 @@ impl Pipeline {
         // If INDEX succeeded, we MUST save counters regardless of EMBED status.
         let (index_result, index_metrics) = index_join
             .map_err(|_| PipelineError::ChannelRecv("INDEX thread panicked".to_string()))?;
-        let (mut stats, pending_relationships, symbol_cache, _) = index_result?;
+        let (mut stats, pending_relationships, pending_bindings, pending_barriers, symbol_cache, _) =
+            index_result?;
 
         // Add INDEX metrics
         if let (Some(m), Some(im)) = (&metrics, index_metrics) {
@@ -439,6 +478,15 @@ impl Pipeline {
         // INDEX succeeded, so we MUST persist the new ID pointers to prevent
         // duplicate IDs on the next run.
         self.save_final_counters(&index_for_metadata, final_file_count, final_symbol_count)?;
+
+        // Parser-construction failure is a config error: every file of the
+        // language was skipped, so reporting success would present a
+        // truncated index as complete. Counters are saved above (INDEX
+        // committed the other languages' rows); failing here keeps the
+        // partial index consistent and re-indexable after the config fix.
+        if let Some(e) = parse_construction_error {
+            return Err(e);
+        }
 
         // Handle EMBED results (Soft Failure - log but don't fail pipeline)
         // The index is valid even if embeddings failed; semantic search will be incomplete.
@@ -524,7 +572,14 @@ impl Pipeline {
             stats.elapsed
         );
 
-        Ok((stats, pending_relationships, symbol_cache, metrics))
+        Ok((
+            stats,
+            pending_relationships,
+            pending_bindings,
+            pending_barriers,
+            symbol_cache,
+            metrics,
+        ))
     }
 }
 
@@ -645,7 +700,7 @@ export { processUser, main };
         let result = pipeline.index_directory(&src_dir, index);
 
         match result {
-            Ok((stats, pending_relationships, symbol_cache)) => {
+            Ok((stats, pending_relationships, _bindings, _barriers, symbol_cache)) => {
                 // Categorize relationships by kind
                 let calls: Vec<_> = pending_relationships
                     .iter()

@@ -204,7 +204,7 @@ These grammar nodes aren't in comprehensive.java:
 ## Symbol Kinds Extracted
 - Class
 - Enum
-- Function
 - Interface
+- Method
 - Variable
 

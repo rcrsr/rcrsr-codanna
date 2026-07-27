@@ -13,6 +13,9 @@ mod test_typescript_call_tracking;
 #[path = "parsers/typescript/test_nested_functions.rs"]
 mod test_typescript_nested_functions;
 
+#[path = "parsers/typescript/test_function_wrappers.rs"]
+mod test_typescript_function_wrappers;
+
 #[path = "parsers/typescript/test_alias_resolution.rs"]
 mod test_typescript_alias_resolution;
 
@@ -21,6 +24,12 @@ mod test_typescript_jsx_uses;
 
 #[path = "parsers/javascript/test_nested_functions.rs"]
 mod test_javascript_nested_functions;
+
+#[path = "parsers/typescript/test_default_export.rs"]
+mod test_typescript_default_export;
+
+#[path = "parsers/javascript/test_default_export.rs"]
+mod test_javascript_default_export;
 
 #[path = "parsers/c/test_resolution.rs"]
 mod test_c_resolution;
@@ -204,3 +213,6 @@ mod test_go_extract_parameter_type;
 
 #[path = "parsers/java/test_extract_parameter_type.rs"]
 mod test_java_extract_parameter_type;
+
+#[path = "parsers/java/test_method_kind.rs"]
+mod test_java_method_kind;

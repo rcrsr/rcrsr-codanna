@@ -259,6 +259,21 @@ impl DiscoverStage {
         Ok(files)
     }
 
+    /// Resolve a workspace-relative path to a readable filesystem path.
+    ///
+    /// `disk_set`/`indexed_set` in `run_incremental` carry paths normalized
+    /// (relative to `workspace_root`) so they can be compared against the
+    /// index's stored rows. Opening a relative path as-is resolves against
+    /// the process CWD, not the workspace root -- the same class of bug
+    /// fixed for `ReadStage` (see its `run()` comment). Mirror that fix here
+    /// for any filesystem read performed on one of those normalized paths.
+    fn resolve_read_path(&self, path: &Path) -> PathBuf {
+        match &self.workspace_root {
+            Some(root) if path.is_relative() => root.join(path),
+            _ => path.to_path_buf(),
+        }
+    }
+
     /// Check if a file has been modified.
     /// Uses mtime as fast heuristic - only reads file if mtime changed.
     fn is_modified(&self, path: &Path, index: &DocumentIndex) -> PipelineResult<bool> {
@@ -272,16 +287,20 @@ impl DiscoverStage {
             return Ok(true);
         };
 
+        // `path` is workspace-relative (see `resolve_read_path`); resolve it
+        // against workspace_root before touching the filesystem.
+        let read_path = self.resolve_read_path(path);
+
         // Fast path: check mtime first (stat only, no file read)
-        let current_mtime = crate::indexing::file_info::get_file_mtime(path).unwrap_or(0);
+        let current_mtime = crate::indexing::file_info::get_file_mtime(&read_path).unwrap_or(0);
         if stored_mtime > 0 && current_mtime == stored_mtime {
             // mtime unchanged = file unchanged
             return Ok(false);
         }
 
         // mtime changed or unknown - verify with hash (requires file read)
-        let content = fs::read_to_string(path).map_err(|e| PipelineError::FileRead {
-            path: path.to_path_buf(),
+        let content = fs::read_to_string(&read_path).map_err(|e| PipelineError::FileRead {
+            path: read_path.clone(),
             source: e,
         })?;
         let current_hash = calculate_hash(&content);

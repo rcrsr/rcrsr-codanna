@@ -548,13 +548,17 @@ impl SimpleSemanticSearch {
 
         // Save all embeddings
         storage.save_batch(&embeddings)?;
+        drop(storage);
 
         let staged_vec = staging_dir.join("segment_0.vec");
-        std::fs::File::open(&staged_vec)
+        // write(true): Windows FlushFileBuffers requires GENERIC_WRITE
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&staged_vec)
             .and_then(|f| f.sync_all())
             .map_err(|e| SemanticSearchError::StorageError {
                 message: format!("Failed to sync staged vector file: {e}"),
-                suggestion: "Check disk space".to_string(),
+                suggestion: "Check disk space and staged-file write access".to_string(),
             })?;
         std::fs::rename(&staged_vec, path.join("segment_0.vec")).map_err(|e| {
             SemanticSearchError::StorageError {

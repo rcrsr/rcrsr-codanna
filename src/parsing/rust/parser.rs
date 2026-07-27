@@ -870,10 +870,7 @@ impl RustParser {
                 }
             }
 
-            {
-                let parent = node.parent()?;
-                node = parent
-            }
+            node = node.parent()?;
         }
     }
 

@@ -1,0 +1,30 @@
+# .github/workflows/label.yml
+name: Label
+
+on:
+  # `pull_request_target` runs the workflow from the BASE branch with a write
+  # token, which is what lets labeling work on pull requests opened from forks
+  # -- a plain `pull_request` trigger gets a read-only token there and the
+  # labeling step fails. The usual danger of this trigger is checking out and
+  # executing PR-authored code with that token; this job never checks out the
+  # repository at all, so untrusted code is never run.
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  label:
+    name: Apply area labels
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/labeler@8558fd74291d67161a8a78ce36a881fa63b766a9 # v5.0.0
+        with:
+          configuration-path: .github/labeler.yml
+          # Add-only. With sync-labels enabled, a later push that no longer
+          # touches an area would strip a label a human had deliberately
+          # applied; area labels are cheap to remove by hand and expensive to
+          # lose silently.
+          sync-labels: false

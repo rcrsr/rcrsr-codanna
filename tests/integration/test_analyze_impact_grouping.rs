@@ -43,11 +43,29 @@ async fn build_server() -> CodeIntelligenceServer {
         .unwrap_or_else(|e| panic!("write {file} fixture: {e}"));
     }
 
-    let settings = Settings {
+    // The indexed root must be registered so symbols get a `module_path`.
+    // Since upstream v0.12.0 an import binding resolves only against
+    // candidates carrying one -- exact module match, or an exactly-one
+    // suffix survivor -- so without this the cross-file imports have no
+    // evidence to bind and correctly fail closed, collapsing the impact
+    // graph to zero.
+    // (Before v0.12.0 a `None` module_path persisted as "", which
+    // suffix-matched every candidate and bound this fixture by accident.)
+    //
+    // `indexed_paths_cache` rather than `workspace_root`: both give
+    // `select_strip_base` a base to strip, but setting `workspace_root`
+    // makes the read stage store paths relative to it, and those are then
+    // resolved against the process CWD -- which only works when CWD happens
+    // to equal the workspace root. Test binaries run from the repo root, so
+    // that path yields zero symbols. This one has no CWD dependency.
+    // Expected counts below are unchanged; this supplies the evidence the
+    // resolver now requires.
+    let mut settings = Settings {
         index_path: root.join("index"),
         workspace_root: None,
         ..Default::default()
     };
+    settings.indexed_paths_cache = vec![root.to_path_buf()];
     let mut facade =
         IndexFacade::new(Arc::new(settings)).expect("create facade over temp index dir");
     facade

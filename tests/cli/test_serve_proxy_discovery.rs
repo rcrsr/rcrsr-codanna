@@ -391,10 +391,9 @@ fn any_file_named(root: &Path, filename: &str) -> bool {
 /// cannot tell "the process refused to proceed" apart from "the process was
 /// working fine and we killed it".
 ///
-/// Only the https-server-gated pinned-cert test calls this today, so the
-/// helper is gated to match and avoid a dead-code warning under default
-/// features.
-#[cfg(feature = "https-server")]
+/// Called by the https-server-gated pinned-cert test and by Arm A of the
+/// emission-gate test below, which is compiled unconditionally -- so this
+/// helper carries no `#[cfg]` gate.
 fn wait_for_self_exit(child: &mut Child, deadline: Duration) -> Option<std::process::ExitStatus> {
     let start = std::time::Instant::now();
     loop {
@@ -1092,5 +1091,169 @@ fn proxy_refuses_https_when_pinned_cert_does_not_match() {
         "proxy exited non-zero, but its stderr does not show it failing to connect to the \
          pinned https:// upstream, so this test is not actually observing the pinned-cert \
          rejection. stderr:\n{stderr_text}"
+    );
+}
+
+/// THE EMISSION-GATE x PROXY-MODE REGRESSION TEST.
+///
+/// `main.rs`'s pre-dispatch `needs_indexer` predicate (`src/main.rs:307-320`)
+/// gates a full-process read of `index.meta`'s `emission_version` against the
+/// binary's `EMISSION_SEMANTICS_VERSION`, refusing to proceed on a mismatch
+/// (`src/main.rs:392-417`). `needs_indexer` is `&& !is_proxy_serve(..)`
+/// (`src/main.rs:320`, `is_proxy_serve` at `src/main.rs:200-216`) because
+/// `serve --proxy` never constructs its own `IndexFacade` in-process -- it
+/// only discovers-or-spawns a backing `codanna serve --http` and relays
+/// stdio traffic to it (`src/mcp/proxy.rs`'s `serve_proxy`).
+///
+/// A ONE-ARMED "proxy starts against a corrupted index" test would prove
+/// nothing: a fresh workspace's `index.meta` always carries the current
+/// `emission_version` (stamped at build time by `persistence.rs`), so the
+/// gate never fires and the proxy would "pass" even with the exemption
+/// deleted. This test is deliberately two-armed:
+///
+/// - Arm A is the CONTROL. It proves the gate is actually ARMED against the
+///   on-disk state this test writes: a plain, non-proxy `codanna serve`
+///   process reads that state at its own startup and is refused.
+/// - Arm B is the ASSERTION. Against the exact SAME on-disk state, a NEW
+///   `codanna serve --proxy` process is not refused at its own startup (the
+///   `is_proxy_serve` exemption) and reaches the "Proxy: delegating to
+///   backing MCP server at ..." line by discovering an already-live backing
+///   server that finished loading its `IndexFacade` into memory BEFORE this
+///   test corrupts `index.meta` on disk. That ordering is what makes the
+///   scenario real rather than contrived: the backing server's in-memory
+///   state is unaffected by the later on-disk corruption (it never re-reads
+///   `index.meta` mid-flight), while any FRESH process -- proxy or not --
+///   reading that same file at startup sees the mismatch.
+///
+/// Defect each arm discriminates if `src/main.rs:320`'s
+/// `&& !is_proxy_serve(&cli.command, &config)` is deleted (or otherwise
+/// broken, e.g. inverted or scoped to the wrong `Commands::Serve` variant):
+///
+/// - Arm A would be unaffected (it never touches `is_proxy_serve`) -- it is
+///   the control that proves the corrupted `index.meta` this test writes is
+///   real and load-bearing, not a no-op fixture.
+/// - Arm B would FAIL: the proxy process's own `needs_indexer` would become
+///   `true` again, so main.rs's emission gate would fire *in the proxy's own
+///   process* against the corrupted on-disk `index.meta` before `serve_proxy`
+///   (and therefore `discover_or_spawn`) is ever reached. The proxy would
+///   print the same "Error: index emission semantics changed ..." refusal
+///   Arm A asserts on and exit with `IndexCorrupted`, never printing the
+///   delegating line -- `await_upstream` would time out and panic.
+#[test]
+fn proxy_mode_is_exempt_from_the_emission_gate_that_refuses_plain_serve() {
+    let workspace = prepare_workspace();
+    let _reaper = Reaper(workspace.path().to_path_buf());
+
+    // Warm a healthy backing server FIRST, while `index.meta` still carries
+    // the current `emission_version` `prepare_workspace`'s index build
+    // stamped. `start_proxy` + `await_upstream` is the existing
+    // discover-or-spawn harness reused verbatim; killing this first proxy
+    // process only stops the stdio relay, not the detached backing
+    // `serve --http` server it spawned (same pattern as
+    // `killed_server_is_respawned_and_record_is_updated` and
+    // `second_proxy_shares_one_upstream_one_record_one_pid` above).
+    let mut warm_proxy = start_proxy(workspace.path());
+    let (backing_pid, _backing_port) = await_upstream(&mut warm_proxy);
+    let _ = warm_proxy.kill();
+    let _ = warm_proxy.wait();
+    assert!(
+        codanna::serve_discovery::pid_is_alive(backing_pid),
+        "the backing server warmed for this test should still be alive after only the stdio \
+         proxy relay in front of it was killed"
+    );
+
+    // Deliberately write a mismatched `emission_version` into the on-disk
+    // `index.meta` the fixture's index build produced -- the mismatch this
+    // test's two arms observe is WRITTEN here, not assumed.
+    let index_dir = workspace.path().join(".codanna").join("index");
+    let mut meta = codanna::storage::IndexMetadata::load(&index_dir)
+        .expect("load the index.meta written by prepare_workspace's index build");
+    assert_eq!(
+        meta.emission_version,
+        Some(codanna::storage::EMISSION_SEMANTICS_VERSION),
+        "prepare_workspace's index build should have stamped the binary's current \
+         emission_version before this test corrupts it"
+    );
+    meta.emission_version = Some(codanna::storage::EMISSION_SEMANTICS_VERSION + 999);
+    meta.save(&index_dir)
+        .expect("write the deliberately mismatched emission_version to index.meta");
+
+    // Arm A (control): a FRESH, non-proxy `codanna serve` process reads this
+    // on-disk state at its own startup and is refused by the emission gate.
+    //
+    // Spawned and polled rather than routed through `run_cli`, because
+    // upstream v0.10.1 made this path enter an rmcp stdio serve loop before
+    // exiting: the gate now serves a degraded zero-tool handshake so
+    // client-spawned servers receive the heal command over the protocol
+    // instead of on a stderr nobody reads. Closed stdin ends that session at
+    // once, but `run_cli` uses `.output()`, which would block FOREVER rather
+    // than fail if a future rmcp ever stopped returning on stdin EOF. This
+    // file's `DEADLINE` exists precisely so a stuck server fails the test
+    // instead of hanging CI, and before v0.10.1 `serve` could not block here
+    // at all -- bounding this wait restores that invariant.
+    let test_home = workspace.path().join(".home");
+    std::fs::create_dir_all(&test_home).expect("create test home");
+    let mut serve = Command::new(codanna_binary())
+        .args(["serve"])
+        .current_dir(workspace.path())
+        .env("HOME", &test_home)
+        .env("XDG_CONFIG_HOME", &test_home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        // Left undrained while we poll below: the gate emits three short
+        // lines, orders of magnitude under the pipe buffer, so it cannot
+        // fill and deadlock the child on write. Anything that materially
+        // increases this path's stderr output must drain concurrently.
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn non-proxy codanna serve");
+
+    let status = wait_for_self_exit(&mut serve, DEADLINE).unwrap_or_else(|| {
+        panic!(
+            "non-proxy `codanna serve` did not exit on its own within {DEADLINE:?} against the \
+             deliberately mismatched index.meta -- the emission gate's degraded stdio handshake \
+             is not returning on stdin EOF, which would hang CI rather than fail this assertion"
+        )
+    });
+
+    let mut stderr = String::new();
+    {
+        use std::io::Read;
+        serve
+            .stderr
+            .take()
+            .expect("piped serve stderr")
+            .read_to_string(&mut stderr)
+            .expect("read serve stderr");
+    }
+
+    assert_eq!(
+        status.code(),
+        Some(codanna::io::ExitCode::IndexCorrupted as i32),
+        "non-proxy `codanna serve` should exit with the emission gate's IndexCorrupted code \
+         against the deliberately mismatched index.meta; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("index emission semantics changed"),
+        "non-proxy `codanna serve` should print the emission gate's specific refusal message, \
+         not merely exit non-zero for some unrelated reason; stderr:\n{stderr}"
+    );
+
+    // Arm B (the actual assertion): against the exact SAME on-disk state, a
+    // NEW `codanna serve --proxy` process is not refused at its own startup
+    // and reaches the delegating line -- because it discovers the
+    // already-warmed backing server above rather than trying (and failing)
+    // to spawn a new one.
+    let mut proxy = start_proxy(workspace.path());
+    let (delegated_pid, _delegated_port) = await_upstream(&mut proxy);
+    let _ = proxy.kill();
+    let _ = proxy.wait();
+
+    assert_eq!(
+        delegated_pid, backing_pid,
+        "the proxy should delegate to the SAME already-warmed backing server rather than \
+         attempting to spawn a new one -- a fresh spawn would hit its own emission-gate \
+         refusal against the corrupted on-disk index.meta and this test would instead time \
+         out in await_upstream"
     );
 }
