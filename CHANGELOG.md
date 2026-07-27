@@ -27,10 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Merged upstream v0.10.0:** rebased the fork's upstream base from 0.9.23 to 0.10.0 (see the `[0.10.0]` entry below for upstream's changes); the fork build counter resets to `+rcrsr.1` on the new base.
-- **Merged upstream v0.10.1:** rebased the fork's upstream base from 0.10.0 to 0.10.1 (see the `[0.10.1]` entry below for upstream's changes); the fork build counter resets to `+rcrsr.1` on the new base.
-- **Merged upstream v0.11.1:** rebased the fork's upstream base from 0.10.1 to 0.11.1 (see the `[0.11.1]` and `[0.11.0]` entries below for upstream's changes); the fork build counter resets to `+rcrsr.1` on the new base.
-- **Merged upstream v0.12.0:** rebased the fork's upstream base from 0.11.1 to 0.12.0 (see the `[0.12.0]` entry below for upstream's changes); the fork build counter resets to `+rcrsr.1` on the new base.
+- **Merged upstream v0.10.0:** rebased the fork's upstream base from 0.9.23 to 0.10.0 (see the `[0.10.0]` entry below for upstream's changes).
+- **Merged upstream v0.10.1:** rebased the fork's upstream base from 0.10.0 to 0.10.1 (see the `[0.10.1]` entry below for upstream's changes).
+- **Merged upstream v0.11.1:** rebased the fork's upstream base from 0.10.1 to 0.11.1 (see the `[0.11.1]` and `[0.11.0]` entries below for upstream's changes).
+- **Merged upstream v0.12.0:** rebased the fork's upstream base from 0.11.1 to 0.12.0 (see the `[0.12.0]` entry below for upstream's changes).
 
 ## [0.12.0] - 2026-07-26
 

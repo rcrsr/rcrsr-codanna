@@ -65,10 +65,8 @@ upstream), so it will shadow an upstream install on the same `PATH`.
 ## Upstream base
 
 The fork now tracks upstream **v0.12.0** (merged from the prior v0.11.1 base).
-The fork build counter resets to `+rcrsr.1` every time the upstream base moves,
-so an unchanged `+rcrsr.1` across two releases does not mean the fork stopped
-changing — read the base version, not the counter (see [Identifying the
-fork](#identifying-the-fork)).
+Moving the upstream base does not touch the fork build counter, which only ever
+counts up (see [Identifying the fork](#identifying-the-fork)).
 
 One upstream v0.10.0 change is user-visible for existing MCP clients:
 **unknown `key:value` arguments on an MCP tool call now reject** instead of
@@ -668,7 +666,11 @@ codanna --version        # e.g. codanna <upstream-version>+rcrsr.N
 MCP clients see the same string in the `initialize` handshake, so a connected
 client can confirm which build it is talking to. The `+rcrsr.N` suffix is build
 metadata — it does not change how the version compares, so a fork build counts as
-the same release as the upstream version it is built on. `N` is just a running
-count of fork additions on the current upstream base.
+the same release as the upstream version it is built on. `N` is a running count
+of fork additions over the whole life of the fork, not per upstream base: it only
+ever counts up, and moving to a newer upstream base does not reset it. So a
+higher `N` always means more fork work, and an unchanged `N` always means none
+was added — but `N` still says nothing about which upstream release you are on.
+Read the base version for that.
 
 Everything not listed here behaves as it does in upstream codanna.

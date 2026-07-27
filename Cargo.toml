@@ -3,12 +3,16 @@ name = "codanna"
 # Fork version: <upstream base>+rcrsr.<private addition counter>
 #
 #   0.12.0   -- the upstream release this fork is built from. Bump ONLY when
-#               rebasing/merging onto a new upstream release, and reset the
-#               counter to .1 when you do.
-#   +rcrsr.N -- N increments once per private addition landed on top of that
-#               base. Surfaces in `codanna --version` and, via
-#               CARGO_PKG_VERSION, in the MCP `initialize` handshake, so a
+#               rebasing/merging onto a new upstream release. Moving the base
+#               does NOT touch the counter.
+#   +rcrsr.N -- N counts private additions across the fork's whole life, NOT
+#               per base. It is monotonic: it only ever increments, and never
+#               resets when the base moves. The fork keeps adding to one body
+#               of work, so a counter that went backwards would report that
+#               body as having shrunk. Surfaces in `codanna --version` and,
+#               via CARGO_PKG_VERSION, in the MCP `initialize` handshake, so a
 #               connected client reports exactly which build it is talking to.
+#               It is at .1 because nothing has been released yet.
 #
 # `+` is BUILD METADATA, which semver ignores in precedence: every +rcrsr.N
 # compares EQUAL to a bare 0.11.1, and +rcrsr.7 does NOT sort above +rcrsr.1.
