@@ -2,7 +2,7 @@
 
 ## Summary
 - Key nodes: 21/21 (100%)
-- Symbol kinds extracted: 8
+- Symbol kinds extracted: 9
 
 > **Note:** Key nodes are symbol-producing constructs (classes, functions, traits).
 

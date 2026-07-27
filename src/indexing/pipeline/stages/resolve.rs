@@ -182,6 +182,16 @@ impl ResolveStage {
             {
                 return self.resolve_lexical_this_member(from_id, unresolved, context);
             }
+            // A self-alias receiver names the caller's own instance, so an
+            // inherited member is in reach: walk the enclosing class's
+            // Extends rows before the ladder, whose single-survivor pick
+            // carries no class evidence. Applies to every language — the
+            // receiver is explicit here, unlike the bare-call arm below.
+            if let Some(resolved) =
+                self.resolve_inherited_member(from_id, unresolved, context, &caller)
+            {
+                return Some(resolved);
+            }
         }
 
         if let Some(to_id) = context.resolve(&unresolved.to_name) {
@@ -195,6 +205,24 @@ impl ResolveStage {
                 && self.is_instance_type_compatible(unresolved, to_id, &caller.language_id, context)
             {
                 return self.accept_unwitnessed_pick(from_id, to_id, unresolved);
+            }
+        }
+
+        // Inheritance witness for bare calls inside a class body, only
+        // where the language vouches that a bare name can dispatch to an
+        // instance member. Runs after the scope lookup — file-local and
+        // import identities keep precedence — and ahead of the tier
+        // ladder, so an inherited member resolves on the walk's evidence
+        // rather than on a single-survivor pick.
+        if Self::is_bare_instance_call(unresolved)
+            && self
+                .get_behavior(&caller.language_id)
+                .is_some_and(|b| b.implicit_this_dispatch())
+        {
+            if let Some(resolved) =
+                self.resolve_inherited_member(from_id, unresolved, context, &caller)
+            {
+                return Some(resolved);
             }
         }
 
@@ -237,6 +265,9 @@ impl ResolveStage {
                     caller.file_id,
                     &caller.language_id,
                 ) {
+                    return None;
+                }
+                if self.is_unevidenced_cross_file_member_pick(to_id, unresolved, &caller, context) {
                     return None;
                 }
                 self.accept_unwitnessed_pick(from_id, to_id, unresolved)
@@ -358,6 +389,58 @@ impl ResolveStage {
         }
         self.get_behavior(language_id)
             .is_some_and(|b| b.private_members_are_file_scoped())
+    }
+
+    /// Member predicate shared by the `disambiguate` gate and the
+    /// Found-arm gate: Method/Field kind, or parser-declared ClassMember
+    /// scope. Kind check alongside scope because some parsers leave
+    /// member scope_context untracked (kotlin suspend members among the
+    /// census's scope_none rows), and those slip a scope-only gate.
+    fn is_member_kind_or_scope(sym: &Symbol) -> bool {
+        matches!(
+            sym.kind,
+            crate::SymbolKind::Method | crate::SymbolKind::Field
+        ) || matches!(
+            sym.scope_context,
+            Some(crate::symbol::ScopeContext::ClassMember { .. })
+        )
+    }
+
+    /// The `disambiguate` member gate on the single-survivor Found path:
+    /// a Calls pick of another file's member with no import identity is
+    /// module identity plus candidate count — not evidence for a member
+    /// (a survivor's KIND is evidence too). Same-file picks keep their
+    /// local evidence (the caller's own members live in its file);
+    /// imported picks keep the import identity tier 2 resolved through;
+    /// a pick whose receiver type inferred is chain-verified already
+    /// (`is_instance_type_compatible` ran before this gate). Self-alias
+    /// receivers never infer — their evidence is the self-form arm and
+    /// the inheritance walk, and what those miss fails closed here.
+    /// Calls-only — Defines rows route through the
+    /// `accept_unwitnessed_pick` containment rescue.
+    fn is_unevidenced_cross_file_member_pick(
+        &self,
+        to_id: SymbolId,
+        unresolved: &UnresolvedRelationship,
+        caller: &CallerContext,
+        context: &ResolutionContext,
+    ) -> bool {
+        if unresolved.kind != RelationKind::Calls {
+            return false;
+        }
+        let Some(sym) = self.symbol_cache.get_ref(to_id) else {
+            return false;
+        };
+        if !Self::is_member_kind_or_scope(&sym) || sym.file_id == caller.file_id {
+            return false;
+        }
+        if self
+            .infer_receiver_type(unresolved, &caller.language_id, context)
+            .is_some()
+        {
+            return false;
+        }
+        !self.is_imported(&sym, &context.imports, context)
     }
 
     /// Filter candidates by static-call receiver type.
@@ -775,25 +858,7 @@ impl ResolveStage {
         let file_id = caller_sym.file_id;
         drop(caller_sym);
 
-        // Innermost class in the caller's file whose range encloses the
-        // calling method.
-        let class_id = self
-            .symbol_cache
-            .symbols_in_file(file_id)
-            .into_iter()
-            .filter(|&id| {
-                self.symbol_cache.get_ref(id).is_some_and(|sym| {
-                    sym.kind == crate::SymbolKind::Class
-                        && sym.range.start_line <= caller_range.start_line
-                        && caller_range.end_line <= sym.range.end_line
-                })
-            })
-            .max_by_key(|&id| {
-                self.symbol_cache
-                    .get_ref(id)
-                    .map(|sym| sym.range.start_line)
-                    .unwrap_or(0)
-            })?;
+        let class_id = self.innermost_enclosing_class(file_id, caller_range)?;
 
         for rel in &context.unresolved_rels {
             if rel.kind != RelationKind::Extends || rel.from_id != Some(class_id) {
@@ -814,35 +879,9 @@ impl ResolveStage {
             {
                 continue;
             }
-            let (parent_file, parent_range) = (parent.file_id, parent.range);
-            let parent_name = parent.name.clone();
             drop(parent);
 
-            let member = self
-                .symbol_cache
-                .lookup_candidates(&unresolved.to_name)
-                .into_iter()
-                .find(|&id| {
-                    let Some((member_range, member_scope)) =
-                        self.symbol_cache.get_ref(id).and_then(|sym| {
-                            (sym.file_id == parent_file
-                                && sym.kind == crate::SymbolKind::Method
-                                && parent_range.start_line <= sym.range.start_line
-                                && sym.range.end_line <= parent_range.end_line)
-                                .then(|| (sym.range, sym.scope_context.clone()))
-                        })
-                    else {
-                        return false;
-                    };
-                    self.is_direct_member(
-                        member_scope.as_ref(),
-                        member_range,
-                        parent_id,
-                        &parent_name,
-                        parent_file,
-                    )
-                });
-            if let Some(to_id) = member {
+            if let Some(to_id) = self.direct_method_of(parent_id, &unresolved.to_name) {
                 return Some(ResolvedRelationship {
                     from_id,
                     to_id,
@@ -852,6 +891,145 @@ impl ResolveStage {
             }
         }
         None
+    }
+
+    /// Innermost Class-kinded symbol in `file_id` whose span encloses
+    /// `range`.
+    fn innermost_enclosing_class(
+        &self,
+        file_id: FileId,
+        range: crate::types::Range,
+    ) -> Option<SymbolId> {
+        self.symbol_cache
+            .symbols_in_file(file_id)
+            .into_iter()
+            .filter(|&id| {
+                self.symbol_cache.get_ref(id).is_some_and(|sym| {
+                    sym.kind == crate::SymbolKind::Class
+                        && sym.range.start_line <= range.start_line
+                        && range.end_line <= sym.range.end_line
+                })
+            })
+            .max_by_key(|&id| {
+                self.symbol_cache
+                    .get_ref(id)
+                    .map(|sym| sym.range.start_line)
+                    .unwrap_or(0)
+            })
+    }
+
+    /// The first candidate named `member_name` that is a Method inside
+    /// `parent_id`'s span and its direct member per `is_direct_member`.
+    fn direct_method_of(&self, parent_id: SymbolId, member_name: &str) -> Option<SymbolId> {
+        let parent = self.symbol_cache.get_ref(parent_id)?;
+        let (parent_file, parent_range) = (parent.file_id, parent.range);
+        let parent_name = parent.name.clone();
+        drop(parent);
+
+        self.symbol_cache
+            .lookup_candidates(member_name)
+            .into_iter()
+            .find(|&id| {
+                let Some((member_range, member_scope)) =
+                    self.symbol_cache.get_ref(id).and_then(|sym| {
+                        (sym.file_id == parent_file
+                            && sym.kind == crate::SymbolKind::Method
+                            && parent_range.start_line <= sym.range.start_line
+                            && sym.range.end_line <= parent_range.end_line)
+                            .then(|| (sym.range, sym.scope_context.clone()))
+                    })
+                else {
+                    return false;
+                };
+                self.is_direct_member(
+                    member_scope.as_ref(),
+                    member_range,
+                    parent_id,
+                    &parent_name,
+                    parent_file,
+                )
+            })
+    }
+
+    /// A Calls row with no receiver metadata and no static flag.
+    fn is_bare_instance_call(unresolved: &UnresolvedRelationship) -> bool {
+        unresolved.kind == RelationKind::Calls
+            && unresolved
+                .metadata
+                .as_ref()
+                .is_none_or(|m| !m.static_call && m.receiver.is_none())
+    }
+
+    /// Inheritance witness for a bare call inside a class body: the
+    /// caller's innermost enclosing class, its own Extends rows
+    /// (`from_id`-anchored, per invariant 14's identity-walk rule), and
+    /// the first parent declaring the name as a direct member. Single
+    /// hop, like `resolve_super_call` — deeper chains stay documented
+    /// misses.
+    fn resolve_inherited_member(
+        &self,
+        from_id: SymbolId,
+        unresolved: &UnresolvedRelationship,
+        context: &ResolutionContext,
+        caller: &CallerContext,
+    ) -> Option<ResolvedRelationship> {
+        let caller_sym = self.symbol_cache.get_ref(from_id)?;
+        let caller_range = caller_sym.range;
+        let file_id = caller_sym.file_id;
+        drop(caller_sym);
+
+        let class_id = self.innermost_enclosing_class(file_id, caller_range)?;
+
+        for rel in &context.unresolved_rels {
+            if rel.kind != RelationKind::Extends || rel.from_id != Some(class_id) {
+                continue;
+            }
+            let Some(parent_id) = self.resolve_parent_class(&rel.to_name, context, caller) else {
+                continue;
+            };
+            if let Some(to_id) = self.direct_method_of(parent_id, &unresolved.to_name) {
+                return Some(ResolvedRelationship {
+                    from_id,
+                    to_id,
+                    kind: unresolved.kind,
+                    metadata: unresolved.metadata.clone(),
+                });
+            }
+        }
+        None
+    }
+
+    /// Parent-class identity for an inheritance hop: the file's scope
+    /// bindings first (imports, file-locals), else the SAME tier lookup
+    /// the Extends edge itself resolves through — a `Found` parent is
+    /// exactly the target the persisted Extends edge names. Ambiguous
+    /// and NotFound fail closed.
+    fn resolve_parent_class(
+        &self,
+        parent_name: &str,
+        context: &ResolutionContext,
+        caller: &CallerContext,
+    ) -> Option<SymbolId> {
+        use crate::parsing::{PipelineSymbolCache, ResolveResult};
+
+        let is_parent_class = |id: SymbolId| {
+            self.symbol_cache.get_ref(id).is_some_and(|sym| {
+                sym.kind == crate::SymbolKind::Class
+                    && sym.language_id.as_ref() == Some(&caller.language_id)
+            })
+        };
+
+        if let Some(id) = context.resolve(parent_name) {
+            return is_parent_class(id).then_some(id);
+        }
+
+        match self
+            .symbol_cache
+            .resolve(parent_name, caller, None, &context.imports)
+        {
+            ResolveResult::Found(id) => is_parent_class(id).then_some(id),
+            ResolveResult::Ambiguous(_) | ResolveResult::NotFound => None,
+        }
     }
 
     /// Direct membership in the parent class, not mere line-range
@@ -877,24 +1055,7 @@ impl ResolveStage {
             Some(ScopeContext::ClassMember { class_name: None }) | None => {}
             Some(_) => return false,
         }
-        let innermost = self
-            .symbol_cache
-            .symbols_in_file(parent_file)
-            .into_iter()
-            .filter(|&id| {
-                self.symbol_cache.get_ref(id).is_some_and(|sym| {
-                    sym.kind == crate::SymbolKind::Class
-                        && sym.range.start_line <= member_range.start_line
-                        && member_range.end_line <= sym.range.end_line
-                })
-            })
-            .max_by_key(|&id| {
-                self.symbol_cache
-                    .get_ref(id)
-                    .map(|sym| sym.range.start_line)
-                    .unwrap_or(0)
-            });
-        innermost == Some(parent_id)
+        self.innermost_enclosing_class(parent_file, member_range) == Some(parent_id)
     }
 
     /// An instance call whose receiver is a self alias for the caller's
@@ -934,6 +1095,8 @@ impl ResolveStage {
     ) -> Option<ResolvedRelationship> {
         let caller_sym = self.symbol_cache.get_ref(from_id)?;
         let caller_file = caller_sym.file_id;
+        let caller_language = caller_sym.language_id;
+        let caller_module = caller_sym.module_path.clone();
         let enclosing = match caller_sym.scope_context.as_ref() {
             Some(crate::symbol::ScopeContext::ClassMember {
                 class_name: Some(name),
@@ -943,12 +1106,95 @@ impl ResolveStage {
         drop(caller_sym);
 
         self.sole_member_of_class(caller_file, &enclosing, &unresolved.to_name)
+            .or_else(|| {
+                let language_id = caller_language.as_ref()?;
+                if !self
+                    .get_behavior(language_id)
+                    .is_some_and(|b| b.type_members_span_files())
+                {
+                    return None;
+                }
+                self.sole_same_tree_member_of_class(
+                    caller_file,
+                    &enclosing,
+                    &unresolved.to_name,
+                    language_id,
+                    caller_module.as_deref()?,
+                )
+            })
             .map(|to_id| ResolvedRelationship {
                 from_id,
                 to_id,
                 kind: unresolved.kind,
                 metadata: unresolved.metadata.clone(),
             })
+    }
+
+    /// Cross-file variant of `sole_member_of_class` for split member
+    /// definitions (rust impl blocks across files, cpp out-of-line
+    /// members): the caller and the member both declare membership in
+    /// the same-named type. The named match is weaker than the file
+    /// identity it relaxes, so three disciplines bound it: any
+    /// same-file member claimant for the name vetoes the borrow (the
+    /// caller's own file already claims the name under another class;
+    /// witnessed leak: minified twin bundles, where scrambled class
+    /// names make the caller's class match the TWIN bundle's copy
+    /// while its own copy sits same-file under a different name);
+    /// exactly one candidate over the whole tree (duplicate type
+    /// copies fail closed); and a shared module-tree root (cross-tree
+    /// twins are not candidates). Module None on either side fails
+    /// closed: loose files carry no tree identity.
+    fn sole_same_tree_member_of_class(
+        &self,
+        caller_file: FileId,
+        class_name: &str,
+        member_name: &str,
+        language_id: &LanguageId,
+        caller_module: &str,
+    ) -> Option<SymbolId> {
+        let separator = self
+            .get_behavior(language_id)
+            .map(|b| b.module_separator())
+            .unwrap_or("::");
+        let caller_root = caller_module.split(separator).next()?;
+
+        let same_file_claimant = self
+            .symbol_cache
+            .lookup_candidates(member_name)
+            .into_iter()
+            .any(|id| {
+                self.symbol_cache.get_ref(id).is_some_and(|sym| {
+                    sym.file_id == caller_file && Self::is_member_kind_or_scope(&sym)
+                })
+            });
+        if same_file_claimant {
+            return None;
+        }
+
+        let mut members = self
+            .symbol_cache
+            .lookup_candidates(member_name)
+            .into_iter()
+            .filter(|&id| {
+                self.symbol_cache.get_ref(id).is_some_and(|sym| {
+                    sym.language_id.as_ref() == Some(language_id)
+                        && matches!(
+                            sym.scope_context.as_ref(),
+                            Some(crate::symbol::ScopeContext::ClassMember {
+                                class_name: Some(name),
+                            }) if name.as_ref() == class_name
+                        )
+                        && sym
+                            .module_path
+                            .as_deref()
+                            .and_then(|m| m.split(separator).next())
+                            == Some(caller_root)
+                })
+            });
+        match (members.next(), members.next()) {
+            (Some(id), None) => Some(id),
+            _ => None,
+        }
     }
 
     /// True when the caller's own scope names its enclosing type.
@@ -1391,15 +1637,31 @@ impl ResolveStage {
             return Some(local_matches[0]);
         }
 
+        // Exactly one import-witnessed candidate is identity; two or more
+        // import-matched copies leave first-pick as the only tiebreak,
+        // which is candidate order, not evidence - fail closed (D3).
         if imported_matches.len() == 1 {
             return Some(imported_matches[0]);
         }
-        if !imported_matches.is_empty() {
-            return Some(imported_matches[0]);
+        if imported_matches.len() > 1 {
+            return None;
         }
 
         if language_matches.len() == 1 {
-            return Some(language_matches[0]);
+            // A survivor pruned to one by the kind-compat filter carries
+            // the same evidence class the member gates reject: language
+            // identity plus candidate count. Receiver-typed rows exited at
+            // the instance filter and imported rows fill the bucket above,
+            // so the shared Found-arm predicate decides. No static
+            // exemption here: a class-evidenced static exits at the
+            // pre-bucket receiver filter (exactly-one) or arrives with
+            // multiple class-matched copies for the same-module arm below;
+            // a static reaching this arm alone is class-mismatched.
+            let survivor = language_matches[0];
+            if self.is_unevidenced_cross_file_member_pick(survivor, unresolved, caller, context) {
+                return None;
+            }
+            return Some(survivor);
         }
         if !language_matches.is_empty() {
             // Multiple same-language candidates with no local, import, or
@@ -1424,20 +1686,10 @@ impl ResolveStage {
                 // static fall-through — `Type::name` calls whose class-match
                 // filter left multiple class-correct copies — keeps the
                 // same-module tiebreak (receiver type IS class evidence).
-                use crate::symbol::ScopeContext;
-                // Kind check alongside scope: parsers leave scope_context
-                // None on some members (kotlin suspend members among the
-                // census's 120 scope_none rows), and those slipped a
-                // scope-only gate to wrong cross-file member picks.
                 let is_member = self
                     .symbol_cache
                     .get_ref(same_module[0])
-                    .is_some_and(|sym| {
-                        matches!(
-                            sym.kind,
-                            crate::SymbolKind::Method | crate::SymbolKind::Field
-                        ) || matches!(sym.scope_context, Some(ScopeContext::ClassMember { .. }))
-                    });
+                    .is_some_and(|sym| Self::is_member_kind_or_scope(&sym));
                 let class_evidenced_static = unresolved
                     .metadata
                     .as_ref()

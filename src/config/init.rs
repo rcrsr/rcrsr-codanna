@@ -145,6 +145,8 @@ impl Settings {
                 result.push_str("# .gitignore or .codannaignore.\n");
             } else if line.starts_with("indexed_paths = ") {
                 result.push_str("\n# List of directories to index\n");
+                result
+                    .push_str("# Ignore rules: .gitignore and .codannaignore (gitignore syntax)\n");
                 result.push_str("# Add folders using: codanna add-dir <path>\n");
                 result.push_str("# Remove folders using: codanna remove-dir <path>\n");
                 result.push_str("# List all folders using: codanna list-dirs\n");

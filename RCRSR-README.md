@@ -64,7 +64,7 @@ upstream), so it will shadow an upstream install on the same `PATH`.
 
 ## Upstream base
 
-The fork now tracks upstream **v0.11.1** (merged from the prior v0.10.1 base).
+The fork now tracks upstream **v0.12.0** (merged from the prior v0.11.1 base).
 The fork build counter resets to `+rcrsr.1` every time the upstream base moves,
 so an unchanged `+rcrsr.1` across two releases does not mean the fork stopped
 changing — read the base version, not the counter (see [Identifying the
@@ -126,6 +126,40 @@ same way. An ambiguous symbol name still exits **3** with `code: AMBIGUOUS`
 regardless of what you passed to `--fields`, because the fork decides
 ambiguity before it renders anything, so the new exit-2 rejection never
 swallows the fork's ambiguity handling.
+
+**Upstream v0.12.0 forces a one-time re-index of every existing index.**
+Upstream changed how symbol relationships are emitted, and bumped the
+emission-semantics version from 1 to 3 to say so. The gate that guards this is
+absolute, not advisory: any index written by an older binary is refused. In a
+terminal you get `index emission semantics changed (index: v1, binary: v3)` and
+exit code **7**; over stdio MCP you get the degraded zero-tool handshake
+described above, with `INDEX STALE - ALL TOOLS DISABLED` in the instructions.
+Run `codanna index` once per workspace to heal it, and restart any MCP server
+afterwards. This is upstream's intended behavior, not a fork decision — but it
+lands on upgrade with no warning beforehand, so re-index before you rely on a
+workspace. The proxy-mode caveat in the fork note above applies here too: a
+proxy forced to spawn a fresh backing server against a stale index reports a
+readiness timeout rather than the stale-index reason.
+
+The reason for the bump is worth knowing, because it changes result counts.
+Upstream made cross-file resolution **fail closed**: a call that cannot be tied
+to a definition by actual evidence is now left unresolved instead of being
+guessed from the first plausible candidate. Import bindings resolve only on an
+exact module match or an exactly-one survivor, and a symbol with no module
+identity no longer matches everything by accident. Expect relationship counts
+to *drop* on re-index — upstream measured -7.6% on one corpus and -48% on
+another — with the lost recall being mostly wrong answers. If you have tooling
+that asserts on caller or impact counts, re-baseline it against a freshly built
+index rather than assuming a regression.
+
+Upstream v0.12.0 also adds `builder_commit` to `index.meta` and to
+`get_index_info --json`: the commit the building binary came from, suffixed
+`-dirty` when built from a modified tree. It is descriptive only — nothing
+reads it back — and it is absent for tarball builds and for indexes written
+before the stamp existed. **Fork note:** upstream declares this field on its
+own `IndexInfo` in `cli/commands/mcp.rs`; the fork long ago relocated that
+struct to `mcp/service.rs`, so the field is carried there instead. The emitted
+JSON is the same either way.
 
 # Improvements
 
@@ -407,7 +441,12 @@ is the way to re-sync on demand.
 but was never consulted by any walk — upstream, setting it had no effect on
 what got indexed ([issue #22](https://github.com/rcrsr/rcrsr-codanna/issues/22)).
 The fork wires it into every walk (`codanna index`, `--dry-run`, incremental
-reindex, and watch-triggered reindex).
+reindex, and watch-triggered reindex). That now includes upstream v0.12.0's
+created-directory handling: when `serve --watch` sees a new directory appear
+under a watched root, the subtree it registers watches for and the files it
+catches up are decided by the same walk, so `ignore_patterns` prunes them
+exactly as it prunes a batch index. A directory you have excluded never gets
+watched.
 
 `ignore_patterns` uses the **same gitignore dialect as `.codannaignore`**:
 `!` negation, trailing `/` for directory-only matches, `**`, and the usual
@@ -430,6 +469,17 @@ The four patterns codanna used to hard-code as the default (`target/**`,
 already excluded by the default `.codannaignore` that `codanna init` writes.
 Existing `settings.toml` files are left untouched; any patterns already on
 disk in `ignore_patterns` now take effect.
+
+**As of upstream v0.12.0 this setting is fork-only.** Upstream resolved the
+same issue #22 in the opposite direction — it deleted `ignore_patterns`
+outright, on the grounds that nothing consumed it and the settings surface
+was promising an exclusion that never happened. That reasoning does not hold
+here, because the fork had already made it real. The fork keeps the setting
+and its behavior. The practical consequence: a `settings.toml` written for
+this fork is not portable to upstream codanna — upstream will load the file
+without complaint and silently ignore the key, so anything you exclude only
+via `ignore_patterns` would get indexed there. Move those patterns to
+`.codannaignore` if you need a config that behaves identically on both.
 
 ## Document collection controls (`search_documents`)
 

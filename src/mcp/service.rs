@@ -834,6 +834,15 @@ pub struct IndexInfo {
     pub symbol_count: usize,
     pub file_count: usize,
     pub relationship_count: usize,
+    /// Commit of the binary that last wrote this index, `-dirty` when built
+    /// from a modified tree. Absent for indexes written before the stamp
+    /// existed and for binaries built without a work tree.
+    ///
+    /// Upstream declares this on its own `IndexInfo` in `cli/commands/mcp.rs`;
+    /// the fork relocated the struct here, so upstream's field arrives at this
+    /// call site instead. Descriptive only -- no read path compares it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub builder_commit: Option<String>,
     pub symbol_kinds: SymbolKindBreakdown,
     /// Symbol counts per language, from the same `facade::symbol_stats`
     /// assembly the text rendering consumes, so the two cannot drift.
@@ -912,6 +921,9 @@ pub fn index_info_data(facade: &IndexFacade) -> IndexInfo {
         symbol_count,
         file_count: file_count as usize,
         relationship_count,
+        builder_commit: crate::storage::IndexMetadata::load(facade.index_base())
+            .ok()
+            .and_then(|m| m.builder_commit),
         symbol_kinds: SymbolKindBreakdown {
             functions,
             methods,

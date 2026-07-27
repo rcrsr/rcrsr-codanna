@@ -710,13 +710,13 @@ async fn get_index_info_request_accepts_json_output_format_and_returns_envelope(
 /// next `load()` instead of degrading gracefully, bricking the index
 /// rather than just reporting the new field as unknown/absent.
 ///
-/// Note: the work item's originating spec additionally named a third
-/// field, `builder_commit`. Per W-3's authoritative resolution of this
-/// same file's merge conflict, no such field exists on `IndexMetadata`
-/// in either merge parent (fork `HEAD` or upstream `v0.10.0`) --
-/// confirmed via `grep -rn "builder_commit"` returning zero hits
-/// repo-wide. Only the two fields that actually exist,
-/// `ignore_fingerprint` and `emission_version`, are asserted below.
+/// A third field, `builder_commit`, arrived with the upstream v0.12.0
+/// merge (`storage::metadata`) and is asserted here too. An earlier
+/// revision of this comment recorded that no such field existed in
+/// either merge parent; that was accurate against the v0.10.0 base and
+/// is not anymore. It is exactly the shape this test guards -- a new
+/// `Option` field whose absence from a legacy `index.meta` must read
+/// back as `None` rather than failing the parse.
 #[test]
 fn legacy_index_metadata_json_loads_with_new_optional_fields_none() {
     let temp_dir = TempDir::new().expect("create temp dir");
@@ -746,9 +746,13 @@ fn legacy_index_metadata_json_loads_with_new_optional_fields_none() {
         metadata.emission_version, None,
         "emission_version must degrade to None on legacy metadata, not error"
     );
+    assert_eq!(
+        metadata.builder_commit, None,
+        "builder_commit must degrade to None on legacy metadata, not error"
+    );
 
     println!(
-        "[OK] legacy IndexMetadata JSON (no ignore_fingerprint/emission_version) loads with both None."
+        "[OK] legacy IndexMetadata JSON (no ignore_fingerprint/emission_version/builder_commit) loads with all None."
     );
 }
 

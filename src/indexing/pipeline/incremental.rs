@@ -77,6 +77,9 @@ impl Pipeline {
 
         // Check if file already exists by querying Tantivy
         let mut existing_changed = false;
+        let mut captured_inbound: Vec<
+            crate::indexing::pipeline::stages::cleanup::CapturedInboundEdge,
+        > = Vec::new();
         if let Ok(Some((existing_file_id, existing_hash, _mtime))) = index.get_file_info(path_str) {
             if existing_hash == content_hash {
                 // File hasn't changed, skip re-indexing
@@ -110,7 +113,12 @@ impl Pipeline {
                 CleanupStage::new(Arc::clone(&index), &semantic_path)
             };
 
-            cleanup_stage.cleanup_files(&[normalized_path.to_path_buf()])?;
+            // Capture the edges pointing into this file before its rows go:
+            // the re-index below re-derives only this file's OWN outgoing
+            // edges, so inbound edges owned by unchanged files would be lost.
+            let (_, captured) =
+                cleanup_stage.cleanup_files_for_reindex(&[normalized_path.to_path_buf()])?;
+            captured_inbound = captured;
 
             // Commit cleanup changes before re-indexing
             index.commit_batch()?;
@@ -161,6 +169,18 @@ impl Pipeline {
 
         // Commit the batch
         index.commit_batch()?;
+
+        // Replacements are visible now, so the captured edges can find their
+        // new targets. Runs after the commit because the rebind looks the
+        // targets up through the searcher.
+        if !captured_inbound.is_empty() {
+            let rebind_stage = if let Some(ref sem) = semantic {
+                CleanupStage::new(Arc::clone(&index), &semantic_path).with_semantic(Arc::clone(sem))
+            } else {
+                CleanupStage::new(Arc::clone(&index), &semantic_path)
+            };
+            rebind_stage.rebind_inbound_edges(&captured_inbound)?;
+        }
 
         // Generate embeddings for symbols with doc_comments
         if let (Some(pool), Some(sem)) = (&embedding_pool, &semantic) {
@@ -289,6 +309,7 @@ impl Pipeline {
             cleanup_stats,
             deleted_symbols,
             discover_counts,
+            captured_inbound,
         ) = if force {
             // Force mode: use DualProgressBar for semantic+embedding, else single bar
             let has_embedding = semantic.is_some() && embedding_pool.is_some();
@@ -341,6 +362,7 @@ impl Pipeline {
                     CleanupStats::default(),
                     0,
                     (files_indexed, 0, 0),
+                    Vec::new(),
                 )
             } else {
                 // Single progress bar (no embedding or no semantic)
@@ -382,6 +404,7 @@ impl Pipeline {
                     CleanupStats::default(),
                     0,
                     (files_indexed, 0, 0),
+                    Vec::new(),
                 )
             }
         } else {
@@ -426,6 +449,9 @@ impl Pipeline {
 
             let mut cleanup_stats = CleanupStats::default();
             let mut deleted_symbols = 0;
+            let mut captured_inbound: Vec<
+                crate::indexing::pipeline::stages::cleanup::CapturedInboundEdge,
+            > = Vec::new();
             if !discover_result.deleted_files.is_empty() {
                 let stats = cleanup_stage.cleanup_files(&discover_result.deleted_files)?;
                 cleanup_stats.files_cleaned += stats.files_cleaned;
@@ -433,9 +459,11 @@ impl Pipeline {
                 deleted_symbols = stats.symbols_removed;
             }
             if !discover_result.modified_files.is_empty() {
-                let stats = cleanup_stage.cleanup_files(&discover_result.modified_files)?;
+                let (stats, captured) =
+                    cleanup_stage.cleanup_files_for_reindex(&discover_result.modified_files)?;
                 cleanup_stats.files_cleaned += stats.files_cleaned;
                 cleanup_stats.symbols_removed += stats.symbols_removed;
+                captured_inbound = captured;
             }
 
             // Create Phase 1 bar with actual files to index count
@@ -492,6 +520,7 @@ impl Pipeline {
                 cleanup_stats,
                 deleted_symbols,
                 counts,
+                captured_inbound,
             )
         };
 
@@ -505,6 +534,18 @@ impl Pipeline {
             Arc::clone(&index),
             true,
         )?;
+
+        // Phase 2 has stored the changed files' own edges; the replacements
+        // are committed and findable, so the edges captured from unchanged
+        // files can be re-pointed at them.
+        if !captured_inbound.is_empty() {
+            let rebind_stage = if let Some(ref sem) = semantic {
+                CleanupStage::new(Arc::clone(&index), &semantic_path).with_semantic(Arc::clone(sem))
+            } else {
+                CleanupStage::new(Arc::clone(&index), &semantic_path)
+            };
+            rebind_stage.rebind_inbound_edges(&captured_inbound)?;
+        }
 
         // Save embeddings
         self.persist_embeddings(semantic.as_ref(), &semantic_path)?;
@@ -605,12 +646,18 @@ impl Pipeline {
             deleted_symbols = stats.symbols_removed;
         }
 
-        // Cleanup modified files (old data must be removed before re-indexing)
+        // Cleanup modified files (old data must be removed before re-indexing).
+        // Capture the edges pointing into them first: deleting a file's rows
+        // also deletes every edge targeting its symbols, and the re-index
+        // re-derives only the file's OWN outgoing edges.
+        let mut captured_inbound = Vec::new();
         if !discover_result.modified_files.is_empty() {
-            let stats = cleanup_stage.cleanup_files(&discover_result.modified_files)?;
+            let (stats, captured) =
+                cleanup_stage.cleanup_files_for_reindex(&discover_result.modified_files)?;
             cleanup_stats.files_cleaned += stats.files_cleaned;
             cleanup_stats.symbols_removed += stats.symbols_removed;
             cleanup_stats.embeddings_removed += stats.embeddings_removed;
+            captured_inbound = captured;
         }
 
         // Run Phase 1 on the files to index
@@ -650,6 +697,12 @@ impl Pipeline {
             Arc::clone(&index),
             show_progress,
         )?;
+
+        // Replacements are committed and findable now, so the captured edges
+        // can be re-pointed at them.
+        if !captured_inbound.is_empty() {
+            cleanup_stage.rebind_inbound_edges(&captured_inbound)?;
+        }
 
         // Save embeddings
         self.persist_embeddings(semantic.as_ref(), &semantic_path)?;
@@ -931,6 +984,9 @@ mod tests {
             "from pkg import helper\n\n\ndef reexport_caller(x):\n    return helper(x)\n";
         std::fs::write(pkg.join("c.py"), consumer).unwrap();
 
+        // Canonical root, as the facade guarantees before the pipeline
+        // sees it: the Walk-lane module-path strip needs it.
+        let root = root.canonicalize().unwrap();
         let settings = Arc::new(Settings {
             index_path: dir.path().join("index"),
             workspace_root: None,
@@ -940,8 +996,13 @@ mod tests {
             Arc::new(DocumentIndex::new(settings.index_path.join("tantivy"), &settings).unwrap());
         let pipeline = Pipeline::with_settings(Arc::clone(&settings));
 
+        // First pass force=true: production never runs incremental on an
+        // empty index (the facade auto-forces at document_count == 0),
+        // and only the force lane's Walk source computes module paths
+        // here. The re-export arc must form on module identity, not on
+        // the None/"" storage collapse this lock predated.
         pipeline
-            .index_incremental(&root, Arc::clone(&index), None, None, false)
+            .index_incremental(&root, Arc::clone(&index), None, None, true)
             .unwrap();
         assert!(
             calls_edge_exists(&index, "reexport_caller", "helper"),

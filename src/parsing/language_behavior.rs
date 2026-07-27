@@ -358,6 +358,28 @@ pub trait LanguageBehavior: Send + Sync {
         false
     }
 
+    /// True when a bare receiver-less call inside a class body can
+    /// dispatch to an instance member (implicit this) AND the parser
+    /// emits no receiver for it. The resolve stage then tries the
+    /// inheritance-witness walk for bare calls. Default false: python
+    /// bare calls never reach members (self is explicit), and csharp/cpp
+    /// parsers emit a `this` receiver for member dispatch, which routes
+    /// through the self-form arm instead.
+    fn implicit_this_dispatch(&self) -> bool {
+        false
+    }
+
+    /// True when one type's members may be DEFINED across multiple
+    /// files (rust impl blocks, cpp out-of-line member definitions,
+    /// csharp partial classes). Gates the cross-file named-ClassMember
+    /// self-form arm. Default false: in one-declaration-per-file
+    /// languages a same-named class in another file is a DIFFERENT
+    /// class, never a continuation — borrowing its member is a
+    /// wrong-class pick (witnessed: laravel namespace twins).
+    fn type_members_span_files(&self) -> bool {
+        false
+    }
+
     /// Consumed by `ResolveStage::resolve_static_call` pre-gate.
     fn static_class_keywords(&self) -> &'static [&'static str] {
         &[]
@@ -475,10 +497,13 @@ pub trait LanguageBehavior: Send + Sync {
                 imports,
             );
 
+            // Ambiguous stays unresolved: a bound import is identity-grade
+            // (receiver anchor, chain walk), and ids.first() is candidate
+            // order, not evidence.
             let resolved_symbol = match result {
                 crate::parsing::ResolveResult::Found(id) => Some(id),
-                crate::parsing::ResolveResult::Ambiguous(ids) => ids.first().copied(),
-                crate::parsing::ResolveResult::NotFound => None,
+                crate::parsing::ResolveResult::Ambiguous(_)
+                | crate::parsing::ResolveResult::NotFound => None,
             };
 
             // Determine origin (simplified without Tantivy access)

@@ -90,6 +90,39 @@ impl FileWalker {
             }))
     }
 
+    /// Directories the index walk would traverse under `root`, ignore
+    /// chains applied. Feeds watch registration for created directories;
+    /// the walk root itself is always yielded (even dot-prefixed, so a
+    /// scope explicitly named by the caller is never dropped), while
+    /// dot-prefixed directories below the root are skipped (keeps `.git`
+    /// trees out of watch sets). Does not warn on skipped symlinked
+    /// directories, for the same reason as [`Self::walk_quiet`]: this is a
+    /// second walk site over a tree the index walk already reports on. No
+    /// depth limit.
+    ///
+    /// Known asymmetry with [`Self::walk`], documented rather than
+    /// unified: the file walk filters hidden *files* by name but still
+    /// descends *into* dot-prefixed directories, whereas this walk skips
+    /// dot-prefixed directories below the root outright (so it never
+    /// descends into them at all). Both are intentional for their own
+    /// callers and are not reconciled here.
+    pub fn walk_dirs(&self, root: &Path) -> IndexResult<impl Iterator<Item = PathBuf>> {
+        let mut builder = build_walker(&self.settings, root)?;
+        builder.max_depth(None); // No depth limit
+        Ok(builder
+            .build()
+            .filter_map(Result::ok) // Skip entries we can't access; dir + dot-dir filters below
+            .filter(|entry| entry.file_type().is_some_and(|ft| ft.is_dir()))
+            .filter(|entry| {
+                entry.depth() == 0
+                    || entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|n| !n.starts_with('.'))
+            })
+            .map(|entry| entry.path().to_path_buf()))
+    }
+
     /// Get list of enabled file extensions from the registry
     fn get_enabled_extensions(&self) -> Vec<String> {
         let registry = get_registry();
@@ -166,6 +199,39 @@ mod tests {
         assert!(files[0].ends_with("visible.rs"));
     }
 
+    // walk_dirs feeds the watcher's directory-chain registration: a new
+    // directory subtree gets watches only where the index walk would
+    // traverse -- an ignored tree (node_modules, generated/) is pruned
+    // by the same chains before any kernel watch is added.
+    #[test]
+    fn walk_dirs_prunes_ignored_subtrees() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        fs::create_dir_all(root.join("newmod/empty_sub")).unwrap();
+        fs::create_dir_all(root.join("generated/deep")).unwrap();
+        fs::write(root.join(".gitignore"), "generated/\n").unwrap();
+
+        let settings = create_test_settings();
+        let walker = FileWalker::new(settings);
+
+        let mut dirs: Vec<_> = walker
+            .walk_dirs(root)
+            .unwrap()
+            .map(|p| p.strip_prefix(root).unwrap().to_path_buf())
+            .filter(|p| !p.as_os_str().is_empty())
+            .collect();
+        dirs.sort();
+
+        assert_eq!(
+            dirs,
+            vec![
+                std::path::PathBuf::from("newmod"),
+                std::path::PathBuf::from("newmod/empty_sub"),
+            ],
+            "empty traversable dirs are yielded, ignored subtrees pruned"
+        );
+    }
+
     #[test]
     fn test_gitignore_respected() {
         let temp_dir = TempDir::new().unwrap();
@@ -186,5 +252,155 @@ mod tests {
         // Should only find the included file
         assert_eq!(files.len(), 1);
         assert!(files[0].ends_with("included.rs"));
+    }
+
+    #[test]
+    fn walk_dirs_honors_ignore_patterns() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        fs::create_dir_all(root.join("proj/keep")).unwrap();
+        fs::create_dir_all(root.join("proj/skipped/nested")).unwrap();
+
+        let mut settings = Settings::default();
+        settings.languages.get_mut("python").unwrap().enabled = false;
+        settings.languages.get_mut("php").unwrap().enabled = false;
+        // Bare directory form, not "skipped/**": per the gitignore dialect,
+        // `skipped/**` matches the directory's contents but not the
+        // directory entry itself, which would make this assertion
+        // ambiguous about whether the directory entry was actually pruned.
+        settings.indexing.ignore_patterns = vec!["skipped/".to_string()];
+        let walker = FileWalker::new(Arc::new(settings));
+
+        let dirs: Vec<_> = walker
+            .walk_dirs(root)
+            .unwrap()
+            .map(|p| p.strip_prefix(root).unwrap().to_path_buf())
+            .collect();
+
+        assert!(dirs.contains(&std::path::PathBuf::from("proj/keep")));
+        assert!(!dirs.contains(&std::path::PathBuf::from("proj/skipped")));
+        assert!(!dirs.contains(&std::path::PathBuf::from("proj/skipped/nested")));
+    }
+
+    #[test]
+    fn walk_dirs_honors_gitignore_and_codannaignore() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        fs::create_dir_all(root.join("ignored_dir")).unwrap();
+        fs::create_dir_all(root.join("other_dir")).unwrap();
+        fs::create_dir_all(root.join("kept_dir")).unwrap();
+        fs::write(root.join(".gitignore"), "ignored_dir/\n").unwrap();
+        fs::write(root.join(".codannaignore"), "other_dir/\n").unwrap();
+
+        let settings = create_test_settings();
+        let walker = FileWalker::new(settings);
+
+        let dirs: Vec<_> = walker
+            .walk_dirs(root)
+            .unwrap()
+            .map(|p| p.strip_prefix(root).unwrap().to_path_buf())
+            .collect();
+
+        assert!(dirs.contains(&std::path::PathBuf::from("kept_dir")));
+        assert!(!dirs.contains(&std::path::PathBuf::from("ignored_dir")));
+        assert!(!dirs.contains(&std::path::PathBuf::from("other_dir")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_dirs_respects_follow_links_setting() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        fs::create_dir_all(root.join("real_target/inner")).unwrap();
+        std::os::unix::fs::symlink(root.join("real_target"), root.join("linked")).unwrap();
+
+        let mut settings_no_follow = Settings::default();
+        settings_no_follow
+            .languages
+            .get_mut("python")
+            .unwrap()
+            .enabled = false;
+        settings_no_follow.languages.get_mut("php").unwrap().enabled = false;
+        settings_no_follow.indexing.follow_links = false;
+        let walker_no_follow = FileWalker::new(Arc::new(settings_no_follow));
+
+        let dirs_no_follow: Vec<_> = walker_no_follow
+            .walk_dirs(root)
+            .unwrap()
+            .map(|p| p.strip_prefix(root).unwrap().to_path_buf())
+            .collect();
+        assert!(!dirs_no_follow.contains(&std::path::PathBuf::from("linked/inner")));
+
+        let mut settings_follow = Settings::default();
+        settings_follow.languages.get_mut("python").unwrap().enabled = false;
+        settings_follow.languages.get_mut("php").unwrap().enabled = false;
+        settings_follow.indexing.follow_links = true;
+        let walker_follow = FileWalker::new(Arc::new(settings_follow));
+
+        let dirs_follow: Vec<_> = walker_follow
+            .walk_dirs(root)
+            .unwrap()
+            .map(|p| p.strip_prefix(root).unwrap().to_path_buf())
+            .collect();
+        assert!(dirs_follow.contains(&std::path::PathBuf::from("linked/inner")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_dirs_refuses_symlink_escaping_workspace_root() {
+        let workspace = TempDir::new().unwrap();
+        let root = workspace.path();
+        let outside = TempDir::new().unwrap();
+        fs::create_dir_all(outside.path().join("escaped/deep")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("escaped"), root.join("linked")).unwrap();
+
+        let mut settings = Settings::default();
+        settings.languages.get_mut("python").unwrap().enabled = false;
+        settings.languages.get_mut("php").unwrap().enabled = false;
+        settings.indexing.follow_links = true;
+        settings.workspace_root = Some(root.to_path_buf());
+        let walker = FileWalker::new(Arc::new(settings));
+
+        let dirs: Vec<_> = walker
+            .walk_dirs(root)
+            .unwrap()
+            .map(|p| p.strip_prefix(root).unwrap().to_path_buf())
+            .collect();
+
+        assert!(!dirs.contains(&std::path::PathBuf::from("linked/deep")));
+    }
+
+    #[test]
+    fn walk_dirs_yields_root_even_when_dot_prefixed() {
+        let temp_dir = TempDir::new().unwrap();
+        let hidden_scope = temp_dir.path().join(".hidden_scope");
+        fs::create_dir_all(&hidden_scope).unwrap();
+
+        let settings = create_test_settings();
+        let walker = FileWalker::new(settings);
+
+        let dirs: Vec<_> = walker.walk_dirs(&hidden_scope).unwrap().collect();
+
+        assert!(dirs.contains(&hidden_scope));
+    }
+
+    #[test]
+    fn walk_dirs_skips_dot_directories_below_root() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+
+        let settings = create_test_settings();
+        let walker = FileWalker::new(settings);
+
+        let dirs: Vec<_> = walker
+            .walk_dirs(root)
+            .unwrap()
+            .map(|p| p.strip_prefix(root).unwrap().to_path_buf())
+            .collect();
+
+        assert!(!dirs.contains(&std::path::PathBuf::from(".git")));
+        assert!(dirs.contains(&std::path::PathBuf::from("src")));
     }
 }
