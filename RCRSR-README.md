@@ -62,6 +62,22 @@ Or download a platform archive directly from the [releases page](https://github.
 and put the `codanna` binary on your `PATH`. The binary is named `codanna` (same as
 upstream), so it will shadow an upstream install on the same `PATH`.
 
+## Upstream base
+
+The fork now tracks upstream **v0.10.0** (merged from the prior v0.9.23 base;
+the fork build counter reset to `+rcrsr.1` on this base — see [Identifying
+the fork](#identifying-the-fork)).
+
+One upstream v0.10.0 change is user-visible for existing MCP clients:
+**unknown `key:value` arguments on an MCP tool call now reject** instead of
+being silently ignored — this applies on every surface (positional CLI args,
+`--args`, and serve-mode `tools/call`, where the rejection surfaces as
+`isError: true`); tool schemas also now advertise `additionalProperties:
+false`. A misspelled or stale argument key that previously passed through
+unnoticed now fails the call. If you have automation or scripts calling
+codanna's MCP tools, check argument names against the current tool schemas
+after upgrading.
+
 # Improvements
 
 The sections below are the fork's additions over upstream codanna — new

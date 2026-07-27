@@ -525,16 +525,14 @@ impl KotlinParser {
                         continue;
                     }
 
-                    {
-                        let arg_type = self.extract_value_argument_type(
-                            value_arg,
-                            code,
-                            var_types,
-                            signatures,
-                            infer_depth,
-                        )?;
-                        types.push(arg_type);
-                    }
+                    let arg_type = self.extract_value_argument_type(
+                        value_arg,
+                        code,
+                        var_types,
+                        signatures,
+                        infer_depth,
+                    )?;
+                    types.push(arg_type);
                 }
             }
         }

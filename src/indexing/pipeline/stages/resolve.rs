@@ -159,6 +159,18 @@ impl ResolveStage {
             return self.resolve_super_call(from_id, unresolved, context, &caller);
         }
 
+        // Self-aliased receivers (self/this/cls) name their container: the
+        // caller's own enclosing type, evidenced by its ClassMember scope.
+        // Resolve within that type's direct members before the scope
+        // lookup, whose frozen winner may be a same-name member of a
+        // sibling type. A miss falls through — implicit-this languages
+        // emit the alias for free-function calls too.
+        if self.is_self_form_instance_call(unresolved, &caller.language_id) {
+            if let Some(resolved) = self.resolve_self_form_member(from_id, unresolved) {
+                return Some(resolved);
+            }
+        }
+
         if let Some(to_id) = context.resolve(&unresolved.to_name) {
             if self.is_compatible(
                 from_kind,
@@ -167,14 +179,9 @@ impl ResolveStage {
                 caller.file_id,
                 &caller.language_id,
             ) && self.is_receiver_compat(to_id, unresolved, &caller.language_id)
-                && self.is_instance_type_compatible(unresolved, to_id, &caller.language_id)
+                && self.is_instance_type_compatible(unresolved, to_id, &caller.language_id, context)
             {
-                return Some(ResolvedRelationship {
-                    from_id,
-                    to_id,
-                    kind: unresolved.kind,
-                    metadata: unresolved.metadata.clone(),
-                });
+                return self.accept_unwitnessed_pick(from_id, to_id, unresolved);
             }
         }
 
@@ -204,27 +211,94 @@ impl ResolveStage {
                 ) {
                     return None;
                 }
-                if !self.is_instance_type_compatible(unresolved, to_id, &caller.language_id) {
+                if !self.is_instance_type_compatible(
+                    unresolved,
+                    to_id,
+                    &caller.language_id,
+                    context,
+                ) {
                     return None;
                 }
-                Some(ResolvedRelationship {
-                    from_id,
+                if self.is_file_scoped_private_member_cross_file(
                     to_id,
-                    kind: unresolved.kind,
-                    metadata: unresolved.metadata.clone(),
-                })
+                    caller.file_id,
+                    &caller.language_id,
+                ) {
+                    return None;
+                }
+                self.accept_unwitnessed_pick(from_id, to_id, unresolved)
             }
             ResolveResult::Ambiguous(candidates) => {
-                let to_id = self.disambiguate(&candidates, unresolved, context, false)?;
-                Some(ResolvedRelationship {
-                    from_id,
-                    to_id,
-                    kind: unresolved.kind,
-                    metadata: unresolved.metadata.clone(),
-                })
+                let to_id = self.disambiguate(&candidates, unresolved, &caller, context, false)?;
+                self.accept_unwitnessed_pick(from_id, to_id, unresolved)
             }
-            ResolveResult::NotFound => None,
+            ResolveResult::NotFound => {
+                self.resolve_typed_receiver_global(from_id, from_kind, unresolved, &caller, context)
+            }
         }
+    }
+
+    /// Type-directed member lookup for instance calls whose receiver type is
+    /// inferred but whose bare name is not in scope — an inherited member
+    /// called from a file that never imports it (`m = Model(...);
+    /// m.model_dump()` in a test file). Evidence-gated: candidates come from
+    /// the global name index, filtered to Method-kind symbols of the caller's
+    /// language whose ClassMember class sits on the receiver type's chain;
+    /// exactly one minimal-distance survivor resolves, anything else fails
+    /// closed.
+    fn resolve_typed_receiver_global(
+        &self,
+        from_id: SymbolId,
+        from_kind: Option<crate::SymbolKind>,
+        unresolved: &UnresolvedRelationship,
+        caller: &CallerContext,
+        context: &ResolutionContext,
+    ) -> Option<ResolvedRelationship> {
+        if unresolved.kind != RelationKind::Calls {
+            return None;
+        }
+        let (type_name, caller_sym) =
+            self.infer_receiver_type(unresolved, &caller.language_id, context)?;
+        let mut best: Option<usize> = None;
+        let mut scored: Vec<(SymbolId, usize)> = Vec::new();
+        for id in self.symbol_cache.lookup_candidates(&unresolved.to_name) {
+            let Some(sym) = self.symbol_cache.get_ref(id) else {
+                continue;
+            };
+            if sym.kind != crate::SymbolKind::Method
+                || sym.language_id.as_ref() != Some(&caller.language_id)
+            {
+                continue;
+            }
+            if let Some(distance) = self.receiver_chain_distance(
+                &sym,
+                &type_name,
+                Some(&*caller_sym),
+                &caller.language_id,
+                context,
+            ) {
+                best = Some(best.map_or(distance, |b| b.min(distance)));
+                scored.push((id, distance));
+            }
+        }
+        let survivors: Vec<SymbolId> = scored
+            .into_iter()
+            .filter(|&(_, distance)| Some(distance) == best)
+            .map(|(id, _)| id)
+            .collect();
+        let [to_id] = survivors[..] else {
+            return None;
+        };
+        if !self.is_compatible(
+            from_kind,
+            to_id,
+            unresolved.kind,
+            caller.file_id,
+            &caller.language_id,
+        ) {
+            return None;
+        }
+        self.accept_unwitnessed_pick(from_id, to_id, unresolved)
     }
 
     fn is_compatible(
@@ -245,6 +319,32 @@ impl ResolveStage {
             return true;
         };
         behavior.is_compatible_relationship(from_kind, to_kind, rel_kind, file_id)
+    }
+
+    /// True when the pick is a Private Method/Field in another file and the
+    /// caller's language declares private members file-scoped (kotlin):
+    /// such symbols are unreferencable from the caller, so a name-keyed
+    /// pick of one is wrong by construction.
+    fn is_file_scoped_private_member_cross_file(
+        &self,
+        to_id: SymbolId,
+        caller_file: FileId,
+        language_id: &LanguageId,
+    ) -> bool {
+        let Some(sym) = self.symbol_cache.get_ref(to_id) else {
+            return false;
+        };
+        if sym.file_id == caller_file || sym.visibility != crate::Visibility::Private {
+            return false;
+        }
+        if !matches!(
+            sym.kind,
+            crate::SymbolKind::Method | crate::SymbolKind::Field
+        ) {
+            return false;
+        }
+        self.get_behavior(language_id)
+            .is_some_and(|b| b.private_members_are_file_scoped())
     }
 
     /// Filter candidates by static-call receiver type.
@@ -295,6 +395,7 @@ impl ResolveStage {
         &'a self,
         unresolved: &UnresolvedRelationship,
         language_id: &LanguageId,
+        context: &ResolutionContext,
     ) -> Option<(String, impl std::ops::Deref<Target = crate::Symbol> + 'a)> {
         let metadata = unresolved.metadata.as_ref()?;
         if metadata.static_call {
@@ -303,9 +404,75 @@ impl ResolveStage {
         let receiver = metadata.receiver.as_deref()?;
         let behavior = self.get_behavior(language_id)?;
         let caller = self.symbol_cache.get_ref(unresolved.from_id?)?;
+
+        // Local bindings outrank the parameter annotation: they carry a
+        // binding site, so the last binding before the call wins over a
+        // position-less signature type (a rebinding shadows the parameter).
+        // Self-aliased receivers never consult bindings — the self-form arm
+        // and alias vocabulary own them; a rebound `cls` (metaclass idiom)
+        // must not trade a resolvable alias for a method-result guess.
+        if !behavior.self_receiver_aliases().contains(&receiver) {
+            if let Some(type_name) =
+                self.binding_type_at_call_site(unresolved, receiver, &caller, context)
+            {
+                return Some((type_name, caller));
+            }
+        }
+
         let signature = caller.signature.as_deref()?;
         let type_name = behavior.extract_parameter_type(signature, receiver)?;
         Some((type_name, caller))
+    }
+
+    /// Type of the last in-scope binding of `receiver` before the call site.
+    /// A binding counts when it sits inside the caller's span, precedes the
+    /// call, and is not enclosed by a narrower function-like symbol (a
+    /// nested def's locals do not leak outward).
+    fn binding_type_at_call_site(
+        &self,
+        unresolved: &UnresolvedRelationship,
+        receiver: &str,
+        caller: &crate::Symbol,
+        context: &ResolutionContext,
+    ) -> Option<String> {
+        let call_site = unresolved.to_range.as_ref()?;
+        let mut best: Option<&crate::indexing::pipeline::VariableBinding> = None;
+        for binding in &context.variable_bindings {
+            if binding.name != receiver
+                || !range_contains(&caller.range, &binding.range)
+                || !starts_before(&binding.range, call_site)
+                || self.binding_in_narrower_scope(&binding.range, caller, context)
+            {
+                continue;
+            }
+            if best.is_none_or(|b| starts_before(&b.range, &binding.range)) {
+                best = Some(binding);
+            }
+        }
+        best.map(|b| b.type_name.clone())
+    }
+
+    /// A binding enclosed by a function-like symbol narrower than the caller
+    /// belongs to that nested scope, not the caller's.
+    fn binding_in_narrower_scope(
+        &self,
+        binding_range: &crate::Range,
+        caller: &crate::Symbol,
+        context: &ResolutionContext,
+    ) -> bool {
+        context.local_symbols.iter().any(|&id| {
+            if id == caller.id {
+                return false;
+            }
+            self.symbol_cache.get_ref(id).is_some_and(|sym| {
+                matches!(
+                    sym.kind,
+                    crate::SymbolKind::Function | crate::SymbolKind::Method
+                ) && range_contains(&caller.range, &sym.range)
+                    && sym.range != caller.range
+                    && range_contains(&sym.range, binding_range)
+            })
+        })
     }
 
     /// An instance call whose receiver is syntactically present but whose
@@ -318,6 +485,7 @@ impl ResolveStage {
         &self,
         unresolved: &UnresolvedRelationship,
         language_id: &LanguageId,
+        context: &ResolutionContext,
     ) -> bool {
         if unresolved.kind != RelationKind::Calls {
             return false;
@@ -338,7 +506,8 @@ impl ResolveStage {
         if self_aliases.contains(&receiver) {
             return false;
         }
-        self.infer_receiver_type(unresolved, language_id).is_none()
+        self.infer_receiver_type(unresolved, language_id, context)
+            .is_none()
     }
 
     /// Single-candidate gate (Found arm of `resolve_one`): when the inferred
@@ -351,17 +520,161 @@ impl ResolveStage {
         unresolved: &UnresolvedRelationship,
         to_id: SymbolId,
         language_id: &LanguageId,
+        context: &ResolutionContext,
     ) -> bool {
-        let Some((type_name, caller)) = self.infer_receiver_type(unresolved, language_id) else {
-            return !self.has_uninferrable_instance_receiver(unresolved, language_id);
+        let Some((type_name, caller)) = self.infer_receiver_type(unresolved, language_id, context)
+        else {
+            return !self.has_uninferrable_instance_receiver(unresolved, language_id, context);
         };
-        let Some(behavior) = self.get_behavior(language_id) else {
+        if self.get_behavior(language_id).is_none() {
             return true;
-        };
+        }
         let Some(candidate) = self.symbol_cache.get_ref(to_id) else {
             return true;
         };
-        behavior.is_receiver_compatible(&candidate, &type_name, Some(&*caller))
+        self.receiver_chain_distance(&candidate, &type_name, Some(&*caller), language_id, context)
+            .is_some()
+    }
+
+    /// Ancestor-aware receiver compatibility: 0 = member of the receiver's
+    /// own type, n = member of the n-nearest type on its inheritance chain
+    /// (Extends evidence, MRO order for python), None = not on the chain.
+    /// Inherited members resolve through the chain; the concrete type's own
+    /// override always ranks closer.
+    /// Identity anchor for an inferred receiver type: the specific Class
+    /// symbol the type name denotes in THIS file — file-scope resolution
+    /// (imports included) first, then the exactly-one function-local Class
+    /// inside the caller's span. None when the name does not resolve to a
+    /// Class here (unresolvable import specifier, non-Class kinds such as
+    /// rust Structs): copy selection is then impossible and distance 0
+    /// stays name-keyed.
+    fn receiver_type_anchor(
+        &self,
+        type_name: &str,
+        caller: Option<&crate::Symbol>,
+        context: &ResolutionContext,
+    ) -> Option<SymbolId> {
+        context
+            .resolve(type_name)
+            .filter(|&id| {
+                self.symbol_cache
+                    .get_ref(id)
+                    .is_some_and(|sym| sym.kind == crate::SymbolKind::Class)
+            })
+            .or_else(|| {
+                // Function-local classes never reach the file scope; a Class
+                // of this name inside the caller's own span is identity
+                // evidence. Exactly one, else fail closed.
+                let caller_sym = caller?;
+                let mut only = None;
+                for &id in &context.local_symbols {
+                    let is_match = self.symbol_cache.get_ref(id).is_some_and(|sym| {
+                        sym.kind == crate::SymbolKind::Class
+                            && sym.name.as_ref() == type_name
+                            && range_contains(&caller_sym.range, &sym.range)
+                    });
+                    if is_match {
+                        if only.is_some() {
+                            return None;
+                        }
+                        only = Some(id);
+                    }
+                }
+                only
+            })
+    }
+
+    fn receiver_chain_distance(
+        &self,
+        candidate: &crate::Symbol,
+        type_name: &str,
+        caller: Option<&crate::Symbol>,
+        language_id: &LanguageId,
+        context: &ResolutionContext,
+    ) -> Option<usize> {
+        let behavior = self.get_behavior(language_id)?;
+        // Distance 0: with an identity anchor, membership is in the ANCHORED
+        // class copy — same file, inside the anchor's span, direct member.
+        // Name-keyed compatibility alone cannot split duplicate class copies
+        // (vendored bundles, twin test files) or same-file same-name locals.
+        // Without an anchor, name-keyed is the only evidence there is.
+        let anchor = self.receiver_type_anchor(type_name, caller, context);
+        match anchor {
+            Some(anchor_id) => {
+                let (anchor_name, anchor_file, anchor_range) = {
+                    let sym = self.symbol_cache.get_ref(anchor_id)?;
+                    (sym.name.clone(), sym.file_id, sym.range)
+                };
+                if candidate.file_id == anchor_file
+                    && range_contains(&anchor_range, &candidate.range)
+                    && self.is_direct_member(
+                        candidate.scope_context.as_ref(),
+                        candidate.range,
+                        anchor_id,
+                        &anchor_name,
+                        anchor_file,
+                    )
+                {
+                    return Some(0);
+                }
+            }
+            None => {
+                if behavior.is_receiver_compatible(candidate, type_name, caller) {
+                    return Some(0);
+                }
+            }
+        }
+        // Ancestor hops are identity-grade: the receiver type must resolve
+        // to a Class through THIS file's scope, and each hop follows that
+        // class's own Extends edges with scope-resolved parents. Bare-name
+        // chains merge every same-named class in the corpus (the pydantic
+        // test `Model` population) and mis-attribute inherited members.
+        // Chains dead-end after leaving the file (a parent's own Extends
+        // edges live in its file's context): deep cross-file chains
+        // under-report.
+        let start = anchor?;
+        let mut frontier = vec![start];
+        for distance in 1..=8usize {
+            let mut next = Vec::new();
+            for class_id in frontier {
+                for rel in &context.unresolved_rels {
+                    if rel.kind != RelationKind::Extends || rel.from_id != Some(class_id) {
+                        continue;
+                    }
+                    let Some(parent_id) = context.resolve(&rel.to_name) else {
+                        continue;
+                    };
+                    let Some(parent) = self.symbol_cache.get_ref(parent_id) else {
+                        continue;
+                    };
+                    if parent.kind != crate::SymbolKind::Class
+                        || parent.language_id.as_ref() != Some(language_id)
+                    {
+                        continue;
+                    }
+                    let parent_name = parent.name.clone();
+                    let parent_file = parent.file_id;
+                    drop(parent);
+                    if candidate.file_id == parent_file
+                        && self.is_direct_member(
+                            candidate.scope_context.as_ref(),
+                            candidate.range,
+                            parent_id,
+                            &parent_name,
+                            parent_file,
+                        )
+                    {
+                        return Some(distance);
+                    }
+                    next.push(parent_id);
+                }
+            }
+            if next.is_empty() {
+                return None;
+            }
+            frontier = next;
+        }
+        None
     }
 
     /// Filter candidates by inferred parameter-type for instance calls.
@@ -373,17 +686,29 @@ impl ResolveStage {
         candidates: &[SymbolId],
         unresolved: &UnresolvedRelationship,
         language_id: &LanguageId,
+        context: &ResolutionContext,
     ) -> Option<Vec<SymbolId>> {
-        let (type_name, caller) = self.infer_receiver_type(unresolved, language_id)?;
-        let behavior = self.get_behavior(language_id)?;
-        let matches: Vec<SymbolId> = candidates
-            .iter()
-            .copied()
-            .filter(|&id| {
-                self.symbol_cache.get_ref(id).is_some_and(|sym| {
-                    behavior.is_receiver_compatible(&sym, &type_name, Some(&*caller))
-                })
-            })
+        let (type_name, caller) = self.infer_receiver_type(unresolved, language_id, context)?;
+        self.get_behavior(language_id)?;
+        // Nearest-class-wins: the concrete type's own member (distance 0)
+        // shadows inherited same-name members further up the chain.
+        let mut best: Option<usize> = None;
+        let mut scored: Vec<(SymbolId, usize)> = Vec::new();
+        for &id in candidates {
+            let Some(sym) = self.symbol_cache.get_ref(id) else {
+                continue;
+            };
+            if let Some(distance) =
+                self.receiver_chain_distance(&sym, &type_name, Some(&*caller), language_id, context)
+            {
+                best = Some(best.map_or(distance, |b| b.min(distance)));
+                scored.push((id, distance));
+            }
+        }
+        let matches: Vec<SymbolId> = scored
+            .into_iter()
+            .filter(|&(_, distance)| Some(distance) == best)
+            .map(|(id, _)| id)
             .collect();
         Some(matches)
     }
@@ -559,6 +884,77 @@ impl ResolveStage {
         innermost == Some(parent_id)
     }
 
+    /// An instance call whose receiver is a self alias for the caller's
+    /// language (`self`, `this`, `cls`, ...).
+    fn is_self_form_instance_call(
+        &self,
+        unresolved: &UnresolvedRelationship,
+        language_id: &LanguageId,
+    ) -> bool {
+        if unresolved.kind != RelationKind::Calls {
+            return false;
+        }
+        let Some(metadata) = unresolved.metadata.as_ref() else {
+            return false;
+        };
+        if metadata.static_call {
+            return false;
+        }
+        let Some(receiver) = metadata.receiver.as_deref() else {
+            return false;
+        };
+        self.get_behavior(language_id)
+            .map(|b| b.self_receiver_aliases())
+            .unwrap_or(&["self"])
+            .contains(&receiver)
+    }
+
+    /// Resolve a self-form call within the caller's own type: the caller's
+    /// `ClassMember { class_name: Some }` names the enclosing type, and a
+    /// same-file candidate carrying the same named evidence is its direct
+    /// member. Exactly one survivor resolves; zero or several return None
+    /// and the caller falls through to the ordinary path.
+    fn resolve_self_form_member(
+        &self,
+        from_id: SymbolId,
+        unresolved: &UnresolvedRelationship,
+    ) -> Option<ResolvedRelationship> {
+        let caller_sym = self.symbol_cache.get_ref(from_id)?;
+        let caller_file = caller_sym.file_id;
+        let enclosing = match caller_sym.scope_context.as_ref() {
+            Some(crate::symbol::ScopeContext::ClassMember {
+                class_name: Some(name),
+            }) => name.clone(),
+            _ => return None,
+        };
+        drop(caller_sym);
+
+        let mut members = self
+            .symbol_cache
+            .lookup_candidates(&unresolved.to_name)
+            .into_iter()
+            .filter(|&id| {
+                self.symbol_cache.get_ref(id).is_some_and(|sym| {
+                    sym.file_id == caller_file
+                        && matches!(
+                            sym.scope_context.as_ref(),
+                            Some(crate::symbol::ScopeContext::ClassMember {
+                                class_name: Some(name),
+                            }) if *name == enclosing
+                        )
+                })
+            });
+        match (members.next(), members.next()) {
+            (Some(to_id), None) => Some(ResolvedRelationship {
+                from_id,
+                to_id,
+                kind: unresolved.kind,
+                metadata: unresolved.metadata.clone(),
+            }),
+            _ => None,
+        }
+    }
+
     fn resolve_static_call(
         &self,
         from_id: SymbolId,
@@ -609,7 +1005,7 @@ impl ResolveStage {
         let to_id = match filtered.len() {
             0 => return None,
             1 => filtered[0],
-            _ => self.disambiguate(&filtered, unresolved, context, true)?,
+            _ => self.disambiguate(&filtered, unresolved, caller, context, true)?,
         };
         Some(ResolvedRelationship {
             from_id,
@@ -651,6 +1047,155 @@ impl ResolveStage {
         behavior.is_receiver_compatible(&candidate, receiver, caller.as_deref())
     }
 
+    /// Final acceptance for a pick made without receiver evidence.
+    ///
+    /// Scope maps and the locality ladder pick last-declared/closest, not
+    /// the right container: when the winner is one of several same-file
+    /// member symbols with the same name, the pick is a guess. Calls fail
+    /// closed (under-report, not mis-report); Defines fall back to the
+    /// definer's own contained member before failing closed. Non-member
+    /// collisions (plain-function shadowing) pass through untouched —
+    /// closest-before-call IS the scope semantics there.
+    fn accept_unwitnessed_pick(
+        &self,
+        from_id: SymbolId,
+        to_id: SymbolId,
+        unresolved: &UnresolvedRelationship,
+    ) -> Option<ResolvedRelationship> {
+        let to_id = if self.is_unwitnessed_member_pick(to_id, unresolved) {
+            if unresolved.kind != RelationKind::Defines {
+                return None;
+            }
+            self.defines_member_by_containment(from_id, unresolved)?
+        } else {
+            to_id
+        };
+        Some(ResolvedRelationship {
+            from_id,
+            to_id,
+            kind: unresolved.kind,
+            metadata: unresolved.metadata.clone(),
+        })
+    }
+
+    fn is_unwitnessed_member_pick(
+        &self,
+        to_id: SymbolId,
+        unresolved: &UnresolvedRelationship,
+    ) -> bool {
+        if !matches!(unresolved.kind, RelationKind::Calls | RelationKind::Defines) {
+            return false;
+        }
+        if unresolved
+            .metadata
+            .as_ref()
+            .is_some_and(|m| m.receiver.is_some())
+        {
+            return false;
+        }
+        let Some(winner) = self.symbol_cache.get_ref(to_id) else {
+            return false;
+        };
+        if !Self::is_member_symbol(&winner) {
+            return false;
+        }
+        let (winner_file, winner_name) = (winner.file_id, winner.name.clone());
+        drop(winner);
+        self.symbol_cache
+            .lookup_candidates(&winner_name)
+            .into_iter()
+            .filter(|&id| id != to_id)
+            .any(|id| {
+                self.symbol_cache
+                    .get_ref(id)
+                    .is_some_and(|sym| sym.file_id == winner_file && Self::is_member_symbol(&sym))
+            })
+    }
+
+    fn is_member_symbol(sym: &Symbol) -> bool {
+        sym.kind == crate::SymbolKind::Method
+            || matches!(
+                sym.scope_context,
+                Some(crate::symbol::ScopeContext::ClassMember { .. })
+            )
+    }
+
+    /// Membership pick for gated Defines: parser evidence names the
+    /// definer's own member without guessing. Evidence order:
+    ///
+    /// 1. Site identity — the edge's `to_range` is the member's
+    ///    parse-recorded location; the same-file candidate starting
+    ///    there IS the member. Disambiguates same-name members of one
+    ///    definer (field + accessor) and same-name definers in one
+    ///    file, where name evidence alone sees rival claimants.
+    /// 2. `ClassMember { class_name: Some }` matching the definer —
+    ///    direct membership regardless of span containment (rust
+    ///    members live in impl blocks outside the struct's span).
+    /// 3. Span containment plus `is_direct_member` for unnamed or
+    ///    untracked scopes.
+    ///
+    /// Exactly one survivor resolves; zero or several fail closed.
+    fn defines_member_by_containment(
+        &self,
+        from_id: SymbolId,
+        unresolved: &UnresolvedRelationship,
+    ) -> Option<SymbolId> {
+        let definer = self.symbol_cache.get_ref(from_id)?;
+        let (definer_file, definer_range) = (definer.file_id, definer.range);
+        let definer_name = definer.name.clone();
+        drop(definer);
+
+        if let Some(to_range) = unresolved.to_range {
+            let mut at_site = self
+                .symbol_cache
+                .lookup_candidates(&unresolved.to_name)
+                .into_iter()
+                .filter(|&id| {
+                    self.symbol_cache.get_ref(id).is_some_and(|sym| {
+                        sym.file_id == definer_file && sym.range.start_line == to_range.start_line
+                    })
+                });
+            if let (Some(id), None) = (at_site.next(), at_site.next()) {
+                return Some(id);
+            }
+        }
+
+        let mut contained = self
+            .symbol_cache
+            .lookup_candidates(&unresolved.to_name)
+            .into_iter()
+            .filter(|&id| {
+                let Some((member_range, member_scope)) =
+                    self.symbol_cache.get_ref(id).and_then(|sym| {
+                        (sym.file_id == definer_file)
+                            .then(|| (sym.range, sym.scope_context.clone()))
+                    })
+                else {
+                    return false;
+                };
+                if let Some(crate::symbol::ScopeContext::ClassMember {
+                    class_name: Some(class_name),
+                }) = member_scope.as_ref()
+                {
+                    return class_name.as_ref() == &*definer_name;
+                }
+                definer_range.start_line <= member_range.start_line
+                    && member_range.end_line <= definer_range.end_line
+                    && self.is_direct_member(
+                        member_scope.as_ref(),
+                        member_range,
+                        from_id,
+                        &definer_name,
+                        definer_file,
+                    )
+            });
+        let survivor = contained.next();
+        match (survivor, contained.next()) {
+            (Some(id), None) => Some(id),
+            _ => None,
+        }
+    }
+
     /// Disambiguate among multiple candidates.
     ///
     /// Priority order:
@@ -662,6 +1207,7 @@ impl ResolveStage {
         &self,
         candidates: &[SymbolId],
         unresolved: &UnresolvedRelationship,
+        caller: &CallerContext,
         context: &ResolutionContext,
         static_pre_filtered: bool,
     ) -> Option<SymbolId> {
@@ -695,21 +1241,22 @@ impl ResolveStage {
                 }
             }
         }
-        // Instance-call disambiguation via inferred parameter type: when the
-        // receiver names a parameter on the caller's signature, filter candidates
-        // to those whose containing type matches the inferred type. Zero
-        // survivors → NotFound (don't fall through to a wrong-class same-name
-        // pick); single survivor wins; multiple fall through.
+        // Instance-call disambiguation via inferred receiver type: filter
+        // candidates to those whose containing type matches. Single survivor
+        // wins; zero fail closed; multiple ALSO fail closed — the survivors
+        // are class-correct but copy-ambiguous (duplicate class copies in a
+        // corpus), and the ladder below is name-keyed first-pick, not
+        // identity evidence. An unresolved edge beats a wrong-copy or
+        // wrong-class guess.
         if unresolved.kind == RelationKind::Calls {
             if let Some(survivors) =
-                self.filter_by_instance_receiver_type(&filtered, unresolved, language_id)
+                self.filter_by_instance_receiver_type(&filtered, unresolved, language_id, context)
             {
-                match survivors.len() {
-                    1 => return Some(survivors[0]),
-                    0 => return None,
-                    _ => {}
-                }
-            } else if self.has_uninferrable_instance_receiver(unresolved, language_id) {
+                return match survivors.len() {
+                    1 => Some(survivors[0]),
+                    _ => None,
+                };
+            } else if self.has_uninferrable_instance_receiver(unresolved, language_id, context) {
                 // Receiver present, type unknown: an unresolved edge beats
                 // a first-pick guess from the priority ladder below.
                 return None;
@@ -766,7 +1313,54 @@ impl ResolveStage {
             return Some(language_matches[0]);
         }
         if !language_matches.is_empty() {
-            return Some(language_matches[0]);
+            // Multiple same-language candidates with no local, import, or
+            // receiver evidence: module identity is the only evidence left.
+            // Exactly one same-module survivor wins; anything else is a
+            // first-pick over unimported cross-module copies — fail closed.
+            let same_module: Vec<SymbolId> = language_matches
+                .iter()
+                .copied()
+                .filter(|&id| {
+                    self.symbol_cache
+                        .get_ref(id)
+                        .is_some_and(|sym| caller.is_same_module(sym.module_path.as_deref()))
+                })
+                .collect();
+            if same_module.len() == 1 {
+                // Module identity alone cannot pick a class member: a name
+                // reaching this arm receiver-less has no instance of the
+                // survivor's class, and a `this`/instance receiver reaching
+                // it never passed class matching (the self-form and instance
+                // filters missed). Members fail closed. Exception: the
+                // static fall-through — `Type::name` calls whose class-match
+                // filter left multiple class-correct copies — keeps the
+                // same-module tiebreak (receiver type IS class evidence).
+                use crate::symbol::ScopeContext;
+                // Kind check alongside scope: parsers leave scope_context
+                // None on some members (kotlin suspend members among the
+                // census's 120 scope_none rows), and those slipped a
+                // scope-only gate to wrong cross-file member picks.
+                let is_member = self
+                    .symbol_cache
+                    .get_ref(same_module[0])
+                    .is_some_and(|sym| {
+                        matches!(
+                            sym.kind,
+                            crate::SymbolKind::Method | crate::SymbolKind::Field
+                        ) || matches!(sym.scope_context, Some(ScopeContext::ClassMember { .. }))
+                    });
+                let class_evidenced_static = unresolved
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|m| m.static_call && m.receiver.is_some())
+                    && self
+                        .filter_by_static_receiver(&same_module, unresolved, language_id)
+                        .is_some_and(|s| s.len() == 1);
+                if !is_member || class_evidenced_static {
+                    return Some(same_module[0]);
+                }
+            }
+            return None;
         }
 
         // No appropriate match found - don't resolve cross-language
@@ -893,6 +1487,15 @@ impl ResolveStage {
     }
 }
 
+fn starts_before(a: &crate::Range, b: &crate::Range) -> bool {
+    (a.start_line, a.start_column) < (b.start_line, b.start_column)
+}
+
+fn range_contains(outer: &crate::Range, inner: &crate::Range) -> bool {
+    (outer.start_line, outer.start_column) <= (inner.start_line, inner.start_column)
+        && (inner.end_line, inner.end_column) <= (outer.end_line, outer.end_column)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -935,6 +1538,7 @@ mod tests {
             local_symbols,
             scope: Box::new(NoOpScope),
             unresolved_rels,
+            variable_bindings: vec![],
         }
     }
 
@@ -1008,6 +1612,396 @@ mod tests {
         fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
             self
         }
+    }
+
+    fn make_member(
+        id: u32,
+        name: &str,
+        file_id: u32,
+        lang: LanguageId,
+        start: u32,
+        end: u32,
+    ) -> Symbol {
+        let mut sym = make_symbol(id, name, file_id, lang);
+        sym.kind = SymbolKind::Method;
+        sym.range = Range::new(start, 0, end, 1);
+        sym
+    }
+
+    /// Caller + three same-file same-name methods (the lua
+    /// `createObject` shape: Config:new / Container:new / Vector:new).
+    fn member_collision_cache() -> Arc<SymbolLookupCache> {
+        let lua = LanguageId::new("lua");
+        let cache = Arc::new(SymbolLookupCache::new());
+        let mut caller = make_symbol(1, "createObject", 1, lua);
+        caller.range = Range::new(300, 0, 316, 1);
+        cache.insert(caller);
+        cache.insert(make_member(2, "new", 1, lua, 100, 110));
+        cache.insert(make_member(3, "new", 1, lua, 150, 160));
+        cache.insert(make_member(4, "new", 1, lua, 252, 260));
+        cache
+    }
+
+    #[test]
+    fn metadataless_call_frozen_scope_winner_fails_closed() {
+        // The scope map hands back the last-declared same-name member; with
+        // no receiver evidence and two rivals in the winner's file, the pick
+        // is a guess and must fail closed.
+        let lua = LanguageId::new("lua");
+        let cache = member_collision_cache();
+        let stage = make_stage(cache);
+
+        let mut rel = make_unresolved(1, "new", 1, RelationKind::Calls);
+        rel.to_range = Some(Range::new(308, 8, 308, 20));
+        let mut context = make_context(1, lua, vec![SymbolId::new(1).unwrap()], vec![rel]);
+        let mut map = std::collections::HashMap::new();
+        map.insert("new".to_string(), SymbolId::new(4).unwrap());
+        context.scope = Box::new(MapScope(map));
+
+        let (batch, stats) = stage.resolve(&context);
+
+        assert_eq!(stats.resolved, 0, "member collision must not resolve");
+        assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn metadataless_call_member_collision_ladder_fails_closed() {
+        // Same collision through the cache tiers: Ambiguous -> disambiguate
+        // must not fall back to closest-by-range among member candidates.
+        let lua = LanguageId::new("lua");
+        let cache = member_collision_cache();
+        let stage = make_stage(cache);
+
+        let mut rel = make_unresolved(1, "new", 1, RelationKind::Calls);
+        rel.to_range = Some(Range::new(308, 8, 308, 20));
+        let context = make_context(1, lua, vec![SymbolId::new(1).unwrap()], vec![rel]);
+
+        let (batch, stats) = stage.resolve(&context);
+
+        assert_eq!(stats.resolved, 0, "ladder must not re-guess a gated pick");
+        assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn plain_function_shadowing_still_resolves() {
+        // Two same-file same-name FUNCTIONS are genuine shadowing;
+        // closest-before-call is the scope semantics, not a guess.
+        let lua = LanguageId::new("lua");
+        let cache = Arc::new(SymbolLookupCache::new());
+        cache.insert(make_symbol(1, "caller", 1, lua));
+        let mut early = make_symbol(2, "helper", 1, lua);
+        early.range = Range::new(1, 0, 2, 1);
+        cache.insert(early);
+        let mut late = make_symbol(3, "helper", 1, lua);
+        late.range = Range::new(3, 0, 4, 1);
+        cache.insert(late);
+        let stage = make_stage(cache);
+
+        let rel = make_unresolved(1, "helper", 1, RelationKind::Calls);
+        let context = make_context(1, lua, vec![SymbolId::new(1).unwrap()], vec![rel]);
+
+        let (batch, stats) = stage.resolve(&context);
+
+        assert_eq!(stats.resolved, 1, "function shadowing must keep resolving");
+        assert_eq!(batch.relationships[0].to_id, SymbolId::new(3).unwrap());
+    }
+
+    #[test]
+    fn single_member_candidate_still_resolves() {
+        let lua = LanguageId::new("lua");
+        let cache = Arc::new(SymbolLookupCache::new());
+        cache.insert(make_symbol(1, "caller", 1, lua));
+        cache.insert(make_member(2, "init", 1, lua, 100, 110));
+        let stage = make_stage(cache);
+
+        let rel = make_unresolved(1, "init", 1, RelationKind::Calls);
+        let mut context = make_context(1, lua, vec![SymbolId::new(1).unwrap()], vec![rel]);
+        let mut map = std::collections::HashMap::new();
+        map.insert("init".to_string(), SymbolId::new(2).unwrap());
+        context.scope = Box::new(MapScope(map));
+
+        let (batch, stats) = stage.resolve(&context);
+
+        assert_eq!(stats.resolved, 1, "unambiguous member must keep resolving");
+        assert_eq!(batch.relationships[0].to_id, SymbolId::new(2).unwrap());
+    }
+
+    #[test]
+    fn defines_collision_resolves_to_definer_own_member() {
+        // Base(5..25) __init__@10..20; Derived(35..55) __init__@40..50.
+        // Defines from Derived through a scope map frozen on Base's member
+        // must land on Derived's own member (containment + direct
+        // membership), not the frozen winner.
+        let python = LanguageId::new("python");
+        let cache = Arc::new(SymbolLookupCache::new());
+        let mut base = make_symbol(5, "Base", 1, python);
+        base.kind = SymbolKind::Class;
+        base.range = Range::new(5, 0, 25, 1);
+        cache.insert(base);
+        cache.insert(make_member(2, "__init__", 1, python, 10, 20));
+        let mut derived = make_symbol(3, "Derived", 1, python);
+        derived.kind = SymbolKind::Class;
+        derived.range = Range::new(35, 0, 55, 1);
+        cache.insert(derived);
+        cache.insert(make_member(4, "__init__", 1, python, 40, 50));
+        let stage = make_stage(cache);
+
+        let mut rel = make_unresolved(3, "__init__", 1, RelationKind::Defines);
+        rel.to_range = Some(Range::new(40, 0, 50, 1));
+        let mut context = make_context(1, python, vec![SymbolId::new(3).unwrap()], vec![rel]);
+        let mut map = std::collections::HashMap::new();
+        map.insert("__init__".to_string(), SymbolId::new(2).unwrap());
+        context.scope = Box::new(MapScope(map));
+
+        let (batch, stats) = stage.resolve(&context);
+
+        assert_eq!(stats.resolved, 1, "defines must resolve via containment");
+        assert_eq!(
+            batch.relationships[0].to_id,
+            SymbolId::new(4).unwrap(),
+            "must be the definer's own member, not the frozen winner"
+        );
+    }
+
+    #[test]
+    fn defines_collision_without_contained_member_fails_closed() {
+        let python = LanguageId::new("python");
+        let cache = Arc::new(SymbolLookupCache::new());
+        cache.insert(make_member(2, "__init__", 1, python, 10, 20));
+        cache.insert(make_member(4, "__init__", 1, python, 40, 50));
+        let mut definer = make_symbol(3, "Empty", 1, python);
+        definer.kind = SymbolKind::Class;
+        definer.range = Range::new(60, 0, 70, 1);
+        cache.insert(definer);
+        let stage = make_stage(cache);
+
+        let mut rel = make_unresolved(3, "__init__", 1, RelationKind::Defines);
+        rel.to_range = Some(Range::new(60, 0, 70, 1));
+        let mut context = make_context(1, python, vec![SymbolId::new(3).unwrap()], vec![rel]);
+        let mut map = std::collections::HashMap::new();
+        map.insert("__init__".to_string(), SymbolId::new(2).unwrap());
+        context.scope = Box::new(MapScope(map));
+
+        let (batch, stats) = stage.resolve(&context);
+
+        assert_eq!(stats.resolved, 0, "no contained member: fail closed");
+        assert!(batch.is_empty());
+    }
+
+    /// The rust witness shape: struct spans hold only the declaration;
+    /// members live in impl blocks OUTSIDE the span, carrying
+    /// `ClassMember { class_name: Some }` as the membership evidence.
+    fn rust_impl_member_cache() -> Arc<SymbolLookupCache> {
+        let rust = LanguageId::new("rust");
+        let cache = Arc::new(SymbolLookupCache::new());
+        let mut method_call = make_symbol(1, "MethodCall", 1, rust);
+        method_call.kind = SymbolKind::Struct;
+        method_call.range = Range::new(62, 0, 70, 1);
+        cache.insert(method_call);
+        let mut resolver = make_symbol(3, "MethodCallResolver", 1, rust);
+        resolver.kind = SymbolKind::Struct;
+        resolver.range = Range::new(205, 0, 210, 1);
+        cache.insert(resolver);
+        let mut new_a = make_member(2, "new", 1, rust, 100, 110);
+        new_a.scope_context = Some(crate::symbol::ScopeContext::ClassMember {
+            class_name: Some("MethodCall".into()),
+        });
+        cache.insert(new_a);
+        let mut new_b = make_member(4, "new", 1, rust, 214, 220);
+        new_b.scope_context = Some(crate::symbol::ScopeContext::ClassMember {
+            class_name: Some("MethodCallResolver".into()),
+        });
+        cache.insert(new_b);
+        cache
+    }
+
+    #[test]
+    fn rust_defines_rescue_reaches_impl_member_outside_span() {
+        // Defines from MethodCallResolver, scope map frozen on the OTHER
+        // struct's `new`. The definer's own member sits outside its span
+        // but carries named ClassMember evidence — rescue must re-target
+        // onto it instead of dropping.
+        let rust = LanguageId::new("rust");
+        let cache = rust_impl_member_cache();
+        let stage = make_stage(cache);
+
+        let mut rel = make_unresolved(3, "new", 1, RelationKind::Defines);
+        rel.to_range = Some(Range::new(214, 0, 220, 1));
+        let mut context = make_context(1, rust, vec![SymbolId::new(3).unwrap()], vec![rel]);
+        let mut map = std::collections::HashMap::new();
+        map.insert("new".to_string(), SymbolId::new(2).unwrap());
+        context.scope = Box::new(MapScope(map));
+
+        let (batch, stats) = stage.resolve(&context);
+
+        assert_eq!(
+            stats.resolved, 1,
+            "named ClassMember evidence must rescue the gated Defines"
+        );
+        assert_eq!(
+            batch.relationships[0].to_id,
+            SymbolId::new(4).unwrap(),
+            "must be the definer's own impl member"
+        );
+    }
+
+    #[test]
+    fn rust_defines_witness_pair_each_struct_names_own_member() {
+        // Both structs' Defines in one pass, both frozen on the same
+        // winner: each must land its OWN impl member, never a cross-pick.
+        let rust = LanguageId::new("rust");
+        let cache = rust_impl_member_cache();
+        let stage = make_stage(cache);
+
+        let mut rel_a = make_unresolved(1, "new", 1, RelationKind::Defines);
+        rel_a.to_range = Some(Range::new(100, 0, 110, 1));
+        let mut rel_b = make_unresolved(3, "new", 1, RelationKind::Defines);
+        rel_b.to_range = Some(Range::new(214, 0, 220, 1));
+        let mut context = make_context(
+            1,
+            rust,
+            vec![SymbolId::new(1).unwrap(), SymbolId::new(3).unwrap()],
+            vec![rel_a, rel_b],
+        );
+        let mut map = std::collections::HashMap::new();
+        map.insert("new".to_string(), SymbolId::new(2).unwrap());
+        context.scope = Box::new(MapScope(map));
+
+        let (batch, stats) = stage.resolve(&context);
+
+        assert_eq!(stats.resolved, 2, "both gated Defines must rescue");
+        let pairs: Vec<(u32, u32)> = batch
+            .relationships
+            .iter()
+            .map(|r| (r.from_id.value(), r.to_id.value()))
+            .collect();
+        assert!(pairs.contains(&(1, 2)), "MethodCall defines its own new");
+        assert!(
+            pairs.contains(&(3, 4)),
+            "MethodCallResolver defines its own new"
+        );
+    }
+
+    #[test]
+    fn self_form_call_resolves_within_enclosing_type() {
+        // Shape::display calls self-form `area()`; three same-file `area`
+        // members (Shape/Circle/Rectangle), scope frozen on Rectangle's.
+        // The caller's own ClassMember evidence names Shape — the call
+        // must land on Shape's member, not the frozen winner.
+        let lang = LanguageId::new("python");
+        let cache = Arc::new(SymbolLookupCache::new());
+        let mut display = make_member(1, "display", 1, lang, 57, 60);
+        display.scope_context = Some(crate::symbol::ScopeContext::ClassMember {
+            class_name: Some("Shape".into()),
+        });
+        cache.insert(display);
+        for (id, class, line) in [(2, "Shape", 46), (3, "Circle", 83), (4, "Rectangle", 111)] {
+            let mut m = make_member(id, "area", 1, lang, line, line + 2);
+            m.scope_context = Some(crate::symbol::ScopeContext::ClassMember {
+                class_name: Some(class.into()),
+            });
+            cache.insert(m);
+        }
+        let stage = make_stage(cache);
+
+        let mut rel = make_instance_call(1, "area", 1, "self");
+        rel.to_range = Some(Range::new(58, 8, 58, 20));
+        let mut context = make_context(1, lang, vec![SymbolId::new(1).unwrap()], vec![rel]);
+        let mut map = std::collections::HashMap::new();
+        map.insert("area".to_string(), SymbolId::new(4).unwrap());
+        context.scope = Box::new(MapScope(map));
+
+        let (batch, stats) = stage.resolve(&context);
+
+        assert_eq!(stats.resolved, 1, "self-form member call must resolve");
+        assert_eq!(
+            batch.relationships[0].to_id,
+            SymbolId::new(2).unwrap(),
+            "must be the enclosing type's own member, not the frozen winner"
+        );
+    }
+
+    #[test]
+    fn self_form_miss_falls_through_to_existing_path() {
+        // Enclosing type has no such member: the self-form arm must not
+        // fail the call closed — implicit-this languages emit the alias
+        // for free-function calls too, and the plain path still applies.
+        let lang = LanguageId::new("python");
+        let cache = Arc::new(SymbolLookupCache::new());
+        let mut caller = make_member(1, "display", 1, lang, 57, 60);
+        caller.scope_context = Some(crate::symbol::ScopeContext::ClassMember {
+            class_name: Some("Shape".into()),
+        });
+        cache.insert(caller);
+        cache.insert(make_symbol(2, "helper", 1, lang));
+        let stage = make_stage(cache);
+
+        let mut rel = make_instance_call(1, "helper", 1, "self");
+        rel.to_range = Some(Range::new(58, 8, 58, 20));
+        let mut context = make_context(1, lang, vec![SymbolId::new(1).unwrap()], vec![rel]);
+        let mut map = std::collections::HashMap::new();
+        map.insert("helper".to_string(), SymbolId::new(2).unwrap());
+        context.scope = Box::new(MapScope(map));
+
+        let (batch, stats) = stage.resolve(&context);
+
+        assert_eq!(stats.resolved, 1, "arm miss keeps the existing path");
+        assert_eq!(batch.relationships[0].to_id, SymbolId::new(2).unwrap());
+    }
+
+    #[test]
+    fn rust_defines_field_and_accessor_both_resolve_by_site() {
+        // One struct owns BOTH a field `state` (inside its span) and an
+        // accessor method `state` (in the impl block, outside). Two true
+        // Defines edges; each carries the member's parse-recorded
+        // to_range. Both must resolve to their own site — name evidence
+        // alone sees two claimants and would fail closed.
+        let rust = LanguageId::new("rust");
+        let cache = Arc::new(SymbolLookupCache::new());
+        let mut owner = make_symbol(1, "CBehavior", 1, rust);
+        owner.kind = SymbolKind::Struct;
+        owner.range = Range::new(12, 0, 20, 1);
+        cache.insert(owner);
+        let mut field = make_member(2, "state", 1, rust, 14, 14);
+        field.kind = SymbolKind::Field;
+        field.scope_context = Some(crate::symbol::ScopeContext::ClassMember {
+            class_name: Some("CBehavior".into()),
+        });
+        cache.insert(field);
+        let mut accessor = make_member(3, "state", 1, rust, 100, 105);
+        accessor.scope_context = Some(crate::symbol::ScopeContext::ClassMember {
+            class_name: Some("CBehavior".into()),
+        });
+        cache.insert(accessor);
+        let stage = make_stage(cache);
+
+        let mut field_rel = make_unresolved(1, "state", 1, RelationKind::Defines);
+        field_rel.to_range = Some(Range::new(14, 4, 14, 20));
+        let mut accessor_rel = make_unresolved(1, "state", 1, RelationKind::Defines);
+        accessor_rel.to_range = Some(Range::new(100, 4, 105, 5));
+        let mut context = make_context(
+            1,
+            rust,
+            vec![SymbolId::new(1).unwrap()],
+            vec![field_rel, accessor_rel],
+        );
+        let mut map = std::collections::HashMap::new();
+        map.insert("state".to_string(), SymbolId::new(2).unwrap());
+        context.scope = Box::new(MapScope(map));
+
+        let (batch, stats) = stage.resolve(&context);
+
+        assert_eq!(stats.resolved, 2, "both member edges must resolve by site");
+        let pairs: Vec<(u32, u32)> = batch
+            .relationships
+            .iter()
+            .map(|r| (r.from_id.value(), r.to_id.value()))
+            .collect();
+        assert!(pairs.contains(&(1, 2)), "field edge lands on the field");
+        assert!(
+            pairs.contains(&(1, 3)),
+            "accessor edge lands on the accessor"
+        );
     }
 
     /// class A: def m (5..25, m at 10..20); class B(A): def m (35..55,
@@ -1420,6 +2414,311 @@ mod tests {
 
         assert_eq!(stats.resolved, 1, "cls resolves, untyped local does not");
         assert_eq!(batch.relationships[0].to_id, SymbolId::new(2).unwrap());
+    }
+
+    #[test]
+    fn constructor_bound_local_resolves_via_binding_last_wins() {
+        // m = Other(...); m = Model(...); m.dump() — the last binding before
+        // the call names the type; the same-name method on Other loses.
+        let python = LanguageId::new("python");
+        let cache = Arc::new(SymbolLookupCache::new());
+        cache.insert(make_symbol(1, "use_model", 1, python));
+        for (id, class) in [(2u32, "Model"), (3u32, "Other")] {
+            let mut method = make_symbol(id, "dump", 1, python);
+            method.kind = SymbolKind::Method;
+            method.scope_context = Some(crate::symbol::ScopeContext::ClassMember {
+                class_name: Some(class.into()),
+            });
+            cache.insert(method);
+        }
+
+        let behaviors: HashMap<LanguageId, StdArc<dyn LanguageBehavior>> = HashMap::from([(
+            python,
+            StdArc::new(crate::parsing::python::PythonBehavior::new())
+                as StdArc<dyn LanguageBehavior>,
+        )]);
+        let stage = ResolveStage::new(cache, behaviors);
+        let mut context = make_context(
+            1,
+            python,
+            vec![
+                SymbolId::new(1).unwrap(),
+                SymbolId::new(2).unwrap(),
+                SymbolId::new(3).unwrap(),
+            ],
+            vec![make_instance_call(1, "dump", 1, "m")],
+        );
+        context.variable_bindings = vec![
+            crate::indexing::pipeline::VariableBinding {
+                name: "m".into(),
+                type_name: "Other".into(),
+                range: Range::new(2, 4, 2, 20),
+            },
+            crate::indexing::pipeline::VariableBinding {
+                name: "m".into(),
+                type_name: "Model".into(),
+                range: Range::new(4, 4, 4, 20),
+            },
+        ];
+
+        let (batch, stats) = stage.resolve(&context);
+
+        assert_eq!(stats.resolved, 1, "constructor-typed local resolves");
+        assert_eq!(
+            batch.relationships[0].to_id,
+            SymbolId::new(2).unwrap(),
+            "last binding before the call wins"
+        );
+    }
+
+    fn make_class(id: u32, name: &str, file_id: u32, lang: LanguageId) -> Symbol {
+        let mut sym = make_symbol(id, name, file_id, lang);
+        sym.kind = SymbolKind::Class;
+        sym
+    }
+
+    fn make_extends(
+        from_id: u32,
+        from_name: &str,
+        to_name: &str,
+        file_id: u32,
+    ) -> UnresolvedRelationship {
+        UnresolvedRelationship {
+            from_id: Some(SymbolId::new(from_id).unwrap()),
+            from_name: StdArc::from(from_name),
+            to_name: StdArc::from(to_name),
+            file_id: FileId::new(file_id).unwrap(),
+            kind: RelationKind::Extends,
+            metadata: None,
+            to_range: None,
+        }
+    }
+
+    fn python_stage_with_class_scope(
+        cache: Arc<SymbolLookupCache>,
+    ) -> (ResolveStage, Box<MapScope>) {
+        let python = LanguageId::new("python");
+        let behaviors: HashMap<LanguageId, StdArc<dyn LanguageBehavior>> = HashMap::from([(
+            python,
+            StdArc::new(crate::parsing::python::PythonBehavior::new())
+                as StdArc<dyn LanguageBehavior>,
+        )]);
+        let scope = Box::new(MapScope(std::collections::HashMap::from([
+            ("Model".to_string(), SymbolId::new(10).unwrap()),
+            ("Base".to_string(), SymbolId::new(11).unwrap()),
+        ])));
+        (ResolveStage::new(cache, behaviors), scope)
+    }
+
+    fn model_binding() -> crate::indexing::pipeline::VariableBinding {
+        crate::indexing::pipeline::VariableBinding {
+            name: "m".into(),
+            type_name: "Model".into(),
+            range: Range::new(3, 4, 3, 20),
+        }
+    }
+
+    #[test]
+    fn inherited_member_resolves_through_extends_chain() {
+        // m = Model(); m.dump() where only Base defines dump and Model
+        // extends Base: the identity chain (scope-resolved Model -> its
+        // Extends edge -> scope-resolved Base) names Base.dump; the
+        // same-name member on an unrelated class stays excluded.
+        let python = LanguageId::new("python");
+        let cache = Arc::new(SymbolLookupCache::new());
+        cache.insert(make_symbol(1, "use_model", 1, python));
+        for (id, class) in [(2u32, "Base"), (3u32, "Rogue")] {
+            let mut method = make_symbol(id, "dump", 1, python);
+            method.kind = SymbolKind::Method;
+            method.scope_context = Some(crate::symbol::ScopeContext::ClassMember {
+                class_name: Some(class.into()),
+            });
+            cache.insert(method);
+        }
+        cache.insert(make_class(10, "Model", 1, python));
+        cache.insert(make_class(11, "Base", 1, python));
+
+        let (stage, scope) = python_stage_with_class_scope(Arc::clone(&cache));
+        let context = ResolutionContext {
+            file_id: FileId::new(1).unwrap(),
+            language_id: python,
+            imports: vec![],
+            local_symbols: vec![
+                SymbolId::new(1).unwrap(),
+                SymbolId::new(2).unwrap(),
+                SymbolId::new(3).unwrap(),
+            ],
+            scope,
+            unresolved_rels: vec![
+                make_instance_call(1, "dump", 1, "m"),
+                make_extends(10, "Model", "Base", 1),
+            ],
+            variable_bindings: vec![model_binding()],
+        };
+
+        let (batch, stats) = stage.resolve(&context);
+
+        assert_eq!(
+            stats.calls_resolved, 1,
+            "inherited member resolves via chain"
+        );
+        let call = batch
+            .relationships
+            .iter()
+            .find(|r| r.kind == RelationKind::Calls)
+            .expect("calls edge present");
+        assert_eq!(
+            call.to_id,
+            SymbolId::new(2).unwrap(),
+            "Base.dump wins over the unrelated same-name member"
+        );
+    }
+
+    #[test]
+    fn inherited_member_resolves_cross_file_without_import() {
+        // m = Model(); m.model_dump() in a file that never imports the
+        // member: the typed-receiver global lookup walks the identity chain
+        // and finds the parent-file member; the same-name method on an
+        // off-chain class stays excluded.
+        let python = LanguageId::new("python");
+        let cache = Arc::new(SymbolLookupCache::new());
+        cache.insert(make_symbol(1, "test_repr", 1, python));
+        let mut base_dump = make_symbol(2, "model_dump", 2, python);
+        base_dump.kind = SymbolKind::Method;
+        base_dump.scope_context = Some(crate::symbol::ScopeContext::ClassMember {
+            class_name: Some("Base".into()),
+        });
+        cache.insert(base_dump);
+        let mut rogue_dump = make_symbol(3, "model_dump", 3, python);
+        rogue_dump.kind = SymbolKind::Method;
+        rogue_dump.scope_context = Some(crate::symbol::ScopeContext::ClassMember {
+            class_name: Some("Rogue".into()),
+        });
+        cache.insert(rogue_dump);
+        cache.insert(make_class(10, "Model", 1, python));
+        cache.insert(make_class(11, "Base", 2, python));
+
+        let (stage, scope) = python_stage_with_class_scope(Arc::clone(&cache));
+        let context = ResolutionContext {
+            file_id: FileId::new(1).unwrap(),
+            language_id: python,
+            imports: vec![],
+            local_symbols: vec![SymbolId::new(1).unwrap()],
+            scope,
+            unresolved_rels: vec![
+                make_instance_call(1, "model_dump", 1, "m"),
+                make_extends(10, "Model", "Base", 1),
+            ],
+            variable_bindings: vec![model_binding()],
+        };
+
+        let (batch, stats) = stage.resolve(&context);
+
+        assert_eq!(
+            stats.calls_resolved, 1,
+            "cross-file inherited member resolves"
+        );
+        let call = batch
+            .relationships
+            .iter()
+            .find(|r| r.kind == RelationKind::Calls)
+            .expect("calls edge present");
+        assert_eq!(call.to_id, SymbolId::new(2).unwrap());
+    }
+
+    #[test]
+    fn own_override_shadows_inherited_member() {
+        // Both Model and Base define dump; Model extends Base; m = Model()
+        // resolves to Model.dump (distance 0 beats the live chain).
+        let python = LanguageId::new("python");
+        let cache = Arc::new(SymbolLookupCache::new());
+        cache.insert(make_symbol(1, "use_model", 1, python));
+        for (id, class) in [(2u32, "Model"), (3u32, "Base")] {
+            let mut method = make_symbol(id, "dump", 1, python);
+            method.kind = SymbolKind::Method;
+            method.scope_context = Some(crate::symbol::ScopeContext::ClassMember {
+                class_name: Some(class.into()),
+            });
+            cache.insert(method);
+        }
+        cache.insert(make_class(10, "Model", 1, python));
+        cache.insert(make_class(11, "Base", 1, python));
+
+        let (stage, scope) = python_stage_with_class_scope(Arc::clone(&cache));
+        let context = ResolutionContext {
+            file_id: FileId::new(1).unwrap(),
+            language_id: python,
+            imports: vec![],
+            local_symbols: vec![
+                SymbolId::new(1).unwrap(),
+                SymbolId::new(2).unwrap(),
+                SymbolId::new(3).unwrap(),
+            ],
+            scope,
+            unresolved_rels: vec![
+                make_instance_call(1, "dump", 1, "m"),
+                make_extends(10, "Model", "Base", 1),
+            ],
+            variable_bindings: vec![model_binding()],
+        };
+
+        let (batch, stats) = stage.resolve(&context);
+
+        assert_eq!(stats.calls_resolved, 1);
+        let call = batch
+            .relationships
+            .iter()
+            .find(|r| r.kind == RelationKind::Calls)
+            .expect("calls edge present");
+        assert_eq!(
+            call.to_id,
+            SymbolId::new(2).unwrap(),
+            "the concrete type's own override shadows the inherited member"
+        );
+    }
+
+    #[test]
+    fn nested_scope_binding_does_not_leak_to_outer_caller() {
+        // A binding inside a nested def is not evidence for the enclosing
+        // caller's receiver; without usable evidence the call fails closed.
+        let python = LanguageId::new("python");
+        let cache = Arc::new(SymbolLookupCache::new());
+        cache.insert(make_symbol(1, "use_model", 1, python));
+        let mut inner = make_symbol(4, "inner", 1, python);
+        inner.range = Range::new(2, 0, 4, 1);
+        cache.insert(inner);
+        let mut method = make_symbol(2, "dump", 1, python);
+        method.kind = SymbolKind::Method;
+        method.scope_context = Some(crate::symbol::ScopeContext::ClassMember {
+            class_name: Some("Model".into()),
+        });
+        cache.insert(method);
+
+        let behaviors: HashMap<LanguageId, StdArc<dyn LanguageBehavior>> = HashMap::from([(
+            python,
+            StdArc::new(crate::parsing::python::PythonBehavior::new())
+                as StdArc<dyn LanguageBehavior>,
+        )]);
+        let stage = ResolveStage::new(cache, behaviors);
+        let mut context = make_context(
+            1,
+            python,
+            vec![
+                SymbolId::new(1).unwrap(),
+                SymbolId::new(2).unwrap(),
+                SymbolId::new(4).unwrap(),
+            ],
+            vec![make_instance_call(1, "dump", 1, "m")],
+        );
+        context.variable_bindings = vec![crate::indexing::pipeline::VariableBinding {
+            name: "m".into(),
+            type_name: "Model".into(),
+            range: Range::new(3, 4, 3, 20),
+        }];
+
+        let (_, stats) = stage.resolve(&context);
+
+        assert_eq!(stats.resolved, 0, "nested-scope binding must not leak");
     }
 
     #[test]

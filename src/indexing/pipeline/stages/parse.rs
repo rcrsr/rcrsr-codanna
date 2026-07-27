@@ -230,6 +230,19 @@ fn parse_with_parser(
     // Extract relationships
     let raw_relationships = extract_relationships(parser, &content.content);
 
+    // Typed local bindings feed receiver-type inference in Phase 2
+    let variable_bindings = parser
+        .find_variable_types(&content.content)
+        .into_iter()
+        .map(
+            |(name, type_name, range)| crate::indexing::pipeline::VariableBinding {
+                name: name.to_string(),
+                type_name: type_name.to_string(),
+                range,
+            },
+        )
+        .collect();
+
     Ok(ParsedFile {
         path: content.path,
         content_hash: content.hash,
@@ -238,6 +251,7 @@ fn parse_with_parser(
         raw_symbols,
         raw_imports,
         raw_relationships,
+        variable_bindings,
     })
 }
 
@@ -350,24 +364,41 @@ fn extract_relationships(parser: &mut dyn LanguageParser, content: &str) -> Vec<
         );
     }
 
+    // Method-channel records end here; the bare-segment absorb below is
+    // scoped to them — plain-vs-plain must not absorb (a nested
+    // `foo(Bar::foo())` keeps both records).
+    let method_records = relationships.len();
+
     // Plain function calls (legacy - no caller_range available)
     for (caller, called, call_site) in parser.find_calls(content) {
-        // Avoid duplicates - method_calls should be comprehensive
-        // but some parsers might return both
-        let already_exists = relationships.iter().any(|r| {
+        // Method-call records absorb their plain-call twins. Parsers that
+        // visit a scoped call (`Type::method`) in both find_calls (full
+        // path) and find_method_calls (bare name + receiver) emit two
+        // records for one site; verbatim comparison alone misses the
+        // qualified form, so the method-call record also absorbs on
+        // last-`::`-segment match at the same call-site line.
+        let bare = called.rsplit_once("::").map_or(called, |(_, tail)| tail);
+        let already_exists = relationships.iter().enumerate().any(|(i, r)| {
             r.from_name.as_ref() == caller
-                && r.to_name.as_ref() == called
                 && r.to_range.start_line == call_site.start_line
+                && (r.to_name.as_ref() == called
+                    || (i < method_records && r.to_name.as_ref() == bare))
         });
         if !already_exists {
             // from_range = call_site triggers fallback to name-only lookup in COLLECT
-            relationships.push(RawRelationship::new(
-                caller,
-                call_site, // no caller_range available, use call_site
-                called,
-                call_site, // to_range = call site
-                crate::RelationKind::Calls,
-            ));
+            relationships.push(
+                RawRelationship::new(
+                    caller,
+                    call_site, // no caller_range available, use call_site
+                    called,
+                    call_site, // to_range = call site
+                    crate::RelationKind::Calls,
+                )
+                .with_metadata(
+                    crate::relationship::RelationshipMetadata::new()
+                        .at_position(call_site.start_line, call_site.start_column),
+                ),
+            );
         }
     }
 
@@ -626,6 +657,53 @@ fn add_items() {
             !meta.static_call,
             "static_call must be false for instance method calls"
         );
+    }
+
+    #[test]
+    fn test_qualified_call_twin_absorbed_by_method_call() {
+        let settings = Arc::new(Settings::default());
+        init_parser_cache(settings.clone());
+
+        let content = FileContent::new(
+            "test.rs".into(),
+            r#"
+pub struct Alpha;
+impl Alpha {
+    pub fn new() -> Self { Alpha }
+}
+pub struct Beta;
+impl Beta {
+    pub fn new() -> Self { Beta }
+}
+fn build_alpha() {
+    let _a = Alpha::new();
+}
+"#
+            .to_string(),
+            "twin_hash".to_string(),
+        );
+
+        let parsed = parse_file(content, &settings).unwrap();
+        let calls: Vec<_> = parsed
+            .raw_relationships
+            .iter()
+            .filter(|r| {
+                r.from_name.as_ref() == "build_alpha" && r.kind == crate::RelationKind::Calls
+            })
+            .collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "one call site must persist one edge; qualified plain-call twin must be absorbed: {calls:?}"
+        );
+        let rel = calls[0];
+        assert_eq!(rel.to_name.as_ref(), "new");
+        let meta = rel
+            .metadata
+            .as_ref()
+            .expect("surviving edge is the receiver-carrying record");
+        assert_eq!(meta.receiver.as_deref(), Some("Alpha"));
+        assert!(meta.static_call);
     }
 
     #[test]

@@ -5,9 +5,11 @@ use std::sync::Arc;
 use codanna::config::Settings;
 use codanna::indexing::facade::IndexFacade;
 use codanna::mcp::{
-    AnalyzeImpactRequest, CodeIntelligenceServer, GetIndexInfoRequest, ReindexRequest,
+    AnalyzeImpactRequest, CallerFilter, CodeIntelligenceServer, FindCallersRequest,
+    FindSymbolRequest, GetCallsRequest, GetIndexInfoRequest, GroupBy, OutputFormat, ReindexRequest,
     SearchDocumentsRequest, SearchSymbolsRequest, SemanticSearchRequest,
 };
+use rmcp::handler::server::wrapper::Parameters;
 use tempfile::TempDir;
 use tokio::sync::RwLock;
 
@@ -503,4 +505,590 @@ fn call_tool_result_json(result: &rmcp::model::CallToolResult) -> serde_json::Va
         .find_map(|block| block.as_text().map(|t| t.text.clone()))
         .expect("CallToolResult must contain a text content block");
     serde_json::from_str(&text).expect("tool JSON output must parse as valid JSON")
+}
+
+/// Extract the raw text of the single content block out of a
+/// `CallToolResult` produced by `output_format: Text` (default) tool
+/// calls, without attempting a JSON parse.
+fn call_tool_result_text(result: &rmcp::model::CallToolResult) -> String {
+    result
+        .content
+        .iter()
+        .find_map(|block| block.as_text().map(|t| t.text.clone()))
+        .expect("CallToolResult must contain a text content block")
+}
+
+// ===========================================================================
+// W-11: request/consumer regression coverage for fork-added request fields.
+// ===========================================================================
+
+/// Assertion group 1: each of the 4 fork-documented legacy aliases
+/// (`function_name` on `GetCallsRequest`, `function_name` on
+/// `FindCallersRequest`, `symbol_name` on `AnalyzeImpactRequest`, `depth`
+/// on `AnalyzeImpactRequest`) still deserializes into its canonical field
+/// (`name` / `max_depth`) even though every one of these structs also
+/// carries `#[serde(deny_unknown_fields)]`. Fails on a future edit that
+/// adds `deny_unknown_fields` to a struct without carrying the field's
+/// `#[serde(alias = "...")]` attribute along with it -- serde's
+/// `deny_unknown_fields` machinery only recognizes a key as "known" when
+/// the alias is declared on the very field it targets, so a dropped
+/// alias attribute breaks exactly this deserialization, not a compile
+/// error.
+#[test]
+fn legacy_field_aliases_deserialize_under_deny_unknown_fields() {
+    let get_calls: GetCallsRequest =
+        serde_json::from_value(serde_json::json!({"function_name": "caller"}))
+            .expect("GetCallsRequest.function_name alias must deserialize into name");
+    assert_eq!(get_calls.name.as_deref(), Some("caller"));
+
+    let find_callers: FindCallersRequest =
+        serde_json::from_value(serde_json::json!({"function_name": "callee"}))
+            .expect("FindCallersRequest.function_name alias must deserialize into name");
+    assert_eq!(find_callers.name.as_deref(), Some("callee"));
+
+    let analyze_impact_name: AnalyzeImpactRequest =
+        serde_json::from_value(serde_json::json!({"symbol_name": "target"}))
+            .expect("AnalyzeImpactRequest.symbol_name alias must deserialize into name");
+    assert_eq!(analyze_impact_name.name.as_deref(), Some("target"));
+
+    let analyze_impact_depth: AnalyzeImpactRequest =
+        serde_json::from_value(serde_json::json!({"name": "target", "depth": 7}))
+            .expect("AnalyzeImpactRequest.depth alias must deserialize into max_depth");
+    assert_eq!(analyze_impact_depth.max_depth, 7);
+
+    println!("[OK] all 4 legacy field aliases deserialize under deny_unknown_fields.");
+}
+
+/// Assertion group 2: every fork-added request field deserializes on its
+/// owning struct, checked one field at a time with a minimal JSON
+/// payload. Fails, per-field, if any of `output_format`, `count_only`,
+/// `max_results`, `group_by`, `filter`, `collection`,
+/// `exclude_collections`, `documents`, `force`, or `paths` is silently
+/// dropped from its struct definition -- e.g. by an upstream merge that
+/// replaces the struct wholesale and only keeps the fields upstream
+/// itself defines.
+#[test]
+fn fork_added_fields_deserialize_on_owning_structs() {
+    let output_format: FindSymbolRequest =
+        serde_json::from_value(serde_json::json!({"name": "x", "output_format": "json"}))
+            .expect("output_format must deserialize on FindSymbolRequest");
+    assert_eq!(output_format.output_format, OutputFormat::Json);
+
+    let count_only: FindCallersRequest =
+        serde_json::from_value(serde_json::json!({"name": "x", "count_only": true}))
+            .expect("count_only must deserialize on FindCallersRequest");
+    assert!(count_only.count_only);
+
+    let max_results: AnalyzeImpactRequest =
+        serde_json::from_value(serde_json::json!({"name": "x", "max_results": 50}))
+            .expect("max_results must deserialize on AnalyzeImpactRequest");
+    assert_eq!(max_results.max_results, 50);
+
+    let group_by: AnalyzeImpactRequest =
+        serde_json::from_value(serde_json::json!({"name": "x", "group_by": "file"}))
+            .expect("group_by must deserialize on AnalyzeImpactRequest");
+    assert_eq!(group_by.group_by, GroupBy::File);
+
+    let filter: FindCallersRequest =
+        serde_json::from_value(serde_json::json!({"name": "x", "filter": "production"}))
+            .expect("filter must deserialize on FindCallersRequest");
+    assert_eq!(filter.filter, CallerFilter::Production);
+
+    let collection: SearchDocumentsRequest =
+        serde_json::from_value(serde_json::json!({"query": "q", "collection": "docs"}))
+            .expect("collection must deserialize on SearchDocumentsRequest");
+    assert!(collection.collection.is_some());
+
+    let exclude_collections: SearchDocumentsRequest = serde_json::from_value(serde_json::json!({
+        "query": "q",
+        "exclude_collections": ["a", "b"],
+    }))
+    .expect("exclude_collections must deserialize on SearchDocumentsRequest");
+    assert_eq!(
+        exclude_collections.exclude_collections,
+        Some(vec!["a".to_string(), "b".to_string()])
+    );
+
+    let documents: ReindexRequest = serde_json::from_value(serde_json::json!({"documents": true}))
+        .expect("documents must deserialize on ReindexRequest");
+    assert!(documents.documents);
+
+    let force: ReindexRequest = serde_json::from_value(serde_json::json!({"force": true}))
+        .expect("force must deserialize on ReindexRequest");
+    assert!(force.force);
+
+    let paths: ReindexRequest =
+        serde_json::from_value(serde_json::json!({"paths": ["src", "tests"]}))
+            .expect("paths must deserialize on ReindexRequest");
+    assert_eq!(
+        paths.paths,
+        Some(vec!["src".to_string(), "tests".to_string()])
+    );
+
+    println!("[OK] all fork-added fields deserialize on their owning structs.");
+}
+
+/// Assertion group 3: `{"bogus": 1}` is rejected on more than one
+/// `deny_unknown_fields` struct. Fails on a "shadow" regression where
+/// `#[serde(deny_unknown_fields)]` is written in source but not actually
+/// live at derive time on a given struct (e.g. a manual `Deserialize`
+/// impl added later that bypasses the derive, or a merge that drops the
+/// attribute from one struct's derive line while leaving it textually
+/// present elsewhere) -- checking >= 2 independently-attributed structs
+/// means a shadow on any single struct still gets caught by the others
+/// failing, rather than one passing struct hiding a broken sibling.
+#[test]
+fn bogus_field_rejected_across_multiple_structs() {
+    assert!(
+        serde_json::from_value::<GetCallsRequest>(serde_json::json!({"name": "x", "bogus": 1}))
+            .is_err(),
+        "GetCallsRequest must reject an unknown field ('bogus')"
+    );
+    assert!(
+        serde_json::from_value::<FindCallersRequest>(serde_json::json!({"name": "x", "bogus": 1}))
+            .is_err(),
+        "FindCallersRequest must reject an unknown field ('bogus')"
+    );
+    assert!(
+        serde_json::from_value::<AnalyzeImpactRequest>(
+            serde_json::json!({"name": "x", "bogus": 1})
+        )
+        .is_err(),
+        "AnalyzeImpactRequest must reject an unknown field ('bogus')"
+    );
+
+    println!("[OK] {{\"bogus\":1}} rejected across 3 independent deny_unknown_fields structs.");
+}
+
+/// Assertion group 4: `GetIndexInfoRequest` accepts
+/// `{"output_format":"json"}` AND the `get_index_info` tool actually
+/// returns an `Envelope`-shaped JSON payload (a `status`/`code`/`data`
+/// object), not the pre-existing human-readable text string. Fails on a
+/// future merge silently re-adopting upstream's empty
+/// `GetIndexInfoRequest {}` (no `output_format` field, see W-2's
+/// PRESERVED INVENTORY): if `deny_unknown_fields` were also lost in that
+/// swap, `{"output_format":"json"}` would still deserialize successfully
+/// (the unknown key silently discarded) and the tool would always return
+/// plain text -- this assertion inspects the actual returned payload
+/// shape, not just deserialization success, so that silent win by the
+/// upstream empty struct cannot hide behind a passing `from_value`.
+#[tokio::test]
+async fn get_index_info_request_accepts_json_output_format_and_returns_envelope() {
+    let request: GetIndexInfoRequest =
+        serde_json::from_value(serde_json::json!({"output_format": "json"}))
+            .expect("GetIndexInfoRequest must accept output_format:json");
+    assert_eq!(request.output_format, OutputFormat::Json);
+
+    let (_temp_dir, facade) = build_test_facade();
+    let server = CodeIntelligenceServer::new(facade);
+
+    let result = server
+        .get_index_info(Parameters(request))
+        .await
+        .expect("get_index_info should succeed");
+
+    let envelope = call_tool_result_json(&result);
+    assert!(
+        envelope.get("status").is_some() && envelope.get("code").is_some(),
+        "output_format:json must return an Envelope-shaped payload (status/code fields present), got: {envelope:?}"
+    );
+    assert!(
+        envelope.get("data").is_some(),
+        "envelope must carry a 'data' key (present, even if null) -- a bare text string has no such key, got: {envelope:?}"
+    );
+
+    println!("[OK] GetIndexInfoRequest output_format:json returns an Envelope, not plain text.");
+}
+
+/// Assertion group 5: `IndexMetadata` JSON that predates the fork's
+/// `ignore_fingerprint` field and upstream's `emission_version` field
+/// (i.e. a bare pre-gate `index.meta` on disk) still `load()`s
+/// successfully, with both fields reading back as `None`. Fails if a
+/// future new `IndexMetadata` field is added as a required
+/// (non-`Option`, non-`#[serde(default)]`) field: that would turn every
+/// existing on-disk index's `index.meta` into a hard parse error on the
+/// next `load()` instead of degrading gracefully, bricking the index
+/// rather than just reporting the new field as unknown/absent.
+///
+/// Note: the work item's originating spec additionally named a third
+/// field, `builder_commit`. Per W-3's authoritative resolution of this
+/// same file's merge conflict, no such field exists on `IndexMetadata`
+/// in either merge parent (fork `HEAD` or upstream `v0.10.0`) --
+/// confirmed via `grep -rn "builder_commit"` returning zero hits
+/// repo-wide. Only the two fields that actually exist,
+/// `ignore_fingerprint` and `emission_version`, are asserted below.
+#[test]
+fn legacy_index_metadata_json_loads_with_new_optional_fields_none() {
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let base_path = temp_dir.path();
+
+    let legacy_meta = serde_json::json!({
+        "version": 1,
+        "data_source": "Fresh",
+        "symbol_count": 3,
+        "file_count": 1,
+        "last_modified": 0
+    });
+    std::fs::write(
+        base_path.join("index.meta"),
+        serde_json::to_string_pretty(&legacy_meta).unwrap(),
+    )
+    .expect("write legacy index.meta fixture");
+
+    let metadata = codanna::storage::IndexMetadata::load(base_path)
+        .expect("load() must succeed on metadata lacking ignore_fingerprint/emission_version");
+
+    assert_eq!(
+        metadata.ignore_fingerprint, None,
+        "ignore_fingerprint must degrade to None on legacy metadata, not error"
+    );
+    assert_eq!(
+        metadata.emission_version, None,
+        "emission_version must degrade to None on legacy metadata, not error"
+    );
+
+    println!(
+        "[OK] legacy IndexMetadata JSON (no ignore_fingerprint/emission_version) loads with both None."
+    );
+}
+
+/// Assertion group 6: `get_index_info`'s text-mode staleness warning
+/// (`"Warning: index may be stale: ignore rules changed since last
+/// index"`) appears if and only if the on-disk `ignore_fingerprint`
+/// differs from one freshly recomputed from current settings -- checked
+/// both ways (matching -> absent, mismatched -> present) against the
+/// exact live string. Fails on a relocated or hardcoded warning string
+/// (e.g. a copy of the message elsewhere that drifts from the real one
+/// `service::ignore_rules_changed` guards), and fails on the warning
+/// becoming unconditional (always shown) or permanently suppressed
+/// (never shown) regardless of the actual fingerprint comparison.
+#[tokio::test]
+async fn get_index_info_text_staleness_warning_matches_fingerprint_mismatch() {
+    use codanna::indexing::walk_config::ignore_fingerprint;
+
+    const WARNING: &str = "Warning: index may be stale: ignore rules changed since last index";
+
+    // Matching fingerprint: warning must be absent.
+    {
+        let (temp_dir, facade) = build_test_facade();
+        let root = temp_dir.path();
+        let current = ignore_fingerprint(facade.settings(), root)
+            .expect("compute current ignore fingerprint");
+
+        let mut metadata = codanna::storage::IndexMetadata::new();
+        metadata.update_ignore_fingerprint(current);
+        metadata
+            .save(facade.index_base())
+            .expect("save matching-fingerprint metadata");
+
+        let server = CodeIntelligenceServer::new(facade);
+        let result = server
+            .get_index_info(Parameters(GetIndexInfoRequest {
+                output_format: OutputFormat::Text,
+            }))
+            .await
+            .expect("get_index_info should succeed");
+        let text = call_tool_result_text(&result);
+        assert!(
+            !text.contains(WARNING),
+            "matching fingerprint must not emit the staleness warning, got:\n{text}"
+        );
+    }
+
+    // Mismatched fingerprint: warning must be present, verbatim.
+    {
+        let (_temp_dir, facade) = build_test_facade();
+        let mut metadata = codanna::storage::IndexMetadata::new();
+        metadata.update_ignore_fingerprint("deliberately-mismatched-fingerprint".to_string());
+        metadata
+            .save(facade.index_base())
+            .expect("save mismatched-fingerprint metadata");
+
+        let server = CodeIntelligenceServer::new(facade);
+        let result = server
+            .get_index_info(Parameters(GetIndexInfoRequest {
+                output_format: OutputFormat::Text,
+            }))
+            .await
+            .expect("get_index_info should succeed");
+        let text = call_tool_result_text(&result);
+        assert!(
+            text.contains(WARNING),
+            "mismatched fingerprint must emit the exact staleness warning string, got:\n{text}"
+        );
+    }
+
+    println!(
+        "[OK] get_index_info text staleness warning appears iff the on-disk fingerprint mismatches."
+    );
+}
+
+/// Assertion group 7: extends
+/// [`test_reindex_tool_present_in_list_tools_for_all_constructors`]'s
+/// single-tool ("does 'reindex' appear") check to the *complete* expected
+/// 13-tool set, for each of the three `CodeIntelligenceServer`
+/// constructors independently. Fails on an upstream tool wired into only
+/// one or two of the three constructors' routers (a mistake a single
+/// "some server has tool X" check would hide, since the other two
+/// constructors would still pass), and fails on a fork tool (e.g.
+/// `reindex`) dropped from any one constructor's composed router set.
+#[tokio::test]
+async fn full_tool_set_matches_for_all_constructors() {
+    let expected: std::collections::BTreeSet<&str> = [
+        "find_symbol",
+        "find_symbols",
+        "get_calls",
+        "find_callers",
+        "analyze_impact",
+        "get_index_info",
+        "search_symbols",
+        "semantic_search_docs",
+        "semantic_search_with_context",
+        "search_documents",
+        "reindex",
+        "get_file_outline",
+        "read_symbol",
+    ]
+    .into_iter()
+    .collect();
+
+    // Constructor 1: `new` -- takes ownership of a bare `IndexFacade`.
+    {
+        let (_temp_dir, facade) = build_test_facade();
+        let server = CodeIntelligenceServer::new(facade);
+        let names = list_tool_names(server).await;
+        let actual: std::collections::BTreeSet<&str> = names.iter().map(String::as_str).collect();
+        assert_eq!(
+            actual, expected,
+            "CodeIntelligenceServer::new tool set mismatch, got: {names:?}"
+        );
+    }
+
+    // Constructor 2: `from_facade` -- shares an already-`Arc<RwLock<_>>`-wrapped facade.
+    {
+        let (_temp_dir, facade) = build_test_facade();
+        let server = CodeIntelligenceServer::from_facade(Arc::new(RwLock::new(facade)));
+        let names = list_tool_names(server).await;
+        let actual: std::collections::BTreeSet<&str> = names.iter().map(String::as_str).collect();
+        assert_eq!(
+            actual, expected,
+            "CodeIntelligenceServer::from_facade tool set mismatch, got: {names:?}"
+        );
+    }
+
+    // Constructor 3: `new_with_facade` -- the HTTP server's construction path.
+    {
+        let (_temp_dir, facade) = build_test_facade();
+        let settings = Arc::new(Settings::default());
+        let server =
+            CodeIntelligenceServer::new_with_facade(Arc::new(RwLock::new(facade)), settings);
+        let names = list_tool_names(server).await;
+        let actual: std::collections::BTreeSet<&str> = names.iter().map(String::as_str).collect();
+        assert_eq!(
+            actual, expected,
+            "CodeIntelligenceServer::new_with_facade tool set mismatch, got: {names:?}"
+        );
+    }
+
+    println!("[OK] full 13-tool set matches expected for new, from_facade, and new_with_facade.");
+}
+
+/// Index a fixture where `dup` is defined identically in two separate
+/// files -- an ambiguous-by-construction fixture, so `get_calls`'s name
+/// resolution cannot pick a "correct" one and must report `Ambiguous`.
+async fn build_ambiguous_server() -> (TempDir, CodeIntelligenceServer) {
+    let temp = TempDir::new().expect("create temp dir");
+    let src_dir = temp.path().join("src");
+    std::fs::create_dir_all(&src_dir).expect("create src dir");
+    std::fs::write(src_dir.join("dup_a.py"), "def dup():\n    pass\n")
+        .expect("write dup_a.py fixture");
+    std::fs::write(src_dir.join("dup_b.py"), "def dup():\n    pass\n")
+        .expect("write dup_b.py fixture");
+
+    let settings = Settings {
+        index_path: temp.path().join("index"),
+        workspace_root: None,
+        ..Default::default()
+    };
+    let mut facade =
+        IndexFacade::new(Arc::new(settings)).expect("create facade over temp index dir");
+    facade
+        .index_directory(&src_dir, false)
+        .expect("index fixture directory");
+
+    (temp, CodeIntelligenceServer::new(facade))
+}
+
+/// Assertion group 8 (MCP half): an ambiguous name resolved through the
+/// `output_format: json` MCP path reports `ResultCode::Ambiguous`
+/// (`"code":"AMBIGUOUS"`) and the envelope's declared `exit_code` is `3`
+/// -- not the generic error `exit_code` of `2`. Fails on the exit-code
+/// 2-vs-3 regression: a merge that routes the ambiguous outcome through
+/// `Envelope::error()` (which always stamps `exit_code: 2`) instead of
+/// the dedicated `Envelope::ambiguous()` constructor (`exit_code: 3`)
+/// would still report `status: "ambiguous"` correctly while silently
+/// getting the machine-readable exit code wrong -- a mistake a
+/// status-only assertion (as in the pre-existing `get_calls_json_output_
+/// format_ambiguous` test) cannot catch.
+#[tokio::test]
+async fn ambiguous_name_yields_ambiguous_code_and_exit_code_3_via_mcp_json() {
+    let (_temp_dir, server) = build_ambiguous_server().await;
+
+    let result = server
+        .get_calls(Parameters(GetCallsRequest {
+            name: Some("dup".to_string()),
+            symbol_id: None,
+            output_format: OutputFormat::Json,
+        }))
+        .await
+        .expect("get_calls should succeed (ambiguity is not a tool error)");
+
+    let envelope = call_tool_result_json(&result);
+    assert_eq!(
+        envelope.get("code").and_then(|v| v.as_str()),
+        Some("AMBIGUOUS"),
+        "ambiguous get_calls must report ResultCode::Ambiguous, got: {envelope:?}"
+    );
+    assert_eq!(
+        envelope.get("exit_code").and_then(|v| v.as_u64()),
+        Some(3),
+        "ambiguous get_calls must report exit_code 3, not the generic error exit_code 2, got: {envelope:?}"
+    );
+
+    println!(
+        "[OK] MCP output_format:json ambiguous get_calls reports code=AMBIGUOUS, exit_code=3."
+    );
+}
+
+/// Locate the `codanna` binary for subprocess CLI testing, building it
+/// on demand if neither the Cargo-provided path nor a prior debug build
+/// is available. Self-contained (not shared with
+/// `tests/cli/test_mcp_exit_code_matrix.rs`) because this work item is
+/// restricted to appending to this single file.
+fn locate_codanna_binary_for_cli_ambiguity_test() -> std::path::PathBuf {
+    if let Some(path) = option_env!("CARGO_BIN_EXE_codanna") {
+        let bin = std::path::PathBuf::from(path);
+        if bin.exists() {
+            return bin;
+        }
+    }
+
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::current_dir().expect("current dir"));
+
+    let debug_bin = if cfg!(windows) {
+        manifest_dir.join("target/debug/codanna.exe")
+    } else {
+        manifest_dir.join("target/debug/codanna")
+    };
+    if debug_bin.exists() {
+        return debug_bin;
+    }
+
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--bin", "codanna"])
+        .current_dir(&manifest_dir)
+        .status()
+        .expect("build codanna binary");
+    assert!(status.success(), "cargo build failed");
+    debug_bin
+}
+
+/// Run the `codanna` binary as a subprocess against `workspace`, returning
+/// `(process_exit_code, stdout, stderr)`.
+fn run_codanna_cli_for_ambiguity_test(
+    workspace: &std::path::Path,
+    args: &[&str],
+) -> (i32, String, String) {
+    let bin = locate_codanna_binary_for_cli_ambiguity_test();
+    let test_home = workspace.join(".home");
+    std::fs::create_dir_all(&test_home).expect("create test home");
+
+    let output = std::process::Command::new(&bin)
+        .args(args)
+        .current_dir(workspace)
+        .env("HOME", &test_home)
+        .output()
+        .expect("run codanna CLI");
+
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
+}
+
+/// Assertion group 8 (CLI half): the same ambiguous-name regression as
+/// [`ambiguous_name_yields_ambiguous_code_and_exit_code_3_via_mcp_json`],
+/// exercised through the actual `codanna mcp <tool> --json` CLI
+/// subprocess path (`src/cli/commands/mcp.rs`) instead of an in-process
+/// `CodeIntelligenceServer` call. Fails on the same exit-code 2-vs-3
+/// regression as the MCP half, but on the CLI's independent
+/// envelope-to-process-exit plumbing (`exit_ambiguous`,
+/// `std::process::exit(envelope.exit_code.into())`); also fails if a
+/// future refactor relocates the CLI's ambiguity handling into a helper
+/// that no longer round-trips the declared `exit_code` into the real
+/// process exit status, since this assertion checks the actual spawned
+/// process's exit code, not just the JSON payload.
+#[test]
+fn ambiguous_name_yields_ambiguous_code_and_exit_code_3_via_cli_json() {
+    let workspace = TempDir::new().expect("temp dir");
+    let src = workspace.path().join("src");
+    std::fs::create_dir_all(&src).expect("create src dir");
+    std::fs::write(
+        src.join("alpha.rs"),
+        "pub fn dup_name() -> i32 {\n    1\n}\n",
+    )
+    .expect("write alpha fixture");
+    std::fs::write(
+        src.join("beta.rs"),
+        "pub fn dup_name() -> i32 {\n    2\n}\n",
+    )
+    .expect("write beta fixture");
+
+    let codanna_dir = workspace.path().join(".codanna");
+    std::fs::create_dir_all(&codanna_dir).expect("create .codanna");
+    let src_abs = src.canonicalize().expect("canonicalize src dir");
+    let src_path = src_abs.to_str().expect("utf8 src path");
+    let settings = format!(
+        "index_path = \".codanna/index\"\n\n[indexing]\nindexed_paths = [\"{src_path}\"]\n\n[semantic_search]\nenabled = false\n"
+    );
+    std::fs::write(codanna_dir.join("settings.toml"), settings).expect("write settings");
+
+    let (index_code, index_stdout, index_stderr) = run_codanna_cli_for_ambiguity_test(
+        workspace.path(),
+        &["index", "src", "--force", "--no-progress"],
+    );
+    assert_eq!(
+        index_code, 0,
+        "index should succeed\nstdout:\n{index_stdout}\nstderr:\n{index_stderr}"
+    );
+
+    let (code, stdout, stderr) = run_codanna_cli_for_ambiguity_test(
+        workspace.path(),
+        &["mcp", "get_calls", "function_name:dup_name", "--json"],
+    );
+    assert_eq!(
+        code, 3,
+        "process exit for an ambiguous get_calls CLI call must be 3 (ResultCode::Ambiguous), \
+         not the generic error exit code 2 -- this is the exit-code 2-vs-3 regression\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let envelope: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout is not a JSON envelope: {e}\nstdout:\n{stdout}"));
+    assert_eq!(
+        envelope.get("code").and_then(|v| v.as_str()),
+        Some("AMBIGUOUS"),
+        "ambiguous CLI --json call must report ResultCode::Ambiguous, got: {envelope}"
+    );
+    assert_eq!(
+        envelope.get("exit_code").and_then(|v| v.as_i64()),
+        Some(3),
+        "ambiguous CLI --json call's declared exit_code must be 3, got: {envelope}"
+    );
+
+    println!(
+        "[OK] CLI --json ambiguous get_calls reports code=AMBIGUOUS, exit_code=3, process exit=3."
+    );
 }

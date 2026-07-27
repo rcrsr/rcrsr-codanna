@@ -460,12 +460,40 @@ impl IndexFacade {
         self.document_index.find_symbol_by_id(id).ok().flatten()
     }
 
-    /// Get all symbols (with limit).
+    /// Symbol counts by kind and by language in one pass. Both index-info
+    /// renderings consume this single assembly; the two maps partition the
+    /// same symbol set (languageless legacy rows appear only in kinds).
+    pub fn symbol_stats(
+        &self,
+    ) -> (
+        std::collections::BTreeMap<String, usize>,
+        std::collections::BTreeMap<String, usize>,
+    ) {
+        let mut kinds = std::collections::BTreeMap::new();
+        let mut languages = std::collections::BTreeMap::new();
+        for symbol in self.get_all_symbols() {
+            *kinds.entry(format!("{:?}", symbol.kind)).or_insert(0usize) += 1;
+            if let Some(lang) = symbol.language_id.as_ref() {
+                *languages.entry(lang.as_str().to_string()).or_insert(0usize) += 1;
+            }
+        }
+        (kinds, languages)
+    }
+
+    /// Get all symbols, sized by the exact symbol count.
     ///
     /// Returns empty vec on error for SimpleIndexer API compatibility.
     pub fn get_all_symbols(&self) -> Vec<Symbol> {
+        let total = match self.document_index.count_symbols() {
+            Ok(0) => return Vec::new(),
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(target: "facade", "get_all_symbols count error: {e}");
+                return Vec::new();
+            }
+        };
         self.document_index
-            .get_all_symbols(10000)
+            .get_all_symbols(total)
             .unwrap_or_else(|e| {
                 tracing::warn!(target: "facade", "get_all_symbols error: {e}");
                 Vec::new()
@@ -702,6 +730,7 @@ impl IndexFacade {
             .get_file_path(symbol.file_id)
             .ok()
             .flatten()
+            .map(|p| self.document_index.to_portable_file_path(&p).unwrap_or(p))
             .unwrap_or_else(|| symbol.file_path.to_string());
 
         let mut relationships = SymbolRelationships::default();
@@ -975,11 +1004,15 @@ impl IndexFacade {
             .map(|(id, _, _)| id)
     }
 
-    /// Get file path for a FileId.
+    /// Get file path for a FileId, in the emitted contract shape.
     ///
     /// Returns None on error for SimpleIndexer API compatibility.
     pub fn get_file_path(&self, file_id: FileId) -> Option<String> {
-        self.document_index.get_file_path(file_id).ok().flatten()
+        self.document_index
+            .get_file_path(file_id)
+            .ok()
+            .flatten()
+            .map(|p| self.document_index.to_portable_file_path(&p).unwrap_or(p))
     }
 
     /// Get the stored content hash for a file path.
@@ -1068,11 +1101,21 @@ impl IndexFacade {
     /// Index a single file using the parallel pipeline.
     ///
     /// Returns `IndexingResult::Indexed` with the file ID on success.
+    /// File records key off path text: an uncanonical root or file path
+    /// (`./src`, `x/../x`) addresses a key space disjoint from the
+    /// registered indexed_paths walks, re-indexing every file as new and
+    /// doubling the index. Normalize every externally-supplied path once,
+    /// here; nonexistent paths pass through raw so callers keep their
+    /// error reporting.
+    fn canonical_or_raw(path: &std::path::Path) -> std::path::PathBuf {
+        path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+    }
+
     pub fn index_file(
         &mut self,
         path: impl AsRef<std::path::Path>,
     ) -> crate::IndexResult<crate::IndexingResult> {
-        let path = path.as_ref();
+        let path = &Self::canonical_or_raw(path.as_ref());
         if self.has_semantic_search() {
             if let Err(e) = self.ensure_embedding_pool() {
                 tracing::warn!("Failed to initialize embedding pool: {e}");
@@ -1112,7 +1155,7 @@ impl IndexFacade {
     ///
     /// Uses the Pipeline's cleanup stage to remove symbols and embeddings.
     pub fn remove_file(&mut self, path: impl AsRef<std::path::Path>) -> crate::IndexResult<()> {
-        let path = path.as_ref();
+        let path = &Self::canonical_or_raw(path.as_ref());
         let semantic_path = self.settings.index_path.join("semantic");
 
         use crate::indexing::pipeline::stages::CleanupStage;
@@ -1123,7 +1166,7 @@ impl IndexFacade {
             CleanupStage::new(Arc::clone(&self.document_index), &semantic_path)
         };
 
-        cleanup_stage.cleanup_files(&[path.to_path_buf()])?;
+        cleanup_stage.cleanup_files(std::slice::from_ref(path))?;
         Ok(())
     }
 
@@ -1152,6 +1195,7 @@ impl IndexFacade {
     ///
     /// This is the primary indexing entry point using Pipeline.
     pub fn index_directory(&mut self, path: &Path, force: bool) -> FacadeResult<IndexingStats> {
+        let path = &Self::canonical_or_raw(path);
         if self.has_semantic_search() {
             if let Err(e) = self.ensure_embedding_pool() {
                 tracing::warn!("Failed to initialize embedding pool: {e}");
@@ -1195,7 +1239,7 @@ impl IndexFacade {
         use crate::indexing::FileWalker;
         use crate::indexing::progress::IndexStats;
 
-        let dir = dir.as_ref();
+        let dir = &Self::canonical_or_raw(dir.as_ref());
         let walker = FileWalker::new(Arc::clone(&self.settings));
         let files: Vec<_> = walker.walk(dir)?.collect();
 
@@ -1882,6 +1926,44 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // Regression: file records key off the walk root's textual form. An
+    // uncanonical root used to address a key space disjoint from the
+    // canonical indexed_paths walk, re-indexing every file as new and
+    // doubling the index (witnessed live: 2x13370 symbols after
+    // `rm -rf .codanna/index` + `codanna index .`).
+    #[test]
+    fn uncanonical_walk_root_does_not_double_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let corpus = dir.path().join("proj").join("src");
+        std::fs::create_dir_all(&corpus).unwrap();
+        std::fs::write(
+            corpus.join("a.rs"),
+            "pub fn alpha() { beta(); }\npub fn beta() {}\n",
+        )
+        .unwrap();
+
+        let settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        let root = dir.path().join("proj");
+        let canonical = root.canonicalize().unwrap();
+        facade.index_directory(&canonical, false).unwrap();
+        let count = facade.document_count().unwrap();
+        assert!(count > 0, "seed pass must index the corpus");
+
+        let alias = root.join("..").join("proj");
+        facade.index_directory(&alias, false).unwrap();
+        assert_eq!(
+            facade.document_count().unwrap(),
+            count,
+            "an uncanonical alias of an indexed root must not duplicate records"
+        );
+    }
+
     // Regression: every symbol-card surface requests
     // ContextIncludes::SYMBOL_CARD. The CLI JSON paths used to request a
     // subset, rendering extends/extended_by/uses null while the MCP text
@@ -1938,6 +2020,53 @@ mod tests {
             extended_by.iter().any(|s| s.name.as_ref() == "Derived"),
             "Base extended by Derived"
         );
+    }
+
+    // Regression: get_all_symbols sampled the first 10k symbol docs and
+    // consumers (get_index_info kind counts) presented the sample as
+    // totals.
+    #[test]
+    fn get_all_symbols_uncapped_beyond_10k() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        let facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        facade.document_index.start_batch().unwrap();
+        for i in 1..=10500u32 {
+            let kind = if i <= 100 {
+                crate::SymbolKind::Struct
+            } else {
+                crate::SymbolKind::Function
+            };
+            let sym = crate::Symbol::new(
+                crate::SymbolId::new(i).unwrap(),
+                format!("sym_{i}").as_str(),
+                kind,
+                crate::FileId::new(1).unwrap(),
+                crate::Range::new(i, 0, i, 10),
+            );
+            facade
+                .document_index
+                .add_document(&sym, "src/generated.rs")
+                .unwrap();
+        }
+        facade.document_index.commit_batch().unwrap();
+
+        let symbols = facade.get_all_symbols();
+        assert_eq!(
+            symbols.len(),
+            10500,
+            "expected all symbols, got a capped sample"
+        );
+        let structs = symbols
+            .iter()
+            .filter(|s| s.kind == crate::SymbolKind::Struct)
+            .count();
+        assert_eq!(structs, 100);
     }
 
     // Regression: a deletion-only incremental run must surface removal

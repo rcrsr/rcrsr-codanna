@@ -14,3 +14,18 @@ mod test_serve_proxy_discovery;
 
 #[path = "cli/test_idle_shutdown.rs"]
 mod test_idle_shutdown;
+
+#[path = "cli/test_mcp_exit_code_matrix.rs"]
+mod test_mcp_exit_code_matrix;
+
+#[path = "cli/test_mcp_line_convention.rs"]
+mod test_mcp_line_convention;
+
+#[path = "cli/test_mcp_call_metadata_matrix.rs"]
+mod test_mcp_call_metadata_matrix;
+
+#[path = "cli/test_emission_version_gate.rs"]
+mod test_emission_version_gate;
+
+#[path = "cli/test_file_path_portable.rs"]
+mod test_file_path_portable;

@@ -92,6 +92,111 @@ pub fn resolve_symbol_or_id(
     }
 }
 
+/// Outcome of resolving a `find_symbol` query string: `symbol_id:<id>`
+/// resolves by direct id lookup, anything else by name with the
+/// dotted-member fallback.
+pub enum FindSymbolTarget {
+    /// Matches, possibly empty. `label` is the queried name, or the
+    /// resolved symbol's own name for the `symbol_id:` form.
+    Symbols { symbols: Vec<Symbol>, label: String },
+    /// `symbol_id:` prefix with a non-numeric id.
+    InvalidId(String),
+}
+
+/// Resolve a `find_symbol` target. One policy for the MCP handler, the
+/// CLI JSON collection, and the CLI text-mode exit plan — the id-lookup
+/// arm must not diverge between renderings.
+///
+/// `symbol_id` is the typed `FindSymbolRequest::symbol_id` field and takes
+/// precedence over `name` when both are present (per that field's doc).
+/// The legacy `name: "symbol_id:<id>"` string form (from semantic-search
+/// ambiguity hints) is checked next, then plain name resolution with the
+/// dotted-member fallback.
+pub fn resolve_find_symbol_target(
+    facade: &IndexFacade,
+    symbol_id: Option<u32>,
+    name: &str,
+    lang: Option<&str>,
+) -> FindSymbolTarget {
+    if let Some(id) = symbol_id {
+        let symbols: Vec<Symbol> = facade.get_symbol(crate::SymbolId(id)).into_iter().collect();
+        let label = symbols
+            .first()
+            .map(|s| s.name.to_string())
+            .unwrap_or_else(|| format!("symbol_id:{id}"));
+        return FindSymbolTarget::Symbols { symbols, label };
+    }
+    if let Some(id_str) = name.strip_prefix("symbol_id:") {
+        let Ok(id) = id_str.parse::<u32>() else {
+            return FindSymbolTarget::InvalidId(id_str.to_string());
+        };
+        let symbols: Vec<Symbol> = facade.get_symbol(crate::SymbolId(id)).into_iter().collect();
+        let label = symbols
+            .first()
+            .map(|s| s.name.to_string())
+            .unwrap_or_else(|| name.to_string());
+        return FindSymbolTarget::Symbols { symbols, label };
+    }
+    let mut symbols = facade.find_symbols_by_name(name, lang);
+    if symbols.is_empty() {
+        symbols = find_dotted_members(name, |n| facade.find_symbols_by_name(n, lang));
+    }
+    FindSymbolTarget::Symbols {
+        symbols,
+        label: name.to_string(),
+    }
+}
+
+/// Per-tool argument vocabulary: accepted keys plus the required subset
+/// (at least one must be present). One table for the CLI validation
+/// surface and the serve-side handler arms. `find_symbol`'s `symbol_id`
+/// and `analyze_impact`'s `depth` are CLI/alias sugar: the serve schema
+/// carries them as the `name` string form and a serde alias respectively.
+pub fn tool_param_spec(tool: &str) -> (&'static [&'static str], &'static [&'static str]) {
+    match tool {
+        "find_symbol" => (&["name", "symbol_id", "lang"], &["name"]),
+        "get_calls" | "find_callers" => (
+            &["function_name", "symbol_id"],
+            &["function_name", "symbol_id"],
+        ),
+        "analyze_impact" => (
+            &["symbol_name", "symbol_id", "max_depth", "depth"],
+            &["symbol_name", "symbol_id"],
+        ),
+        "get_index_info" => (&[], &[]),
+        "search_symbols" => (&["query", "limit", "kind", "module", "lang"], &["query"]),
+        "semantic_search_docs" | "semantic_search_with_context" => {
+            (&["query", "limit", "threshold", "lang"], &["query"])
+        }
+        "search_documents" => (&["query", "collection", "limit"], &["query"]),
+        _ => (&[], &[]),
+    }
+}
+
+/// Message for a call missing its required parameter(s); one wording for
+/// both transports.
+pub fn missing_param_message(tool: &str) -> String {
+    let (_, requires_one_of) = tool_param_spec(tool);
+    if requires_one_of.len() == 1 {
+        format!("{tool} requires '{}' parameter", requires_one_of[0])
+    } else {
+        format!(
+            "{tool} requires either '{}' parameter",
+            requires_one_of.join("' or '")
+        )
+    }
+}
+
+/// Trailing "Accepted parameters" line on argument errors, both renderings.
+pub fn accepted_params_line(tool: &str) -> String {
+    let (accepted, _) = tool_param_spec(tool);
+    if accepted.is_empty() {
+        format!("{tool} accepts no key:value parameters")
+    } else {
+        format!("Accepted parameters for {tool}: {}", accepted.join(", "))
+    }
+}
+
 /// Class-scoped fallback for dotted queries: "Class.method" resolves the
 /// method within the named type when no symbol matches the literal name.
 /// Uniform across languages; `find` supplies name candidates (typically a
@@ -376,10 +481,12 @@ pub fn count_callers_by_role(callers: &[CallerRelation]) -> CallerCounts {
 }
 
 /// Build full symbol-card contexts for an already-resolved symbol list.
-/// Shared tail of [`find_symbol_data`] and [`find_symbol_data_by_id_or_name`]
-/// so the context-building fallback (missing relationship-index entry ->
-/// bare context from the facade's file path) lives in one place.
-fn symbols_to_contexts(
+/// Shared tail for every `find_symbol`-shaped JSON payload: callers resolve
+/// via [`resolve_find_symbol_target`] first, then pass the resulting
+/// symbols here so the context-building fallback (missing
+/// relationship-index entry -> bare context from the facade's file path)
+/// lives in one place instead of being re-derived per call site.
+pub fn symbols_to_contexts(
     facade: &IndexFacade,
     symbols: Vec<Symbol>,
 ) -> Vec<crate::symbol::context::SymbolContext> {
@@ -401,46 +508,6 @@ fn symbols_to_contexts(
         }
     }
     results
-}
-
-/// Build the `find_symbol` JSON data payload: full symbol-card context for
-/// every match (including the dotted-member fallback). An empty result
-/// means "not found"; `find_symbol` treats multiple matches as ordinary
-/// success data, never ambiguity.
-pub fn find_symbol_data(
-    facade: &IndexFacade,
-    name: &str,
-    lang: Option<&str>,
-) -> Vec<crate::symbol::context::SymbolContext> {
-    let mut symbols = facade.find_symbols_by_name(name, lang);
-    if symbols.is_empty() {
-        symbols = find_dotted_members(name, |n| facade.find_symbols_by_name(n, lang));
-    }
-    if symbols.is_empty() {
-        return Vec::new();
-    }
-    symbols_to_contexts(facade, symbols)
-}
-
-/// Build the `find_symbol` JSON data payload, resolving by `symbol_id` when
-/// present (mirroring the text-mode path's typed-id preference) and falling
-/// back to name-based resolution (via [`find_symbol_data`]) otherwise. Keeps
-/// the JSON and text renderings consistent: `find_symbol(symbol_id:...)`
-/// must resolve identically in both output modes.
-pub fn find_symbol_data_by_id_or_name(
-    facade: &IndexFacade,
-    symbol_id: Option<u32>,
-    name: &str,
-    lang: Option<&str>,
-) -> Vec<crate::symbol::context::SymbolContext> {
-    if let Some(id) = symbol_id {
-        let symbols = facade
-            .get_symbol(crate::SymbolId(id))
-            .map(|s| vec![s])
-            .unwrap_or_default();
-        return symbols_to_contexts(facade, symbols);
-    }
-    find_symbol_data(facade, name, lang)
 }
 
 /// Build the `get_calls` JSON data payload.
@@ -559,6 +626,8 @@ pub struct SymbolInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
     pub module_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language_id: Option<String>,
 }
 
 /// Search result with nested symbol for consistent JSON output.
@@ -585,6 +654,7 @@ impl From<crate::storage::tantivy::SearchResult> for SearchSymbolResult {
                 doc_comment: sr.doc_comment,
                 signature: sr.signature,
                 module_path: sr.module_path,
+                language_id: sr.language_id,
             },
             score: sr.score,
             highlights: sr.highlights,
@@ -765,6 +835,11 @@ pub struct IndexInfo {
     pub file_count: usize,
     pub relationship_count: usize,
     pub symbol_kinds: SymbolKindBreakdown,
+    /// Symbol counts per language, from the same `facade::symbol_stats`
+    /// assembly the text rendering consumes, so the two cannot drift.
+    /// Partitions `symbol_count` except for legacy rows carrying no
+    /// `language_id`, which are counted in `symbol_kinds` only.
+    pub languages: std::collections::BTreeMap<String, usize>,
     pub semantic_search: SemanticSearchInfo,
     /// Whether the ignore-rule inputs (`.codannaignore`, `.gitignore`,
     /// `.git/info/exclude`, `indexing.ignore_patterns`,
@@ -802,15 +877,16 @@ pub fn index_info_data(facade: &IndexFacade) -> IndexInfo {
     let file_count = facade.file_count();
     let relationship_count = facade.relationship_count();
 
-    let mut kind_counts = std::collections::HashMap::new();
-    for symbol in facade.get_all_symbols() {
-        *kind_counts.entry(symbol.kind).or_insert(0) += 1;
-    }
+    // One shared assembly for kind and language counts -- the same
+    // `facade::symbol_stats` pass the text rendering consumes, so the two
+    // renderings cannot drift, and the symbol set is walked once here
+    // rather than twice.
+    let (kind_counts, languages) = facade.symbol_stats();
 
-    let functions = *kind_counts.get(&crate::SymbolKind::Function).unwrap_or(&0);
-    let methods = *kind_counts.get(&crate::SymbolKind::Method).unwrap_or(&0);
-    let structs = *kind_counts.get(&crate::SymbolKind::Struct).unwrap_or(&0);
-    let traits = *kind_counts.get(&crate::SymbolKind::Trait).unwrap_or(&0);
+    let functions = kind_counts.get("Function").copied().unwrap_or(0);
+    let methods = kind_counts.get("Method").copied().unwrap_or(0);
+    let structs = kind_counts.get("Struct").copied().unwrap_or(0);
+    let traits = kind_counts.get("Trait").copied().unwrap_or(0);
 
     let semantic_search = if let Some(metadata) = facade.get_semantic_metadata() {
         SemanticSearchInfo {
@@ -842,6 +918,7 @@ pub fn index_info_data(facade: &IndexFacade) -> IndexInfo {
             structs,
             traits,
         },
+        languages,
         semantic_search,
         ignore_rules_changed: ignore_rules_changed(facade),
     }
@@ -1487,6 +1564,26 @@ mod tests {
         assert!(find_dotted_members("plain", |_| unreachable!("no dot, no lookup")).is_empty());
         assert!(find_dotted_members(".x", |_| Vec::new()).is_empty());
         assert!(find_dotted_members("x.", |_| Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn param_vocabulary_messages_are_stable() {
+        assert_eq!(
+            missing_param_message("get_calls"),
+            "get_calls requires either 'function_name' or 'symbol_id' parameter"
+        );
+        assert_eq!(
+            missing_param_message("find_symbol"),
+            "find_symbol requires 'name' parameter"
+        );
+        assert_eq!(
+            accepted_params_line("get_calls"),
+            "Accepted parameters for get_calls: function_name, symbol_id"
+        );
+        assert_eq!(
+            accepted_params_line("get_index_info"),
+            "get_index_info accepts no key:value parameters"
+        );
     }
 
     #[test]

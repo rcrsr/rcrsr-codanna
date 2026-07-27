@@ -5,7 +5,20 @@ use crate::config::Settings;
 use crate::indexing::facade::IndexFacade;
 use crate::io::args::parse_positional_args;
 use crate::io::envelope::EntityType;
-use crate::mcp::service::{RelationOutcome, SearchOutcome, ambiguous_envelope, filter_callers};
+use crate::mcp::service::{
+    FindSymbolTarget, RelationOutcome, SearchOutcome, SymbolResolution, ambiguous_envelope,
+    filter_callers, missing_param_message, resolve_find_symbol_target, resolve_symbol_or_id,
+    symbols_to_contexts, tool_param_spec,
+};
+use serde::Serialize;
+
+/// Print a terminal envelope and exit with the envelope's own exit_code.
+/// The single choke point keeping the declared `exit_code` field and the
+/// delivered process exit synchronized on every JSON error path.
+fn emit_envelope_and_exit<T: Serialize>(envelope: crate::io::envelope::Envelope<T>) -> ! {
+    println!("{}", envelope.to_json().expect("envelope serialization"));
+    std::process::exit(envelope.exit_code.into());
+}
 
 /// Print the shared `Ambiguous`-status envelope for an ambiguous symbol name
 /// and exit with its `exit_code`. Delegates to `service::ambiguous_envelope`
@@ -32,8 +45,37 @@ fn exit_index_error(entity: EntityType, query: &str, error: impl std::fmt::Displ
     )
     .with_entity_type(entity)
     .with_query(query);
-    println!("{}", envelope.to_json().expect("envelope serialization"));
-    std::process::exit(2);
+    emit_envelope_and_exit(envelope);
+}
+
+/// Reject an invalid argument set: INVALID_QUERY envelope (JSON) or stderr
+/// message (text), exit 2 in both modes. One emitter for missing required
+/// params and unknown keys alike — the two failure directions of the same
+/// parsing layer.
+fn exit_invalid_args(tool: &str, message: &str, accepted: &[&str], json: bool) -> ! {
+    // Build the "Accepted parameters" line from the `accepted` slice the
+    // caller actually passed in, not by re-deriving it from
+    // `service::tool_param_spec(tool)` (which only knows the 9 tools
+    // shared with upstream): the validation surface below additionally
+    // covers fork-only tools (`read_symbol`, `reindex`, `get_file_outline`,
+    // `find_symbols`) via a local override, and re-deriving here would
+    // silently discard that override and misreport what those tools
+    // accept.
+    let accepted_list = if accepted.is_empty() {
+        format!("{tool} accepts no key:value parameters")
+    } else {
+        format!("Accepted parameters for {tool}: {}", accepted.join(", "))
+    };
+    if json {
+        use crate::io::envelope::{Envelope, ResultCode};
+        let envelope: Envelope<()> =
+            Envelope::error(ResultCode::InvalidQuery, message).with_hint(accepted_list);
+        emit_envelope_and_exit(envelope);
+    } else {
+        eprintln!("Error: {message}");
+        eprintln!("{accepted_list}");
+        std::process::exit(2);
+    }
 }
 
 /// Parse a JSON argument value that may be a bare string or an array of
@@ -78,14 +120,8 @@ pub async fn run(
         // Parse JSON arguments if provided (backward compatibility)
         match serde_json::from_str::<serde_json::Value>(args_str) {
             Ok(serde_json::Value::Object(map)) => Some(map),
-            Ok(_) => {
-                eprintln!("Error: Arguments must be a JSON object");
-                std::process::exit(1);
-            }
-            Err(e) => {
-                eprintln!("Error parsing arguments: {e}");
-                std::process::exit(1);
-            }
+            Ok(_) => exit_invalid_args(&tool, "Arguments must be a JSON object", &[], json),
+            Err(e) => exit_invalid_args(&tool, &format!("Failed to parse --args: {e}"), &[], json),
         }
     } else {
         // Start with empty map if no --args
@@ -222,19 +258,114 @@ pub async fn run(
         std::process::exit(1);
     }
 
+    // One validation surface for both output modes (replaces the per-tool
+    // checks that used to sit duplicated in the JSON collection blocks and
+    // the text dispatch): unknown keys reject instead of silently dropping,
+    // and missing required params error as INVALID_QUERY, exit 2.
+    let mut arguments = arguments;
+    {
+        // `tool_param_spec` (src/mcp/service.rs) only declares the 9 tools
+        // shared with the upstream MCP tool routers; the 4 fork-only tools
+        // in KNOWN_TOOLS above (`read_symbol`, `reindex`, `get_file_outline`,
+        // `find_symbols`) fall through its catch-all `(&[], &[])` — "accepts
+        // no parameters" — even though their dispatch arms below require
+        // exactly these keys. Declared locally here (out of
+        // `service.rs`'s scope for this change) so the shared spec stays
+        // the single source of truth for the 9 tools it does own.
+        let (accepted, requires_one_of): (&[&str], &[&str]) = match tool.as_str() {
+            "read_symbol" => (&["name", "symbol_id"], &["name", "symbol_id"]),
+            "get_file_outline" => (&["path", "max_results"], &["path"]),
+            "reindex" => (&["paths", "force", "documents"], &[]),
+            "find_symbols" => (&["names", "lang"], &["names"]),
+            _ => tool_param_spec(&tool),
+        };
+
+        // `depth:` is a documented alias of `max_depth:` on analyze_impact —
+        // the envelope's own meta field is named `depth`, so the surface must
+        // accept the key it emits.
+        if tool == "analyze_impact" {
+            if let Some(map) = arguments.as_mut() {
+                if let Some(depth) = map.remove("depth") {
+                    if map.contains_key("max_depth") {
+                        exit_invalid_args(
+                            &tool,
+                            "analyze_impact accepts either 'depth' or 'max_depth', not both",
+                            accepted,
+                            json,
+                        );
+                    }
+                    map.insert("max_depth".to_string(), depth);
+                }
+            }
+        }
+
+        if let Some(map) = arguments.as_ref() {
+            for key in map.keys() {
+                if !accepted.contains(&key.as_str()) {
+                    exit_invalid_args(
+                        &tool,
+                        &format!("Unknown parameter '{key}' for {tool}"),
+                        accepted,
+                        json,
+                    );
+                }
+            }
+        }
+
+        if !requires_one_of.is_empty() {
+            let satisfied = arguments
+                .as_ref()
+                .is_some_and(|map| requires_one_of.iter().any(|k| map.contains_key(*k)));
+            if !satisfied {
+                // `service::missing_param_message` shares the same blind
+                // spot as `tool_param_spec` above for the 4 fork-only
+                // tools, so build the message from the `requires_one_of`
+                // this block already resolved (shared spec or local
+                // override) instead of re-deriving it from the tool name
+                // alone.
+                let message = if requires_one_of.len() == 1 {
+                    format!("{tool} requires '{}' parameter", requires_one_of[0])
+                } else {
+                    format!(
+                        "{tool} requires either '{}' parameter",
+                        requires_one_of.join("' or '")
+                    )
+                };
+                exit_invalid_args(&tool, &message, accepted, json);
+            }
+        }
+    }
+    let arguments = arguments;
+
     // Collect data for find_symbol if JSON output is requested
     let find_symbol_data = if json && tool == "find_symbol" {
         let name = arguments
             .as_ref()
             .and_then(|m| m.get("name"))
             .and_then(|v| v.as_str());
+        let symbol_id = arguments
+            .as_ref()
+            .and_then(|m| m.get("symbol_id"))
+            .and_then(|v| v.as_u64())
+            .map(|id| id as u32);
         let language = arguments
             .as_ref()
             .and_then(|m| m.get("lang"))
             .and_then(|v| v.as_str());
 
+        // One resolution policy with the MCP handler: `resolve_find_symbol_target`
+        // is the single source of the id-precedence / symbol_id: prefix / dotted-
+        // member fallback rules, then `symbols_to_contexts` builds the shared
+        // symbol-card tail (see `service::symbols_to_contexts`).
         name.map(|symbol_name| {
-            crate::mcp::service::find_symbol_data(&facade, symbol_name, language)
+            let symbols =
+                match resolve_find_symbol_target(&facade, symbol_id, symbol_name, language) {
+                    FindSymbolTarget::Symbols { symbols, .. } => symbols,
+                    // Non-numeric id: nothing to look up; renders the
+                    // not_found envelope exactly like an unmatched name.
+                    FindSymbolTarget::InvalidId(_) => Vec::new(),
+                };
+            symbols_to_contexts(&facade, symbols)
         })
     } else {
         None
@@ -249,13 +380,19 @@ pub async fn run(
     > = if json && tool == "find_symbols" {
         let names: Vec<String> = match arguments.as_ref().and_then(|m| m.get("names")) {
             Some(value) => serde_json::from_value(value.clone()).unwrap_or_else(|e| {
-                eprintln!("Error: `names` must be an array of strings: {e}");
-                std::process::exit(1);
+                exit_invalid_args(
+                    &tool,
+                    &format!("`names` must be an array of strings: {e}"),
+                    &["names", "lang"],
+                    json,
+                )
             }),
-            None => {
-                eprintln!("Error: find_symbols requires a 'names' array parameter");
-                std::process::exit(1);
-            }
+            None => exit_invalid_args(
+                &tool,
+                "find_symbols requires a 'names' array parameter",
+                &["names", "lang"],
+                json,
+            ),
         };
         if names.len() > crate::mcp::tools::symbols::MAX_FIND_SYMBOLS_NAMES {
             use crate::io::envelope::{Envelope, ResultCode};
@@ -310,10 +447,12 @@ pub async fn run(
             RelationOutcome::Ambiguous { name, candidates } => {
                 exit_ambiguous(EntityType::Calls, &name, candidates)
             }
-            RelationOutcome::MissingParam => {
-                eprintln!("Error: get_calls requires either 'name' or 'symbol_id' parameter");
-                std::process::exit(1);
-            }
+            RelationOutcome::MissingParam => exit_invalid_args(
+                &tool,
+                &missing_param_message(&tool),
+                tool_param_spec(&tool).0,
+                json,
+            ),
         }
     } else {
         None
@@ -369,10 +508,12 @@ pub async fn run(
             RelationOutcome::Ambiguous { name, candidates } => {
                 exit_ambiguous(EntityType::Callers, &name, candidates)
             }
-            RelationOutcome::MissingParam => {
-                eprintln!("Error: find_callers requires either 'name' or 'symbol_id' parameter");
-                std::process::exit(1);
-            }
+            RelationOutcome::MissingParam => exit_invalid_args(
+                &tool,
+                &missing_param_message(&tool),
+                tool_param_spec(&tool).0,
+                json,
+            ),
         }
     } else {
         None
@@ -427,10 +568,12 @@ pub async fn run(
             RelationOutcome::Ambiguous { name, candidates } => {
                 exit_ambiguous(EntityType::ImpactGraph, &name, candidates)
             }
-            RelationOutcome::MissingParam => {
-                eprintln!("Error: analyze_impact requires either 'name' or 'symbol_id' parameter");
-                std::process::exit(1);
-            }
+            RelationOutcome::MissingParam => exit_invalid_args(
+                &tool,
+                &missing_param_message(&tool),
+                tool_param_spec(&tool).0,
+                json,
+            ),
         }
     } else {
         None
@@ -471,8 +614,7 @@ pub async fn run(
                     let envelope: Envelope<()> = Envelope::error(ResultCode::InvalidQuery, msg)
                         .with_entity_type(EntityType::SearchResult)
                         .with_query(q);
-                    println!("{}", envelope.to_json().expect("envelope serialization"));
-                    std::process::exit(2);
+                    emit_envelope_and_exit(envelope);
                 }
                 SearchOutcome::Error(msg) => exit_index_error(EntityType::SearchResult, q, msg),
             }
@@ -709,6 +851,80 @@ pub async fn run(
         None
     };
 
+    // Text mode plans its exit code before the facade moves into the
+    // server: the outcome comes from the same shared resolution service
+    // the JSON path uses (not_found -> 1, ambiguous -> 3, sourced from
+    // `Envelope::ambiguous`'s own `exit_code` field below rather than a
+    // re-mapped literal, so this text-mode precheck can never drift from
+    // the JSON path's `exit_ambiguous`/`ambiguous_envelope` mapping); the
+    // handler still renders the text. Search-class tools keep exit 0 on
+    // empty text results — they declare no envelope to contradict.
+    let text_exit: i32 = if json {
+        0
+    } else {
+        match tool.as_str() {
+            "find_symbol" => {
+                let name = arguments
+                    .as_ref()
+                    .and_then(|m| m.get("name"))
+                    .and_then(|v| v.as_str())
+                    .expect("required param validated upstream");
+                let symbol_id = arguments
+                    .as_ref()
+                    .and_then(|m| m.get("symbol_id"))
+                    .and_then(|v| v.as_u64())
+                    .map(|id| id as u32);
+                let lang = arguments
+                    .as_ref()
+                    .and_then(|m| m.get("lang"))
+                    .and_then(|v| v.as_str());
+                let found = match resolve_find_symbol_target(&facade, symbol_id, name, lang) {
+                    FindSymbolTarget::Symbols { symbols, .. } => !symbols.is_empty(),
+                    FindSymbolTarget::InvalidId(_) => false,
+                };
+                if found { 0 } else { 1 }
+            }
+            "get_calls" | "find_callers" | "analyze_impact" => {
+                let symbol_id = arguments
+                    .as_ref()
+                    .and_then(|m| m.get("symbol_id"))
+                    .and_then(|v| v.as_u64())
+                    .map(|id| id as u32);
+                let name_key = if tool == "analyze_impact" {
+                    "symbol_name"
+                } else {
+                    "function_name"
+                };
+                let symbol_name = arguments
+                    .as_ref()
+                    .and_then(|m| m.get(name_key))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                match resolve_symbol_or_id(&facade, symbol_id, symbol_name) {
+                    SymbolResolution::Resolved { .. } => 0,
+                    SymbolResolution::NotFoundById(_) | SymbolResolution::NotFoundByName(_) => 1,
+                    // Never a literal: the ambiguous exit code is owned by
+                    // `Envelope::ambiguous` (src/io/envelope.rs) alone, the
+                    // same source `exit_ambiguous`/`ambiguous_envelope` use
+                    // for the JSON path, so text and JSON modes cannot drift
+                    // apart on the same ambiguous request (§RS.3.5).
+                    SymbolResolution::Ambiguous { .. } => {
+                        crate::io::envelope::Envelope::<()>::ambiguous(String::new(), None)
+                            .exit_code
+                            .into()
+                    }
+                    SymbolResolution::MissingParam => exit_invalid_args(
+                        &tool,
+                        &missing_param_message(&tool),
+                        tool_param_spec(&tool).0,
+                        json,
+                    ),
+                }
+            }
+            _ => 0,
+        }
+    };
+
     // Embedded mode - use already loaded facade directly
     let server = {
         let server = crate::mcp::CodeIntelligenceServer::new(facade);
@@ -778,10 +994,7 @@ pub async fn run(
                     .as_ref()
                     .and_then(|m| m.get("name"))
                     .and_then(|v| v.as_str())
-                    .unwrap_or_else(|| {
-                        eprintln!("Error: find_symbol requires 'name' parameter");
-                        std::process::exit(1);
-                    });
+                    .expect("required param validated upstream");
                 let lang = arguments
                     .as_ref()
                     .and_then(|m| m.get("lang"))
@@ -808,13 +1021,19 @@ pub async fn run(
                 // offending entries, which would silently narrow the batch.
                 let names: Vec<String> = match arguments.as_ref().and_then(|m| m.get("names")) {
                     Some(value) => serde_json::from_value(value.clone()).unwrap_or_else(|e| {
-                        eprintln!("Error: `names` must be an array of strings: {e}");
-                        std::process::exit(1);
+                        exit_invalid_args(
+                            &tool,
+                            &format!("`names` must be an array of strings: {e}"),
+                            &["names", "lang"],
+                            json,
+                        )
                     }),
-                    None => {
-                        eprintln!("Error: find_symbols requires a 'names' array parameter");
-                        std::process::exit(1);
-                    }
+                    None => exit_invalid_args(
+                        &tool,
+                        "find_symbols requires a 'names' array parameter",
+                        &["names", "lang"],
+                        json,
+                    ),
                 };
                 let lang = arguments
                     .as_ref()
@@ -842,12 +1061,6 @@ pub async fn run(
                     .and_then(|v| v.as_u64())
                     .map(|id| id as u32);
 
-                // Require either name or symbol_id
-                if name.is_none() && symbol_id.is_none() {
-                    eprintln!("Error: get_calls requires either 'name' or 'symbol_id' parameter");
-                    std::process::exit(1);
-                }
-
                 server
                     .get_calls(Parameters(GetCallsRequest {
                         name,
@@ -868,14 +1081,6 @@ pub async fn run(
                     .and_then(|m| m.get("symbol_id"))
                     .and_then(|v| v.as_u64())
                     .map(|id| id as u32);
-
-                // Require either name or symbol_id
-                if name.is_none() && symbol_id.is_none() {
-                    eprintln!(
-                        "Error: find_callers requires either 'name' or 'symbol_id' parameter"
-                    );
-                    std::process::exit(1);
-                }
 
                 server
                     .find_callers(Parameters(FindCallersRequest {
@@ -899,14 +1104,6 @@ pub async fn run(
                     .and_then(|m| m.get("symbol_id"))
                     .and_then(|v| v.as_u64())
                     .map(|id| id as u32);
-
-                // Require either name or symbol_id
-                if name.is_none() && symbol_id.is_none() {
-                    eprintln!(
-                        "Error: analyze_impact requires either 'name' or 'symbol_id' parameter"
-                    );
-                    std::process::exit(1);
-                }
 
                 let max_depth = arguments
                     .as_ref()
@@ -939,10 +1136,7 @@ pub async fn run(
                     .as_ref()
                     .and_then(|m| m.get("query"))
                     .and_then(|v| v.as_str())
-                    .unwrap_or_else(|| {
-                        eprintln!("Error: search_symbols requires 'query' parameter");
-                        std::process::exit(1);
-                    });
+                    .expect("required param validated upstream");
                 let limit = arguments
                     .as_ref()
                     .and_then(|m| m.get("limit"))
@@ -979,10 +1173,7 @@ pub async fn run(
                     .as_ref()
                     .and_then(|m| m.get("query"))
                     .and_then(|v| v.as_str())
-                    .unwrap_or_else(|| {
-                        eprintln!("Error: semantic_search_docs requires 'query' parameter");
-                        std::process::exit(1);
-                    });
+                    .expect("required param validated upstream");
                 let limit = arguments
                     .as_ref()
                     .and_then(|m| m.get("limit"))
@@ -1013,10 +1204,7 @@ pub async fn run(
                     .as_ref()
                     .and_then(|m| m.get("query"))
                     .and_then(|v| v.as_str())
-                    .unwrap_or_else(|| {
-                        eprintln!("Error: semantic_search_with_context requires 'query' parameter");
-                        std::process::exit(1);
-                    });
+                    .expect("required param validated upstream");
                 let limit = arguments
                     .as_ref()
                     .and_then(|m| m.get("limit"))
@@ -1048,10 +1236,7 @@ pub async fn run(
                     .as_ref()
                     .and_then(|m| m.get("query"))
                     .and_then(|v| v.as_str())
-                    .unwrap_or_else(|| {
-                        eprintln!("Error: search_documents requires 'query' parameter");
-                        std::process::exit(1);
-                    })
+                    .expect("required param validated upstream")
                     .to_string();
                 let collection = arguments
                     .as_ref()
@@ -1080,8 +1265,12 @@ pub async fn run(
                 let (paths, force, documents) =
                     crate::mcp::requests::ReindexRequest::parse_args(arguments.as_ref())
                         .unwrap_or_else(|e| {
-                            eprintln!("Error: invalid reindex arguments: {e}");
-                            std::process::exit(1);
+                            exit_invalid_args(
+                                &tool,
+                                &format!("invalid reindex arguments: {e}"),
+                                &["paths", "force", "documents"],
+                                json,
+                            )
                         });
                 server
                     .reindex(Parameters(ReindexRequest {
@@ -1098,8 +1287,12 @@ pub async fn run(
                     .and_then(|m| m.get("path"))
                     .and_then(|v| v.as_str())
                     .unwrap_or_else(|| {
-                        eprintln!("Error: get_file_outline requires 'path' parameter");
-                        std::process::exit(1);
+                        exit_invalid_args(
+                            &tool,
+                            "get_file_outline requires 'path' parameter",
+                            &["path", "max_results"],
+                            json,
+                        )
                     });
                 let max_results = arguments
                     .as_ref()
@@ -1127,8 +1320,12 @@ pub async fn run(
                     .map(|id| id as u32);
 
                 if name.is_none() && symbol_id.is_none() {
-                    eprintln!("Error: read_symbol requires either 'name' or 'symbol_id' parameter");
-                    std::process::exit(1);
+                    exit_invalid_args(
+                        &tool,
+                        "read_symbol requires either 'name' or 'symbol_id' parameter",
+                        &["name", "symbol_id"],
+                        json,
+                    );
                 }
 
                 server
@@ -1200,8 +1397,7 @@ pub async fn run(
                     );
                     if is_not_found {
                         // Envelope serialization is infallible for simple types
-                        println!("{}", envelope.to_json().expect("envelope serialization"));
-                        std::process::exit(3);
+                        emit_envelope_and_exit(envelope);
                     }
                     let output = match &fields {
                         Some(f) => envelope.to_json_with_fields(f),
@@ -1254,11 +1450,13 @@ pub async fn run(
                         None => envelope.to_json(),
                     };
                     println!("{}", output.expect("envelope serialization"));
+                    if envelope.exit_code != 0 {
+                        std::process::exit(envelope.exit_code.into());
+                    }
                 } else {
                     let envelope =
                         crate::mcp::service::get_calls_not_found_envelope(&indexer, &identifier);
-                    println!("{}", envelope.to_json().expect("envelope serialization"));
-                    std::process::exit(3);
+                    emit_envelope_and_exit(envelope);
                 }
             } else if json && tool == "find_callers" {
                 let identifier = if let Some(id) = arguments
@@ -1281,16 +1479,20 @@ pub async fn run(
                     // UNFILTERED caller set — `filter` narrows the returned
                     // listing, never the counted breakdown (see
                     // `service::find_callers_counts_envelope`).
-                    let output = if find_callers_count_only {
+                    // Each arm yields its own envelope, so the exit code rides
+                    // out alongside the rendered output — the code stays
+                    // envelope-derived rather than a literal at the call site.
+                    let (output, exit_code) = if find_callers_count_only {
                         let envelope = crate::mcp::service::find_callers_counts_envelope(
                             &indexer,
                             &identifier,
                             &unfiltered,
                         );
-                        match &fields {
+                        let rendered = match &fields {
                             Some(f) => envelope.to_json_with_fields(f),
                             None => envelope.to_json(),
-                        }
+                        };
+                        (rendered, envelope.exit_code)
                     } else {
                         let filtered = filter_callers(unfiltered, find_callers_filter);
                         let envelope = crate::mcp::service::find_callers_list_envelope(
@@ -1298,17 +1500,20 @@ pub async fn run(
                             &identifier,
                             filtered,
                         );
-                        match &fields {
+                        let rendered = match &fields {
                             Some(f) => envelope.to_json_with_fields(f),
                             None => envelope.to_json(),
-                        }
+                        };
+                        (rendered, envelope.exit_code)
                     };
                     println!("{}", output.expect("envelope serialization"));
+                    if exit_code != 0 {
+                        std::process::exit(exit_code.into());
+                    }
                 } else {
                     let envelope =
                         crate::mcp::service::find_callers_not_found_envelope(&indexer, &identifier);
-                    println!("{}", envelope.to_json().expect("envelope serialization"));
-                    std::process::exit(3);
+                    emit_envelope_and_exit(envelope);
                 }
             } else if json && tool == "analyze_impact" {
                 // Get identifier for messages
@@ -1334,17 +1539,21 @@ pub async fn run(
                     .unwrap_or(3) as u32;
 
                 if let Some(impacted) = analyze_impact_data {
-                    let output = if analyze_impact_count_only {
+                    // Each arm yields its own envelope, so the exit code rides
+                    // out alongside the rendered output — the code stays
+                    // envelope-derived rather than a literal at the call site.
+                    let (output, exit_code) = if analyze_impact_count_only {
                         let envelope = crate::mcp::service::analyze_impact_counts_envelope(
                             &indexer,
                             &identifier,
                             max_depth,
                             &impacted,
                         );
-                        match &fields {
+                        let rendered = match &fields {
                             Some(f) => envelope.to_json_with_fields(f),
                             None => envelope.to_json(),
-                        }
+                        };
+                        (rendered, envelope.exit_code)
                     } else {
                         let envelope = crate::mcp::service::analyze_impact_listing_envelope(
                             &indexer,
@@ -1354,20 +1563,23 @@ pub async fn run(
                             analyze_impact_group_by,
                             analyze_impact_max_results,
                         );
-                        match &fields {
+                        let rendered = match &fields {
                             Some(f) => envelope.to_json_with_fields(f),
                             None => envelope.to_json(),
-                        }
+                        };
+                        (rendered, envelope.exit_code)
                     };
                     println!("{}", output.expect("envelope serialization"));
+                    if exit_code != 0 {
+                        std::process::exit(exit_code.into());
+                    }
                 } else {
                     // Symbol not found
                     let envelope = crate::mcp::service::analyze_impact_not_found_envelope(
                         &indexer,
                         &identifier,
                     );
-                    println!("{}", envelope.to_json().expect("envelope serialization"));
-                    std::process::exit(3);
+                    emit_envelope_and_exit(envelope);
                 }
             } else if json && tool == "search_symbols" {
                 use crate::io::envelope::{EntityType, Envelope, ResultCode};
@@ -1393,6 +1605,9 @@ pub async fn run(
                         None => envelope.to_json(),
                     };
                     println!("{}", output.expect("envelope serialization"));
+                    if envelope.exit_code != 0 {
+                        std::process::exit(envelope.exit_code.into());
+                    }
                 } else {
                     let envelope: Envelope<()> = Envelope::error(
                         ResultCode::InvalidQuery,
@@ -1402,8 +1617,7 @@ pub async fn run(
                     .with_query(query)
                     .with_hint("Check query syntax");
 
-                    println!("{}", envelope.to_json().expect("envelope serialization"));
-                    std::process::exit(1);
+                    emit_envelope_and_exit(envelope);
                 }
             } else if json && tool == "semantic_search_docs" {
                 use crate::io::envelope::{Envelope, ResultCode};
@@ -1427,13 +1641,15 @@ pub async fn run(
                         None => envelope.to_json(),
                     };
                     println!("{}", output.expect("envelope serialization"));
+                    if envelope.exit_code != 0 {
+                        std::process::exit(envelope.exit_code.into());
+                    }
                 } else if !has_semantic_search {
                     let envelope = crate::mcp::service::semantic_search_error_envelope(
                         query,
                         "Semantic search is not enabled",
                     );
-                    println!("{}", envelope.to_json().expect("envelope serialization"));
-                    std::process::exit(1);
+                    emit_envelope_and_exit(envelope);
                 } else {
                     let envelope: Envelope<()> = Envelope::error(
                         ResultCode::InvalidQuery,
@@ -1443,8 +1659,7 @@ pub async fn run(
                     .with_query(query)
                     .with_hint("Check query syntax");
 
-                    println!("{}", envelope.to_json().expect("envelope serialization"));
-                    std::process::exit(1);
+                    emit_envelope_and_exit(envelope);
                 }
             } else if json && tool == "semantic_search_with_context" {
                 use crate::io::envelope::{Envelope, ResultCode};
@@ -1468,13 +1683,15 @@ pub async fn run(
                         None => envelope.to_json(),
                     };
                     println!("{}", output.expect("envelope serialization"));
+                    if envelope.exit_code != 0 {
+                        std::process::exit(envelope.exit_code.into());
+                    }
                 } else if !has_semantic_search {
                     let envelope = crate::mcp::service::semantic_search_error_envelope(
                         query,
                         "Semantic search is not enabled",
                     );
-                    println!("{}", envelope.to_json().expect("envelope serialization"));
-                    std::process::exit(1);
+                    emit_envelope_and_exit(envelope);
                 } else {
                     let envelope: Envelope<()> = Envelope::error(
                         ResultCode::InvalidQuery,
@@ -1484,8 +1701,7 @@ pub async fn run(
                     .with_query(query)
                     .with_hint("Check query syntax");
 
-                    println!("{}", envelope.to_json().expect("envelope serialization"));
-                    std::process::exit(1);
+                    emit_envelope_and_exit(envelope);
                 }
             } else if json && tool == "search_documents" {
                 use crate::io::envelope::{EntityType, Envelope};
@@ -1537,9 +1753,8 @@ pub async fn run(
                         None => envelope.to_json(),
                     };
                     println!("{}", output.expect("envelope serialization"));
-
-                    if count == 0 {
-                        std::process::exit(1);
+                    if envelope.exit_code != 0 {
+                        std::process::exit(envelope.exit_code.into());
                     }
                 } else {
                     let envelope: Envelope<()> = Envelope::error(
@@ -1550,8 +1765,7 @@ pub async fn run(
                     .with_query(query)
                     .with_hint("Run 'codanna documents index' to create the index");
 
-                    println!("{}", envelope.to_json().expect("envelope serialization"));
-                    std::process::exit(1);
+                    emit_envelope_and_exit(envelope);
                 }
             } else if json && tool == "reindex" {
                 if let Some(outcome) = reindex_data {
@@ -1575,6 +1789,9 @@ pub async fn run(
                         }
                     }
                 }
+                if text_exit != 0 {
+                    std::process::exit(text_exit);
+                }
             }
         }
         Err(e) => {
@@ -1584,11 +1801,10 @@ pub async fn run(
                     Envelope::error(ResultCode::InternalError, e.message.to_string())
                         .with_hint("Check the tool name and arguments");
 
-                println!("{}", envelope.to_json().expect("envelope serialization"));
-                std::process::exit(1);
+                emit_envelope_and_exit(envelope);
             } else {
                 eprintln!("Error calling tool: {}", e.message);
-                std::process::exit(1);
+                std::process::exit(2);
             }
         }
     }
