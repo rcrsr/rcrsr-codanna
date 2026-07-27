@@ -45,7 +45,13 @@ pub(crate) fn render_envelope_json<T: Serialize>(
                 ));
                 emit_envelope_and_exit(err);
             }
-            Err(FieldProjectionError::Serde(e)) => panic!("envelope serialization: {e}"),
+            Err(FieldProjectionError::Serde(e)) => {
+                let err: Envelope<()> = Envelope::error(
+                    ResultCode::InternalError,
+                    format!("Envelope serialization failed: {e}"),
+                );
+                emit_envelope_and_exit(err);
+            }
         },
     }
 }

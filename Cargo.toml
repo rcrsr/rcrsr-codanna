@@ -15,8 +15,8 @@ name = "codanna"
 #               It is at .1 because nothing has been released yet.
 #
 # `+` is BUILD METADATA, which semver ignores in precedence: every +rcrsr.N
-# compares EQUAL to a bare 0.11.1, and +rcrsr.7 does NOT sort above +rcrsr.1.
-# That is deliberate -- a `-rcrsr` pre-release would instead sort BELOW 0.11.1,
+# compares EQUAL to a bare 0.12.0, and +rcrsr.7 does NOT sort above +rcrsr.1.
+# That is deliberate -- a `-rcrsr` pre-release would instead sort BELOW 0.12.0,
 # making a fork with strictly more code compare as older than the upstream it
 # was built from. The counter is informational, not orderable. Do not rely on
 # it for version-range gating.

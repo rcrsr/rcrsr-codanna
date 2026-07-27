@@ -23,7 +23,7 @@ use crate::parsing::resolution::{GenericInheritanceResolver, InheritanceResolver
 use crate::parsing::{Import, LanguageBehavior, LanguageId};
 use crate::types::{FileId, SymbolId};
 use crate::{RelationKind, Symbol};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Resolve stage for symbol resolution.
@@ -87,6 +87,38 @@ impl ResolveStage {
         self.behaviors.get(language_id)
     }
 
+    /// Index `Extends` `UnresolvedRelationship`s by their source (`from_id`),
+    /// storing indices into `rels` rather than clones. Iterates `rels` once
+    /// in order, so each class's bucket preserves `rels`' original relative
+    /// order — the same order the previous per-hop linear scan visited them
+    /// in, which matters for first-match-wins tie-breaks downstream.
+    fn build_extends_by_from(rels: &[UnresolvedRelationship]) -> HashMap<SymbolId, Vec<usize>> {
+        let mut index: HashMap<SymbolId, Vec<usize>> = HashMap::new();
+        for (i, rel) in rels.iter().enumerate() {
+            if rel.kind != RelationKind::Extends {
+                continue;
+            }
+            if let Some(from_id) = rel.from_id {
+                index.entry(from_id).or_default().push(i);
+            }
+        }
+        index
+    }
+
+    /// `Extends` rows whose source is `class_id`, looked up in `O(1)` via
+    /// `extends_by_from` instead of scanning `unresolved_rels`.
+    fn extends_from<'a>(
+        unresolved_rels: &'a [UnresolvedRelationship],
+        extends_by_from: &'a HashMap<SymbolId, Vec<usize>>,
+        class_id: SymbolId,
+    ) -> impl Iterator<Item = &'a UnresolvedRelationship> {
+        extends_by_from
+            .get(&class_id)
+            .into_iter()
+            .flatten()
+            .map(move |&i| &unresolved_rels[i])
+    }
+
     /// Resolve all relationships in a context.
     ///
     /// Returns resolved batch and statistics.
@@ -94,10 +126,20 @@ impl ResolveStage {
         let mut batch = ResolvedBatch::with_capacity(context.unresolved_rels.len());
         let mut stats = ResolveStats::default();
 
+        // `Extends` edges indexed by source (`from_id`), built once per file
+        // and reused by every ambiguous-candidate / bare-instance-call
+        // lookup below. `context.unresolved_rels` is not mutated anywhere
+        // in this loop (or anywhere else `resolve()` is reachable from —
+        // `resolve()` takes `&ResolutionContext`), so the index cannot go
+        // stale for the lifetime of this call. Order within each class's
+        // bucket matches `unresolved_rels`' own order, preserving the old
+        // scan's first-match-wins behavior.
+        let extends_by_from = Self::build_extends_by_from(&context.unresolved_rels);
+
         for unresolved in &context.unresolved_rels {
             stats.total_processed += 1;
 
-            if let Some(resolved) = self.resolve_one(unresolved, context) {
+            if let Some(resolved) = self.resolve_one(unresolved, context, &extends_by_from) {
                 match resolved.kind {
                     RelationKind::Defines => stats.defines_resolved += 1,
                     RelationKind::Calls => stats.calls_resolved += 1,
@@ -128,6 +170,7 @@ impl ResolveStage {
         &self,
         unresolved: &UnresolvedRelationship,
         context: &ResolutionContext,
+        extends_by_from: &HashMap<SymbolId, Vec<usize>>,
     ) -> Option<ResolvedRelationship> {
         use crate::parsing::{PipelineSymbolCache, ResolveResult};
 
@@ -156,7 +199,7 @@ impl ResolveStage {
         // self-edge class); misses fail closed instead of falling through
         // to a bare-name guess.
         if Self::is_super_instance_call(unresolved) {
-            return self.resolve_super_call(from_id, unresolved, context, &caller);
+            return self.resolve_super_call(from_id, unresolved, context, &caller, extends_by_from);
         }
 
         // Self-aliased receivers (self/this/cls) name their container: the
@@ -187,9 +230,13 @@ impl ResolveStage {
             // Extends rows before the ladder, whose single-survivor pick
             // carries no class evidence. Applies to every language — the
             // receiver is explicit here, unlike the bare-call arm below.
-            if let Some(resolved) =
-                self.resolve_inherited_member(from_id, unresolved, context, &caller)
-            {
+            if let Some(resolved) = self.resolve_inherited_member(
+                from_id,
+                unresolved,
+                context,
+                &caller,
+                extends_by_from,
+            ) {
                 return Some(resolved);
             }
         }
@@ -202,7 +249,13 @@ impl ResolveStage {
                 caller.file_id,
                 &caller.language_id,
             ) && self.is_receiver_compat(to_id, unresolved, &caller.language_id)
-                && self.is_instance_type_compatible(unresolved, to_id, &caller.language_id, context)
+                && self.is_instance_type_compatible(
+                    unresolved,
+                    to_id,
+                    &caller.language_id,
+                    context,
+                    extends_by_from,
+                )
             {
                 return self.accept_unwitnessed_pick(from_id, to_id, unresolved);
             }
@@ -219,9 +272,13 @@ impl ResolveStage {
                 .get_behavior(&caller.language_id)
                 .is_some_and(|b| b.implicit_this_dispatch())
         {
-            if let Some(resolved) =
-                self.resolve_inherited_member(from_id, unresolved, context, &caller)
-            {
+            if let Some(resolved) = self.resolve_inherited_member(
+                from_id,
+                unresolved,
+                context,
+                &caller,
+                extends_by_from,
+            ) {
                 return Some(resolved);
             }
         }
@@ -231,7 +288,14 @@ impl ResolveStage {
         // before consulting any non-local match. Bypass tier logic and filter
         // candidates by receiver-compat directly.
         if Self::is_qualified_static_call(unresolved) {
-            return self.resolve_static_call(from_id, from_kind, unresolved, &caller, context);
+            return self.resolve_static_call(
+                from_id,
+                from_kind,
+                unresolved,
+                &caller,
+                context,
+                extends_by_from,
+            );
         }
 
         let result = self.symbol_cache.resolve(
@@ -257,6 +321,7 @@ impl ResolveStage {
                     to_id,
                     &caller.language_id,
                     context,
+                    extends_by_from,
                 ) {
                     return None;
                 }
@@ -273,12 +338,24 @@ impl ResolveStage {
                 self.accept_unwitnessed_pick(from_id, to_id, unresolved)
             }
             ResolveResult::Ambiguous(candidates) => {
-                let to_id = self.disambiguate(&candidates, unresolved, &caller, context, false)?;
+                let to_id = self.disambiguate(
+                    &candidates,
+                    unresolved,
+                    &caller,
+                    context,
+                    false,
+                    extends_by_from,
+                )?;
                 self.accept_unwitnessed_pick(from_id, to_id, unresolved)
             }
-            ResolveResult::NotFound => {
-                self.resolve_typed_receiver_global(from_id, from_kind, unresolved, &caller, context)
-            }
+            ResolveResult::NotFound => self.resolve_typed_receiver_global(
+                from_id,
+                from_kind,
+                unresolved,
+                &caller,
+                context,
+                extends_by_from,
+            ),
         }
     }
 
@@ -297,6 +374,7 @@ impl ResolveStage {
         unresolved: &UnresolvedRelationship,
         caller: &CallerContext,
         context: &ResolutionContext,
+        extends_by_from: &HashMap<SymbolId, Vec<usize>>,
     ) -> Option<ResolvedRelationship> {
         if unresolved.kind != RelationKind::Calls {
             return None;
@@ -320,6 +398,7 @@ impl ResolveStage {
                 Some(&*caller_sym),
                 &caller.language_id,
                 context,
+                extends_by_from,
             ) {
                 best = Some(best.map_or(distance, |b| b.min(distance)));
                 scored.push((id, distance));
@@ -617,6 +696,7 @@ impl ResolveStage {
         to_id: SymbolId,
         language_id: &LanguageId,
         context: &ResolutionContext,
+        extends_by_from: &HashMap<SymbolId, Vec<usize>>,
     ) -> bool {
         let Some((type_name, caller)) = self.infer_receiver_type(unresolved, language_id, context)
         else {
@@ -628,8 +708,15 @@ impl ResolveStage {
         let Some(candidate) = self.symbol_cache.get_ref(to_id) else {
             return true;
         };
-        self.receiver_chain_distance(&candidate, &type_name, Some(&*caller), language_id, context)
-            .is_some()
+        self.receiver_chain_distance(
+            &candidate,
+            &type_name,
+            Some(&*caller),
+            language_id,
+            context,
+            extends_by_from,
+        )
+        .is_some()
     }
 
     /// Ancestor-aware receiver compatibility: 0 = member of the receiver's
@@ -687,6 +774,7 @@ impl ResolveStage {
         caller: Option<&crate::Symbol>,
         language_id: &LanguageId,
         context: &ResolutionContext,
+        extends_by_from: &HashMap<SymbolId, Vec<usize>>,
     ) -> Option<usize> {
         let behavior = self.get_behavior(language_id)?;
         // Distance 0: with an identity anchor, membership is in the ANCHORED
@@ -729,17 +817,28 @@ impl ResolveStage {
         // edges live in its file's context): deep cross-file chains
         // under-report.
         let start = anchor?;
+        // Cycle-safe frontier walk (mirrors `get_inheritance_chain` in
+        // `src/parsing/resolution.rs`): a class is marked visited the
+        // moment it is discovered, so a diamond or cyclic `Extends` graph
+        // is bounded by the graph's own shape rather than by the 8-hop
+        // cap alone. Re-visits are dropped before the membership check;
+        // dropping them cannot change which distance a candidate resolves
+        // at, since a class is only ever first reached at its shortest
+        // distance and the membership predicate does not depend on how
+        // many times a class is revisited.
+        let mut visited: HashSet<SymbolId> = HashSet::new();
+        visited.insert(start);
         let mut frontier = vec![start];
         for distance in 1..=8usize {
             let mut next = Vec::new();
             for class_id in frontier {
-                for rel in &context.unresolved_rels {
-                    if rel.kind != RelationKind::Extends || rel.from_id != Some(class_id) {
-                        continue;
-                    }
+                for rel in Self::extends_from(&context.unresolved_rels, extends_by_from, class_id) {
                     let Some(parent_id) = context.resolve(&rel.to_name) else {
                         continue;
                     };
+                    if !visited.insert(parent_id) {
+                        continue;
+                    }
                     let Some(parent) = self.symbol_cache.get_ref(parent_id) else {
                         continue;
                     };
@@ -783,6 +882,7 @@ impl ResolveStage {
         unresolved: &UnresolvedRelationship,
         language_id: &LanguageId,
         context: &ResolutionContext,
+        extends_by_from: &HashMap<SymbolId, Vec<usize>>,
     ) -> Option<Vec<SymbolId>> {
         let (type_name, caller) = self.infer_receiver_type(unresolved, language_id, context)?;
         self.get_behavior(language_id)?;
@@ -794,9 +894,14 @@ impl ResolveStage {
             let Some(sym) = self.symbol_cache.get_ref(id) else {
                 continue;
             };
-            if let Some(distance) =
-                self.receiver_chain_distance(&sym, &type_name, Some(&*caller), language_id, context)
-            {
+            if let Some(distance) = self.receiver_chain_distance(
+                &sym,
+                &type_name,
+                Some(&*caller),
+                language_id,
+                context,
+                extends_by_from,
+            ) {
                 best = Some(best.map_or(distance, |b| b.min(distance)));
                 scored.push((id, distance));
             }
@@ -852,6 +957,7 @@ impl ResolveStage {
         unresolved: &UnresolvedRelationship,
         context: &ResolutionContext,
         caller: &CallerContext,
+        extends_by_from: &HashMap<SymbolId, Vec<usize>>,
     ) -> Option<ResolvedRelationship> {
         let caller_sym = self.symbol_cache.get_ref(from_id)?;
         let caller_range = caller_sym.range;
@@ -860,10 +966,7 @@ impl ResolveStage {
 
         let class_id = self.innermost_enclosing_class(file_id, caller_range)?;
 
-        for rel in &context.unresolved_rels {
-            if rel.kind != RelationKind::Extends || rel.from_id != Some(class_id) {
-                continue;
-            }
+        for rel in Self::extends_from(&context.unresolved_rels, extends_by_from, class_id) {
             // Same lookup the Extends edge itself resolves through: the
             // scope has the file's import bindings (e.g. `from .main
             // import BaseModel`). A scope miss skips the base — parents
@@ -972,6 +1075,7 @@ impl ResolveStage {
         unresolved: &UnresolvedRelationship,
         context: &ResolutionContext,
         caller: &CallerContext,
+        extends_by_from: &HashMap<SymbolId, Vec<usize>>,
     ) -> Option<ResolvedRelationship> {
         let caller_sym = self.symbol_cache.get_ref(from_id)?;
         let caller_range = caller_sym.range;
@@ -980,10 +1084,7 @@ impl ResolveStage {
 
         let class_id = self.innermost_enclosing_class(file_id, caller_range)?;
 
-        for rel in &context.unresolved_rels {
-            if rel.kind != RelationKind::Extends || rel.from_id != Some(class_id) {
-                continue;
-            }
+        for rel in Self::extends_from(&context.unresolved_rels, extends_by_from, class_id) {
             let Some(parent_id) = self.resolve_parent_class(&rel.to_name, context, caller) else {
                 continue;
             };
@@ -1297,6 +1398,7 @@ impl ResolveStage {
         unresolved: &UnresolvedRelationship,
         caller: &CallerContext,
         context: &ResolutionContext,
+        extends_by_from: &HashMap<SymbolId, Vec<usize>>,
     ) -> Option<ResolvedRelationship> {
         let raw_receiver = unresolved.metadata.as_ref()?.receiver.as_deref()?;
         let behavior = self.get_behavior(&caller.language_id)?;
@@ -1340,7 +1442,14 @@ impl ResolveStage {
         let to_id = match filtered.len() {
             0 => return None,
             1 => filtered[0],
-            _ => self.disambiguate(&filtered, unresolved, caller, context, true)?,
+            _ => self.disambiguate(
+                &filtered,
+                unresolved,
+                caller,
+                context,
+                true,
+                extends_by_from,
+            )?,
         };
         Some(ResolvedRelationship {
             from_id,
@@ -1545,6 +1654,7 @@ impl ResolveStage {
         caller: &CallerContext,
         context: &ResolutionContext,
         static_pre_filtered: bool,
+        extends_by_from: &HashMap<SymbolId, Vec<usize>>,
     ) -> Option<SymbolId> {
         let file_id = context.file_id;
         let language_id = &context.language_id;
@@ -1584,9 +1694,13 @@ impl ResolveStage {
         // identity evidence. An unresolved edge beats a wrong-copy or
         // wrong-class guess.
         if unresolved.kind == RelationKind::Calls {
-            if let Some(survivors) =
-                self.filter_by_instance_receiver_type(&filtered, unresolved, language_id, context)
-            {
+            if let Some(survivors) = self.filter_by_instance_receiver_type(
+                &filtered,
+                unresolved,
+                language_id,
+                context,
+                extends_by_from,
+            ) {
                 return match survivors.len() {
                     1 => Some(survivors[0]),
                     _ => None,
@@ -2920,6 +3034,137 @@ mod tests {
             call.to_id,
             SymbolId::new(2).unwrap(),
             "Base.dump wins over the unrelated same-name member"
+        );
+    }
+
+    #[test]
+    fn cyclic_extends_chain_resolves_without_hanging() {
+        // Same as `inherited_member_resolves_through_extends_chain`, but
+        // with a cyclic `Extends` graph: Model extends Base AND Base
+        // extends Model. The frontier walk's `visited` set must terminate
+        // on the cycle and still find Base.dump at distance 1 — a
+        // cyclic/diamond graph must not change which member wins, only
+        // how many times an already-visited class is re-scanned.
+        let python = LanguageId::new("python");
+        let cache = Arc::new(SymbolLookupCache::new());
+        cache.insert(make_symbol(1, "use_model", 1, python));
+        for (id, class) in [(2u32, "Base"), (3u32, "Rogue")] {
+            let mut method = make_symbol(id, "dump", 1, python);
+            method.kind = SymbolKind::Method;
+            method.scope_context = Some(crate::symbol::ScopeContext::ClassMember {
+                class_name: Some(class.into()),
+            });
+            cache.insert(method);
+        }
+        cache.insert(make_class(10, "Model", 1, python));
+        cache.insert(make_class(11, "Base", 1, python));
+
+        let (stage, scope) = python_stage_with_class_scope(Arc::clone(&cache));
+        let context = ResolutionContext {
+            file_id: FileId::new(1).unwrap(),
+            language_id: python,
+            imports: vec![],
+            local_symbols: vec![
+                SymbolId::new(1).unwrap(),
+                SymbolId::new(2).unwrap(),
+                SymbolId::new(3).unwrap(),
+            ],
+            scope,
+            unresolved_rels: vec![
+                make_instance_call(1, "dump", 1, "m"),
+                make_extends(10, "Model", "Base", 1),
+                // Back-edge closing the cycle: Base -> Model.
+                make_extends(11, "Base", "Model", 1),
+            ],
+            variable_bindings: vec![model_binding()],
+            this_barrier_spans: vec![],
+        };
+
+        let (batch, stats) = stage.resolve(&context);
+
+        assert_eq!(
+            stats.calls_resolved, 1,
+            "inherited member resolves via chain despite the cycle"
+        );
+        let call = batch
+            .relationships
+            .iter()
+            .find(|r| r.kind == RelationKind::Calls)
+            .expect("calls edge present");
+        assert_eq!(
+            call.to_id,
+            SymbolId::new(2).unwrap(),
+            "Base.dump still wins with a cyclic Extends graph"
+        );
+    }
+
+    #[test]
+    fn diamond_extends_chain_resolves_nearest_member() {
+        // Diamond: Model extends Left and Right; both Left and Right
+        // extend Base. Base.dump is reachable via two distinct paths at
+        // the same distance (2); the frontier walk's `visited` set must
+        // not skip processing Base just because it is reached twice, and
+        // must not change the result versus a non-diamond chain.
+        let python = LanguageId::new("python");
+        let cache = Arc::new(SymbolLookupCache::new());
+        cache.insert(make_symbol(1, "use_model", 1, python));
+        let mut base_dump = make_symbol(2, "dump", 1, python);
+        base_dump.kind = SymbolKind::Method;
+        base_dump.scope_context = Some(crate::symbol::ScopeContext::ClassMember {
+            class_name: Some("Base".into()),
+        });
+        cache.insert(base_dump);
+        cache.insert(make_class(10, "Model", 1, python));
+        cache.insert(make_class(11, "Base", 1, python));
+        cache.insert(make_class(12, "Left", 1, python));
+        cache.insert(make_class(13, "Right", 1, python));
+
+        let python2 = python;
+        let behaviors: HashMap<LanguageId, StdArc<dyn LanguageBehavior>> = HashMap::from([(
+            python2,
+            StdArc::new(crate::parsing::python::PythonBehavior::new())
+                as StdArc<dyn LanguageBehavior>,
+        )]);
+        let scope = Box::new(MapScope(std::collections::HashMap::from([
+            ("Model".to_string(), SymbolId::new(10).unwrap()),
+            ("Base".to_string(), SymbolId::new(11).unwrap()),
+            ("Left".to_string(), SymbolId::new(12).unwrap()),
+            ("Right".to_string(), SymbolId::new(13).unwrap()),
+        ])));
+        let stage = ResolveStage::new(Arc::clone(&cache), behaviors);
+
+        let context = ResolutionContext {
+            file_id: FileId::new(1).unwrap(),
+            language_id: python,
+            imports: vec![],
+            local_symbols: vec![SymbolId::new(1).unwrap(), SymbolId::new(2).unwrap()],
+            scope,
+            unresolved_rels: vec![
+                make_instance_call(1, "dump", 1, "m"),
+                make_extends(10, "Model", "Left", 1),
+                make_extends(10, "Model", "Right", 1),
+                make_extends(12, "Left", "Base", 1),
+                make_extends(13, "Right", "Base", 1),
+            ],
+            variable_bindings: vec![model_binding()],
+            this_barrier_spans: vec![],
+        };
+
+        let (batch, stats) = stage.resolve(&context);
+
+        assert_eq!(
+            stats.calls_resolved, 1,
+            "inherited member resolves via either diamond path"
+        );
+        let call = batch
+            .relationships
+            .iter()
+            .find(|r| r.kind == RelationKind::Calls)
+            .expect("calls edge present");
+        assert_eq!(
+            call.to_id,
+            SymbolId::new(2).unwrap(),
+            "Base.dump resolves once despite two equal-distance paths"
         );
     }
 

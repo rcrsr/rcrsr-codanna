@@ -98,20 +98,27 @@ impl ReadStage {
                         // workspace root read nothing and got an empty index
                         // with no error -- the CLI only escaped it by always
                         // running from the workspace root.
-                        let read_path = match *workspace_root {
-                            Some(ref root) if path.is_relative() => root.join(&path),
-                            _ => path.clone(),
-                        };
-
-                        match read_file(&read_path) {
-                            Ok(mut content) => {
-                                // Normalize path to relative if workspace_root is set
+                        let read_result = match *workspace_root {
+                            Some(ref root) if path.is_relative() => read_file(&root.join(&path))
+                                .map(|mut content| {
+                                    content.path = path.clone();
+                                    content
+                                }),
+                            // Absolute lane: read_file returns an absolute
+                            // path, which must still be normalized to
+                            // workspace-relative when workspace_root is set.
+                            _ => read_file(&path).map(|mut content| {
                                 if let Some(ref root) = *workspace_root {
                                     if let Ok(relative) = content.path.strip_prefix(root) {
                                         content.path = relative.to_path_buf();
                                     }
                                 }
+                                content
+                            }),
+                        };
 
+                        match read_result {
+                            Ok(content) => {
                                 read_count.fetch_add(1, Ordering::Relaxed);
 
                                 // Track output wait (time blocked on send)

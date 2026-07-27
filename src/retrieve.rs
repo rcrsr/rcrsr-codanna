@@ -287,7 +287,12 @@ fn emit_envelope_json<T: Serialize>(
             ExitCode::BlockingError
         }
         Err(FieldProjectionError::Serde(e)) => {
-            panic!("envelope serialization: {e}")
+            let err: Envelope<()> = Envelope::error(
+                ResultCode::InternalError,
+                format!("Envelope serialization failed: {e}"),
+            );
+            println!("{}", err.to_json().expect("envelope serialization"));
+            ExitCode::BlockingError
         }
     }
 }

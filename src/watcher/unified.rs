@@ -490,30 +490,42 @@ impl UnifiedWatcher {
             return;
         }
 
-        let (dirs, files) = {
+        // Resolve the owning indexed root under a short read lock only --
+        // `discoverable_scope_root` is a settings lookup plus a single
+        // `canonicalize()`, not a directory walk. The actual walk runs
+        // below, off the lock and on a blocking-pool thread, so a large or
+        // bursty newly-materialized subtree cannot stall the tokio worker
+        // driving the watch loop.
+        let (scope_root, settings) = {
             let facade = self.facade.read().await;
             (
-                facade.discoverable_dirs(path),
-                facade.discoverable_files(path),
+                facade.discoverable_scope_root(path),
+                Arc::clone(facade.settings()),
             )
         };
+        let Some((scope, root)) = scope_root else {
+            return;
+        };
 
-        let dirs = match dirs {
-            Ok(dirs) => dirs,
-            Err(e) => {
+        let path_owned = path.to_path_buf();
+        let walk_result = tokio::task::spawn_blocking(move || {
+            IndexFacade::discoverable_entries_for(&settings, &root, &scope)
+        })
+        .await;
+
+        let (dirs, files) = match walk_result {
+            Ok(Ok(entries)) => entries,
+            Ok(Err(e)) => {
                 tracing::warn!(
-                    "[watcher] failed to discover directories under {}: {e}",
-                    path.display()
+                    "[watcher] failed to discover entries under {}: {e}",
+                    path_owned.display()
                 );
                 return;
             }
-        };
-        let files = match files {
-            Ok(files) => files,
             Err(e) => {
                 tracing::warn!(
-                    "[watcher] failed to discover files under {}: {e}",
-                    path.display()
+                    "[watcher] discovery task for {} panicked: {e}",
+                    path_owned.display()
                 );
                 return;
             }

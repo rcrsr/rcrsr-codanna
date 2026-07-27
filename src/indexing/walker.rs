@@ -123,6 +123,63 @@ impl FileWalker {
             .map(|entry| entry.path().to_path_buf()))
     }
 
+    /// Single traversal yielding both the directories and the files
+    /// `Self::walk_dirs` and `Self::walk` would each report under `root`,
+    /// applying the same filters as both (dot-directory skip for dirs,
+    /// hidden-file/extension filters for files). Exists so a caller that
+    /// needs both results (e.g. watch registration plus catch-up indexing
+    /// for a newly created directory) walks the subtree once instead of
+    /// twice; see `Self::walk` / `Self::walk_dirs` for the individual
+    /// filter semantics this preserves.
+    pub fn walk_dirs_and_files(&self, root: &Path) -> IndexResult<(Vec<PathBuf>, Vec<PathBuf>)> {
+        let mut builder = build_walker(&self.settings, root)?;
+        builder.max_depth(None); // No depth limit
+
+        let enabled_extensions = self.get_enabled_extensions();
+        let follow_links = self.settings.indexing.follow_links;
+
+        let mut dirs = Vec::new();
+        let mut files = Vec::new();
+
+        for entry in builder.build().filter_map(Result::ok) {
+            warn_if_skipped_symlink_dir(&entry, follow_links);
+
+            if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                let keep = entry.depth() == 0
+                    || entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|n| !n.starts_with('.'));
+                if keep {
+                    dirs.push(entry.path().to_path_buf());
+                }
+                continue;
+            }
+
+            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+                continue;
+            }
+
+            let path = entry.path();
+            if let Some(file_name) = path.file_name() {
+                if let Some(name_str) = file_name.to_str() {
+                    if name_str.starts_with('.') {
+                        continue;
+                    }
+                }
+            }
+            if let Some(extension) = path.extension() {
+                if let Some(ext_str) = extension.to_str() {
+                    if enabled_extensions.iter().any(|ext| ext == ext_str) {
+                        files.push(path.to_path_buf());
+                    }
+                }
+            }
+        }
+
+        Ok((dirs, files))
+    }
+
     /// Get list of enabled file extensions from the registry
     fn get_enabled_extensions(&self) -> Vec<String> {
         let registry = get_registry();
@@ -402,5 +459,32 @@ mod tests {
 
         assert!(!dirs.contains(&std::path::PathBuf::from(".git")));
         assert!(dirs.contains(&std::path::PathBuf::from("src")));
+    }
+
+    #[test]
+    fn walk_dirs_and_files_matches_the_two_separate_walks() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("main.rs"), "fn main() {}").unwrap();
+        fs::write(root.join("sub/lib.rs"), "pub fn lib() {}").unwrap();
+        fs::write(root.join(".hidden.rs"), "fn hidden() {}").unwrap();
+        fs::write(root.join("README.md"), "# Test").unwrap();
+
+        let settings = create_test_settings();
+        let walker = FileWalker::new(settings);
+
+        let mut expected_dirs: Vec<_> = walker.walk_dirs(root).unwrap().collect();
+        let mut expected_files: Vec<_> = walker.walk(root).unwrap().collect();
+        expected_dirs.sort();
+        expected_files.sort();
+
+        let (mut dirs, mut files) = walker.walk_dirs_and_files(root).unwrap();
+        dirs.sort();
+        files.sort();
+
+        assert_eq!(dirs, expected_dirs);
+        assert_eq!(files, expected_files);
     }
 }

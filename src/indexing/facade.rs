@@ -1173,6 +1173,50 @@ impl IndexFacade {
         )
     }
 
+    /// The owning registered indexed root for `scope`, if any -- the same
+    /// resolution [`Self::discoverable_files`]/[`Self::discoverable_dirs`]
+    /// use, factored out so a caller (e.g. the watcher) can look this up
+    /// under a short lock and then run the actual walk afterward, off the
+    /// lock. `settings.indexed_paths_cache` lookup and `canonicalize()` are
+    /// both cheap (no directory traversal), unlike the walk itself.
+    ///
+    /// Returns the canonicalized `scope` alongside the matched root.
+    pub fn discoverable_scope_root(
+        &self,
+        scope: &std::path::Path,
+    ) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        let scope = Self::canonical_or_raw(scope);
+        let root = self
+            .settings
+            .indexed_paths_cache
+            .iter()
+            .filter(|r| scope.starts_with(r))
+            .max_by_key(|r| r.as_os_str().len())?
+            .clone();
+        Some((scope, root))
+    }
+
+    /// Both the directories and files [`Self::discoverable_dirs`] and
+    /// [`Self::discoverable_files`] would each report under `scope`, from a
+    /// single filesystem walk (see
+    /// [`crate::indexing::walker::FileWalker::walk_dirs_and_files`]).
+    /// Takes `settings`/`root`/`scope` directly (rather than `&self`) so the
+    /// walk itself can run outside any facade lock -- see
+    /// [`Self::discoverable_scope_root`] for computing the arguments under a
+    /// short lock beforehand.
+    pub fn discoverable_entries_for(
+        settings: &Arc<Settings>,
+        root: &std::path::Path,
+        scope: &std::path::Path,
+    ) -> crate::IndexResult<(Vec<PathBuf>, Vec<PathBuf>)> {
+        let (dirs, files) = crate::indexing::walker::FileWalker::new(Arc::clone(settings))
+            .walk_dirs_and_files(root)?;
+        Ok((
+            dirs.into_iter().filter(|p| p.starts_with(scope)).collect(),
+            files.into_iter().filter(|p| p.starts_with(scope)).collect(),
+        ))
+    }
+
     pub fn index_file(
         &mut self,
         path: impl AsRef<std::path::Path>,
@@ -2218,6 +2262,22 @@ mod tests {
                 .iter()
                 .any(|s| s.name.as_ref() == "alpha"),
             "the parsed symbol must be retrievable from the built index"
+        );
+
+        // Second pass: exercises the incremental lane. `disk_set` and
+        // `indexed_set` now both contain the file, so
+        // `DiscoverStage::is_modified` actually runs (the first pass only
+        // ever hits the "new file" branch, which never calls it). Without
+        // `workspace_root` also being honored there, this call fails
+        // entirely -- `is_modified`'s CWD-relative reads error out of
+        // `run_incremental` via `?`, turning one stale-mtime check into a
+        // failure of the whole reindex.
+        let stats2 = facade
+            .index_directory(&root, false)
+            .expect("second incremental pass must not fail on an unmodified file");
+        assert_eq!(
+            stats2.files_indexed, 0,
+            "unmodified file must not be re-indexed"
         );
     }
 
