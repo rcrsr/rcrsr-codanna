@@ -391,10 +391,9 @@ fn any_file_named(root: &Path, filename: &str) -> bool {
 /// cannot tell "the process refused to proceed" apart from "the process was
 /// working fine and we killed it".
 ///
-/// Only the https-server-gated pinned-cert test calls this today, so the
-/// helper is gated to match and avoid a dead-code warning under default
-/// features.
-#[cfg(feature = "https-server")]
+/// Called by the https-server-gated pinned-cert test and by Arm A of the
+/// emission-gate test below, which is compiled unconditionally -- so this
+/// helper carries no `#[cfg]` gate.
 fn wait_for_self_exit(child: &mut Child, deadline: Duration) -> Option<std::process::ExitStatus> {
     let start = std::time::Instant::now();
     loop {
@@ -1181,10 +1180,56 @@ fn proxy_mode_is_exempt_from_the_emission_gate_that_refuses_plain_serve() {
 
     // Arm A (control): a FRESH, non-proxy `codanna serve` process reads this
     // on-disk state at its own startup and is refused by the emission gate.
-    let (code, _stdout, stderr) = run_cli(workspace.path(), &["serve"]);
+    //
+    // Spawned and polled rather than routed through `run_cli`, because
+    // upstream v0.10.1 made this path enter an rmcp stdio serve loop before
+    // exiting: the gate now serves a degraded zero-tool handshake so
+    // client-spawned servers receive the heal command over the protocol
+    // instead of on a stderr nobody reads. Closed stdin ends that session at
+    // once, but `run_cli` uses `.output()`, which would block FOREVER rather
+    // than fail if a future rmcp ever stopped returning on stdin EOF. This
+    // file's `DEADLINE` exists precisely so a stuck server fails the test
+    // instead of hanging CI, and before v0.10.1 `serve` could not block here
+    // at all -- bounding this wait restores that invariant.
+    let test_home = workspace.path().join(".home");
+    std::fs::create_dir_all(&test_home).expect("create test home");
+    let mut serve = Command::new(codanna_binary())
+        .args(["serve"])
+        .current_dir(workspace.path())
+        .env("HOME", &test_home)
+        .env("XDG_CONFIG_HOME", &test_home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        // Left undrained while we poll below: the gate emits three short
+        // lines, orders of magnitude under the pipe buffer, so it cannot
+        // fill and deadlock the child on write. Anything that materially
+        // increases this path's stderr output must drain concurrently.
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn non-proxy codanna serve");
+
+    let status = wait_for_self_exit(&mut serve, DEADLINE).unwrap_or_else(|| {
+        panic!(
+            "non-proxy `codanna serve` did not exit on its own within {DEADLINE:?} against the \
+             deliberately mismatched index.meta -- the emission gate's degraded stdio handshake \
+             is not returning on stdin EOF, which would hang CI rather than fail this assertion"
+        )
+    });
+
+    let mut stderr = String::new();
+    {
+        use std::io::Read;
+        serve
+            .stderr
+            .take()
+            .expect("piped serve stderr")
+            .read_to_string(&mut stderr)
+            .expect("read serve stderr");
+    }
+
     assert_eq!(
-        code,
-        codanna::io::ExitCode::IndexCorrupted as i32,
+        status.code(),
+        Some(codanna::io::ExitCode::IndexCorrupted as i32),
         "non-proxy `codanna serve` should exit with the emission gate's IndexCorrupted code \
          against the deliberately mismatched index.meta; stderr:\n{stderr}"
     );

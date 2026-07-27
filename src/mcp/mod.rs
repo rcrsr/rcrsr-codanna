@@ -25,11 +25,13 @@ pub mod proxy;
 pub mod requests;
 pub mod server;
 pub mod service;
+pub mod stale_server;
 pub mod tools;
 
 pub use proxy::{ProxyError, ProxyResult, serve_proxy};
 pub use requests::*;
 pub use server::{CodeIntelligenceServer, format_relative_time};
+pub use stale_server::StaleIndexServer;
 
 /// Bearer token accepted by the dev-mode auth middleware. Bare token — rmcp
 /// `auth_header` adds the "Bearer " prefix itself.

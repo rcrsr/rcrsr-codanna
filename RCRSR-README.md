@@ -64,9 +64,11 @@ upstream), so it will shadow an upstream install on the same `PATH`.
 
 ## Upstream base
 
-The fork now tracks upstream **v0.10.0** (merged from the prior v0.9.23 base;
-the fork build counter reset to `+rcrsr.1` on this base — see [Identifying
-the fork](#identifying-the-fork)).
+The fork now tracks upstream **v0.10.1** (merged from the prior v0.10.0 base).
+The fork build counter resets to `+rcrsr.1` every time the upstream base moves,
+so an unchanged `+rcrsr.1` across two releases does not mean the fork stopped
+changing — read the base version, not the counter (see [Identifying the
+fork](#identifying-the-fork)).
 
 One upstream v0.10.0 change is user-visible for existing MCP clients:
 **unknown `key:value` arguments on an MCP tool call now reject** instead of
@@ -77,6 +79,29 @@ false`. A misspelled or stale argument key that previously passed through
 unnoticed now fails the call. If you have automation or scripts calling
 codanna's MCP tools, check argument names against the current tool schemas
 after upgrading.
+
+Upstream v0.10.1 changes what a **stale index** looks like to an MCP client.
+When the index was built by a binary with different emission semantics,
+`codanna serve` (stdio) no longer fails to start — it completes the MCP
+handshake and advertises **zero tools**, with instructions beginning `INDEX
+STALE - ALL TOOLS DISABLED` that name `codanna index` as the fix and remind you
+to restart the MCP server afterwards. Clients that launch codanna themselves
+usually discard its error output, so the old behavior showed up as an opaque
+connection failure with no hint of the cause; now the reason arrives over the
+protocol. Nothing becomes readable — the refusal is still absolute, the process
+still exits with code 7 once the session ends, and running in a terminal still
+prints `index emission semantics changed`.
+
+**Fork note — this does not cover proxy mode.** `codanna serve --proxy` (and a
+bare `codanna serve` when `mode = "proxy"` is set in `settings.toml`) is exempt
+from the staleness check by design, because a proxy holds no index of its own.
+It delegates to a backing server started as `codanna serve --http`, which
+upstream's degraded-handshake path deliberately excludes, and the fork starts
+that backing process with its error output detached. So if a proxy has to start
+a *fresh* backing server against a stale index, you get a readiness timeout —
+`backing 'codanna serve --http' did not become healthy within …ms` — rather
+than the stale-index explanation. An already-running backing server is
+unaffected. Run `codanna index` in the workspace to heal it.
 
 # Improvements
 
