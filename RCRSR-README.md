@@ -64,7 +64,7 @@ upstream), so it will shadow an upstream install on the same `PATH`.
 
 ## Upstream base
 
-The fork now tracks upstream **v0.10.1** (merged from the prior v0.10.0 base).
+The fork now tracks upstream **v0.11.1** (merged from the prior v0.10.1 base).
 The fork build counter resets to `+rcrsr.1` every time the upstream base moves,
 so an unchanged `+rcrsr.1` across two releases does not mean the fork stopped
 changing — read the base version, not the counter (see [Identifying the
@@ -102,6 +102,30 @@ a *fresh* backing server against a stale index, you get a readiness timeout —
 `backing 'codanna serve --http' did not become healthy within …ms` — rather
 than the stale-index explanation. An already-running backing server is
 unaffected. Run `codanna index` in the workspace to heal it.
+
+Upstream v0.11.1 changes what happens when you ask for output fields that
+don't exist. `--fields` now **rejects** unknown field names instead of
+silently returning stripped-empty items, and it does so on every surface that
+accepts the flag — `codanna mcp <tool> --json --fields`, `codanna retrieve
+<query> --json --fields`, and `codanna documents search --json --fields`, all
+of which share one rejection path. A rejection is a JSON error envelope on stdout with
+`code: INVALID_QUERY` and exit code 2, carrying a hint that lists the
+available top-level fields. `--fields` also now understands dotted paths, so
+you can project into a nested field instead of only picking top-level keys.
+If you have scripts that pass `--fields`, check the field names you're
+asking for after upgrading — a misspelling that used to come back as an
+empty object now fails the command outright. Note that the accepted names
+are derived from the records a tool actually returns, so they differ between
+tools: `role` is a valid field on `find_callers`, for instance, but not on
+`analyze_impact`. The hint in the rejection always lists what the tool you
+called will accept.
+
+**Fork note.** The new rejection applies to the fork-only tools too —
+`find_symbols` and `reindex` reject an unknown `--fields` name exactly the
+same way. An ambiguous symbol name still exits **3** with `code: AMBIGUOUS`
+regardless of what you passed to `--fields`, because the fork decides
+ambiguity before it renders anything, so the new exit-2 rejection never
+swallows the fork's ambiguity handling.
 
 # Improvements
 

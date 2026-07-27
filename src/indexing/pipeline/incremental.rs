@@ -76,6 +76,7 @@ impl Pipeline {
         let content_hash = file_content.hash.clone();
 
         // Check if file already exists by querying Tantivy
+        let mut existing_changed = false;
         if let Ok(Some((existing_file_id, existing_hash, _mtime))) = index.get_file_info(path_str) {
             if existing_hash == content_hash {
                 // File hasn't changed, skip re-indexing
@@ -88,7 +89,17 @@ impl Pipeline {
                     elapsed: start.elapsed(),
                 });
             }
+            existing_changed = true;
+        }
 
+        // Parse BEFORE cleanup: parse is pure (settings-only), so a parse
+        // failure here leaves the file's old rows untouched. Cleanup-first
+        // turned a construction failure into durable row loss.
+        init_parser_cache(Arc::clone(&self.settings));
+        let parse_stage = ParseStage::new(Arc::clone(&self.settings));
+        let parsed = parse_stage.parse(file_content)?;
+
+        if existing_changed {
             // File has changed - cleanup old data within a batch
             // Start batch for cleanup to avoid creating temporary writers
             index.start_batch()?;
@@ -105,16 +116,12 @@ impl Pipeline {
             index.commit_batch()?;
         }
 
-        // Parse file
-        init_parser_cache(Arc::clone(&self.settings));
-        let parse_stage = ParseStage::new(Arc::clone(&self.settings));
-        let parsed = parse_stage.parse(file_content)?;
-
         // Collect into a batch (now includes embedding candidates)
         let collect_stage = CollectStage::new(self.config.batch_size);
         let (mut batch, unresolved, embed_batch) =
             collect_stage.process_single(parsed, Arc::clone(&index))?;
         let variable_bindings = std::mem::take(&mut batch.variable_bindings);
+        let this_barrier_spans = std::mem::take(&mut batch.this_barrier_spans);
 
         // Index the batch
         let index_stage = IndexStage::new(Arc::clone(&index), self.config.batches_per_commit);
@@ -193,7 +200,13 @@ impl Pipeline {
         let symbol_cache = Arc::new(SymbolLookupCache::from_index(&index)?);
 
         // Run Phase 2 resolution
-        let phase2_stats = self.run_phase2(unresolved, variable_bindings, symbol_cache, index)?;
+        let phase2_stats = self.run_phase2(
+            unresolved,
+            variable_bindings,
+            this_barrier_spans,
+            symbol_cache,
+            index,
+        )?;
 
         // Save embeddings
         self.persist_embeddings(semantic.as_ref(), &semantic_path)?;
@@ -271,6 +284,7 @@ impl Pipeline {
             index_stats,
             unresolved,
             variable_bindings,
+            this_barriers,
             symbol_cache,
             cleanup_stats,
             deleted_symbols,
@@ -292,7 +306,7 @@ impl Pipeline {
                 ));
                 let dual_status = StatusLine::new(Arc::clone(&dual_bar));
 
-                let (stats, unresolved, bindings, cache, metrics) = self.run_phase1(
+                let (stats, unresolved, bindings, barriers, cache, metrics) = self.run_phase1(
                     FileSource::Walk(root.to_path_buf()),
                     Arc::clone(&index),
                     Phase1Options {
@@ -322,6 +336,7 @@ impl Pipeline {
                     stats,
                     unresolved,
                     bindings,
+                    barriers,
                     cache,
                     CleanupStats::default(),
                     0,
@@ -341,7 +356,7 @@ impl Pipeline {
 
                 // has_embedding is false here, so semantic and pool are never
                 // both present: the embed stage cannot run in this arm.
-                let (stats, unresolved, bindings, cache, metrics) = self.run_phase1(
+                let (stats, unresolved, bindings, barriers, cache, metrics) = self.run_phase1(
                     FileSource::Walk(root.to_path_buf()),
                     Arc::clone(&index),
                     Phase1Options {
@@ -362,6 +377,7 @@ impl Pipeline {
                     stats,
                     unresolved,
                     bindings,
+                    barriers,
                     cache,
                     CleanupStats::default(),
                     0,
@@ -389,6 +405,18 @@ impl Pipeline {
                 });
             }
 
+            let files_to_index: Vec<PathBuf> = discover_result
+                .new_files
+                .iter()
+                .chain(discover_result.modified_files.iter())
+                .cloned()
+                .collect();
+
+            // Validate parser construction for every language in the
+            // change set BEFORE removing the modified files' old rows: a
+            // config error must fail the run with the rows still in place.
+            super::stages::preflight_file_parsers(&files_to_index, &self.settings)?;
+
             // Cleanup
             let cleanup_stage = if let Some(ref sem) = semantic {
                 CleanupStage::new(Arc::clone(&index), &semantic_path).with_semantic(Arc::clone(sem))
@@ -410,13 +438,6 @@ impl Pipeline {
                 cleanup_stats.symbols_removed += stats.symbols_removed;
             }
 
-            let files_to_index: Vec<PathBuf> = discover_result
-                .new_files
-                .iter()
-                .chain(discover_result.modified_files.iter())
-                .cloned()
-                .collect();
-
             // Create Phase 1 bar with actual files to index count
             // Labels: files, indexed, failed, embedded (for embedding visibility)
             let phase1_bar = Arc::new(ProgressBar::with_4_labels(
@@ -436,7 +457,7 @@ impl Pipeline {
                 }),
                 _ => None,
             };
-            let (stats, unresolved, bindings, _run_cache, metrics) = self.run_phase1(
+            let (stats, unresolved, bindings, barriers, _run_cache, metrics) = self.run_phase1(
                 FileSource::List(files_to_index),
                 Arc::clone(&index),
                 Phase1Options {
@@ -466,6 +487,7 @@ impl Pipeline {
                 stats,
                 unresolved,
                 bindings,
+                barriers,
                 cache,
                 cleanup_stats,
                 deleted_symbols,
@@ -478,6 +500,7 @@ impl Pipeline {
         let phase2_stats = self.run_phase2_maybe_bar(
             unresolved,
             variable_bindings,
+            this_barriers,
             symbol_cache,
             Arc::clone(&index),
             true,
@@ -551,6 +574,19 @@ impl Pipeline {
             });
         }
 
+        // Combine new + modified for indexing
+        let files_to_index: Vec<PathBuf> = discover_result
+            .new_files
+            .iter()
+            .chain(discover_result.modified_files.iter())
+            .cloned()
+            .collect();
+
+        // Validate parser construction for every language in the change
+        // set BEFORE removing the modified files' old rows: a config
+        // error must fail the run with the rows still in place.
+        super::stages::preflight_file_parsers(&files_to_index, &self.settings)?;
+
         // Create cleanup stage
         let cleanup_stage = if let Some(ref sem) = semantic {
             CleanupStage::new(Arc::clone(&index), &semantic_path).with_semantic(Arc::clone(sem))
@@ -577,14 +613,6 @@ impl Pipeline {
             cleanup_stats.embeddings_removed += stats.embeddings_removed;
         }
 
-        // Combine new + modified for indexing
-        let files_to_index: Vec<PathBuf> = discover_result
-            .new_files
-            .iter()
-            .chain(discover_result.modified_files.iter())
-            .cloned()
-            .collect();
-
         // Run Phase 1 on the files to index
         let show_progress = progress.is_some();
         let embed = match (&semantic, &embedding_pool) {
@@ -594,14 +622,15 @@ impl Pipeline {
             }),
             _ => None,
         };
-        let (index_stats, unresolved, variable_bindings, _run_cache, metrics) = self.run_phase1(
-            FileSource::List(files_to_index),
-            Arc::clone(&index),
-            Phase1Options {
-                progress: progress.map_or(ProgressSink::Silent, ProgressSink::Bar),
-                embed,
-            },
-        )?;
+        let (index_stats, unresolved, variable_bindings, this_barriers, _run_cache, metrics) = self
+            .run_phase1(
+                FileSource::List(files_to_index),
+                Arc::clone(&index),
+                Phase1Options {
+                    progress: progress.map_or(ProgressSink::Silent, ProgressSink::Bar),
+                    embed,
+                },
+            )?;
 
         // Log pipeline metrics (no StatusLine in this path, safe to log immediately)
         if let Some(m) = metrics {
@@ -616,6 +645,7 @@ impl Pipeline {
         let phase2_stats = self.run_phase2_maybe_bar(
             unresolved,
             variable_bindings,
+            this_barriers,
             symbol_cache,
             Arc::clone(&index),
             show_progress,

@@ -28,6 +28,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Merged upstream v0.10.0:** rebased the fork's upstream base from 0.9.23 to 0.10.0 (see the `[0.10.0]` entry below for upstream's changes); the fork build counter resets to `+rcrsr.1` on the new base.
 - **Merged upstream v0.10.1:** rebased the fork's upstream base from 0.10.0 to 0.10.1 (see the `[0.10.1]` entry below for upstream's changes); the fork build counter resets to `+rcrsr.1` on the new base.
+- **Merged upstream v0.11.1:** rebased the fork's upstream base from 0.10.1 to 0.11.1 (see the `[0.11.1]` and `[0.11.0]` entries below for upstream's changes); the fork build counter resets to `+rcrsr.1` on the new base.
+
+## [0.11.1] - 2026-07-24
+
+### Fixed
+
+- `this.name()` inside an arrow function resolves to the enclosing method's class member instead of a same-named local or the arrow's own symbol. A self-alias receiver (`this`, `self`, `$this`) on a caller carrying no class-member evidence no longer falls through to scope lookup in JavaScript, TypeScript, Python, PHP, Kotlin, and Java; JavaScript and TypeScript recover the call site through its innermost non-arrow enclosing callable, and a site with no such evidence produces no edge. Resolved-relationship counts move down where the resolver refuses picks it cannot prove: three.js 33695 -> 33491, laravel -6, ktor -2, pydantic -9. Python nested functions and PHP closures capturing `self`/`$this` fall into the refused class — their calls are dropped rather than resolved by scope proximity. Existing indexes converge through incremental re-index; `codanna index --force` adopts the change across every file at once.
+
+## [0.11.0] - 2026-07-24
+
+### Added
+
+- `function_wrappers` parser option for TypeScript (`[languages.typescript.parser_options]`): functions declared through named wrapper calls are extracted with their inner call edges. A declared name matches the call's full dotted text (`Effect.gen` matches `Effect.gen(...)` only) or its final property name (`memo` matches both `memo(...)` and `React.memo(...)`); curried forms (`wrap("name")(fn)`) descend. Emission is unchanged when the option is absent. Closes #115; dotted-text matching adopted from PR #116. The generated `codanna init` settings carry a commented example.
+
+### Changed
+
+- `--fields` projects dotted paths (`symbols.name,symbols.range.start_line`) with output nesting preserved. An unknown first segment rejects with an `INVALID_QUERY` envelope listing the available fields (exit `2`); unknown names previously dropped silently, returning output that looked complete. Scripts passing misspelled field names now fail the call.
+
+### Fixed
+
+- A language whose parser cannot construct (for example a malformed `parser_options` value) fails the indexing run with an error naming the language and cause, on every entry path: `codanna index` exits `2` before touching the index, watch-triggered re-index and MCP force-reindex surface the error on stderr. Previously the run reported success while every file of the language was silently skipped.
+- A failed re-index leaves the file's existing rows in place. Single-file re-index parses the new content before removing old rows; directory re-index validates parser construction for the change-set's languages before cleanup. Previously a parser-construction failure durably removed the changed files' rows until the next successful index run.
+- `codanna index` after deleting `.codanna/index` runs a single indexing pass in the command phase. Previously the pre-command config sync re-indexed every configured root against the freshly created empty index and the command phase then reported "Index up to date".
 
 ## [0.10.1] - 2026-07-23
 
@@ -1468,6 +1491,8 @@ _Note: v0.5.0 was an internal milestone, not a public release. Changes were incl
 ### Performance
 - Significant CI pipeline optimization
 
+[0.11.1]: https://github.com/bartolli/codanna/compare/v0.11.0...v0.11.1
+[0.11.0]: https://github.com/bartolli/codanna/compare/v0.10.1...v0.11.0
 [0.10.1]: https://github.com/bartolli/codanna/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/bartolli/codanna/compare/v0.9.23...v0.10.0
 [0.9.23]: https://github.com/bartolli/codanna/compare/v0.9.22...v0.9.23

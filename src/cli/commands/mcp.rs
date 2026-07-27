@@ -20,6 +20,36 @@ fn emit_envelope_and_exit<T: Serialize>(envelope: crate::io::envelope::Envelope<
     std::process::exit(envelope.exit_code.into());
 }
 
+/// Render an envelope as JSON, applying --fields projection when requested.
+/// An unknown projection field emits an InvalidQuery error envelope and
+/// exits via `emit_envelope_and_exit`, mirroring the unknown-argument
+/// rejection register while keeping the declared `exit_code` field and the
+/// delivered process exit synchronized.
+pub(crate) fn render_envelope_json<T: Serialize>(
+    envelope: &crate::io::envelope::Envelope<T>,
+    fields: Option<&Vec<String>>,
+) -> String {
+    use crate::io::envelope::{Envelope, FieldProjectionError, ResultCode};
+    match fields {
+        None => envelope.to_json().expect("envelope serialization"),
+        Some(f) => match envelope.to_json_with_fields(f) {
+            Ok(json) => json,
+            Err(FieldProjectionError::UnknownField { field, available }) => {
+                let err: Envelope<()> = Envelope::error(
+                    ResultCode::InvalidQuery,
+                    format!("Unknown field '{field}' in --fields"),
+                )
+                .with_hint(format!(
+                    "Available top-level fields: {}",
+                    available.join(", ")
+                ));
+                emit_envelope_and_exit(err);
+            }
+            Err(FieldProjectionError::Serde(e)) => panic!("envelope serialization: {e}"),
+        },
+    }
+}
+
 /// Print the shared `Ambiguous`-status envelope for an ambiguous symbol name
 /// and exit with its `exit_code`. Delegates to `service::ambiguous_envelope`
 /// — the single source of the status/code/exit_code mapping — so an
@@ -1370,11 +1400,8 @@ pub async fn run(
         Ok(call_result) => {
             if json && tool == "get_index_info" {
                 let envelope = crate::mcp::service::index_info_envelope(&indexer);
-                let output = match &fields {
-                    Some(f) => envelope.to_json_with_fields(f),
-                    None => envelope.to_json(),
-                };
-                println!("{}", output.expect("envelope serialization"));
+                let output = render_envelope_json(&envelope, fields.as_ref());
+                println!("{output}");
             } else if json && tool == "find_symbol" {
                 // Use pre-collected data for JSON output
                 if let Some(symbol_contexts) = find_symbol_data {
@@ -1399,11 +1426,8 @@ pub async fn run(
                         // Envelope serialization is infallible for simple types
                         emit_envelope_and_exit(envelope);
                     }
-                    let output = match &fields {
-                        Some(f) => envelope.to_json_with_fields(f),
-                        None => envelope.to_json(),
-                    };
-                    println!("{}", output.expect("envelope serialization"));
+                    let output = render_envelope_json(&envelope, fields.as_ref());
+                    println!("{output}");
                 }
             } else if json && tool == "find_symbols" {
                 // Use pre-collected data for JSON output — mirrors find_symbol
@@ -1417,11 +1441,8 @@ pub async fn run(
 
                     let envelope =
                         crate::mcp::service::find_symbols_envelope(&indexer, results, language);
-                    let output = match &fields {
-                        Some(f) => envelope.to_json_with_fields(f),
-                        None => envelope.to_json(),
-                    };
-                    println!("{}", output.expect("envelope serialization"));
+                    let output = render_envelope_json(&envelope, fields.as_ref());
+                    println!("{output}");
                 }
             } else if json && tool == "get_calls" {
                 let identifier = if let Some(id) = arguments
@@ -1445,11 +1466,8 @@ pub async fn run(
                         &identifier,
                         calls,
                     );
-                    let output = match &fields {
-                        Some(f) => envelope.to_json_with_fields(f),
-                        None => envelope.to_json(),
-                    };
-                    println!("{}", output.expect("envelope serialization"));
+                    let output = render_envelope_json(&envelope, fields.as_ref());
+                    println!("{output}");
                     if envelope.exit_code != 0 {
                         std::process::exit(envelope.exit_code.into());
                     }
@@ -1488,10 +1506,7 @@ pub async fn run(
                             &identifier,
                             &unfiltered,
                         );
-                        let rendered = match &fields {
-                            Some(f) => envelope.to_json_with_fields(f),
-                            None => envelope.to_json(),
-                        };
+                        let rendered = render_envelope_json(&envelope, fields.as_ref());
                         (rendered, envelope.exit_code)
                     } else {
                         let filtered = filter_callers(unfiltered, find_callers_filter);
@@ -1500,13 +1515,10 @@ pub async fn run(
                             &identifier,
                             filtered,
                         );
-                        let rendered = match &fields {
-                            Some(f) => envelope.to_json_with_fields(f),
-                            None => envelope.to_json(),
-                        };
+                        let rendered = render_envelope_json(&envelope, fields.as_ref());
                         (rendered, envelope.exit_code)
                     };
-                    println!("{}", output.expect("envelope serialization"));
+                    println!("{output}");
                     if exit_code != 0 {
                         std::process::exit(exit_code.into());
                     }
@@ -1549,10 +1561,7 @@ pub async fn run(
                             max_depth,
                             &impacted,
                         );
-                        let rendered = match &fields {
-                            Some(f) => envelope.to_json_with_fields(f),
-                            None => envelope.to_json(),
-                        };
+                        let rendered = render_envelope_json(&envelope, fields.as_ref());
                         (rendered, envelope.exit_code)
                     } else {
                         let envelope = crate::mcp::service::analyze_impact_listing_envelope(
@@ -1563,13 +1572,10 @@ pub async fn run(
                             analyze_impact_group_by,
                             analyze_impact_max_results,
                         );
-                        let rendered = match &fields {
-                            Some(f) => envelope.to_json_with_fields(f),
-                            None => envelope.to_json(),
-                        };
+                        let rendered = render_envelope_json(&envelope, fields.as_ref());
                         (rendered, envelope.exit_code)
                     };
-                    println!("{}", output.expect("envelope serialization"));
+                    println!("{output}");
                     if exit_code != 0 {
                         std::process::exit(exit_code.into());
                     }
@@ -1600,11 +1606,8 @@ pub async fn run(
                     let envelope = crate::mcp::service::search_symbols_envelope(
                         &indexer, query, language, results,
                     );
-                    let output = match &fields {
-                        Some(f) => envelope.to_json_with_fields(f),
-                        None => envelope.to_json(),
-                    };
-                    println!("{}", output.expect("envelope serialization"));
+                    let output = render_envelope_json(&envelope, fields.as_ref());
+                    println!("{output}");
                     if envelope.exit_code != 0 {
                         std::process::exit(envelope.exit_code.into());
                     }
@@ -1636,11 +1639,8 @@ pub async fn run(
                     let envelope = crate::mcp::service::semantic_search_docs_envelope(
                         &indexer, query, language, results,
                     );
-                    let output = match &fields {
-                        Some(f) => envelope.to_json_with_fields(f),
-                        None => envelope.to_json(),
-                    };
-                    println!("{}", output.expect("envelope serialization"));
+                    let output = render_envelope_json(&envelope, fields.as_ref());
+                    println!("{output}");
                     if envelope.exit_code != 0 {
                         std::process::exit(envelope.exit_code.into());
                     }
@@ -1678,11 +1678,8 @@ pub async fn run(
                     let envelope = crate::mcp::service::semantic_search_with_context_envelope(
                         &indexer, query, language, results,
                     );
-                    let output = match &fields {
-                        Some(f) => envelope.to_json_with_fields(f),
-                        None => envelope.to_json(),
-                    };
-                    println!("{}", output.expect("envelope serialization"));
+                    let output = render_envelope_json(&envelope, fields.as_ref());
+                    println!("{output}");
                     if envelope.exit_code != 0 {
                         std::process::exit(envelope.exit_code.into());
                     }
@@ -1748,11 +1745,8 @@ pub async fn run(
                             )
                     };
 
-                    let output = match &fields {
-                        Some(f) => envelope.to_json_with_fields(f),
-                        None => envelope.to_json(),
-                    };
-                    println!("{}", output.expect("envelope serialization"));
+                    let output = render_envelope_json(&envelope, fields.as_ref());
+                    println!("{output}");
                     if envelope.exit_code != 0 {
                         std::process::exit(envelope.exit_code.into());
                     }
@@ -1771,11 +1765,8 @@ pub async fn run(
                 if let Some(outcome) = reindex_data {
                     let envelope = crate::mcp::service::reindex_envelope(&outcome);
 
-                    let output = match &fields {
-                        Some(f) => envelope.to_json_with_fields(f),
-                        None => envelope.to_json(),
-                    };
-                    println!("{}", output.expect("envelope serialization"));
+                    let output = render_envelope_json(&envelope, fields.as_ref());
+                    println!("{output}");
                 }
             } else {
                 // Default text output

@@ -2125,6 +2125,244 @@ mod tests {
         assert!(result.is_ok(), "force on unindexed file: {result:?}");
     }
 
+    fn settings_with_broken_typescript(dir: &std::path::Path) -> Settings {
+        let mut settings = Settings {
+            index_path: dir.join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings
+            .languages
+            .get_mut("typescript")
+            .expect("typescript registered by default")
+            .parser_options
+            .insert("function_wrappers".into(), serde_json::json!(42));
+        settings
+    }
+
+    // Regression: a language whose parser cannot construct (malformed
+    // parser_options) must fail the run, not report success with every
+    // file of that language silently skipped.
+    #[test]
+    fn index_directory_fails_when_parser_construction_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("src");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("app.ts"), "export function main() {}\n").unwrap();
+
+        let settings = settings_with_broken_typescript(dir.path());
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        let result = facade.index_directory(&root, false);
+        let err = result.expect_err("construction failure must fail the run");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("typescript") && msg.contains("function_wrappers"),
+            "error must name the language and cause: {msg}"
+        );
+    }
+
+    // A healthy language in the same run must not mask the broken one:
+    // partial success still fails.
+    #[test]
+    fn index_directory_mixed_languages_still_fails_on_broken_language() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("src");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("lib.rs"), "pub fn alpha() {}\n").unwrap();
+        std::fs::write(root.join("app.ts"), "export function main() {}\n").unwrap();
+
+        let settings = settings_with_broken_typescript(dir.path());
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        let result = facade.index_directory(&root, false);
+        assert!(
+            result.is_err(),
+            "run with a healthy language must still fail: {result:?}"
+        );
+    }
+
+    // Regression: a failed re-index must not evict the file's old rows.
+    // Cleanup used to commit before parse; a construction failure then
+    // left the deletion standing (durable data loss until config fix).
+    #[test]
+    fn index_file_retains_old_rows_when_reindex_parse_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("app.ts");
+        std::fs::write(&source, "export function main() {}\n").unwrap();
+
+        let seeded = {
+            let settings = Settings {
+                index_path: dir.path().join("index"),
+                workspace_root: None,
+                ..Default::default()
+            };
+            let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+            facade.index_file(&source).unwrap();
+            facade.symbol_count()
+        };
+        assert!(seeded > 0, "seed must index symbols");
+
+        std::fs::write(
+            &source,
+            "export function main() {}\nexport function extra() {}\n",
+        )
+        .unwrap();
+
+        let settings = settings_with_broken_typescript(dir.path());
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+        facade
+            .index_file(&source)
+            .expect_err("construction failure must surface");
+        assert_eq!(
+            facade.symbol_count(),
+            seeded,
+            "failed re-index must leave the old rows in place"
+        );
+    }
+
+    // Same invariant on the directory incremental path: the modified
+    // file's rows survive a run whose parser cannot construct.
+    #[test]
+    fn index_directory_retains_old_rows_when_reindex_construction_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("src");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("lib.rs"), "pub fn alpha() {}\n").unwrap();
+        std::fs::write(root.join("app.ts"), "export function main() {}\n").unwrap();
+
+        let seeded = {
+            let settings = Settings {
+                index_path: dir.path().join("index"),
+                workspace_root: None,
+                ..Default::default()
+            };
+            let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+            facade.index_directory(&root, false).unwrap();
+            facade.symbol_count()
+        };
+        assert!(seeded > 0, "seed must index symbols");
+
+        std::fs::write(
+            root.join("app.ts"),
+            "export function main() {}\nexport function extra() {}\n",
+        )
+        .unwrap();
+        // Discover's fast path skips same-second rewrites on stored mtime;
+        // push mtime forward so the file registers as modified.
+        std::fs::File::options()
+            .write(true)
+            .open(root.join("app.ts"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(2))
+            .unwrap();
+
+        let settings = settings_with_broken_typescript(dir.path());
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+        facade
+            .index_directory(&root, false)
+            .expect_err("construction failure must fail the run");
+        assert_eq!(
+            facade.symbol_count(),
+            seeded,
+            "failed incremental run must leave the modified file's rows in place"
+        );
+    }
+
+    // Lexical-this walk, end to end through the real js parser: the
+    // story's minimized reproducer. The arrow shadows the method's name;
+    // the persisted edge must target the ClassMember method, never the
+    // arrow itself.
+    #[test]
+    fn js_arrow_this_shadow_resolves_to_method_not_self_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("widget.js");
+        std::fs::write(
+            &source,
+            "class Widget {\n  render() {\n    const render = () => this.render();\n    return render;\n  }\n}\n",
+        )
+        .unwrap();
+
+        let settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+        facade.index_file(&source).unwrap();
+
+        let arrow = facade
+            .find_symbols_by_name("render", None)
+            .into_iter()
+            .find(|s| s.kind == SymbolKind::Function)
+            .expect("arrow symbol indexed");
+        let callees = facade.get_called_functions(arrow.id);
+        assert_eq!(
+            callees.len(),
+            1,
+            "arrow must call exactly the lexical method: {callees:?}"
+        );
+        assert_eq!(callees[0].kind, SymbolKind::Method, "callee is the method");
+        assert_ne!(callees[0].id, arrow.id, "never a self-loop");
+    }
+
+    // TypeScript twin of the lexical-this lock: modifiers and a return
+    // type must not break the barrier-to-member range equality the walk
+    // depends on.
+    #[test]
+    fn ts_arrow_this_shadow_resolves_to_method_not_self_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("widget.ts");
+        std::fs::write(
+            &source,
+            "class Widget {\n  private render(): number {\n    const render = () => this.render();\n    return render();\n  }\n}\n",
+        )
+        .unwrap();
+
+        let settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+        facade.index_file(&source).unwrap();
+
+        let arrow = facade
+            .find_symbols_by_name("render", None)
+            .into_iter()
+            .find(|s| s.kind == SymbolKind::Function)
+            .expect("arrow symbol indexed");
+        let callees = facade.get_called_functions(arrow.id);
+        assert_eq!(
+            callees.len(),
+            1,
+            "arrow must call exactly the lexical method: {callees:?}"
+        );
+        assert_eq!(callees[0].kind, SymbolKind::Method, "callee is the method");
+        assert_ne!(callees[0].id, arrow.id, "never a self-loop");
+    }
+
+    // Single-file path (watcher reindex): the error names the language,
+    // not an anonymous parse failure with an empty path.
+    #[test]
+    fn index_file_names_language_on_construction_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("app.ts");
+        std::fs::write(&source, "export function main() {}\n").unwrap();
+
+        let settings = settings_with_broken_typescript(dir.path());
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        let err = facade
+            .index_file(&source)
+            .expect_err("construction failure must surface");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cannot initialize typescript parser"),
+            "error must carry the typed construction message: {msg}"
+        );
+    }
+
     fn test_facade(dir: &tempfile::TempDir) -> IndexFacade {
         let settings = Settings {
             index_path: dir.path().join("index"),
