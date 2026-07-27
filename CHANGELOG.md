@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Indexing no longer depends on the process working directory.** Two read paths opened workspace-relative paths as-is, resolving them against the CWD instead of `workspace_root`: the batch READ stage (fed relative paths by `DiscoverStage`, which normalizes them to compare against the index's stored rows) and single-file re-index (fed relative paths by the watch handler). Both now resolve against `workspace_root` first. The CLI and server were unaffected in practice because they run from the workspace root; an in-process embedder with a different CWD indexed nothing and got no error — `index_directory` returned `Ok` with `files_indexed` counted and `symbols_found` zero — and `serve --watch` failed every re-index with `No such file or directory`.
 - **Wedged-reindex visibility:** A full reindex whose walk exceeds ten minutes now logs an `ERROR` naming the elapsed time, the fact that further reindex requests are being rejected with `REINDEX_IN_PROGRESS` meanwhile, and that a restart is the only recovery; it re-logs on a widening interval while stuck — 10 minutes, then 20, then 40, then hourly thereafter, indefinitely. This covers the case the existing catch-up `WARN` misses — a wedged reindex with no watcher running, which was previously silent at every log level. Observability only: the walk is not cancelled and the serialization gate is not released, since the walk runs on an uninterruptible blocking thread and releasing the gate mid-write would re-open the race it guards. ([#46](https://github.com/rcrsr/rcrsr-codanna/pull/46))
 - **Ignore/exclusion config:** ignore patterns and follow_links now take effect; malformed patterns error instead of silently failing. ([#36](https://github.com/rcrsr/rcrsr-codanna/pull/36))
 - **Vector read-path concurrency:** Concurrent document searches no longer serialize on exclusive locks; blocking work runs off the async runtime. ([#32](https://github.com/rcrsr/rcrsr-codanna/pull/32))
@@ -29,7 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Merged upstream v0.10.0:** rebased the fork's upstream base from 0.9.23 to 0.10.0 (see the `[0.10.0]` entry below for upstream's changes); the fork build counter resets to `+rcrsr.1` on the new base.
 - **Merged upstream v0.10.1:** rebased the fork's upstream base from 0.10.0 to 0.10.1 (see the `[0.10.1]` entry below for upstream's changes); the fork build counter resets to `+rcrsr.1` on the new base.
 - **Merged upstream v0.11.1:** rebased the fork's upstream base from 0.10.1 to 0.11.1 (see the `[0.11.1]` and `[0.11.0]` entries below for upstream's changes); the fork build counter resets to `+rcrsr.1` on the new base.
-- **Merged upstream v0.12.0:** rebased the fork's upstream base from 0.11.1 to 0.12.0 (see the `[0.12.0]` entry above for upstream's changes); the fork build counter resets to `+rcrsr.1` on the new base.
+- **Merged upstream v0.12.0:** rebased the fork's upstream base from 0.11.1 to 0.12.0 (see the `[0.12.0]` entry below for upstream's changes); the fork build counter resets to `+rcrsr.1` on the new base.
 
 ## [0.12.0] - 2026-07-26
 

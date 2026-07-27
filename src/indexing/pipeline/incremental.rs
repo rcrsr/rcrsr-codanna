@@ -69,8 +69,24 @@ impl Pipeline {
             })?;
 
         // Read file using ReadStage (with absolute path for fs access)
+        // Resolve against workspace_root before opening, for the same reason
+        // the batch READ stage does: callers hand this method paths in either
+        // form. `serve --watch` reaches here with the handler's already
+        // workspace-relative path, and opening that as-is resolves it against
+        // the process CWD -- so a watcher whose CWD is not the workspace root
+        // failed every reindex with "No such file or directory". The server
+        // only escaped it by always being launched from the workspace root.
+        let read_path = if path.is_relative() {
+            match &self.settings.workspace_root {
+                Some(root) => root.join(path),
+                None => path.to_path_buf(),
+            }
+        } else {
+            path.to_path_buf()
+        };
+
         let read_stage = ReadStage::new(1);
-        let mut file_content = read_stage.read_single(&path.to_path_buf())?;
+        let mut file_content = read_stage.read_single(&read_path)?;
         // Use normalized path for storage consistency with full index
         file_content.path = normalized_path.to_path_buf();
         let content_hash = file_content.hash.clone();

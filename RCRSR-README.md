@@ -481,6 +481,32 @@ without complaint and silently ignore the key, so anything you exclude only
 via `ignore_patterns` would get indexed there. Move those patterns to
 `.codannaignore` if you need a config that behaves identically on both.
 
+## Indexing no longer depends on the working directory
+
+Two read paths opened workspace-relative paths as-is, which resolves them
+against the process working directory rather than `workspace_root`. The batch
+READ stage gets relative paths from the discovery stage, which has to normalize
+them to compare against the index's stored rows; single-file re-index gets them
+from the watch handler. Both now resolve against `workspace_root` before
+opening.
+
+Running `codanna` from the command line was never affected, because the CLI and
+the server are launched from the workspace root, where the two agree. It bit
+anything that did not do that:
+
+- **Embedding `IndexFacade` in another process.** With `workspace_root` set and
+  a different CWD, every file read failed and the run still reported success —
+  `index_directory` returned `Ok` with `files_indexed` counted and
+  `symbols_found` zero, producing a silently empty index with no error to
+  catch.
+- **`serve --watch` started from elsewhere.** Every re-index failed with
+  `No such file or directory` against a path that plainly existed.
+
+Both are covered by regression tests that fail on the pre-fix behavior: one
+asserting a non-empty index when CWD differs from `workspace_root`, and an
+end-to-end watcher test that creates a directory under a watched root and
+requires the file inside it to become retrievable through the real watch loop.
+
 ## Document collection controls (`search_documents`)
 
 The fork adds per-collection default-visibility, negated glob patterns for

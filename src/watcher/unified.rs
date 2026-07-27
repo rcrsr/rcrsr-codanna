@@ -1729,4 +1729,104 @@ mod tests {
         assert_eq!(watcher.catch_up_attempts, 0);
         assert!(watcher.stale);
     }
+
+    /// End-to-end liveness proof for upstream v0.12.0's created-directory
+    /// handling, driven through the real `watch()` loop over a real kernel
+    /// watcher -- no hand-set state.
+    ///
+    /// Every other test of this feature populates `handler_roots` directly,
+    /// so all of them pass even if `register_handler_roots()` is never
+    /// called from `watch()`, or if `watch_roots()` returns empty because
+    /// `init_cache()` ran after it instead of before. In either case the
+    /// feature is dead in production and only this test notices: it asserts
+    /// on the indexed result, so it fails unless the whole chain is live --
+    /// refresh_paths -> init_cache -> eligibility.roots -> watch_roots ->
+    /// register_handler_roots -> handle_created_directory -> debouncer ->
+    /// on_modify -> reindex.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn created_directory_is_indexed_through_the_real_watch_loop() {
+        use crate::config::Settings;
+        use crate::indexing::facade::IndexFacade;
+        use crate::watcher::handlers::CodeFileHandler;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir
+            .path()
+            .canonicalize()
+            .expect("temp dir must canonicalize");
+
+        // Seed one indexed file so the watcher has something to watch and
+        // `tracked_paths()` is non-empty at startup.
+        std::fs::write(root.join("seed.py"), "def seed():\n    pass\n").unwrap();
+
+        let index_dir = tempfile::tempdir().unwrap();
+        // workspace_root set, as a real server's settings.toml has it, and
+        // identical to the value handed to the handler below: the handler
+        // relativizes paths against its own root while the facade resolves
+        // them against settings, so production keeps the two the same.
+        let mut settings = Settings {
+            index_path: index_dir.path().to_path_buf(),
+            workspace_root: Some(root.clone()),
+            ..Default::default()
+        };
+        // `add_indexed_path` populates `indexed_paths_cache` itself, which is
+        // what `init_cache` reads to build `eligibility.roots`.
+        settings
+            .add_indexed_path(root.clone())
+            .expect("register the indexed root");
+
+        let mut facade = IndexFacade::new(Arc::new(settings)).expect("facade over temp index");
+        facade.index_directory(&root, false).expect("seed index");
+        let facade = Arc::new(RwLock::new(facade));
+
+        let handler = CodeFileHandler::new(Arc::clone(&facade), root.clone());
+        let watcher = UnifiedWatcher::builder()
+            .broadcaster(Arc::new(NotificationBroadcaster::new(16)))
+            .indexer(Arc::clone(&facade))
+            .workspace_root(root.clone())
+            .handler(handler)
+            .debounce_ms(0)
+            .build()
+            .expect("builder has all required fields");
+
+        let watch_task = tokio::spawn(watcher.watch());
+
+        // Let watch() finish startup (refresh_paths, tracked_paths,
+        // watch_directory, register_handler_roots) before generating events.
+        tokio::time::sleep(Duration::from_millis(750)).await;
+
+        std::fs::create_dir_all(root.join("fresh")).unwrap();
+        std::fs::write(
+            root.join("fresh/arrival.py"),
+            "def arrival_marker():\n    pass\n",
+        )
+        .unwrap();
+
+        // Poll rather than sleep a fixed span: inotify delivery plus debounce
+        // plus reindex has no bounded latency worth hardcoding. A generous
+        // deadline keeps this from flaking on a loaded machine while still
+        // failing outright if the feature is dead.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut found = false;
+        while Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let f = facade.read().await;
+            if f.find_symbols_by_name("arrival_marker", None)
+                .iter()
+                .any(|s| s.name.as_ref() == "arrival_marker")
+            {
+                found = true;
+                break;
+            }
+        }
+
+        watch_task.abort();
+
+        assert!(
+            found,
+            "a source file created inside a NEW directory under a registered \
+             root must be indexed by the running watcher; not finding it means \
+             the created-directory chain is not wired end to end"
+        );
+    }
 }

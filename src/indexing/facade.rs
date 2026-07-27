@@ -2168,6 +2168,59 @@ mod tests {
         );
     }
 
+    // Regression: indexing with `workspace_root` set must not depend on the
+    // process CWD. DiscoverStage normalizes discovered files to paths
+    // relative to workspace_root (it has to, to compare them against the
+    // index's stored rows), and READ used to open those as-is -- resolving
+    // them against the CWD. Anywhere but the workspace root that read failed
+    // for every file, and the run still returned Ok: `files_indexed` counted
+    // the change set while `symbols_found` was 0, so an in-process embedder
+    // got a silently empty index and no error. The CLI only escaped it by
+    // always running from the workspace root.
+    //
+    // This test binary runs from the repo root, never the temp workspace, so
+    // setting workspace_root is enough to reproduce it -- no chdir needed
+    // (which would be unsound anyway, CWD being process-global while tests
+    // run in parallel).
+    #[test]
+    fn indexing_with_workspace_root_set_does_not_depend_on_process_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/alpha.py"), "def alpha():\n    pass\n").unwrap();
+
+        assert_ne!(
+            std::env::current_dir().unwrap(),
+            root,
+            "precondition: CWD must differ from workspace_root or this proves nothing"
+        );
+
+        // The index lives outside the workspace so it cannot be confused for
+        // indexable content, and so the assertions below speak only to reads.
+        let outside = tempfile::tempdir().unwrap();
+        let settings = Settings {
+            index_path: outside.path().join("index"),
+            workspace_root: Some(root.clone()),
+            ..Default::default()
+        };
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        let stats = facade.index_directory(&root, false).unwrap();
+        assert_eq!(stats.files_indexed, 1, "the one source file is indexed");
+        assert!(
+            stats.symbols_found > 0,
+            "reads must succeed: files_indexed without symbols_found is the \
+             silent-empty-index signature this guards ({stats:?})"
+        );
+        assert!(
+            facade
+                .find_symbols_by_name("alpha", None)
+                .iter()
+                .any(|s| s.name.as_ref() == "alpha"),
+            "the parsed symbol must be retrievable from the built index"
+        );
+    }
+
     // Regression: force re-index of a not-yet-indexed file must still
     // succeed after remove_file errors stopped being swallowed.
     #[test]
