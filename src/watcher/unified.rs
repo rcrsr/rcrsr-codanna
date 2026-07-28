@@ -96,6 +96,13 @@ pub struct UnifiedWatcher {
     /// handling and stays watched even when a root holds no indexed
     /// file directly.
     handler_roots: Vec<PathBuf>,
+    /// Test-only counter of `discoverable_entries_for` invocations from the
+    /// created-directory drain path, so tests can assert the number of
+    /// walks a burst produces directly instead of only inferring "one walk"
+    /// from its side effects (which a per-scope-walk regression could still
+    /// satisfy).
+    #[cfg(test)]
+    walk_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl UnifiedWatcher {
@@ -180,9 +187,14 @@ impl UnifiedWatcher {
 
                 // Process debounced changes
                 _ = &mut timeout => {
-                    // Coalesced created-directory walks first, so files they
-                    // record for catch-up don't wait an extra debounce window
-                    // before this same tick's `take_ready()` below.
+                    // Coalesced created-directory walks run first: this only
+                    // orders the two `take_ready()` calls within the same
+                    // tick (files recorded here still wait a full debounce
+                    // window regardless of order, since `record()` stamps
+                    // `Instant::now()` after this call already started). The
+                    // ordering matters for `maybe_start_catch_up()` below,
+                    // which must see any scope still debouncing in either
+                    // debouncer before deciding whether to fire.
                     self.process_pending_created_dirs().await;
 
                     let ready = self.debouncer.take_ready();
@@ -536,14 +548,37 @@ impl UnifiedWatcher {
             (scopes_by_root, settings)
         };
 
+        // Spawn every root's walk before awaiting any of them, so the total
+        // stall on this select-loop tick is bounded by the slowest single
+        // root's walk rather than the sum of all roots' walks. Pruning and
+        // dedup of each root's scope list also move inside the blocking
+        // closure here, so the (O(n^2) worst case) pruning pass runs off
+        // the tokio worker driving the watch loop too, not just the walk.
+        let mut tasks = Vec::with_capacity(scopes_by_root.len());
         for (root, scopes) in scopes_by_root {
-            let scopes = prune_nested_scopes(&scopes);
             let settings = Arc::clone(&settings);
             let root_owned = root.clone();
-            let walk_result = tokio::task::spawn_blocking(move || {
+            let scopes_for_walk = scopes.clone();
+            #[cfg(test)]
+            let walk_count = Arc::clone(&self.walk_count);
+            let handle = tokio::task::spawn_blocking(move || {
+                let mut scopes = prune_nested_scopes(&scopes_for_walk);
+                // `prune_nested_scopes` deliberately keeps ancestor/descendant
+                // duplicates (see its doc comment), but exact duplicates can
+                // still arrive here after canonicalization; dedup them so
+                // `discoverable_entries_for`'s per-path `any(starts_with)`
+                // filter doesn't redundantly re-check the same scope.
+                scopes.sort();
+                scopes.dedup();
+                #[cfg(test)]
+                walk_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 IndexFacade::discoverable_entries_for(&settings, &root_owned, &scopes)
-            })
-            .await;
+            });
+            tasks.push((root, scopes, handle));
+        }
+
+        for (root, scopes, handle) in tasks {
+            let walk_result = handle.await;
 
             let (dirs, files) = match walk_result {
                 Ok(Ok(entries)) => entries,
@@ -552,6 +587,17 @@ impl UnifiedWatcher {
                         "[watcher] failed to discover entries under {}: {e}",
                         root.display()
                     );
+                    // `take_ready()` above already removed these scopes from
+                    // `dir_debouncer`, so without this they would be dropped
+                    // permanently on a transient failure (e.g. a permission
+                    // race during a large extract). Re-record them so the
+                    // next settled tick retries the whole batch. This is not
+                    // attempt-bounded: a permanently-failing scope retries
+                    // indefinitely, but only once per debounce window (the
+                    // record/take_ready cadence), not in a tight loop.
+                    for scope in scopes {
+                        self.dir_debouncer.record(scope);
+                    }
                     continue;
                 }
                 Err(e) => {
@@ -559,6 +605,9 @@ impl UnifiedWatcher {
                         "[watcher] discovery task for {} panicked: {e}",
                         root.display()
                     );
+                    for scope in scopes {
+                        self.dir_debouncer.record(scope);
+                    }
                     continue;
                 }
             };
@@ -1096,6 +1145,8 @@ impl UnifiedWatcherBuilder {
             catch_up_attempts: 0,
             consecutive_contention: 0,
             handler_roots: Vec::new(),
+            #[cfg(test)]
+            walk_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 }
@@ -1415,17 +1466,15 @@ mod tests {
     // -- coalescing behavior --------------------------------------------
     //
     // These are the point of the change: a burst of created-directory events
-    // must settle into ONE walk per owning root, not one walk per event. We
-    // cannot count walker invocations without adding a counter to production
-    // code (which the task explicitly disallows), so instead each test
-    // proves the *batching* itself: nothing is walked until the drain runs
-    // (via `process_pending_created_dirs`, called exactly once), and that
-    // single drain call is sufficient to discover every sibling/descendant
-    // and every file inside them. A per-event (uncoalesced) implementation
-    // would need N drains/timer ticks to reach the same end state, or would
-    // have already walked before this single drain call - both are ruled out
-    // by asserting the pre-drain state is unchanged and the post-drain state
-    // is complete after exactly one call.
+    // must settle into ONE walk per owning root, not one walk per event.
+    // `UnifiedWatcher::walk_count` (a `#[cfg(test)]`-only counter incremented
+    // once per `discoverable_entries_for` call on the drain path) makes that
+    // walk count directly assertable, rather than only inferring "one walk"
+    // from side effects a per-scope-walk regression could still satisfy.
+    // Each test also proves the *batching* itself: nothing is walked until
+    // the drain runs (via `process_pending_created_dirs`, called exactly
+    // once), and that single drain call is sufficient to discover every
+    // sibling/descendant and every file inside them.
 
     /// The dominant case: several sibling directories created under one
     /// root in a single burst, each holding a file. A nesting-only fix
@@ -1468,6 +1517,11 @@ mod tests {
 
         watcher.process_pending_created_dirs().await;
 
+        assert_eq!(
+            watcher.walk_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "five sibling scopes under one root must produce exactly one walk"
+        );
         for dir in &siblings {
             assert!(
                 watcher.registry.watch_dirs().contains(dir),
@@ -1528,6 +1582,11 @@ mod tests {
 
         watcher.process_pending_created_dirs().await;
 
+        assert_eq!(
+            watcher.walk_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a nested chain under one root must collapse to exactly one walk"
+        );
         for dir in [&a, &b, &c, &d] {
             assert!(
                 watcher.registry.watch_dirs().contains(dir),
@@ -1573,6 +1632,11 @@ mod tests {
 
         watcher.process_pending_created_dirs().await;
 
+        assert_eq!(
+            watcher.walk_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "two disjoint scopes under the same root must group into one walk"
+        );
         let ready = watcher.debouncer.take_ready();
         assert!(
             ready.iter().any(|p| p.ends_with("left.rs")),
@@ -1793,6 +1857,41 @@ mod tests {
             None, // no prior catch-up completion recorded
             CATCH_UP_COOLDOWN,
         ));
+    }
+
+    /// `maybe_start_catch_up` is production's only caller of
+    /// `should_start_catch_up`, and composes the `has_pending` argument from
+    /// *both* debouncers (`self.debouncer.has_pending() ||
+    /// self.dir_debouncer.has_pending()`). The pure `should_start_catch_up_*`
+    /// tests above exercise the predicate with `has_pending` passed in
+    /// directly, so they cannot catch a regression that drops the
+    /// `dir_debouncer` half of that composition. This exercises the
+    /// composition itself: a created-directory scope is still debouncing
+    /// (recorded, not yet drained) while the plain file `debouncer` is
+    /// empty, staleness is armed and past the quiet window, yet
+    /// `maybe_start_catch_up` must not spawn a catch-up task.
+    #[tokio::test]
+    async fn maybe_start_catch_up_defers_while_dir_debouncer_has_pending() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut watcher = test_watcher(&tempdir);
+
+        watcher
+            .dir_debouncer
+            .record(tempdir.path().join("still-settling"));
+        assert!(!watcher.debouncer.has_pending());
+        assert!(watcher.dir_debouncer.has_pending());
+
+        watcher.stale = true;
+        watcher.stale_since =
+            Some(Instant::now() - watcher.debounce_window - Duration::from_millis(50));
+
+        watcher.maybe_start_catch_up();
+
+        assert!(
+            watcher.catch_up_task.is_none(),
+            "a created-directory scope still debouncing must defer catch-up, \
+             the same race `self.dir_debouncer.has_pending()` exists to prevent"
+        );
     }
 
     // ── should_clear_stale_after_success: the overflow-during-walk race ────

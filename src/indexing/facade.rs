@@ -1215,8 +1215,22 @@ impl IndexFacade {
         root: &std::path::Path,
         scopes: &[PathBuf],
     ) -> crate::IndexResult<(Vec<PathBuf>, Vec<PathBuf>)> {
+        if scopes.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
         let (dirs, files) = crate::indexing::walker::FileWalker::new(Arc::clone(settings))
             .walk_dirs_and_files(root)?;
+
+        // Fast path: a single scope (the common case) needs no `any()` over
+        // a one-element slice for every discovered path.
+        if let [scope] = scopes {
+            return Ok((
+                dirs.into_iter().filter(|p| p.starts_with(scope)).collect(),
+                files.into_iter().filter(|p| p.starts_with(scope)).collect(),
+            ));
+        }
+
         Ok((
             dirs.into_iter()
                 .filter(|p| scopes.iter().any(|s| p.starts_with(s)))
