@@ -661,19 +661,40 @@ Details worth knowing:
 - **Staleness-guarded.** The file on disk must still hash to what was indexed
   (the same guard `read_symbol` uses). If the file changed, is unreadable, or
   fails to parse, classification silently falls back to the path heuristic —
-  the pre-existing answer. It never errors, and it degrades toward reporting
-  `production`, so a stale file can't turn "unsafe to delete" into "safe".
+  the pre-existing answer. It never errors, and every failure path degrades
+  toward reporting `production`, so a stale file can't turn "unsafe to delete"
+  into "safe".
 - **`#[cfg(feature = "test")]` is correctly not a test span** — the attribute
   argument is a string literal there, not the `test` identifier.
-- **`#[cfg(all(test, not(windows)))]` is deliberately *not* treated as test.**
-  Any `not(...)` inside the `cfg` disqualifies the span rather than risking a
-  wrong call, so a caller under such an attribute stays `production`.
+- **`#[cfg(any(test, feature = "x"))]` is correctly not a test span**, even
+  though it contains the `test` identifier. `any(...)` is a disjunction: this
+  attribute compiles in a normal (non-test) build whenever the sibling
+  feature is enabled, so treating it as test-only would misclassify a
+  production-reachable caller as `test` — the unsafe direction for a "safe to
+  delete" answer. `#[cfg(not(test))]` is disqualified the same way.
+  `#[cfg(all(test, not(windows)))]` **is** still treated as a test span:
+  `all(...)` is a conjunction, so `test` inside it still means "test builds
+  only" — only a disqualifying `any(...)`/`not(...)` around the `test`
+  identifier itself flips the answer.
 - **No configuration.** There is no toggle; `test_path_patterns` remains the
   only knob, and it still governs the path heuristic for every language.
 
-The cost is one file read plus one parse per *distinct* Rust caller file per
-call (callers in the same file share a cache), gated by a cheap substring check
-that skips the parse entirely for files containing no `#[cfg(` at all.
+The cost is one file read plus one parse attempt per *distinct* Rust caller
+file per call — never more than once per file, even when that attempt fails
+(stale hash, unreadable file, parse error): failure isn't retried per caller,
+it degrades every caller in that file to the path heuristic in one pass. A
+cheap substring check for `cfg` skips the parse entirely for files that
+cannot contain a `#[cfg(...)]` attribute. That check deliberately
+over-matches rather than looking for the exact `#[cfg(` byte sequence, so
+valid-but-unusual formatting (`#[cfg (test)]`, or a line break before the
+token tree) still gets parsed: a spurious parse costs little, whereas
+skipping one would silently misclassify a caller. The read and parse never
+run under the facade's async read
+lock or directly on a tokio worker thread: classification is prepared (path
+heuristics, file de-duplication) while the lock is briefly held, then the
+lock is released and the actual file I/O + parsing runs inside
+`tokio::task::spawn_blocking` (or inline for the synchronous CLI path, which
+has no async runtime to starve).
 
 ### Symbol-scoped reads (`get_file_outline`, `read_symbol`)
 

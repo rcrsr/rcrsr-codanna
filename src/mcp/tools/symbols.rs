@@ -236,17 +236,9 @@ fn resolve_symbol_read_target(
         None => return Err(path_str.to_string()),
     };
 
-    let candidate = std::path::Path::new(path_str);
-    let full_path = if candidate.is_absolute() {
-        candidate.to_path_buf()
-    } else {
-        indexer
-            .settings()
-            .workspace_root
-            .clone()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join(candidate)
-    };
+    let workspace_root = indexer.settings().workspace_root.clone();
+    let full_path =
+        crate::mcp::paths::resolve_workspace_relative_path(path_str, workspace_root.as_deref());
 
     Ok((full_path, indexed_hash))
 }
@@ -762,41 +754,72 @@ impl CodeIntelligenceServer {
         if output_format == OutputFormat::Json {
             let identifier = service::identifier_for(symbol_id, &name);
 
-            return Ok(
-                match service::find_callers_data(&indexer, symbol_id, name, test_path_patterns) {
-                    RelationOutcome::Data(unfiltered) => {
-                        if count_only {
-                            // Per-role breakdown is always computed over the
-                            // UNFILTERED caller set: `filter` narrows the
-                            // returned listing, never the counted breakdown.
-                            json_result(service::find_callers_counts_envelope(
-                                &indexer,
-                                &identifier,
-                                &unfiltered,
-                            ))
-                        } else {
-                            let filtered = service::filter_callers(unfiltered, filter);
-                            json_result(service::find_callers_list_envelope(
-                                &indexer,
-                                &identifier,
-                                filtered,
-                            ))
-                        }
-                    }
-                    RelationOutcome::NotFound => json_result(
-                        service::find_callers_not_found_envelope(&indexer, &identifier),
-                    ),
-                    RelationOutcome::Ambiguous { name, candidates } => {
-                        json_result(ambiguous_envelope(EntityType::Callers, &name, candidates))
-                    }
-                    RelationOutcome::MissingParam => {
-                        json_result(Envelope::<Vec<service::CallerRelation>>::error(
-                            ResultCode::InvalidQuery,
-                            "find_callers requires either 'name' or 'symbol_id' parameter",
+            // PHASE 1: resolve + prepare classification input while the
+            // facade read guard is still held (no file I/O here).
+            let prepared =
+                service::find_callers_prepare(&indexer, symbol_id, name, test_path_patterns);
+
+            return Ok(match prepared {
+                RelationOutcome::Data((calls, prep)) => {
+                    // Release the async read lock before the blocking file
+                    // I/O + tree-sitter parsing in PHASE 2 runs, matching
+                    // `read_symbol`/`resolve_symbol_read_target`'s locking
+                    // discipline.
+                    drop(indexer);
+
+                    let path_only_roles = prep.path_heuristic_roles();
+                    let roles = tokio::task::spawn_blocking(move || {
+                        crate::mcp::caller_scope::classify_prepared(prep)
+                    })
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(
+                            target: "mcp",
+                            error = %e,
+                            "cfg(test) classification task panicked; degrading to path heuristic"
+                        );
+                        path_only_roles
+                    });
+
+                    // Re-acquire the read guard for the envelope builders
+                    // below, which need `&indexer` for settings/context. A
+                    // writer committing in the gap only affects envelope
+                    // metadata, never the already-computed caller roles.
+                    let indexer = self.facade.read().await;
+
+                    let unfiltered = service::find_callers_finish(calls, roles);
+                    if count_only {
+                        // Per-role breakdown is always computed over the
+                        // UNFILTERED caller set: `filter` narrows the
+                        // returned listing, never the counted breakdown.
+                        json_result(service::find_callers_counts_envelope(
+                            &indexer,
+                            &identifier,
+                            &unfiltered,
+                        ))
+                    } else {
+                        let filtered = service::filter_callers(unfiltered, filter);
+                        json_result(service::find_callers_list_envelope(
+                            &indexer,
+                            &identifier,
+                            filtered,
                         ))
                     }
-                },
-            );
+                }
+                RelationOutcome::NotFound => json_result(service::find_callers_not_found_envelope(
+                    &indexer,
+                    &identifier,
+                )),
+                RelationOutcome::Ambiguous { name, candidates } => {
+                    json_result(ambiguous_envelope(EntityType::Callers, &name, candidates))
+                }
+                RelationOutcome::MissingParam => {
+                    json_result(Envelope::<Vec<service::CallerRelation>>::error(
+                        ResultCode::InvalidQuery,
+                        "find_callers requires either 'name' or 'symbol_id' parameter",
+                    ))
+                }
+            });
         }
 
         // Shared resolution policy; see service.rs.
@@ -834,21 +857,42 @@ impl CodeIntelligenceServer {
         // reused here since it drops the call-site `context` this renderer
         // needs for the "(calls receiver.method)" qualifier.
         let all_callers_with_metadata = indexer.get_calling_functions_with_metadata(symbol.id);
-        let workspace_root = indexer.settings().workspace_root.as_deref();
-        let mut span_cache = crate::mcp::TestSpanCache::new();
+
+        // PHASE 1: prepare classification input while the facade read guard
+        // is still held (no file I/O here).
+        let prep = crate::mcp::caller_scope::prepare_classification(
+            &indexer,
+            all_callers_with_metadata.iter().map(|(caller, _)| caller),
+            test_path_patterns,
+        );
+
+        // Release the async read lock before the blocking file I/O +
+        // tree-sitter parsing in PHASE 2 runs, matching `read_symbol`/
+        // `resolve_symbol_read_target`'s locking discipline.
+        drop(indexer);
+
+        let path_only_roles = prep.path_heuristic_roles();
+        let roles =
+            tokio::task::spawn_blocking(move || crate::mcp::caller_scope::classify_prepared(prep))
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        target: "mcp",
+                        error = %e,
+                        "cfg(test) classification task panicked; degrading to path heuristic"
+                    );
+                    path_only_roles
+                });
+
+        // Re-acquire the read guard for `indexer.settings()` used below
+        // (guidance generation). A writer committing in the gap only
+        // affects guidance metadata, never the already-computed roles.
+        let indexer = self.facade.read().await;
+
         let all_tagged: Vec<_> = all_callers_with_metadata
             .into_iter()
-            .map(|(caller, metadata)| {
-                let indexed_hash = indexer.get_file_hash_for_path(&caller.file_path);
-                let role = crate::mcp::classify_caller_role_in_source(
-                    &caller,
-                    test_path_patterns,
-                    workspace_root,
-                    indexed_hash.as_deref(),
-                    &mut span_cache,
-                );
-                (caller, metadata, role)
-            })
+            .zip(roles)
+            .map(|((caller, metadata), role)| (caller, metadata, role))
             .collect();
 
         if count_only {

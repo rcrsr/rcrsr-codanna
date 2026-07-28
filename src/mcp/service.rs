@@ -543,48 +543,40 @@ pub fn get_calls_data(
     }
 }
 
-/// Build the `find_callers` JSON data payload. Every caller is tagged with
-/// its [`CallerRole`] via
-/// [`crate::mcp::caller_scope::classify_caller_role_in_source`] (a `#[cfg(test)]`-aware
-/// refinement of [`classify_caller_role`]), computed against
-/// `test_path_patterns` (typically `Settings.caller_classification`); the
-/// unfiltered, untagged list is returned — callers apply
-/// [`filter_callers`]/[`count_callers_by_role`] as needed.
-///
-/// A single [`crate::mcp::caller_scope::TestSpanCache`] is shared across every caller in
-/// this call, so repeated callers in the same file only pay for one file
-/// read + parse (see `caller_scope` module docs).
-pub fn find_callers_data(
+/// PHASE 1 of `find_callers`' classification: resolves the target symbol,
+/// fetches its raw callers, and prepares `#[cfg(test)]` classification input
+/// via [`crate::mcp::caller_scope::prepare_classification`] — needs the
+/// facade, does no file I/O. Callers on the async MCP path must `drop` the
+/// facade guard after this returns and run [`find_callers_finish`]'s
+/// [`crate::mcp::caller_scope::classify_prepared`] step inside
+/// `tokio::task::spawn_blocking`; the synchronous CLI path
+/// ([`find_callers_data`]) can run both phases inline.
+pub(crate) fn find_callers_prepare(
     facade: &IndexFacade,
     symbol_id: Option<u32>,
     name: Option<String>,
     test_path_patterns: &[String],
-) -> RelationOutcome<Vec<CallerRelation>> {
+) -> RelationOutcome<(
+    Vec<CallRelation>,
+    crate::mcp::caller_scope::ClassificationPrep,
+)> {
     match resolve_symbol_or_id(facade, symbol_id, name) {
         SymbolResolution::Resolved { symbol, .. } => {
             let callers = facade.get_calling_functions_with_metadata(symbol.id);
-            let workspace_root = facade.settings().workspace_root.as_deref();
-            let mut span_cache = crate::mcp::caller_scope::TestSpanCache::new();
-            let mut all_callers = Vec::new();
-            for (caller, metadata) in callers {
-                let indexed_hash = facade.get_file_hash_for_path(&caller.file_path);
-                let role = crate::mcp::caller_scope::classify_caller_role_in_source(
-                    &caller,
-                    test_path_patterns,
-                    workspace_root,
-                    indexed_hash.as_deref(),
-                    &mut span_cache,
-                );
-                all_callers.push(CallerRelation {
-                    call: CallRelation {
-                        symbol: caller,
-                        call_line: metadata.as_ref().and_then(|m| m.line).map(|l| l + 1),
-                        call_column: metadata.as_ref().and_then(|m| m.column),
-                    },
-                    role,
-                });
-            }
-            RelationOutcome::Data(all_callers)
+            let prep = crate::mcp::caller_scope::prepare_classification(
+                facade,
+                callers.iter().map(|(caller, _)| caller),
+                test_path_patterns,
+            );
+            let calls = callers
+                .into_iter()
+                .map(|(caller, metadata)| CallRelation {
+                    symbol: caller,
+                    call_line: metadata.as_ref().and_then(|m| m.line).map(|l| l + 1),
+                    call_column: metadata.as_ref().and_then(|m| m.column),
+                })
+                .collect();
+            RelationOutcome::Data((calls, prep))
         }
         SymbolResolution::NotFoundById(_) | SymbolResolution::NotFoundByName(_) => {
             RelationOutcome::NotFound
@@ -593,6 +585,54 @@ pub fn find_callers_data(
             RelationOutcome::Ambiguous { name, candidates }
         }
         SymbolResolution::MissingParam => RelationOutcome::MissingParam,
+    }
+}
+
+/// PHASE 2 (pairing step): zips phase-1 call data with the
+/// [`CallerRole`]s computed by
+/// [`crate::mcp::caller_scope::classify_prepared`] (run separately by the
+/// caller, either inline or inside `spawn_blocking`) into the final,
+/// unfiltered [`CallerRelation`] list. Callers apply
+/// [`filter_callers`]/[`count_callers_by_role`] as needed.
+pub(crate) fn find_callers_finish(
+    calls: Vec<CallRelation>,
+    roles: Vec<CallerRole>,
+) -> Vec<CallerRelation> {
+    calls
+        .into_iter()
+        .zip(roles)
+        .map(|(call, role)| CallerRelation { call, role })
+        .collect()
+}
+
+/// Build the `find_callers` JSON data payload for the synchronous CLI path
+/// (`src/cli/commands/mcp.rs:536`), which has no async runtime to starve —
+/// runs `find_callers_prepare` then `caller_scope::classify_prepared`
+/// inline. Every caller is tagged with its [`CallerRole`] via a
+/// `#[cfg(test)]`-aware refinement of [`classify_caller_role`], computed
+/// against `test_path_patterns` (typically `Settings.caller_classification`);
+/// the unfiltered, untagged list is returned.
+///
+/// The async MCP tool path (`src/mcp/tools/symbols.rs::find_callers`) does
+/// NOT call this function — it calls `find_callers_prepare` directly so it
+/// can drop the facade guard and run the blocking classification step via
+/// `tokio::task::spawn_blocking` instead.
+pub fn find_callers_data(
+    facade: &IndexFacade,
+    symbol_id: Option<u32>,
+    name: Option<String>,
+    test_path_patterns: &[String],
+) -> RelationOutcome<Vec<CallerRelation>> {
+    match find_callers_prepare(facade, symbol_id, name, test_path_patterns) {
+        RelationOutcome::Data((calls, prep)) => {
+            let roles = crate::mcp::caller_scope::classify_prepared(prep);
+            RelationOutcome::Data(find_callers_finish(calls, roles))
+        }
+        RelationOutcome::NotFound => RelationOutcome::NotFound,
+        RelationOutcome::Ambiguous { name, candidates } => {
+            RelationOutcome::Ambiguous { name, candidates }
+        }
+        RelationOutcome::MissingParam => RelationOutcome::MissingParam,
     }
 }
 
