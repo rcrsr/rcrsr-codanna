@@ -17,10 +17,12 @@
 //!    - Direct access to already-loaded index
 //!    - Most memory efficient for CLI operations
 
+pub(crate) mod caller_scope;
 pub mod client;
 pub mod http_server;
 pub mod https_server;
 pub mod notifications;
+pub(crate) mod paths;
 pub mod proxy;
 pub mod requests;
 pub mod server;
