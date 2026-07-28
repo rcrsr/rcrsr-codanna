@@ -33,6 +33,13 @@ pub struct UnifiedWatcher {
     registry: PathRegistry,
     /// Shared debouncer for all file events.
     debouncer: Debouncer,
+    /// Debouncer for created-directory discovery scopes, kept as a second,
+    /// separate `Debouncer` instance rather than sharing `debouncer`: the
+    /// file debouncer carries paths destined for re-index, while a
+    /// directory path recorded here means "extend the watch set and walk
+    /// for catch-up files" -- a different action on the other side of the
+    /// queue, even though both share the same record/take_ready mechanics.
+    dir_debouncer: Debouncer,
     /// Channel for receiving file events.
     event_rx: mpsc::Receiver<notify::Result<Event>>,
     /// The underlying file watcher.
@@ -89,6 +96,13 @@ pub struct UnifiedWatcher {
     /// handling and stays watched even when a root holds no indexed
     /// file directly.
     handler_roots: Vec<PathBuf>,
+    /// Test-only counter of `discoverable_entries_for` invocations from the
+    /// created-directory drain path, so tests can assert the number of
+    /// walks a burst produces directly instead of only inferring "one walk"
+    /// from its side effects (which a per-scope-walk regression could still
+    /// satisfy).
+    #[cfg(test)]
+    walk_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl UnifiedWatcher {
@@ -173,6 +187,16 @@ impl UnifiedWatcher {
 
                 // Process debounced changes
                 _ = &mut timeout => {
+                    // Coalesced created-directory walks run first: this only
+                    // orders the two `take_ready()` calls within the same
+                    // tick (files recorded here still wait a full debounce
+                    // window regardless of order, since `record()` stamps
+                    // `Instant::now()` after this call already started). The
+                    // ordering matters for `maybe_start_catch_up()` below,
+                    // which must see any scope still debouncing in either
+                    // debouncer before deciding whether to fire.
+                    self.process_pending_created_dirs().await;
+
                     let ready = self.debouncer.take_ready();
                     for path in ready {
                         self.process_modification(&path).await;
@@ -375,7 +399,7 @@ impl UnifiedWatcher {
         if !should_start_catch_up(
             self.catch_up_task.is_some(),
             self.stale,
-            self.debouncer.has_pending(),
+            self.debouncer.has_pending() || self.dir_debouncer.has_pending(),
             since.elapsed(),
             self.debounce_window,
             self.last_catch_up_completed.map(|t| t.elapsed()),
@@ -426,7 +450,13 @@ impl UnifiedWatcher {
             // gate); it is the watcher's own concern: extend the watch set
             // and catch up files that landed before the watch existed.
             if matches!(kind, EventKind::Create(_)) && path.is_dir() {
-                self.handle_created_directory(&path).await;
+                // Apply the handler-root prefix gate at record time so a
+                // path outside every registered root never enters the
+                // coalescing map; the walk itself runs later, batched, in
+                // `process_pending_created_dirs`.
+                if self.handler_roots.iter().any(|r| path.starts_with(r)) {
+                    self.dir_debouncer.record(path);
+                }
                 continue;
             }
 
@@ -481,74 +511,126 @@ impl UnifiedWatcher {
         self.handler_roots = roots;
     }
 
-    /// A directory appeared under a registered root: watch every
-    /// traversable directory of the new subtree (ignore chains anchored
-    /// at the root prune ignored trees), then route the files already
-    /// inside through the normal debounce -> eligibility -> reindex path.
-    async fn handle_created_directory(&mut self, path: &Path) {
-        if !self.handler_roots.iter().any(|r| path.starts_with(r)) {
+    /// Drain every created-directory scope that has settled (been quiet for
+    /// the debounce window), and for each owning indexed root run exactly
+    /// one filesystem walk covering all of that root's settled scopes at
+    /// once -- rather than one full-root walk per created directory. This
+    /// is why the walk is deferred out of `handle_event` and into the
+    /// select-loop timeout tick: the burst has to settle first so
+    /// `dir_debouncer` has coalesced the whole batch before the walk runs.
+    ///
+    /// Watches every traversable directory of each new subtree (ignore
+    /// chains anchored at the root prune ignored trees), then routes the
+    /// files already inside through the normal debounce -> eligibility ->
+    /// reindex path.
+    async fn process_pending_created_dirs(&mut self) {
+        let ready = self.dir_debouncer.take_ready();
+        if ready.is_empty() {
             return;
         }
 
-        // Resolve the owning indexed root under a short read lock only --
+        // Resolve each ready path's owning root under one short read lock --
         // `discoverable_scope_root` is a settings lookup plus a single
-        // `canonicalize()`, not a directory walk. The actual walk runs
-        // below, off the lock and on a blocking-pool thread, so a large or
+        // `canonicalize()`, not a directory walk. The actual walk(s) run
+        // below, off the lock and on blocking-pool threads, so a large or
         // bursty newly-materialized subtree cannot stall the tokio worker
         // driving the watch loop.
-        let (scope_root, settings) = {
+        let (scopes_by_root, settings) = {
             let facade = self.facade.read().await;
-            (
-                facade.discoverable_scope_root(path),
-                Arc::clone(facade.settings()),
-            )
-        };
-        let Some((scope, root)) = scope_root else {
-            return;
-        };
-
-        let path_owned = path.to_path_buf();
-        let walk_result = tokio::task::spawn_blocking(move || {
-            IndexFacade::discoverable_entries_for(&settings, &root, &scope)
-        })
-        .await;
-
-        let (dirs, files) = match walk_result {
-            Ok(Ok(entries)) => entries,
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    "[watcher] failed to discover entries under {}: {e}",
-                    path_owned.display()
-                );
-                return;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "[watcher] discovery task for {} panicked: {e}",
-                    path_owned.display()
-                );
-                return;
-            }
-        };
-
-        for dir in dirs {
-            if self.registry.add_watch_dir(dir.clone()) {
-                if let Err(e) = self.watch_directory(&dir) {
-                    tracing::warn!("[watcher] failed to watch created dir: {e}");
+            let settings = Arc::clone(facade.settings());
+            let mut scopes_by_root: std::collections::HashMap<PathBuf, Vec<PathBuf>> =
+                std::collections::HashMap::new();
+            for path in &ready {
+                if let Some((scope, root)) = facade.discoverable_scope_root(path) {
+                    scopes_by_root.entry(root).or_default().push(scope);
                 }
             }
+            (scopes_by_root, settings)
+        };
+
+        // Spawn every root's walk before awaiting any of them, so the total
+        // stall on this select-loop tick is bounded by the slowest single
+        // root's walk rather than the sum of all roots' walks. Pruning and
+        // dedup of each root's scope list also move inside the blocking
+        // closure here, so the (O(n^2) worst case) pruning pass runs off
+        // the tokio worker driving the watch loop too, not just the walk.
+        let mut tasks = Vec::with_capacity(scopes_by_root.len());
+        for (root, scopes) in scopes_by_root {
+            let settings = Arc::clone(&settings);
+            let root_owned = root.clone();
+            let scopes_for_walk = scopes.clone();
+            #[cfg(test)]
+            let walk_count = Arc::clone(&self.walk_count);
+            let handle = tokio::task::spawn_blocking(move || {
+                let mut scopes = prune_nested_scopes(&scopes_for_walk);
+                // `prune_nested_scopes` deliberately keeps ancestor/descendant
+                // duplicates (see its doc comment), but exact duplicates can
+                // still arrive here after canonicalization; dedup them so
+                // `discoverable_entries_for`'s per-path `any(starts_with)`
+                // filter doesn't redundantly re-check the same scope.
+                scopes.sort();
+                scopes.dedup();
+                #[cfg(test)]
+                walk_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                IndexFacade::discoverable_entries_for(&settings, &root_owned, &scopes)
+            });
+            tasks.push((root, scopes, handle));
         }
-        if !files.is_empty() {
-            crate::log_event!(
-                "watcher",
-                "created dir",
-                "{} ({} files to catch up)",
-                path.display(),
-                files.len()
-            );
-        }
-        for file in files {
-            self.debouncer.record(file);
+
+        for (root, scopes, handle) in tasks {
+            let walk_result = handle.await;
+
+            let (dirs, files) = match walk_result {
+                Ok(Ok(entries)) => entries,
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        "[watcher] failed to discover entries under {}: {e}",
+                        root.display()
+                    );
+                    // `take_ready()` above already removed these scopes from
+                    // `dir_debouncer`, so without this they would be dropped
+                    // permanently on a transient failure (e.g. a permission
+                    // race during a large extract). Re-record them so the
+                    // next settled tick retries the whole batch. This is not
+                    // attempt-bounded: a permanently-failing scope retries
+                    // indefinitely, but only once per debounce window (the
+                    // record/take_ready cadence), not in a tight loop.
+                    for scope in scopes {
+                        self.dir_debouncer.record(scope);
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "[watcher] discovery task for {} panicked: {e}",
+                        root.display()
+                    );
+                    for scope in scopes {
+                        self.dir_debouncer.record(scope);
+                    }
+                    continue;
+                }
+            };
+
+            for dir in dirs {
+                if self.registry.add_watch_dir(dir.clone()) {
+                    if let Err(e) = self.watch_directory(&dir) {
+                        tracing::warn!("[watcher] failed to watch created dir: {e}");
+                    }
+                }
+            }
+            if !files.is_empty() {
+                crate::log_event!(
+                    "watcher",
+                    "created dirs",
+                    "{} ({} files to catch up)",
+                    root.display(),
+                    files.len()
+                );
+            }
+            for file in files {
+                self.debouncer.record(file);
+            }
         }
     }
 
@@ -835,6 +917,32 @@ fn should_catch_up(stale: bool, has_pending: bool, elapsed: Duration, window: Du
     stale && !has_pending && elapsed >= window
 }
 
+/// Drops any scope that is a descendant of another scope in the same list,
+/// so a wide burst of created-directory scopes (e.g. nested `a/b/c/d`)
+/// shrinks to its minimal covering set before being handed to the
+/// `any(starts_with)` filter in [`IndexFacade::discoverable_entries_for`] --
+/// fewer scopes means a cheaper filter pass over the same single walk.
+///
+/// A path always `starts_with` itself, so the comparison excludes a scope
+/// from being considered its own ancestor (otherwise every scope would
+/// "contain" itself and the whole list would collapse to nothing).
+/// Duplicate entries are preserved as ties (neither is a strict descendant
+/// of the other via index-inequality), so they survive rather than
+/// annihilating each other.
+fn prune_nested_scopes(scopes: &[PathBuf]) -> Vec<PathBuf> {
+    scopes
+        .iter()
+        .enumerate()
+        .filter(|(i, scope)| {
+            !scopes
+                .iter()
+                .enumerate()
+                .any(|(j, other)| j != *i && scope.starts_with(other) && **scope != *other)
+        })
+        .map(|(_, scope)| scope.clone())
+        .collect()
+}
+
 /// Minimum time between successive catch-up reindex completions, enforced
 /// independent of `debounce_window` so sustained bursty git activity
 /// (rebase/checkout) can't retrigger a full clear+rebuild on every quiet gap
@@ -1018,6 +1126,7 @@ impl UnifiedWatcherBuilder {
             handlers: self.handlers,
             registry: PathRegistry::new(),
             debouncer: Debouncer::new(self.debounce_ms),
+            dir_debouncer: Debouncer::new(self.debounce_ms),
             event_rx: rx,
             _watcher: watcher,
             broadcaster,
@@ -1036,6 +1145,8 @@ impl UnifiedWatcherBuilder {
             catch_up_attempts: 0,
             consecutive_contention: 0,
             handler_roots: Vec::new(),
+            #[cfg(test)]
+            walk_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 }
@@ -1072,10 +1183,10 @@ mod tests {
 
     /// Build a minimal real `UnifiedWatcher` against a temp-dir-backed index
     /// using caller-supplied `Settings` (e.g. `indexing.ignore_patterns`), so
-    /// `handle_event`/`handle_created_directory` can be exercised directly
-    /// instead of re-simulating their branching logic. `debounce_ms(0)` so
-    /// `debouncer.take_ready()` returns everything recorded without waiting
-    /// out a real debounce window.
+    /// `handle_event`/`process_pending_created_dirs` can be exercised
+    /// directly instead of re-simulating their branching logic.
+    /// `debounce_ms(0)` so `debouncer.take_ready()`/`dir_debouncer.take_ready()`
+    /// return everything recorded without waiting out a real debounce window.
     fn test_watcher_with_settings(
         tempdir: &tempfile::TempDir,
         mut settings: crate::config::Settings,
@@ -1115,8 +1226,9 @@ mod tests {
     /// A directory created inside a registered handler root must be
     /// discovered and watched, and any files already inside it must be
     /// routed through the normal debounce path - exercised via
-    /// `handle_event` (not `handle_created_directory` directly), so the
-    /// wiring from the event loop into the feature is itself under test.
+    /// `handle_event` followed by a `process_pending_created_dirs` drain
+    /// (not `handle_event` alone), so the wiring from the event loop through
+    /// the coalesced walk into the feature is itself under test.
     #[tokio::test]
     async fn created_directory_registers_watch_and_records_files() {
         use crate::config::Settings;
@@ -1137,6 +1249,17 @@ mod tests {
         event.paths.push(newdir.clone());
         watcher.handle_event(event).await;
 
+        // `handle_event` only records the scope into `dir_debouncer` now; the
+        // walk that discovers `a.rs` and registers `newdir` for watching does
+        // not run until the coalescing drain below.
+        assert_eq!(
+            watcher.registry.dir_count(),
+            dirs_before,
+            "handle_event must not walk synchronously; the walk is deferred to process_pending_created_dirs"
+        );
+
+        watcher.process_pending_created_dirs().await;
+
         assert!(
             watcher.registry.dir_count() > dirs_before,
             "the new directory must be registered for watching"
@@ -1153,6 +1276,15 @@ mod tests {
     /// when a directory is created under a registered handler root - checked
     /// at the watcher altitude (the live consumer of `discoverable_*`), not
     /// just at the facade.
+    ///
+    /// The drain (`process_pending_created_dirs`) is required here, not
+    /// optional: without it, `dir_debouncer` still holds the scope and
+    /// nothing has been walked yet, so both assertions below would be
+    /// trivially true against an empty result regardless of whether ignore
+    /// filtering works at all. `sibling.rs` (created alongside the ignored
+    /// subtree, outside it) is the positive control proving the walk did
+    /// run and did find real files - without it, an implementation that
+    /// walked nothing at all would also pass.
     #[tokio::test]
     async fn created_directory_skips_ignored_subtree() {
         use crate::config::Settings;
@@ -1175,12 +1307,20 @@ mod tests {
         let ignored_dir = newdir.join("ignored");
         std::fs::create_dir_all(&ignored_dir).unwrap();
         std::fs::write(ignored_dir.join("b.rs"), "fn b() {}").unwrap();
+        std::fs::write(newdir.join("sibling.rs"), "fn sibling() {}").unwrap();
 
         let mut event = Event::new(EventKind::Create(CreateKind::Folder));
         event.paths.push(newdir.clone());
         watcher.handle_event(event).await;
 
+        watcher.process_pending_created_dirs().await;
+
         let ready = watcher.debouncer.take_ready();
+        assert!(
+            ready.iter().any(|p| p.ends_with("sibling.rs")),
+            "a file outside the ignored subtree must still be debounced (positive \
+             control proving the walk actually ran): {ready:?}"
+        );
         assert!(
             !ready.iter().any(|p| p.ends_with("b.rs")),
             "a file under an ignored subtree must not be debounced: {ready:?}"
@@ -1193,6 +1333,18 @@ mod tests {
 
     /// A directory event outside every registered handler root must be
     /// ignored entirely, preserving the upstream early-return guard.
+    ///
+    /// The handler-roots gate now runs at record time (inside `handle_event`,
+    /// before anything is coalesced into `dir_debouncer`), not at walk time -
+    /// so this asserts `dir_debouncer.has_pending()` is false straight after
+    /// `handle_event`, before any drain. That is the one assertion that would
+    /// catch a regression where the gate got moved/dropped and the path
+    /// silently slipped into `dir_debouncer` anyway, only to be filtered out
+    /// later by coincidence (e.g. `discoverable_scope_root` returning `None`
+    /// for a path outside `indexed_paths_cache`) rather than by the gate
+    /// actually working. The drain is still run afterward so the
+    /// post-drain assertions exercise the same real path production code
+    /// takes, rather than only inspecting pre-drain state.
     #[tokio::test]
     async fn created_directory_outside_handler_roots_is_ignored() {
         use notify::event::CreateKind;
@@ -1212,6 +1364,13 @@ mod tests {
         event.paths.push(newdir.clone());
         watcher.handle_event(event).await;
 
+        assert!(
+            !watcher.dir_debouncer.has_pending(),
+            "a path outside every handler root must never enter dir_debouncer at all"
+        );
+
+        watcher.process_pending_created_dirs().await;
+
         assert_eq!(
             watcher.registry.dir_count(),
             dirs_before,
@@ -1220,6 +1379,272 @@ mod tests {
         assert!(
             watcher.debouncer.take_ready().is_empty(),
             "no file outside handler_roots may be debounced"
+        );
+    }
+
+    // -- prune_nested_scopes -------------------------------------------
+    //
+    // These target the degenerate cases a naive "is `a` a prefix of `b`"
+    // implementation gets wrong: self-elimination via `starts_with` always
+    // being true for a path against itself, string-prefix vs. component-wise
+    // containment, duplicate survival, and order-independence of the result.
+
+    /// A path always `starts_with` itself; the function must special-case
+    /// that away, or every single-element (and every otherwise-unrelated)
+    /// list would collapse to nothing.
+    #[test]
+    fn prune_nested_scopes_self_starts_with_is_not_self_elimination() {
+        let scopes = vec![PathBuf::from("/a")];
+        assert_eq!(prune_nested_scopes(&scopes), vec![PathBuf::from("/a")]);
+    }
+
+    /// Duplicate scopes are ties, not ancestor/descendant pairs (neither
+    /// occurrence is a *strict* descendant of the other), so both must
+    /// survive rather than annihilating each other.
+    #[test]
+    fn prune_nested_scopes_preserves_duplicates() {
+        let scopes = vec![PathBuf::from("/a"), PathBuf::from("/a")];
+        assert_eq!(prune_nested_scopes(&scopes), scopes);
+    }
+
+    /// `/ab` is not a descendant of `/a` despite sharing a string prefix -
+    /// containment must be component-wise (`Path::starts_with`), not a raw
+    /// string `starts_with`. Both must be kept.
+    #[test]
+    fn prune_nested_scopes_keeps_component_wise_siblings_not_string_prefix() {
+        let scopes = vec![PathBuf::from("/a"), PathBuf::from("/ab")];
+        let mut pruned = prune_nested_scopes(&scopes);
+        pruned.sort();
+        assert_eq!(pruned, vec![PathBuf::from("/a"), PathBuf::from("/ab")]);
+    }
+
+    /// A genuine ancestor/descendant pair prunes to the ancestor regardless
+    /// of which order the two scopes were recorded in.
+    #[test]
+    fn prune_nested_scopes_prunes_descendant_regardless_of_input_order() {
+        let child_first = vec![PathBuf::from("/a/b"), PathBuf::from("/a")];
+        let parent_first = vec![PathBuf::from("/a"), PathBuf::from("/a/b")];
+
+        assert_eq!(prune_nested_scopes(&child_first), vec![PathBuf::from("/a")]);
+        assert_eq!(
+            prune_nested_scopes(&parent_first),
+            vec![PathBuf::from("/a")]
+        );
+    }
+
+    #[test]
+    fn prune_nested_scopes_empty_input_returns_empty() {
+        assert!(prune_nested_scopes(&[]).is_empty());
+    }
+
+    /// A three-level chain collapses to just its root ancestor, in any
+    /// recording order - the case the issue names explicitly (`a/b/c/d`
+    /// recorded as separate events).
+    #[test]
+    fn prune_nested_scopes_collapses_three_level_chain() {
+        let root_to_leaf = vec![
+            PathBuf::from("/a"),
+            PathBuf::from("/a/b"),
+            PathBuf::from("/a/b/c"),
+        ];
+        let leaf_to_root = vec![
+            PathBuf::from("/a/b/c"),
+            PathBuf::from("/a/b"),
+            PathBuf::from("/a"),
+        ];
+
+        assert_eq!(
+            prune_nested_scopes(&root_to_leaf),
+            vec![PathBuf::from("/a")]
+        );
+        assert_eq!(
+            prune_nested_scopes(&leaf_to_root),
+            vec![PathBuf::from("/a")]
+        );
+    }
+
+    // -- coalescing behavior --------------------------------------------
+    //
+    // These are the point of the change: a burst of created-directory events
+    // must settle into ONE walk per owning root, not one walk per event.
+    // `UnifiedWatcher::walk_count` (a `#[cfg(test)]`-only counter incremented
+    // once per `discoverable_entries_for` call on the drain path) makes that
+    // walk count directly assertable, rather than only inferring "one walk"
+    // from side effects a per-scope-walk regression could still satisfy.
+    // Each test also proves the *batching* itself: nothing is walked until
+    // the drain runs (via `process_pending_created_dirs`, called exactly
+    // once), and that single drain call is sufficient to discover every
+    // sibling/descendant and every file inside them.
+
+    /// The dominant case: several sibling directories created under one
+    /// root in a single burst, each holding a file. A nesting-only fix
+    /// (one that only collapsed ancestor/descendant chains) would still
+    /// walk once per sibling here, since none is nested inside another -
+    /// this is the case that specifically requires grouping-by-root, not
+    /// just `prune_nested_scopes`.
+    #[tokio::test]
+    async fn created_directory_burst_of_siblings_coalesces_into_one_drain() {
+        use crate::config::Settings;
+        use notify::event::CreateKind;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path().canonicalize().unwrap();
+        let mut watcher = test_watcher_with_settings(&tempdir, Settings::default());
+        watcher.handler_roots = vec![root.clone()];
+
+        let mut siblings = Vec::new();
+        for i in 0..5 {
+            let dir = root.join(format!("sibling{i}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("f.rs"), "fn f() {}").unwrap();
+            siblings.push(dir);
+        }
+
+        let dirs_before = watcher.registry.dir_count();
+
+        for dir in &siblings {
+            let mut event = Event::new(EventKind::Create(CreateKind::Folder));
+            event.paths.push(dir.clone());
+            watcher.handle_event(event).await;
+        }
+
+        // Nothing has been walked yet: five events recorded, zero walks run.
+        assert_eq!(
+            watcher.registry.dir_count(),
+            dirs_before,
+            "handle_event must only coalesce into dir_debouncer, never walk synchronously"
+        );
+
+        watcher.process_pending_created_dirs().await;
+
+        assert_eq!(
+            watcher.walk_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "five sibling scopes under one root must produce exactly one walk"
+        );
+        for dir in &siblings {
+            assert!(
+                watcher.registry.watch_dirs().contains(dir),
+                "sibling directory {dir:?} must be watched after a single drain"
+            );
+        }
+        let ready = watcher.debouncer.take_ready();
+        for dir in &siblings {
+            assert!(
+                ready
+                    .iter()
+                    .any(|p| p.starts_with(dir) && p.ends_with("f.rs")),
+                "file inside sibling {dir:?} must be debounced after a single drain: {ready:?}"
+            );
+        }
+    }
+
+    /// The case the issue names explicitly: a nested chain `a/b/c/d`
+    /// recorded as four separate created-directory events (as a recursive
+    /// mkdir -p or an extraction would generate). After one drain, the
+    /// whole chain must be watched and every file throughout it picked up -
+    /// this is what `prune_nested_scopes` collapsing the chain to its root
+    /// is for, exercised here at the watcher altitude rather than as a bare
+    /// unit test of the pruning function alone.
+    #[tokio::test]
+    async fn created_directory_nested_chain_coalesces_into_one_drain() {
+        use crate::config::Settings;
+        use notify::event::CreateKind;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path().canonicalize().unwrap();
+        let mut watcher = test_watcher_with_settings(&tempdir, Settings::default());
+        watcher.handler_roots = vec![root.clone()];
+
+        let a = root.join("a");
+        let b = a.join("b");
+        let c = b.join("c");
+        let d = c.join("d");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(a.join("fa.rs"), "fn fa() {}").unwrap();
+        std::fs::write(b.join("fb.rs"), "fn fb() {}").unwrap();
+        std::fs::write(c.join("fc.rs"), "fn fc() {}").unwrap();
+        std::fs::write(d.join("fd.rs"), "fn fd() {}").unwrap();
+
+        let dirs_before = watcher.registry.dir_count();
+
+        for dir in [&a, &b, &c, &d] {
+            let mut event = Event::new(EventKind::Create(CreateKind::Folder));
+            event.paths.push(dir.clone());
+            watcher.handle_event(event).await;
+        }
+
+        assert_eq!(
+            watcher.registry.dir_count(),
+            dirs_before,
+            "handle_event must only coalesce into dir_debouncer, never walk synchronously"
+        );
+
+        watcher.process_pending_created_dirs().await;
+
+        assert_eq!(
+            watcher.walk_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a nested chain under one root must collapse to exactly one walk"
+        );
+        for dir in [&a, &b, &c, &d] {
+            assert!(
+                watcher.registry.watch_dirs().contains(dir),
+                "{dir:?} must be watched after a single drain of the whole chain"
+            );
+        }
+        let ready = watcher.debouncer.take_ready();
+        for name in ["fa.rs", "fb.rs", "fc.rs", "fd.rs"] {
+            assert!(
+                ready.iter().any(|p| p.ends_with(name)),
+                "{name} must be debounced after a single drain: {ready:?}"
+            );
+        }
+    }
+
+    /// A burst that spans multiple scopes but all resolving to the same
+    /// owning indexed root must still group into a single walk for that
+    /// root - checked here via two disjoint (non-nested, non-sibling-named)
+    /// subtrees under the same root, so `scopes_by_root` grouping is
+    /// exercised independent of `prune_nested_scopes`.
+    #[tokio::test]
+    async fn created_directory_burst_spanning_same_root_groups_into_one_walk() {
+        use crate::config::Settings;
+        use notify::event::CreateKind;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path().canonicalize().unwrap();
+        let mut watcher = test_watcher_with_settings(&tempdir, Settings::default());
+        watcher.handler_roots = vec![root.clone()];
+
+        let left = root.join("left/deep/path");
+        let right = root.join("right/other/path");
+        std::fs::create_dir_all(&left).unwrap();
+        std::fs::create_dir_all(&right).unwrap();
+        std::fs::write(left.join("left.rs"), "fn left() {}").unwrap();
+        std::fs::write(right.join("right.rs"), "fn right() {}").unwrap();
+
+        for dir in [&left, &right] {
+            let mut event = Event::new(EventKind::Create(CreateKind::Folder));
+            event.paths.push(dir.clone());
+            watcher.handle_event(event).await;
+        }
+
+        watcher.process_pending_created_dirs().await;
+
+        assert_eq!(
+            watcher.walk_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "two disjoint scopes under the same root must group into one walk"
+        );
+        let ready = watcher.debouncer.take_ready();
+        assert!(
+            ready.iter().any(|p| p.ends_with("left.rs")),
+            "file under the first scope must be debounced: {ready:?}"
+        );
+        assert!(
+            ready.iter().any(|p| p.ends_with("right.rs")),
+            "file under the second scope must be debounced: {ready:?}"
         );
     }
 
@@ -1432,6 +1857,41 @@ mod tests {
             None, // no prior catch-up completion recorded
             CATCH_UP_COOLDOWN,
         ));
+    }
+
+    /// `maybe_start_catch_up` is production's only caller of
+    /// `should_start_catch_up`, and composes the `has_pending` argument from
+    /// *both* debouncers (`self.debouncer.has_pending() ||
+    /// self.dir_debouncer.has_pending()`). The pure `should_start_catch_up_*`
+    /// tests above exercise the predicate with `has_pending` passed in
+    /// directly, so they cannot catch a regression that drops the
+    /// `dir_debouncer` half of that composition. This exercises the
+    /// composition itself: a created-directory scope is still debouncing
+    /// (recorded, not yet drained) while the plain file `debouncer` is
+    /// empty, staleness is armed and past the quiet window, yet
+    /// `maybe_start_catch_up` must not spawn a catch-up task.
+    #[tokio::test]
+    async fn maybe_start_catch_up_defers_while_dir_debouncer_has_pending() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut watcher = test_watcher(&tempdir);
+
+        watcher
+            .dir_debouncer
+            .record(tempdir.path().join("still-settling"));
+        assert!(!watcher.debouncer.has_pending());
+        assert!(watcher.dir_debouncer.has_pending());
+
+        watcher.stale = true;
+        watcher.stale_since =
+            Some(Instant::now() - watcher.debounce_window - Duration::from_millis(50));
+
+        watcher.maybe_start_catch_up();
+
+        assert!(
+            watcher.catch_up_task.is_none(),
+            "a created-directory scope still debouncing must defer catch-up, \
+             the same race `self.dir_debouncer.has_pending()` exists to prevent"
+        );
     }
 
     // ── should_clear_stale_after_success: the overflow-during-walk race ────
@@ -1753,8 +2213,12 @@ mod tests {
     /// feature is dead in production and only this test notices: it asserts
     /// on the indexed result, so it fails unless the whole chain is live --
     /// refresh_paths -> init_cache -> eligibility.roots -> watch_roots ->
-    /// register_handler_roots -> handle_created_directory -> debouncer ->
-    /// on_modify -> reindex.
+    /// register_handler_roots -> handle_event (records into dir_debouncer) ->
+    /// process_pending_created_dirs (coalesced walk) -> debouncer ->
+    /// on_modify -> reindex. Drives the real `watch()` loop over a real
+    /// kernel watcher, so it reaches the select! timeout arm (which calls
+    /// `process_pending_created_dirs`) on its own; no manual drain call is
+    /// needed here.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn created_directory_is_indexed_through_the_real_watch_loop() {
         use crate::config::Settings;

@@ -1197,23 +1197,48 @@ impl IndexFacade {
     }
 
     /// Both the directories and files [`Self::discoverable_dirs`] and
-    /// [`Self::discoverable_files`] would each report under `scope`, from a
+    /// [`Self::discoverable_files`] would each report under `scopes`, from a
     /// single filesystem walk (see
     /// [`crate::indexing::walker::FileWalker::walk_dirs_and_files`]).
-    /// Takes `settings`/`root`/`scope` directly (rather than `&self`) so the
+    /// Takes `settings`/`root`/`scopes` directly (rather than `&self`) so the
     /// walk itself can run outside any facade lock -- see
     /// [`Self::discoverable_scope_root`] for computing the arguments under a
     /// short lock beforehand.
+    ///
+    /// `scopes` lets one root walk serve a coalesced burst of
+    /// created-directory scopes (the watcher's created-directory debounce):
+    /// rather than one full-root walk per created directory, the caller
+    /// collects every settled scope for a root over the debounce window and
+    /// filters this single walk's results against all of them at once.
     pub fn discoverable_entries_for(
         settings: &Arc<Settings>,
         root: &std::path::Path,
-        scope: &std::path::Path,
+        scopes: &[PathBuf],
     ) -> crate::IndexResult<(Vec<PathBuf>, Vec<PathBuf>)> {
+        if scopes.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
         let (dirs, files) = crate::indexing::walker::FileWalker::new(Arc::clone(settings))
             .walk_dirs_and_files(root)?;
+
+        // Fast path: a single scope (the common case) needs no `any()` over
+        // a one-element slice for every discovered path.
+        if let [scope] = scopes {
+            return Ok((
+                dirs.into_iter().filter(|p| p.starts_with(scope)).collect(),
+                files.into_iter().filter(|p| p.starts_with(scope)).collect(),
+            ));
+        }
+
         Ok((
-            dirs.into_iter().filter(|p| p.starts_with(scope)).collect(),
-            files.into_iter().filter(|p| p.starts_with(scope)).collect(),
+            dirs.into_iter()
+                .filter(|p| scopes.iter().any(|s| p.starts_with(s)))
+                .collect(),
+            files
+                .into_iter()
+                .filter(|p| scopes.iter().any(|s| p.starts_with(s)))
+                .collect(),
         ))
     }
 
