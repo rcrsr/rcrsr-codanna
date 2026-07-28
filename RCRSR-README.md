@@ -629,12 +629,51 @@ serde aliases, so no existing client breaks. `find_symbol` also gains a typed
 accepts `filter: all | production | test` (default `all`) plus `count_only: bool`
 (returns totals with a per-role breakdown). "Is this safe to delete" becomes
 "zero *production* callers" without a manual second grep over test directories.
-Classification is a path heuristic; the patterns are configurable:
+Classification starts from a path heuristic; the patterns are configurable:
 
 ```toml
 [caller_classification]
 test_path_patterns = ["tests/", "/test/", "*_test.*", "test_*.py", "*.spec.*", "__tests__/"]
 ```
+
+**Rust `#[cfg(test)]` modules are detected.** Every pattern above is
+path-shaped, which cannot see Rust's idiomatic inline
+`#[cfg(test)] mod tests { ... }` — that module lives *inside* the production
+file, so a unit test calling `foo()` from `src/thing.rs` matched no pattern and
+was reported `production`. On a Rust codebase this inverted the feature's main
+use case: a symbol called only by its own unit tests looked load-bearing, and
+`filter: production` was actively misleading rather than merely incomplete.
+
+For Rust callers, codanna now takes a second pass whenever the path heuristic
+says `production`: it parses the caller's current source with tree-sitter,
+collects the line spans covered by `#[cfg(test)]`-annotated items, and
+re-classifies any caller falling inside one as `test`. So the six unit tests
+calling a helper from an inline `mod tests` now report `6 test, 0 production`
+instead of the reverse.
+
+Details worth knowing:
+
+- **No reindex needed.** This is computed at query time from the source on
+  disk, so it fixes existing indexes immediately — nothing is persisted and the
+  emission-semantics version is untouched.
+- **Rust only.** Callers in every other language take the path heuristic
+  unchanged. Nothing about non-Rust results changes.
+- **Staleness-guarded.** The file on disk must still hash to what was indexed
+  (the same guard `read_symbol` uses). If the file changed, is unreadable, or
+  fails to parse, classification silently falls back to the path heuristic —
+  the pre-existing answer. It never errors, and it degrades toward reporting
+  `production`, so a stale file can't turn "unsafe to delete" into "safe".
+- **`#[cfg(feature = "test")]` is correctly not a test span** — the attribute
+  argument is a string literal there, not the `test` identifier.
+- **`#[cfg(all(test, not(windows)))]` is deliberately *not* treated as test.**
+  Any `not(...)` inside the `cfg` disqualifies the span rather than risking a
+  wrong call, so a caller under such an attribute stays `production`.
+- **No configuration.** There is no toggle; `test_path_patterns` remains the
+  only knob, and it still governs the path heuristic for every language.
+
+The cost is one file read plus one parse per *distinct* Rust caller file per
+call (callers in the same file share a cache), gated by a cheap substring check
+that skips the parse entirely for files containing no `#[cfg(` at all.
 
 ### Symbol-scoped reads (`get_file_outline`, `read_symbol`)
 

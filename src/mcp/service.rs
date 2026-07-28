@@ -544,10 +544,16 @@ pub fn get_calls_data(
 }
 
 /// Build the `find_callers` JSON data payload. Every caller is tagged with
-/// its [`CallerRole`] via [`classify_caller_role`], computed against
+/// its [`CallerRole`] via
+/// [`crate::mcp::caller_scope::classify_caller_role_in_source`] (a `#[cfg(test)]`-aware
+/// refinement of [`classify_caller_role`]), computed against
 /// `test_path_patterns` (typically `Settings.caller_classification`); the
 /// unfiltered, untagged list is returned — callers apply
 /// [`filter_callers`]/[`count_callers_by_role`] as needed.
+///
+/// A single [`crate::mcp::caller_scope::TestSpanCache`] is shared across every caller in
+/// this call, so repeated callers in the same file only pay for one file
+/// read + parse (see `caller_scope` module docs).
 pub fn find_callers_data(
     facade: &IndexFacade,
     symbol_id: Option<u32>,
@@ -557,20 +563,27 @@ pub fn find_callers_data(
     match resolve_symbol_or_id(facade, symbol_id, name) {
         SymbolResolution::Resolved { symbol, .. } => {
             let callers = facade.get_calling_functions_with_metadata(symbol.id);
-            let all_callers: Vec<_> = callers
-                .into_iter()
-                .map(|(caller, metadata)| {
-                    let role = classify_caller_role(&caller.file_path, test_path_patterns);
-                    CallerRelation {
-                        call: CallRelation {
-                            symbol: caller,
-                            call_line: metadata.as_ref().and_then(|m| m.line).map(|l| l + 1),
-                            call_column: metadata.as_ref().and_then(|m| m.column),
-                        },
-                        role,
-                    }
-                })
-                .collect();
+            let workspace_root = facade.settings().workspace_root.as_deref();
+            let mut span_cache = crate::mcp::caller_scope::TestSpanCache::new();
+            let mut all_callers = Vec::new();
+            for (caller, metadata) in callers {
+                let indexed_hash = facade.get_file_hash_for_path(&caller.file_path);
+                let role = crate::mcp::caller_scope::classify_caller_role_in_source(
+                    &caller,
+                    test_path_patterns,
+                    workspace_root,
+                    indexed_hash.as_deref(),
+                    &mut span_cache,
+                );
+                all_callers.push(CallerRelation {
+                    call: CallRelation {
+                        symbol: caller,
+                        call_line: metadata.as_ref().and_then(|m| m.line).map(|l| l + 1),
+                        call_column: metadata.as_ref().and_then(|m| m.column),
+                    },
+                    role,
+                });
+            }
             RelationOutcome::Data(all_callers)
         }
         SymbolResolution::NotFoundById(_) | SymbolResolution::NotFoundByName(_) => {

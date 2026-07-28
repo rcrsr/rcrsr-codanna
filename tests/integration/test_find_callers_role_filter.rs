@@ -278,6 +278,160 @@ async fn find_callers_count_only_with_filter_still_reports_unfiltered_breakdown(
     );
 }
 
+/// Index a fixture with a single Rust file under `src/` shaped like the
+/// real bug: a production function called only from an inline
+/// `#[cfg(test)] mod tests { ... }` block that lives inside the same
+/// `src/` file. A path-only classifier would tag the caller `production`
+/// (its `file_path` is under `src/` and matches no test glob); the fix
+/// must read the `#[cfg(test)]` span and tag it `test` regardless.
+///
+/// `workspace_root: None` with NO `indexed_paths_cache` mirrors
+/// `test_read_symbol_and_outline_mcp.rs`'s `build_server`: that combination
+/// stores ABSOLUTE `file_path`s, which the classifier's file-read step
+/// resolves directly. The `indexed_paths_cache = [root]` setup used by
+/// `build_server` above in this file stores paths stripped relative to
+/// `root`, which then resolve against the process CWD -- for this
+/// standalone fixture directory that lookup would silently miss, and the
+/// classifier's fallback would let the test pass vacuously.
+async fn build_rust_cfg_test_server() -> CodeIntelligenceServer {
+    let temp = TempDir::new().expect("create temp dir");
+    let src_dir = temp.path().join("src");
+    std::fs::create_dir_all(&src_dir).expect("create src dir");
+
+    std::fs::write(
+        src_dir.join("storage.rs"),
+        "pub fn write_record() {}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    #[test]\n    fn round_trips() { write_record(); }\n}\n",
+    )
+    .expect("write storage.rs fixture");
+
+    let settings = Settings {
+        index_path: temp.path().join("index"),
+        workspace_root: None,
+        ..Default::default()
+    };
+    let mut facade =
+        IndexFacade::new(Arc::new(settings)).expect("create facade over temp index dir");
+    facade
+        .index_directory(&src_dir, false)
+        .expect("index fixture directory");
+
+    // Keep the temp dir alive for the duration of the test by leaking it:
+    // the facade only needs the on-disk index, not the source directory,
+    // once indexing has completed, but `TempDir` deletes on drop.
+    std::mem::forget(temp);
+
+    CodeIntelligenceServer::new(facade)
+}
+
+/// End-to-end provenance check: an inline `#[cfg(test)] mod tests { }`
+/// caller living inside a `src/` production file must be tagged `test` in
+/// BOTH JSON mode (`src/mcp/service.rs` role production) and text mode
+/// (`src/mcp/tools/symbols.rs` role production). This is the only
+/// assertion that can catch either call site being left unrewired: unit
+/// tests on the span extractor alone exercise neither.
+#[tokio::test(flavor = "current_thread")]
+async fn cfg_test_caller_is_classified_as_test_role_end_to_end() {
+    let server = build_rust_cfg_test_server().await;
+
+    // JSON mode: verify the caller resolved at all, then verify its role.
+    let json_result = server
+        .find_callers(Parameters(FindCallersRequest {
+            name: Some("write_record".to_string()),
+            symbol_id: None,
+            filter: CallerFilter::All,
+            count_only: false,
+            output_format: OutputFormat::Json,
+        }))
+        .await
+        .expect("find_callers should succeed");
+
+    let json_text = text_of(&json_result.content);
+    let envelope: serde_json::Value = serde_json::from_str(&json_text)
+        .unwrap_or_else(|e| panic!("expected parseable JSON envelope: {e}\ngot:\n{json_text}"));
+
+    assert_eq!(envelope["status"], "success", "envelope: {envelope}");
+    let data = envelope["data"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected a caller array, got:\n{envelope}"));
+    assert!(
+        !data.is_empty(),
+        "expected at least one caller of write_record (round_trips -> write_record); \
+         if this is empty, intra-file Rust call resolution never bound the call and this \
+         test cannot exercise the role classifier at all: {envelope}"
+    );
+
+    let caller = &data[0];
+    let file_path = caller["file_path"]
+        .as_str()
+        .expect("caller must carry a file_path");
+    assert!(
+        !file_path.contains("tests/") && !file_path.contains("/test/"),
+        "fixture caller's file_path must NOT match any test path glob (it lives in src/storage.rs), \
+         otherwise this test only re-proves path-based classification: {file_path}"
+    );
+    assert_eq!(
+        caller["role"], "test",
+        "expected the #[cfg(test)] mod tests caller to be tagged 'test' even though its \
+         file_path ({file_path}) is under src/ and matches no test path pattern -- \
+         JSON mode role comes from src/mcp/service.rs: {data:?}"
+    );
+
+    // JSON mode, count_only: the per-role breakdown must reflect the
+    // #[cfg(test)] caller as `test`, not `production`.
+    let json_count_result = server
+        .find_callers(Parameters(FindCallersRequest {
+            name: Some("write_record".to_string()),
+            symbol_id: None,
+            filter: CallerFilter::All,
+            count_only: true,
+            output_format: OutputFormat::Json,
+        }))
+        .await
+        .expect("find_callers should succeed");
+
+    let json_count_text = text_of(&json_count_result.content);
+    let count_envelope: serde_json::Value =
+        serde_json::from_str(&json_count_text).unwrap_or_else(|e| {
+            panic!("expected parseable JSON envelope: {e}\ngot:\n{json_count_text}")
+        });
+
+    assert_eq!(
+        count_envelope["status"], "success",
+        "envelope: {count_envelope}"
+    );
+    let count_data = &count_envelope["data"];
+    assert_eq!(
+        count_data["production"], 0,
+        "expected 0 production callers (the only caller is #[cfg(test)]): {count_data}"
+    );
+    assert_eq!(
+        count_data["test"], 1,
+        "expected 1 test caller (the #[cfg(test)] mod tests caller): {count_data}"
+    );
+
+    // TEXT mode, count_only: this is the only assertion in this test that
+    // exercises src/mcp/tools/symbols.rs's independent role-tagging path.
+    // Without it, that call site could be left unrewired while every JSON
+    // assertion above still passes.
+    let text_count_result = server
+        .find_callers(Parameters(FindCallersRequest {
+            name: Some("write_record".to_string()),
+            symbol_id: None,
+            filter: CallerFilter::All,
+            count_only: true,
+            output_format: OutputFormat::Text,
+        }))
+        .await
+        .expect("find_callers should succeed");
+
+    let text_count_output = text_of(&text_count_result.content);
+    assert!(
+        text_count_output.contains("0 production, 1 test"),
+        "expected text-mode count_only output to report '0 production, 1 test' for the \
+         #[cfg(test)] caller, got:\n{text_count_output}"
+    );
+}
+
 /// (d) unit-level: the path-heuristic classifier tags each of the six
 /// default `test_path_patterns` as `test`, and an ordinary `src/` path as
 /// `production`.

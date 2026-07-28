@@ -17,6 +17,7 @@
 //!    - Direct access to already-loaded index
 //!    - Most memory efficient for CLI operations
 
+pub mod caller_scope;
 pub mod client;
 pub mod http_server;
 pub mod https_server;
@@ -28,6 +29,7 @@ pub mod service;
 pub mod stale_server;
 pub mod tools;
 
+pub use caller_scope::{TestSpanCache, classify_caller_role_in_source};
 pub use proxy::{ProxyError, ProxyResult, serve_proxy};
 pub use requests::*;
 pub use server::{CodeIntelligenceServer, format_relative_time};

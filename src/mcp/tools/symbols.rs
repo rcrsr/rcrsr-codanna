@@ -834,10 +834,19 @@ impl CodeIntelligenceServer {
         // reused here since it drops the call-site `context` this renderer
         // needs for the "(calls receiver.method)" qualifier.
         let all_callers_with_metadata = indexer.get_calling_functions_with_metadata(symbol.id);
+        let workspace_root = indexer.settings().workspace_root.as_deref();
+        let mut span_cache = crate::mcp::TestSpanCache::new();
         let all_tagged: Vec<_> = all_callers_with_metadata
             .into_iter()
             .map(|(caller, metadata)| {
-                let role = service::classify_caller_role(&caller.file_path, test_path_patterns);
+                let indexed_hash = indexer.get_file_hash_for_path(&caller.file_path);
+                let role = crate::mcp::classify_caller_role_in_source(
+                    &caller,
+                    test_path_patterns,
+                    workspace_root,
+                    indexed_hash.as_deref(),
+                    &mut span_cache,
+                );
                 (caller, metadata, role)
             })
             .collect();
