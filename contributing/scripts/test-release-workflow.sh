@@ -33,7 +33,7 @@ test_dir=$(mktemp -d "${TMPDIR:-/tmp}/codanna-release-test.XXXXXX")
 trap 'rm -rf "$test_dir"' EXIT
 
 fail() {
-  # Mirrors release.yml's :38-45 "Error: ... / expected .../ actual ..." shape:
+  # Mirrors the "Extract version" step's "Error: ... / expected ... / actual ..." shape:
   # first arg is the headline, remaining args are already-indented detail lines.
   echo "Error: $1" >&2
   shift
@@ -78,7 +78,7 @@ extract_binstall_field() {
 }
 
 # ---------------------------------------------------------------------------
-# [1] Version extraction (release.yml info job, :28) + asset_version (:62)
+# [1] Version + asset_version derivation (release.yml "Extract version" step)
 # ---------------------------------------------------------------------------
 echo ""
 echo "[1] Version extraction"
@@ -99,7 +99,7 @@ if [[ "$asset_version" == "$version" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# [2] Host target -> release-matrix name (release.yml :76-91)
+# [2] Host target -> release-matrix name (release.yml `build` job matrix)
 # ---------------------------------------------------------------------------
 echo ""
 echo "[2] Host target -> release-matrix name"
@@ -118,7 +118,7 @@ esac
 echo "  host target: $target -> matrix name: $name"
 
 # ---------------------------------------------------------------------------
-# [3] Build (release.yml :113-114) -- full variant ONLY, no slim build.
+# [3] Build (release.yml "Build binary" step) -- full variant ONLY, no slim build.
 # ---------------------------------------------------------------------------
 echo ""
 echo "[3] Build (--all-features only)"
@@ -126,7 +126,8 @@ cargo build --release --locked --target "$target" --all-features
 echo "PASS: build"
 
 # ---------------------------------------------------------------------------
-# [4] Package (release.yml :116-157) + per-file checksums (:131-138 fallback)
+# [4] Package (release.yml "Package (Unix)" / "Package (Windows)" steps),
+#     including their sha256sum/shasum per-file checksum fallback.
 # ---------------------------------------------------------------------------
 echo ""
 echo "[4] Package"
@@ -201,7 +202,8 @@ actual_top_dir="${actual_top_dir%%/*}"
 assert_eq "$actual_top_dir" "$expected_top_dir" "P6 archive top-level dir == binstall bin-dir directory"
 
 # ---------------------------------------------------------------------------
-# [7] Bulk checksums over the narrowed glob (release.yml :184-187)
+# [7] Bulk checksums over the narrowed glob (release.yml "Generate bulk
+#     checksums" step)
 # ---------------------------------------------------------------------------
 echo ""
 echo "[7] Bulk checksums (narrowed glob: codanna-*.tar.xz codanna-*.zip)"
@@ -214,9 +216,10 @@ echo "[7] Bulk checksums (narrowed glob: codanna-*.tar.xz codanna-*.zip)"
     echo "Error: no packaged archives found matching codanna-*.tar.xz / codanna-*.zip" >&2
     exit 1
   fi
-  # sha256sum-first, matching the packaging step above, release.yml :132-138
-  # and scripts/install.sh -- the two fallbacks in this file must not probe in
-  # opposite orders.
+  # sha256sum-first, matching the "Generate bulk checksums" step this mirrors
+  # (and the packaging steps, and scripts/install.sh) -- the fallbacks here and
+  # in the workflow must not probe in opposite orders, or this harness would
+  # pass on a host where the real workflow hard-fails.
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum "${archives[@]}" | tee SHA256SUMS
     sha512sum "${archives[@]}" | tee SHA512SUMS
@@ -242,8 +245,8 @@ fi
 echo "PASS: SHA256SUMS has no *.sha256/*.sha512 sidecar lines"
 
 # ---------------------------------------------------------------------------
-# [9] Manifest generation (release.yml :195-239), including the prefix-strip
-#     platform derivation this file exists to guard.
+# [9] Manifest generation (release.yml "Create manifest" step), including the
+#     prefix-strip platform derivation this file exists to guard.
 # ---------------------------------------------------------------------------
 echo ""
 echo "[9] Manifest generation (prefix-strip platform derivation)"
@@ -291,7 +294,8 @@ echo "PASS: manifest generated"
 
 # ---------------------------------------------------------------------------
 # P5: the manifest platform for the produced file must equal the host
-# platform name exactly (kills the release.yml :182 sed regression).
+# platform name exactly (kills the sed-based platform extraction the "Create
+# manifest" step's prefix strip replaced).
 # ---------------------------------------------------------------------------
 echo ""
 echo "[10] Assertion P5: manifest platform == host platform ($name)"
@@ -420,14 +424,16 @@ fi
 echo "PASS: changelog-section.sh fails loudly for a missing version section"
 
 echo ""
-echo "[15] Release notes extraction for the live Cargo.toml version (release.yml :189-193)"
+echo "[15] Release notes extraction for the live Cargo.toml version (release.yml \"Extract release notes from CHANGELOG.md\" step)"
 if release_notes=$(contributing/scripts/changelog-section.sh "$version" 2>&1); then
   printf '%s\n' "$release_notes" > "$test_dir/RELEASE_NOTES.md"
   echo "PASS: extracted release notes for $version"
 else
   echo "SKIP: CHANGELOG.md has no '## [$version]' section yet -- expected while $version is unreleased"
-  echo "  (release.yml's own tag-time run would fail here too, exactly as it should:"
-  echo "   rename '## [Unreleased]' to '## [$version] - <date>' before tagging.)"
+  echo "  (a real tag push fails on this in release.yml's \"Validate CHANGELOG section\""
+  echo "   step, exactly as it should: rename '## [Unreleased]' to '## [$version] - <date>'"
+  echo "   -- '+rcrsr.N' suffix included -- before tagging. A workflow_dispatch dry run"
+  echo "   substitutes a placeholder instead of failing.)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -458,7 +464,7 @@ if ! grep -qF 'platform="${file#codanna-${asset_version}-}"' "$workflow"; then
   fail "release.yml no longer contains the exact prefix-strip platform derivation" \
        "expected literal: platform=\"\${file#codanna-\${asset_version}-}\"" \
        "in: $workflow" \
-       "This harness mirrors that derivation; if the workflow changed, step [12] is now testing a stale copy."
+       "This harness mirrors that derivation; if the workflow changed, step [9] is now testing a stale copy."
 fi
 echo "PASS: release.yml still derives platform by exact prefix strip"
 
@@ -477,12 +483,29 @@ if ! grep -qF 'asset_version="${version//+/-}"' "$workflow"; then
 fi
 echo "PASS: release.yml still computes asset_version as version with '+' replaced by '-'"
 
-if grep -nE 'shasum -a (256|512) codanna-\*( |$)' "$workflow" >/dev/null; then
+# Covers both branches of the step's sha256sum/shasum fallback -- a bare glob
+# in either one is the same regression.
+if grep -nE '(sha(256|512)sum|shasum -a (256|512)) codanna-\*( |$)' "$workflow" >/dev/null; then
   fail "release.yml bulk checksum glob has regressed to bare codanna-*" \
        "in: $workflow" \
        "A bare glob also matches the per-file .sha256/.sha512 sidecars, checksumming checksum files."
 fi
 echo "PASS: release.yml bulk checksum globs stay narrowed to archives"
+
+# The harness's step [7] fallback is only a faithful mirror if the bulk
+# checksum step has one too; a bare `shasum` there would hard-fail on a runner
+# that ships sha256sum but not shasum, while this harness would pass on the
+# same host. The literal asserted here is the sha256sum branch's own command
+# line, which appears ONLY in that step -- matching on the enclosing
+# `if command -v sha256sum` line instead would be vacuous, since the packaging
+# steps and the manifest step's helper carry that same line.
+if ! grep -qF 'sha256sum codanna-*.tar.xz codanna-*.zip | tee SHA256SUMS' "$workflow"; then
+  fail "release.yml's bulk checksum step no longer prefers sha256sum over shasum" \
+       "expected literal: sha256sum codanna-*.tar.xz codanna-*.zip | tee SHA256SUMS" \
+       "in: $workflow" \
+       "Step [7] mirrors that fallback; without it the harness passes where the workflow fails."
+fi
+echo "PASS: release.yml bulk checksum step keeps the sha256sum-first fallback"
 
 echo ""
 echo "================================="

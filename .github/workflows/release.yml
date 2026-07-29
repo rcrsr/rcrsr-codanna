@@ -32,7 +32,14 @@ jobs:
             exit 1
           fi
 
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+          # The event check is load-bearing, not redundant with the ref-type
+          # check: workflow_dispatch accepts a tag as its ref (both the "Use
+          # workflow from" dropdown and the REST dispatches API, whose `ref` is
+          # "a branch or tag name"), which sets GITHUB_REF_TYPE=tag. Without
+          # the event check a manual dispatch on a tag would set is_release and
+          # publish (or overwrite) a real GitHub Release, contradicting the
+          # documented contract that workflow_dispatch is a dry run.
+          if [ "${GITHUB_EVENT_NAME}" = "push" ] && [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             # Version consistency: the pushed tag must match the Cargo.toml version
             # (release artifacts and binstall URLs both derive from the Cargo.toml
             # version, so a drifted tag would produce assets nobody can resolve).
@@ -64,6 +71,22 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "asset_version=$asset_version" >> "$GITHUB_OUTPUT"
           echo "Found version: $version (asset_version: $asset_version)"
+
+      # Fail fast. The release body comes from the matching CHANGELOG.md
+      # section, but the step that extracts it lives in the `upload` job,
+      # behind the gated test suite and all four platform builds. Checking
+      # here (the checkout is already in hand) turns a missing section into a
+      # seconds-long failure instead of a ~30-minute one.
+      - name: Validate CHANGELOG section
+        if: steps.version.outputs.is_release == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          if ! contributing/scripts/changelog-section.sh "$version" > /dev/null; then
+            echo "::error::cannot release $version: CHANGELOG.md has no usable '## [$version]' section"
+            exit 1
+          fi
 
   test:
     name: Full test suite
@@ -183,14 +206,36 @@ jobs:
 
       - name: Generate bulk checksums
         run: |
-          shasum -a 256 codanna-*.tar.xz codanna-*.zip | tee SHA256SUMS
-          shasum -a 512 codanna-*.tar.xz codanna-*.zip | tee SHA512SUMS
+          set -euo pipefail
+          # Same sha256sum/shasum fallback as the packaging steps: a minimal or
+          # self-hosted runner may ship only one of the two, and a bare `shasum`
+          # here would fail on a host that has `sha256sum` but not `shasum`.
+          if command -v sha256sum > /dev/null; then
+            sha256sum codanna-*.tar.xz codanna-*.zip | tee SHA256SUMS
+            sha512sum codanna-*.tar.xz codanna-*.zip | tee SHA512SUMS
+          else
+            shasum -a 256 codanna-*.tar.xz codanna-*.zip | tee SHA256SUMS
+            shasum -a 512 codanna-*.tar.xz codanna-*.zip | tee SHA512SUMS
+          fi
 
       - name: Extract release notes from CHANGELOG.md
         run: |
           set -euo pipefail
           version="${{ needs.info.outputs.version }}"
-          contributing/scripts/changelog-section.sh "$version" > RELEASE_NOTES.md
+          # Extraction runs on every event so a dry run still exercises it, but
+          # only a real release may die on it: RELEASE_NOTES.md is read solely
+          # by the release step's body_path, which a dry run never reaches, and
+          # hard-failing here would make workflow_dispatch unusable for
+          # validating the pipeline before the CHANGELOG is prepared. A real
+          # release still fails (the info job also pre-checks this, so reaching
+          # a hard failure here means the CHANGELOG changed mid-run).
+          if ! contributing/scripts/changelog-section.sh "$version" > RELEASE_NOTES.md; then
+            if [ "${{ needs.info.outputs.is_release }}" = "true" ]; then
+              exit 1
+            fi
+            echo "::warning::no usable CHANGELOG.md section for '$version'; writing a dry-run placeholder"
+            printf 'Dry run: CHANGELOG.md has no usable section for %s.\n' "$version" > RELEASE_NOTES.md
+          fi
 
       - name: Create manifest
         run: |
@@ -198,6 +243,18 @@ jobs:
           version="${{ needs.info.outputs.version }}"
           asset_version="${{ needs.info.outputs.asset_version }}"
           repo="${{ github.repository }}"
+
+          # Same sha256sum/shasum fallback as the packaging steps. Defined as a
+          # function because its only caller sits inside the command group
+          # redirected into dist-manifest.json below: the digest is captured by
+          # command substitution, so nothing else here may reach stdout.
+          sha256_of() {
+            if command -v sha256sum > /dev/null; then
+              sha256sum "$1" | cut -d' ' -f1
+            else
+              shasum -a 256 "$1" | cut -d' ' -f1
+            fi
+          }
 
           {
             echo "{"
@@ -220,12 +277,16 @@ jobs:
               # strip. Checking here is what makes a raw '+'-bearing filename
               # fail the job instead of silently yielding a bogus platform.
               if [[ "$platform" == "$file" ]]; then
-                echo "::error::filename does not carry the expected asset version '$asset_version': $file"
+                # stderr, not stdout: this runs inside the group redirected
+                # into dist-manifest.json, so an unredirected echo would land
+                # in the manifest file instead of the job log, failing the job
+                # with no visible reason.
+                echo "::error::filename does not carry the expected asset version '$asset_version': $file" >&2
                 exit 1
               fi
               platform="${platform%.tar.xz}"
               platform="${platform%.zip}"
-              sha256=$(shasum -a 256 "$file" | cut -d' ' -f1)
+              sha256=$(sha256_of "$file")
               url="https://github.com/${repo}/releases/download/v${version}/${file}"
 
               [[ "$first" == "false" ]] && echo ","

@@ -80,6 +80,17 @@ main() {
     # be exercised end-to-end offline (e.g. against a local file:// manifest
     # and stub artifacts); this override makes that possible without adding
     # any other configuration surface.
+    #
+    # Restricted to file:// because the manifest is the sole source of BOTH the
+    # artifact URL AND its expected sha256: a remote override would redirect the
+    # install at an arbitrary binary whose checksum then validates against the
+    # attacker's own hash, so verification stops being a control instead of
+    # failing. The seam only ever needs local files, so accepting a remote URL
+    # buys nothing.
+    case "${CODANNA_MANIFEST_URL:-file://}" in
+        file://*) ;;
+        *) err "CODANNA_MANIFEST_URL only accepts file:// URLs" ;;
+    esac
     manifest_url="${CODANNA_MANIFEST_URL:-https://github.com/$REPO/releases/download/$version/dist-manifest.json}"
     manifest=$(curl -sLf "$manifest_url") || err "failed to fetch manifest"
 

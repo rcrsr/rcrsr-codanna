@@ -52,4 +52,13 @@ if ! body=$(awk -v want="[${version}]" '
   exit 1
 fi
 
+# The awk above sets `found` on the heading alone, so a section whose body is
+# empty (e.g. "## [Unreleased]" immediately followed by the next "## ") exits 0
+# and emits a bare newline. That would publish a release with an empty body —
+# the silent bad release this script's hard-fail design exists to prevent.
+if [[ -z "${body//[[:space:]]/}" ]]; then
+  echo "Error: CHANGELOG.md section for '${version}' is empty." >&2
+  exit 1
+fi
+
 printf '%s\n' "$body"

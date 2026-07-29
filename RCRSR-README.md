@@ -46,6 +46,27 @@ The fork is distributed through its own [GitHub Releases](https://github.com/rcr
 not crates.io or Homebrew. Each release is cut by pushing a `v<version>` tag; CI
 builds Linux, macOS (x64 + arm64), and Windows binaries and attaches them.
 
+**Before tagging, prepare `CHANGELOG.md`:** rename `## [Unreleased]` to
+`## [<version>] - <date>`, where `<version>` is the *full* `Cargo.toml`
+version **including the `+rcrsr.N` suffix and its literal `+`** — e.g.
+`## [0.12.0+rcrsr.1] - 2026-07-28`. The release body is extracted from the
+section whose heading matches that version exactly, and the match is a literal
+string compare, so a bare upstream heading (`## [0.12.0]`) will not be found.
+Every heading currently in the file predates the fork's release pipeline and is
+a bare upstream version, so the file's visible convention is the wrong one to
+copy here. A tag push with no matching, non-empty section fails in CI before
+anything is built.
+
+To validate the whole pipeline locally before tagging — version derivation,
+the release build, packaging and checksums, manifest generation, and an
+offline end-to-end run of `scripts/install.sh` — run
+`contributing/scripts/test-release-workflow.sh` from the repository root. It
+mirrors `.github/workflows/release.yml` and asserts against the shipping
+workflow, so it also catches drift between the two. Running the release
+workflow via `workflow_dispatch` exercises the same pipeline on CI as a dry
+run: it builds and uploads artifacts for inspection but never publishes a
+release, even when dispatched against a tag.
+
 ### Quick install (recommended)
 
 The installer script downloads the right archive for your platform from the
