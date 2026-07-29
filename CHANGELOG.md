@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Watcher startup catch-up:** `serve --watch` now arms a catch-up reindex the moment the event loop starts, not only on a later OS watch-queue overflow, so file changes made while the watcher was not running are re-converged automatically instead of requiring a manual reindex. Reuses the existing overflow catch-up machinery (debounce window, cooldown, bounded retries) and honours the existing `refresh_on_overflow` opt-out; a no-op when that flag is `false`. As with overflow catch-up, this performs a full clear-and-rebuild reindex, so MCP queries can return degraded/empty results while it runs. ([#53](https://github.com/rcrsr/rcrsr-codanna/issues/53))
+- **Watcher contention WARN backoff:** a sustained streak of catch-up-vs-`reindex(force: true)` contention rejections no longer re-logs the same `WARN` on every rejection past the threshold — a flat once-per-5s cadence that emitted roughly 17,000 lines a day during a multi-hour wedge. Re-emission is now rate-limited on a widening interval (10 minutes, then 20, then 40, then capped at hourly), mirroring the existing wedged-reindex watchdog cadence, so a long-wedged gate holder stays visible without flooding a log aggregator and without ever going silent. ([#47](https://github.com/rcrsr/rcrsr-codanna/issues/47))
+
 ## [0.12.0+rcrsr.1] - 2026-07-29
 
 ### Added

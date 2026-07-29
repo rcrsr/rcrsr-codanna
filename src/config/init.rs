@@ -243,8 +243,13 @@ impl Settings {
                 result.push_str("\n# Debounce interval in milliseconds\n");
                 result.push_str("# How long to wait after a file change before re-indexing\n");
             } else if line.starts_with("refresh_on_overflow = ") {
-                result
-                    .push_str("\n# Force a full refresh when the OS watch event queue overflows\n");
+                result.push_str(
+                    "\n# Force a full refresh when the OS watch event queue overflows,\n",
+                );
+                result.push_str(
+                    "# and also arm one catch-up reindex at watcher startup to re-converge\n",
+                );
+                result.push_str("# with any changes made while the watcher was not running\n");
                 result.push_str("# Default: true\n");
             } else if line.starts_with("churn_threshold = ") {
                 result.push_str("\n# Reserved for future use: churn-based refresh threshold\n");

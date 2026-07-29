@@ -92,6 +92,17 @@ pub struct UnifiedWatcher {
     /// escalate logging if the gate holder appears wedged (see
     /// `CONSECUTIVE_CONTENTION_WARN_THRESHOLD`).
     consecutive_contention: u32,
+    /// When the last contention WARN was emitted in the current contention
+    /// streak, if any. `None` means no WARN has been emitted yet in this
+    /// streak, so the first past-threshold contention rejection still WARNs
+    /// immediately. Reset alongside `consecutive_contention` (see
+    /// [`UnifiedWatcher::reset_contention_streak`]).
+    contention_warn_last_at: Option<Instant>,
+    /// Quiet interval that must elapse before the next contention WARN may
+    /// be emitted, widening geometrically after each WARN (see
+    /// [`widen_contention_warn_interval`]) and starting at
+    /// `CONTENTION_WARN_BASE_INTERVAL`.
+    contention_warn_interval: Duration,
     /// Registered watch roots from handlers; scopes created-directory
     /// handling and stays watched even when a root holds no indexed
     /// file directly.
@@ -161,6 +172,10 @@ impl UnifiedWatcher {
         let mut broadcast_rx = self.broadcaster.subscribe();
 
         crate::log_event!("watcher", "started");
+
+        // Arm a catch-up reindex now, after handler roots are registered but
+        // before the event loop begins, so `stale_since` measures quiet time
+        self.arm_startup_catch_up();
 
         loop {
             // Periodic check for debounced events
@@ -263,6 +278,29 @@ impl UnifiedWatcher {
         }
     }
 
+    /// Arm a one-time catch-up reindex at watcher startup, if enabled.
+    ///
+    /// Files may have changed while the watcher was not running (process
+    /// restart, machine sleep, etc.), so the index can be stale the moment
+    /// the event loop begins even before any filesystem event is observed.
+    /// Marking staleness up front reuses the exact same debounce/cooldown/
+    /// bounded-retry machinery that already handles the overflow case (see
+    /// `mark_stale` above and the overflow signal handling in `watch()`):
+    /// there is no separate "startup catch-up" code path, only a different
+    /// trigger for the same one. Honours `refresh_on_overflow` since that
+    /// flag is the existing, user-facing opt-out for "actively refresh the
+    /// index in response to a staleness signal" -- a no-op when `false`.
+    fn arm_startup_catch_up(&mut self) {
+        if self.refresh_on_overflow {
+            crate::log_event!(
+                "watcher",
+                "startup catch-up",
+                "arming a catch-up reindex to re-converge with changes made while the watcher was down"
+            );
+            self.mark_stale();
+        }
+    }
+
     /// If a catch-up reindex task is in flight and has finished, take its
     /// result and update staleness state accordingly via
     /// [`Self::handle_catch_up_success`] / [`Self::handle_catch_up_failure`].
@@ -290,6 +328,27 @@ impl UnifiedWatcher {
         }
     }
 
+    /// Reset the contention-streak triple to its start-of-streak state.
+    ///
+    /// `consecutive_contention`, `contention_warn_last_at` and
+    /// `contention_warn_interval` move as one unit: they are all scoped to a
+    /// single *continuous* streak of reindex-gate contention rejections, and
+    /// must be reset together whenever that streak ends, whether because a
+    /// catch-up reindex finally succeeded or because it failed for a genuine
+    /// (non-contention) reason. Resetting only `consecutive_contention` while
+    /// leaving `contention_warn_last_at`/`contention_warn_interval` behind
+    /// would let a brand-new streak inherit a stale WARN timestamp and a
+    /// widened interval from the *previous* streak, suppressing or
+    /// mis-timing the next escalation. Deliberately does not touch
+    /// `catch_up_attempts`: that counter has different lifecycle rules (it is
+    /// bounded by `MAX_CATCH_UP_ATTEMPTS` and cleared on give-up, not on
+    /// every contention-streak boundary).
+    fn reset_contention_streak(&mut self) {
+        self.consecutive_contention = 0;
+        self.contention_warn_last_at = None;
+        self.contention_warn_interval = CONTENTION_WARN_BASE_INTERVAL;
+    }
+
     /// Handle a successfully completed catch-up reindex.
     ///
     /// Logs the outcome and broadcasts `IndexReloaded` unconditionally, but
@@ -308,7 +367,7 @@ impl UnifiedWatcher {
         );
         self.broadcaster.send(FileChangeEvent::IndexReloaded);
         self.catch_up_attempts = 0;
-        self.consecutive_contention = 0;
+        self.reset_contention_streak();
 
         if should_clear_stale_after_success(self.stale_since, started_at) {
             self.stale = false;
@@ -343,16 +402,55 @@ impl UnifiedWatcher {
     /// `CONSECUTIVE_CONTENTION_WARN_THRESHOLD`: normal reindex handoffs are
     /// brief, so a sustained streak likely means the gate holder is wedged
     /// and no signal above debug level would otherwise surface that.
+    ///
+    /// Once past the threshold, re-emission of that WARN is rate-limited by
+    /// [`should_log_contention_warning`] rather than firing on every
+    /// past-threshold rejection: the interval starts at
+    /// `CONTENTION_WARN_BASE_INTERVAL` and widens geometrically (see
+    /// [`widen_contention_warn_interval`]) each time a WARN actually fires,
+    /// capped at [`contention_warn_backoff_cap`]. Past-threshold rejections
+    /// that are suppressed by the rate limit still fall through to
+    /// `crate::debug_event!` so nothing goes silent at any log level.
     fn handle_catch_up_failure(&mut self, failure: CatchUpFailure) {
         if failure.is_contention() {
             self.consecutive_contention += 1;
 
-            if self.consecutive_contention > CONSECUTIVE_CONTENTION_WARN_THRESHOLD {
+            let since_last_warn = self.contention_warn_last_at.map(|t| t.elapsed());
+            if should_log_contention_warning(
+                self.consecutive_contention,
+                CONSECUTIVE_CONTENTION_WARN_THRESHOLD,
+                since_last_warn,
+                self.contention_warn_interval,
+            ) {
+                // Widen only when this streak has already consumed an
+                // interval (i.e. a previous WARN was emitted); the first
+                // past-threshold WARN fires immediately without widening, so
+                // the schedule is base, 2x, 4x, cap, cap... (10m, 20m, 40m,
+                // 60m, 60m...) rather than skipping straight to 2x base.
+                //
+                // The cadence named in the WARN below must be the interval
+                // that will actually gate the *next* report, not the one
+                // that gated this one, so compute it up front and use it in
+                // the message before performing the real state mutation.
+                let next_report_interval = if self.contention_warn_last_at.is_some() {
+                    widen_contention_warn_interval(
+                        self.contention_warn_interval,
+                        CONTENTION_WARN_BASE_INTERVAL,
+                    )
+                } else {
+                    self.contention_warn_interval
+                };
+
                 tracing::warn!(
                     "[watcher] catch-up reindex has been rejected by reindex-gate contention {} times in a row; \
-                     another reindex may be wedged. A restart may be needed if this persists.",
-                    self.consecutive_contention
+                     another reindex may be wedged. A restart may be needed if this persists; \
+                     next report in at most {} minute(s) while this persists.",
+                    self.consecutive_contention,
+                    next_report_interval.as_secs().div_ceil(60)
                 );
+
+                self.contention_warn_interval = next_report_interval;
+                self.contention_warn_last_at = Some(Instant::now());
             } else {
                 crate::debug_event!(
                     "watcher",
@@ -363,7 +461,7 @@ impl UnifiedWatcher {
             return;
         }
 
-        self.consecutive_contention = 0;
+        self.reset_contention_streak();
         self.catch_up_attempts += 1;
 
         if self.catch_up_attempts >= MAX_CATCH_UP_ATTEMPTS {
@@ -958,7 +1056,37 @@ const MAX_CATCH_UP_ATTEMPTS: u32 = 5;
 /// re-fired after `CATCH_UP_COOLDOWN`) past which `handle_catch_up_failure`
 /// escalates from `debug_event!` to `tracing::warn!`. 12 is roughly one
 /// minute at the 5s cooldown, far beyond any legitimate reindex handoff.
+///
+/// Crossing the threshold does not WARN on every single rejection
+/// thereafter: re-emission is rate-limited by
+/// [`should_log_contention_warning`] against `contention_warn_interval`
+/// (starting at `CONTENTION_WARN_BASE_INTERVAL` and widening after each
+/// WARN, see [`widen_contention_warn_interval`]), so a wedged gate holder
+/// pages at a decreasing cadence instead of flooding the log once past
+/// threshold.
 const CONSECUTIVE_CONTENTION_WARN_THRESHOLD: u32 = 12;
+
+/// Base quiet interval that must elapse between consecutive contention WARN
+/// log lines once a streak has passed
+/// `CONSECUTIVE_CONTENTION_WARN_THRESHOLD`, before backoff (see
+/// [`widen_contention_warn_interval`]) widens it further.
+///
+/// The most likely root cause of a sustained contention streak is a wedged
+/// reindex phase-2 walk, which is *already* reported at `tracing::error!` by
+/// `spawn_reindex_phase2_watchdog` (src/indexing/facade.rs:1940) on a
+/// 10m/20m/40m/hourly schedule. Using the same 600s base for this WARN keeps
+/// the two signals proportionate -- roughly two log lines an hour at steady
+/// state -- instead of stacking a faster WARN cadence on top of an
+/// already-visible ERROR for the same underlying wedge.
+const CONTENTION_WARN_BASE_INTERVAL: Duration = Duration::from_secs(600);
+
+/// The interval between contention WARN log lines widens by this factor
+/// after each WARN (10m -> 20m -> 40m -> ...), capped by
+/// [`contention_warn_backoff_cap`], mirroring
+/// `REINDEX_WATCHDOG_BACKOFF_MULTIPLIER` (src/indexing/facade.rs:1893) for
+/// the same reason: a sustained wedge should page loudly at first, then
+/// settle to a low, non-flooding cadence.
+const CONTENTION_WARN_BACKOFF_MULTIPLIER: u32 = 2;
 
 /// Pure decision predicate combining [`should_catch_up`] with the
 /// in-flight-task guard and the distinct catch-up cooldown, used by
@@ -992,6 +1120,52 @@ fn should_start_catch_up(
     }
 
     true
+}
+
+/// Caps the widening contention-WARN interval at 6x `base`. Expressed
+/// relative to `base` rather than a minute literal so the unit tests can
+/// drive the same logic with a millisecond base; at the sole production
+/// base of 600s (`CONTENTION_WARN_BASE_INTERVAL`) this yields a 10m -> 20m
+/// -> 40m -> hourly-thereafter schedule.
+///
+/// This deliberately mirrors `watchdog_backoff_cap`
+/// (src/indexing/facade.rs:1900), the phase-2 reindex watchdog's identical
+/// cap formula, so the two independent backoff schedules stay proportionate
+/// without coupling `watcher/` to `indexing/` for a two-line formula (see
+/// §CDNA.1: extraction is disproportionate at just two call sites).
+fn contention_warn_backoff_cap(base: Duration) -> Duration {
+    base.saturating_mul(6)
+}
+
+/// Widens the contention-WARN interval by `CONTENTION_WARN_BACKOFF_MULTIPLIER`
+/// after each WARN, capped at [`contention_warn_backoff_cap`] relative to
+/// `base`. A fixed point at the cap: `widen(cap, base) == cap`. Never
+/// returns zero and never resets on its own -- only a fresh contention
+/// streak resets the interval back to `base`.
+fn widen_contention_warn_interval(current: Duration, base: Duration) -> Duration {
+    std::cmp::min(
+        current.saturating_mul(CONTENTION_WARN_BACKOFF_MULTIPLIER),
+        contention_warn_backoff_cap(base),
+    )
+}
+
+/// Pure decision predicate for whether a contention rejection should log a
+/// `tracing::warn!` line now.
+///
+/// Fires exactly when the consecutive-contention `streak` has passed
+/// `threshold` (the same strict `>` gate `handle_catch_up_failure` already
+/// applies) *and* either no WARN has been emitted yet in this streak
+/// (`since_last_warn` is `None`, so the first past-threshold rejection still
+/// WARNs immediately, as today) or at least `interval` has elapsed since the
+/// last WARN (`>=`, matching the `elapsed >= window` convention already used
+/// by [`should_catch_up`]).
+fn should_log_contention_warning(
+    streak: u32,
+    threshold: u32,
+    since_last_warn: Option<Duration>,
+    interval: Duration,
+) -> bool {
+    streak > threshold && since_last_warn.is_none_or(|since| since >= interval)
 }
 
 /// Pure decision predicate for whether a successfully completed catch-up
@@ -1144,6 +1318,8 @@ impl UnifiedWatcherBuilder {
             last_catch_up_completed: None,
             catch_up_attempts: 0,
             consecutive_contention: 0,
+            contention_warn_last_at: None,
+            contention_warn_interval: CONTENTION_WARN_BASE_INTERVAL,
             handler_roots: Vec::new(),
             #[cfg(test)]
             walk_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1920,6 +2096,83 @@ mod tests {
         assert!(!should_clear_stale_after_success(Some(later), started_at));
     }
 
+    // ── contention-WARN backoff: contention_warn_backoff_cap /
+    //    widen_contention_warn_interval / should_log_contention_warning ────
+
+    #[test]
+    fn contention_warn_backoff_cap_is_six_times_base() {
+        let base = Duration::from_millis(10);
+        assert_eq!(contention_warn_backoff_cap(base), Duration::from_millis(60));
+    }
+
+    #[test]
+    fn widen_contention_warn_interval_doubles_then_caps() {
+        let base = Duration::from_millis(10);
+        let cap = contention_warn_backoff_cap(base);
+
+        let widened_once = widen_contention_warn_interval(base, base);
+        assert_eq!(widened_once, Duration::from_millis(20), "base -> 2x base");
+
+        let widened_twice = widen_contention_warn_interval(widened_once, base);
+        assert_eq!(widened_twice, Duration::from_millis(40), "2x -> 4x base");
+
+        let widened_thrice = widen_contention_warn_interval(widened_twice, base);
+        assert_eq!(
+            widened_thrice, cap,
+            "4x -> 8x base would exceed the cap, so it clamps to the cap"
+        );
+
+        let widened_again = widen_contention_warn_interval(widened_thrice, base);
+        assert_eq!(
+            widened_again, cap,
+            "widening a value already at the cap must stay fixed at the cap, \
+             never growing unbounded and never resetting on its own"
+        );
+    }
+
+    #[test]
+    fn should_log_contention_warning_respects_existing_threshold_semantics() {
+        let threshold = CONSECUTIVE_CONTENTION_WARN_THRESHOLD;
+        let interval = CONTENTION_WARN_BASE_INTERVAL;
+
+        assert!(
+            !should_log_contention_warning(threshold, threshold, None, interval),
+            "streak == threshold must not fire, matching the existing strict `>` gate"
+        );
+        assert!(
+            should_log_contention_warning(threshold + 1, threshold, None, interval),
+            "the first rejection past threshold must WARN immediately, as today, \
+             even with no prior WARN recorded in this streak"
+        );
+    }
+
+    #[test]
+    fn should_log_contention_warning_suppresses_inside_interval() {
+        let threshold = CONSECUTIVE_CONTENTION_WARN_THRESHOLD;
+        let interval = CONTENTION_WARN_BASE_INTERVAL;
+        let since_last_warn = interval - Duration::from_millis(1);
+
+        assert!(!should_log_contention_warning(
+            threshold + 1,
+            threshold,
+            Some(since_last_warn),
+            interval,
+        ));
+    }
+
+    #[test]
+    fn should_log_contention_warning_fires_at_interval_boundary() {
+        let threshold = CONSECUTIVE_CONTENTION_WARN_THRESHOLD;
+        let interval = CONTENTION_WARN_BASE_INTERVAL;
+
+        assert!(should_log_contention_warning(
+            threshold + 1,
+            threshold,
+            Some(interval),
+            interval,
+        ));
+    }
+
     // ── handle_catch_up_success / handle_catch_up_failure state machine ────
 
     fn dummy_outcome() -> ReindexOutcome {
@@ -2202,6 +2455,329 @@ mod tests {
         assert!(watcher.stale);
     }
 
+    // ── contention-WARN backoff state machine (contention_warn_last_at /
+    //    contention_warn_interval), including a log-capture provenance
+    //    test that the WARN cadence genuinely changes emitted output and
+    //    not merely internal state ─────────────────────────────────────
+
+    /// The very first past-threshold contention rejection in a streak must
+    /// stamp `contention_warn_last_at` and increment the streak, but must
+    /// not widen `contention_warn_interval` -- widening only applies once a
+    /// previous WARN has already consumed an interval (see
+    /// `handle_catch_up_failure`'s "base, 2x, 4x, cap, cap..." schedule).
+    #[tokio::test]
+    async fn contention_first_warn_past_threshold_stamps_without_widening() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut watcher = test_watcher(&tempdir);
+        watcher.consecutive_contention = CONSECUTIVE_CONTENTION_WARN_THRESHOLD;
+        watcher.contention_warn_last_at = None;
+        watcher.contention_warn_interval = CONTENTION_WARN_BASE_INTERVAL;
+        watcher.stale = true;
+        let stale_since = Instant::now();
+        watcher.stale_since = Some(stale_since);
+
+        watcher.handle_catch_up_failure(CatchUpFailure::Watch(WatchError::CatchUpReindexFailed {
+            source: IndexError::ReindexInProgress,
+        }));
+
+        assert_eq!(
+            watcher.consecutive_contention,
+            CONSECUTIVE_CONTENTION_WARN_THRESHOLD + 1
+        );
+        assert!(
+            watcher.contention_warn_last_at.is_some(),
+            "the first past-threshold rejection must stamp the WARN timestamp"
+        );
+        assert_eq!(
+            watcher.contention_warn_interval, CONTENTION_WARN_BASE_INTERVAL,
+            "the first WARN must not widen the interval it just consumed"
+        );
+        assert_eq!(watcher.catch_up_attempts, 0);
+        assert_eq!(watcher.stale_since, Some(stale_since));
+    }
+
+    /// A contention rejection arriving before `contention_warn_interval` has
+    /// elapsed since the last WARN must neither restamp
+    /// `contention_warn_last_at` nor widen `contention_warn_interval`, even
+    /// though the streak itself keeps incrementing.
+    #[tokio::test]
+    async fn contention_inside_interval_neither_restamps_nor_widens() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut watcher = test_watcher(&tempdir);
+        watcher.consecutive_contention = CONSECUTIVE_CONTENTION_WARN_THRESHOLD + 1;
+        let last_warn = Instant::now();
+        watcher.contention_warn_last_at = Some(last_warn);
+        watcher.contention_warn_interval = CONTENTION_WARN_BASE_INTERVAL;
+
+        watcher.handle_catch_up_failure(CatchUpFailure::Watch(WatchError::CatchUpReindexFailed {
+            source: IndexError::ReindexInProgress,
+        }));
+
+        assert_eq!(
+            watcher.consecutive_contention,
+            CONSECUTIVE_CONTENTION_WARN_THRESHOLD + 2,
+            "the streak counter must keep incrementing even while suppressed"
+        );
+        assert_eq!(
+            watcher.contention_warn_last_at,
+            Some(last_warn),
+            "a suppressed rejection must not restamp the WARN timestamp"
+        );
+        assert_eq!(
+            watcher.contention_warn_interval, CONTENTION_WARN_BASE_INTERVAL,
+            "a suppressed rejection must not widen the interval"
+        );
+    }
+
+    /// Once `contention_warn_interval` has fully elapsed since the last
+    /// WARN, the next contention rejection must restamp
+    /// `contention_warn_last_at` and widen `contention_warn_interval` to 2x
+    /// its previous value.
+    #[tokio::test]
+    async fn contention_after_interval_elapses_restamps_and_widens() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut watcher = test_watcher(&tempdir);
+        watcher.consecutive_contention = CONSECUTIVE_CONTENTION_WARN_THRESHOLD + 1;
+        watcher.contention_warn_interval = CONTENTION_WARN_BASE_INTERVAL;
+        let stale_last_warn =
+            Instant::now() - watcher.contention_warn_interval - Duration::from_millis(50);
+        watcher.contention_warn_last_at = Some(stale_last_warn);
+
+        watcher.handle_catch_up_failure(CatchUpFailure::Watch(WatchError::CatchUpReindexFailed {
+            source: IndexError::ReindexInProgress,
+        }));
+
+        assert!(
+            watcher
+                .contention_warn_last_at
+                .is_some_and(|t| t > stale_last_warn),
+            "an elapsed interval must advance the WARN timestamp"
+        );
+        assert_eq!(
+            watcher.contention_warn_interval,
+            CONTENTION_WARN_BASE_INTERVAL * CONTENTION_WARN_BACKOFF_MULTIPLIER,
+            "an elapsed interval must widen to 2x the previous interval"
+        );
+    }
+
+    /// Once `contention_warn_interval` has widened to
+    /// `contention_warn_backoff_cap`, further elapsed-interval rejections
+    /// must keep restamping the WARN timestamp (the signal never stops)
+    /// while leaving the interval capped rather than doubling past it.
+    #[tokio::test]
+    async fn contention_warn_interval_stays_capped_and_never_stops() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut watcher = test_watcher(&tempdir);
+        watcher.consecutive_contention = CONSECUTIVE_CONTENTION_WARN_THRESHOLD + 1;
+        let cap = contention_warn_backoff_cap(CONTENTION_WARN_BASE_INTERVAL);
+        watcher.contention_warn_interval = cap;
+        let stale_last_warn = Instant::now() - cap - Duration::from_millis(50);
+        watcher.contention_warn_last_at = Some(stale_last_warn);
+
+        watcher.handle_catch_up_failure(CatchUpFailure::Watch(WatchError::CatchUpReindexFailed {
+            source: IndexError::ReindexInProgress,
+        }));
+
+        assert_eq!(
+            watcher.contention_warn_interval, cap,
+            "the interval must stay capped rather than doubling past it"
+        );
+        assert!(
+            watcher
+                .contention_warn_last_at
+                .is_some_and(|t| t > stale_last_warn),
+            "a capped interval must still restamp on every elapsed WARN -- the signal must never stop"
+        );
+    }
+
+    /// A genuine (non-contention) failure must reset the full
+    /// contention-warn backoff triple, not just the streak counter --
+    /// otherwise a brand-new streak would inherit a widened interval and a
+    /// stale timestamp from the *previous* streak, suppressing its first
+    /// WARN for up to an hour.
+    #[tokio::test]
+    async fn genuine_failure_resets_contention_warn_backoff() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut watcher = test_watcher(&tempdir);
+        watcher.consecutive_contention = 20;
+        watcher.contention_warn_last_at = Some(Instant::now());
+        watcher.contention_warn_interval =
+            contention_warn_backoff_cap(CONTENTION_WARN_BASE_INTERVAL);
+
+        watcher.handle_catch_up_failure(CatchUpFailure::JoinFailed("boom".to_string()));
+
+        assert_eq!(watcher.consecutive_contention, 0);
+        assert!(
+            watcher.contention_warn_last_at.is_none(),
+            "a genuine failure must clear the WARN timestamp, not just the streak"
+        );
+        assert_eq!(
+            watcher.contention_warn_interval, CONTENTION_WARN_BASE_INTERVAL,
+            "a genuine failure must reset the interval back to base, not just the streak"
+        );
+    }
+
+    /// A successful catch-up must reset the full contention-warn backoff
+    /// triple identically to a genuine failure -- the same partial-fix
+    /// hazard applies: resetting only the streak would suppress the next
+    /// streak's first WARN for up to an hour.
+    #[tokio::test]
+    async fn success_resets_contention_warn_backoff() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut watcher = test_watcher(&tempdir);
+        watcher.consecutive_contention = 20;
+        watcher.contention_warn_last_at = Some(Instant::now());
+        watcher.contention_warn_interval =
+            contention_warn_backoff_cap(CONTENTION_WARN_BASE_INTERVAL);
+
+        watcher.handle_catch_up_success(dummy_outcome(), Instant::now());
+
+        assert_eq!(watcher.consecutive_contention, 0);
+        assert!(
+            watcher.contention_warn_last_at.is_none(),
+            "success must clear the WARN timestamp, not just the streak"
+        );
+        assert_eq!(
+            watcher.contention_warn_interval, CONTENTION_WARN_BASE_INTERVAL,
+            "success must reset the interval back to base, not just the streak"
+        );
+    }
+
+    /// Minimal `MakeWriter` that clones the shared buffer handle on every
+    /// write-site lookup, so a single `Arc<Mutex<Vec<u8>>>` captures every
+    /// line a scoped `tracing::subscriber::with_default` subscriber emits
+    /// during a test -- state-only assertions above cannot distinguish a
+    /// correct gated-WARN implementation from one that gates only the
+    /// *stamp* while still calling `tracing::warn!` unconditionally; only
+    /// capturing real output falsifies that shadow-run outcome.
+    struct VecWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for VecWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct SharedVecMakeWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedVecMakeWriter {
+        type Writer = VecWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            VecWriter(Arc::clone(&self.0))
+        }
+    }
+
+    /// Proof for issue #47: a sustained contention streak emits exactly one
+    /// WARN per rate-limit interval, not one per rejection (which would
+    /// flood the log) and not zero after the first (which would silently
+    /// go dark, reintroducing the #46 blind spot). `handle_catch_up_failure`
+    /// is synchronous, so a current-thread `#[tokio::test]` keeps the
+    /// scoped subscriber installed via `tracing::subscriber::with_default`
+    /// live across the whole drive loop below.
+    ///
+    /// Phase 1 drives 20 consecutive contention rejections with no
+    /// back-dating: the 13th (first past `CONSECUTIVE_CONTENTION_WARN_THRESHOLD`
+    /// = 12) rejection must WARN, and none of the remaining 7 may, since
+    /// `CONTENTION_WARN_BASE_INTERVAL` (10 minutes) cannot have elapsed in
+    /// real wall-clock time within a unit test.
+    ///
+    /// Phase 2 back-dates `contention_warn_last_at` past the (still-base)
+    /// interval and drives one further rejection: this must produce a
+    /// SECOND WARN line, proving the cadence resumes rather than
+    /// permanently capping at one line and going silent again.
+    #[tokio::test]
+    async fn sustained_contention_emits_exactly_one_warn_per_interval() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut watcher = test_watcher(&tempdir);
+        watcher.consecutive_contention = 0;
+        watcher.contention_warn_last_at = None;
+        watcher.contention_warn_interval = CONTENTION_WARN_BASE_INTERVAL;
+
+        let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(SharedVecMakeWriter(Arc::clone(&buf)))
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .without_time()
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            for _ in 0..20 {
+                watcher.handle_catch_up_failure(CatchUpFailure::Watch(
+                    WatchError::CatchUpReindexFailed {
+                        source: IndexError::ReindexInProgress,
+                    },
+                ));
+            }
+        });
+
+        let captured = String::from_utf8(buf.lock().unwrap().clone())
+            .expect("tracing-subscriber's fmt output must be valid UTF-8");
+        let warn_lines: Vec<&str> = captured.lines().filter(|l| l.contains("WARN")).collect();
+
+        assert_eq!(
+            warn_lines.len(),
+            1,
+            "exactly one WARN must be emitted across 20 rejections inside a single \
+             un-elapsed interval, got: {captured:?}"
+        );
+        assert!(
+            warn_lines[0].contains("wedged"),
+            "the WARN must keep naming the recovery guidance, got: {}",
+            warn_lines[0]
+        );
+
+        // Phase 2: force the interval to have elapsed and prove the signal
+        // resumes rather than going permanently silent after the first line.
+        watcher.contention_warn_last_at =
+            Some(Instant::now() - watcher.contention_warn_interval - Duration::from_millis(50));
+
+        tracing::subscriber::with_default(subscriber_from(&buf), || {
+            watcher.handle_catch_up_failure(CatchUpFailure::Watch(
+                WatchError::CatchUpReindexFailed {
+                    source: IndexError::ReindexInProgress,
+                },
+            ));
+        });
+
+        let captured_after = String::from_utf8(buf.lock().unwrap().clone())
+            .expect("tracing-subscriber's fmt output must be valid UTF-8");
+        let warn_lines_after: Vec<&str> = captured_after
+            .lines()
+            .filter(|l| l.contains("WARN"))
+            .collect();
+
+        assert_eq!(
+            warn_lines_after.len(),
+            2,
+            "a second WARN must be emitted once the interval has elapsed again -- \
+             the cadence must never stop, got: {captured_after:?}"
+        );
+    }
+
+    /// Builds a fresh capturing subscriber writing into the same shared
+    /// buffer as an earlier one, so [`sustained_contention_emits_exactly_one_warn_per_interval`]'s
+    /// second phase can install a new scoped subscriber without losing the
+    /// first phase's captured output (the buffer, not the subscriber, is
+    /// what persists across phases).
+    fn subscriber_from(
+        buf: &Arc<std::sync::Mutex<Vec<u8>>>,
+    ) -> impl tracing::Subscriber + Send + Sync {
+        tracing_subscriber::fmt()
+            .with_writer(SharedVecMakeWriter(Arc::clone(buf)))
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .without_time()
+            .finish()
+    }
+
     /// End-to-end liveness proof for upstream v0.12.0's created-directory
     /// handling, driven through the real `watch()` loop over a real kernel
     /// watcher -- no hand-set state.
@@ -2303,6 +2879,267 @@ mod tests {
             "a source file created inside a NEW directory under a registered \
              root must be indexed by the running watcher; not finding it means \
              the created-directory chain is not wired end to end"
+        );
+    }
+
+    /// End-to-end liveness proof that `arm_startup_catch_up` re-converges
+    /// the index with changes made while no watcher process was running, by
+    /// driving the real `watch()` loop over a real kernel watcher -- no
+    /// hand-set state.
+    ///
+    /// `while_down.py` is written to disk *before* `watch()` is ever
+    /// called, so no `notify` event exists for it: the file's creation
+    /// predates the watcher's own existence. A hand-set `stale`/
+    /// `stale_since` (as most other tests in this module use) would prove
+    /// nothing about whether `watch()` itself arms the catch-up; only
+    /// driving the real loop from a cold start, as this test does, can show
+    /// that `arm_startup_catch_up` is actually wired into `watch()`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_catch_up_indexes_files_added_while_watcher_was_down() {
+        use crate::config::Settings;
+        use crate::indexing::facade::IndexFacade;
+        use crate::watcher::handlers::CodeFileHandler;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir
+            .path()
+            .canonicalize()
+            .expect("temp dir must canonicalize");
+
+        std::fs::write(root.join("seed.py"), "def seed():\n    pass\n").unwrap();
+
+        let index_dir = tempfile::tempdir().unwrap();
+        let mut settings = Settings {
+            index_path: index_dir.path().to_path_buf(),
+            workspace_root: Some(root.clone()),
+            ..Default::default()
+        };
+        // A force reindex (which the catch-up path runs) rebuilds from
+        // `indexed_paths_cache`, not from whatever happens to already be in
+        // the index -- without this, the walk covers nothing and the test
+        // would fail for the wrong reason.
+        settings
+            .add_indexed_path(root.clone())
+            .expect("register the indexed root");
+
+        let mut facade = IndexFacade::new(Arc::new(settings)).expect("facade over temp index");
+        facade.index_directory(&root, false).expect("seed index");
+        let facade = Arc::new(RwLock::new(facade));
+
+        // Written to disk before the watcher exists: no notify event will
+        // ever fire for this file. Only startup catch-up can discover it.
+        std::fs::write(
+            root.join("while_down.py"),
+            "def while_down_marker():\n    pass\n",
+        )
+        .unwrap();
+
+        let handler = CodeFileHandler::new(Arc::clone(&facade), root.clone());
+        let watcher = UnifiedWatcher::builder()
+            .broadcaster(Arc::new(NotificationBroadcaster::new(16)))
+            .indexer(Arc::clone(&facade))
+            .workspace_root(root.clone())
+            .handler(handler)
+            .debounce_ms(0)
+            .build()
+            .expect("builder has all required fields");
+
+        let watch_task = tokio::spawn(watcher.watch());
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut found = false;
+        while Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let f = facade.read().await;
+            if f.find_symbols_by_name("while_down_marker", None)
+                .iter()
+                .any(|s| s.name.as_ref() == "while_down_marker")
+            {
+                found = true;
+                break;
+            }
+        }
+
+        watch_task.abort();
+
+        assert!(
+            found,
+            "a file created on disk before the watcher started must be picked \
+             up by a startup catch-up reindex; not finding it means \
+             `arm_startup_catch_up` is not wired into `watch()`"
+        );
+    }
+
+    /// End-to-end liveness proof that startup catch-up also drops symbols
+    /// for files deleted while no watcher process was running, driven
+    /// through the real `watch()` loop.
+    ///
+    /// `gone_marker` is indexed, then its file is deleted from disk before
+    /// `watch()` is ever called -- no notify event exists for the
+    /// deletion either. Only a force/clear+rebuild reindex removes symbols
+    /// for a vanished file; a relocated or "cheaper" incremental walk would
+    /// leave them behind. `seed_marker` is the positive control proving a
+    /// rebuild actually ran rather than the index simply having been wiped
+    /// wholesale: without it, a bug that dropped ALL symbols (not just the
+    /// deleted file's) would also make this test pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_catch_up_drops_symbols_for_files_deleted_while_watcher_was_down() {
+        use crate::config::Settings;
+        use crate::indexing::facade::IndexFacade;
+        use crate::watcher::handlers::CodeFileHandler;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir
+            .path()
+            .canonicalize()
+            .expect("temp dir must canonicalize");
+
+        std::fs::write(root.join("seed.py"), "def seed_marker():\n    pass\n").unwrap();
+        let gone_path = root.join("gone.py");
+        std::fs::write(&gone_path, "def gone_marker():\n    pass\n").unwrap();
+
+        let index_dir = tempfile::tempdir().unwrap();
+        let mut settings = Settings {
+            index_path: index_dir.path().to_path_buf(),
+            workspace_root: Some(root.clone()),
+            ..Default::default()
+        };
+        settings
+            .add_indexed_path(root.clone())
+            .expect("register the indexed root");
+
+        let mut facade = IndexFacade::new(Arc::new(settings)).expect("facade over temp index");
+        facade.index_directory(&root, false).expect("seed index");
+        let facade = Arc::new(RwLock::new(facade));
+
+        // Deleted from disk before the watcher exists: no notify event will
+        // ever fire for this removal. Only startup catch-up can converge it.
+        std::fs::remove_file(&gone_path).unwrap();
+
+        let handler = CodeFileHandler::new(Arc::clone(&facade), root.clone());
+        let watcher = UnifiedWatcher::builder()
+            .broadcaster(Arc::new(NotificationBroadcaster::new(16)))
+            .indexer(Arc::clone(&facade))
+            .workspace_root(root.clone())
+            .handler(handler)
+            .debounce_ms(0)
+            .build()
+            .expect("builder has all required fields");
+
+        let watch_task = tokio::spawn(watcher.watch());
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut gone_absent = false;
+        let mut seed_present_at_convergence = false;
+        while Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let f = facade.read().await;
+            let gone_found = f
+                .find_symbols_by_name("gone_marker", None)
+                .iter()
+                .any(|s| s.name.as_ref() == "gone_marker");
+            if !gone_found {
+                gone_absent = true;
+                seed_present_at_convergence = f
+                    .find_symbols_by_name("seed_marker", None)
+                    .iter()
+                    .any(|s| s.name.as_ref() == "seed_marker");
+                break;
+            }
+        }
+
+        watch_task.abort();
+
+        assert!(
+            gone_absent,
+            "symbols for a file deleted while the watcher was down must be \
+             dropped by a startup catch-up reindex; still finding them means \
+             the rebuild never ran or never reached this file"
+        );
+        assert!(
+            seed_present_at_convergence,
+            "seed_marker (positive control) must still be present at the \
+             moment gone_marker disappears; its absence would mean the index \
+             was wiped wholesale rather than genuinely rebuilt"
+        );
+    }
+
+    /// Negative control proving `refresh_on_overflow(false)` gates startup
+    /// catch-up entirely rather than the arming being unconditional.
+    ///
+    /// `watch()` consumes `self`, so there is no way to introspect
+    /// `stale`/`stale_since` after spawning it; the only observable surface
+    /// is index state. A negative assertion after a bounded wait is
+    /// therefore the only shape available here: there is no positive event
+    /// to poll for (catch-up never fires), so this waits a fixed span
+    /// comfortably longer than one select-loop tick (100ms) plus the
+    /// (zero, per `debounce_ms(0)`) debounce window, then asserts the file
+    /// was never picked up. A short wait risks a false pass if the
+    /// implementation is merely slow; a wait this size only risks the test
+    /// being slightly slower than strictly necessary.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_without_refresh_on_overflow_does_not_arm() {
+        use crate::config::Settings;
+        use crate::indexing::facade::IndexFacade;
+        use crate::watcher::handlers::CodeFileHandler;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir
+            .path()
+            .canonicalize()
+            .expect("temp dir must canonicalize");
+
+        std::fs::write(root.join("seed.py"), "def seed():\n    pass\n").unwrap();
+
+        let index_dir = tempfile::tempdir().unwrap();
+        let mut settings = Settings {
+            index_path: index_dir.path().to_path_buf(),
+            workspace_root: Some(root.clone()),
+            ..Default::default()
+        };
+        settings
+            .add_indexed_path(root.clone())
+            .expect("register the indexed root");
+
+        let mut facade = IndexFacade::new(Arc::new(settings)).expect("facade over temp index");
+        facade.index_directory(&root, false).expect("seed index");
+        let facade = Arc::new(RwLock::new(facade));
+
+        std::fs::write(
+            root.join("while_down.py"),
+            "def while_down_marker():\n    pass\n",
+        )
+        .unwrap();
+
+        let handler = CodeFileHandler::new(Arc::clone(&facade), root.clone());
+        let watcher = UnifiedWatcher::builder()
+            .broadcaster(Arc::new(NotificationBroadcaster::new(16)))
+            .indexer(Arc::clone(&facade))
+            .workspace_root(root.clone())
+            .handler(handler)
+            .debounce_ms(0)
+            .refresh_on_overflow(false)
+            .build()
+            .expect("builder has all required fields");
+
+        let watch_task = tokio::spawn(watcher.watch());
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let found = {
+            let f = facade.read().await;
+            f.find_symbols_by_name("while_down_marker", None)
+                .iter()
+                .any(|s| s.name.as_ref() == "while_down_marker")
+        };
+
+        watch_task.abort();
+
+        assert!(
+            !found,
+            "with refresh_on_overflow(false), no startup catch-up must fire; \
+             finding the file means arming is unconditional rather than \
+             gated by the flag"
         );
     }
 }

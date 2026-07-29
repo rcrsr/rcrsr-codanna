@@ -23,7 +23,8 @@ upstream base. For the how, see the commit history.
   - [Reindexing on demand (`reindex` MCP tool)](#reindexing-on-demand-reindex-mcp-tool)
     - [Arguments](#arguments)
     - [Concurrency contract](#concurrency-contract)
-  - [Catch-up reindex on watch-queue overflow](#catch-up-reindex-on-watch-queue-overflow)
+  - [Catch-up reindex on watch-queue overflow and after downtime](#catch-up-reindex-on-watch-queue-overflow-and-after-downtime)
+    - [Startup catch-up](#startup-catch-up)
     - [Configuration](#configuration-1)
   - [`ignore_patterns` now excludes files during indexing](#ignore_patterns-now-excludes-files-during-indexing)
   - [Document collection controls (`search_documents`)](#document-collection-controls-search_documents)
@@ -470,7 +471,7 @@ until it finishes. This is bounded to one collection at a time rather than
 the entire reindex, but is not "brief" in the same sense as the two
 operations above.
 
-## Catch-up reindex on watch-queue overflow
+## Catch-up reindex on watch-queue overflow and after downtime
 
 When you run a watching server (`codanna serve --watch`, in any serve mode), the
 OS file-watch backend has a bounded event queue. A bulk operation — `git rebase`,
@@ -502,7 +503,13 @@ any manual step. Behavior details:
 - If that rejection repeats for many consecutive cooldowns (roughly a minute),
   a `WARN`-level log is emitted noting that another reindex appears wedged and
   a restart may be needed — normal handoffs resolve within a cooldown or two,
-  so a sustained streak is a signal worth surfacing above debug logging.
+  so a sustained streak is a signal worth surfacing above debug logging. That
+  `WARN` is not a single, one-time event: once it first fires, re-emission is
+  rate-limited on a widening interval rather than repeating on every
+  contention rejection — 10 minutes, then 20, then 40, then capped at hourly
+  and staying hourly indefinitely, mirroring the phase-2 watchdog cadence
+  described below. It widens and caps, but it never stops recurring while the
+  contention persists.
 - That `WARN` only fires when the watcher is the one being rejected. A reindex
   that wedges with no watcher running (or with no file activity to trigger a
   catch-up) is covered separately by a watchdog on the reindex walk itself: if
@@ -518,6 +525,29 @@ any manual step. Behavior details:
   interrupted, and releasing the gate while that thread is still writing would
   re-open the very race the gate exists to prevent, so holding it is correct.
   Recovering a genuinely wedged reindex still requires a restart.
+
+### Startup catch-up
+
+The same overflow catch-up machinery also arms once, automatically, the moment
+a watching server's event loop starts — not only in response to a later
+overflow signal. Files may have changed while the watcher was not running (a
+process restart, a machine sleep, a deploy), so the index can already be stale
+before any filesystem event is observed; this closes that gap without a
+separate code path or a separate config key. It shares the same quiet window,
+cooldown, and bounded-retry behavior described above, and it honours the same
+`refresh_on_overflow` setting: set it to `false` and neither the overflow
+catch-up nor the startup catch-up runs. As with overflow catch-up, this is a
+full clear-and-rebuild reindex, so expect degraded/empty MCP query results
+until it completes on a large index.
+
+This interacts with proxy mode's `server.idle_shutdown_minutes` (see
+[Idle shutdown](#idle-shutdown)): the setting is **`0` (never) by default, so
+it's opt-in**, but if you've set it to a positive value on a large workspace,
+every auto-respawn of the backing server (after it idles out and a new
+request wakes it back up) now also pays for a full startup catch-up rebuild.
+A short idle timeout on a large index can therefore turn into
+respawn-triggers-rebuild churn rather than a clean, cheap restart; size the
+timeout with that cost in mind, or leave it at the default.
 
 ### Configuration
 
