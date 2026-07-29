@@ -11,10 +11,9 @@ on:
   schedule:
     - cron: '0 0 * * *'  # Midnight UTC daily
 
-  # Run on version tags
-  push:
-    tags:
-      - 'v*'
+  # Callable from release.yml so a tag push gates the release build on the
+  # full suite instead of running it a second, ungating time in parallel.
+  workflow_call:
 
 env:
   CARGO_TERM_COLOR: always

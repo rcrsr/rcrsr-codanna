@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -14,6 +15,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
+      asset_version: ${{ steps.version.outputs.asset_version }}
+      is_release: ${{ steps.version.outputs.is_release }}
     steps:
       - uses: actions/checkout@v6
 
@@ -29,26 +32,68 @@ jobs:
             exit 1
           fi
 
-          # Version consistency: the pushed tag must match the Cargo.toml version
-          # (release artifacts and binstall URLs both derive from the Cargo.toml
-          # version, so a drifted tag would produce assets nobody can resolve).
-          tag="${GITHUB_REF_NAME}"
-          expected_tag="v$version"
-          if [[ "$tag" != "$expected_tag" ]]; then
-            echo "Error: release tag does not match the Cargo.toml version."
-            echo "  pushed tag:          $tag"
-            echo "  Cargo.toml version:  $version"
-            echo "  expected tag:        $expected_tag"
-            echo "The tag must be the Cargo.toml version prefixed with 'v',"
-            echo "including any '+rcrsr.N' build-metadata suffix (e.g. v0.9.23+rcrsr.1)."
-            echo "Bump Cargo.toml or retag so they agree before releasing."
+          # The event check is load-bearing, not redundant with the ref-type
+          # check: workflow_dispatch accepts a tag as its ref (both the "Use
+          # workflow from" dropdown and the REST dispatches API, whose `ref` is
+          # "a branch or tag name"), which sets GITHUB_REF_TYPE=tag. Without
+          # the event check a manual dispatch on a tag would set is_release and
+          # publish (or overwrite) a real GitHub Release, contradicting the
+          # documented contract that workflow_dispatch is a dry run.
+          if [ "${GITHUB_EVENT_NAME}" = "push" ] && [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            # Version consistency: the pushed tag must match the Cargo.toml version
+            # (release artifacts and binstall URLs both derive from the Cargo.toml
+            # version, so a drifted tag would produce assets nobody can resolve).
+            tag="${GITHUB_REF_NAME}"
+            expected_tag="v$version"
+            if [[ "$tag" != "$expected_tag" ]]; then
+              echo "Error: release tag does not match the Cargo.toml version."
+              echo "  pushed tag:          $tag"
+              echo "  Cargo.toml version:  $version"
+              echo "  expected tag:        $expected_tag"
+              echo "The tag must be the Cargo.toml version prefixed with 'v',"
+              echo "including any '+rcrsr.N' build-metadata suffix (e.g. v0.9.23+rcrsr.1)."
+              echo "Bump Cargo.toml or retag so they agree before releasing."
+              exit 1
+            fi
+
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Asset filenames and the archive's inner directory cannot carry the
+          # raw '+' from semver build metadata (it breaks manifest platform
+          # extraction and some download tooling), so sanitize it once here
+          # and pass it down as its own output rather than re-deriving it in
+          # every packaging step.
+          asset_version="${version//+/-}"
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "asset_version=$asset_version" >> "$GITHUB_OUTPUT"
+          echo "Found version: $version (asset_version: $asset_version)"
+
+      # Fail fast. The release body comes from the matching CHANGELOG.md
+      # section, but the step that extracts it lives in the `upload` job,
+      # behind the gated test suite and all four platform builds. Checking
+      # here (the checkout is already in hand) turns a missing section into a
+      # seconds-long failure instead of a ~30-minute one.
+      - name: Validate CHANGELOG section
+        if: steps.version.outputs.is_release == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          if ! contributing/scripts/changelog-section.sh "$version" > /dev/null; then
+            echo "::error::cannot release $version: CHANGELOG.md has no usable '## [$version]' section"
             exit 1
           fi
 
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "Found version: $version"
+  test:
+    name: Full test suite
+    uses: ./.github/workflows/full-test.yml
 
   build:
+    needs: [info, test]
     strategy:
       matrix:
         include:
@@ -69,11 +114,11 @@ jobs:
             target: x86_64-pc-windows-msvc
 
     name: Build ${{ matrix.name }}
-    needs: info
     runs-on: ${{ matrix.os }}
 
     env:
       version: ${{ needs.info.outputs.version }}
+      asset_version: ${{ needs.info.outputs.asset_version }}
 
     steps:
       - uses: actions/checkout@v6
@@ -98,7 +143,7 @@ jobs:
           set -euxo pipefail
 
           bin="target/${{ matrix.target }}/release/codanna"
-          dst="codanna-${{ env.version }}-${{ matrix.name }}"
+          dst="codanna-${{ env.asset_version }}-${{ matrix.name }}"
 
           mkdir "$dst"
           cp "$bin" "$dst/"
@@ -122,7 +167,7 @@ jobs:
           set -euxo pipefail
 
           bin="target/${{ matrix.target }}/release/codanna.exe"
-          dst="codanna-${{ env.version }}-${{ matrix.name }}"
+          dst="codanna-${{ env.asset_version }}-${{ matrix.name }}"
 
           mkdir "$dst"
           cp "$bin" "$dst/"
@@ -161,13 +206,55 @@ jobs:
 
       - name: Generate bulk checksums
         run: |
-          shasum -a 256 codanna-* | tee SHA256SUMS
-          shasum -a 512 codanna-* | tee SHA512SUMS
+          set -euo pipefail
+          # Same sha256sum/shasum fallback as the packaging steps: a minimal or
+          # self-hosted runner may ship only one of the two, and a bare `shasum`
+          # here would fail on a host that has `sha256sum` but not `shasum`.
+          if command -v sha256sum > /dev/null; then
+            sha256sum codanna-*.tar.xz codanna-*.zip | tee SHA256SUMS
+            sha512sum codanna-*.tar.xz codanna-*.zip | tee SHA512SUMS
+          else
+            shasum -a 256 codanna-*.tar.xz codanna-*.zip | tee SHA256SUMS
+            shasum -a 512 codanna-*.tar.xz codanna-*.zip | tee SHA512SUMS
+          fi
+
+      - name: Extract release notes from CHANGELOG.md
+        run: |
+          set -euo pipefail
+          version="${{ needs.info.outputs.version }}"
+          # Extraction runs on every event so a dry run still exercises it, but
+          # only a real release may die on it: RELEASE_NOTES.md is read solely
+          # by the release step's body_path, which a dry run never reaches, and
+          # hard-failing here would make workflow_dispatch unusable for
+          # validating the pipeline before the CHANGELOG is prepared. A real
+          # release still fails (the info job also pre-checks this, so reaching
+          # a hard failure here means the CHANGELOG changed mid-run).
+          if ! contributing/scripts/changelog-section.sh "$version" > RELEASE_NOTES.md; then
+            if [ "${{ needs.info.outputs.is_release }}" = "true" ]; then
+              exit 1
+            fi
+            echo "::warning::no usable CHANGELOG.md section for '$version'; writing a dry-run placeholder"
+            printf 'Dry run: CHANGELOG.md has no usable section for %s.\n' "$version" > RELEASE_NOTES.md
+          fi
 
       - name: Create manifest
         run: |
+          set -euo pipefail
           version="${{ needs.info.outputs.version }}"
+          asset_version="${{ needs.info.outputs.asset_version }}"
           repo="${{ github.repository }}"
+
+          # Same sha256sum/shasum fallback as the packaging steps. Defined as a
+          # function because its only caller sits inside the command group
+          # redirected into dist-manifest.json below: the digest is captured by
+          # command substitution, so nothing else here may reach stdout.
+          sha256_of() {
+            if command -v sha256sum > /dev/null; then
+              sha256sum "$1" | cut -d' ' -f1
+            else
+              shasum -a 256 "$1" | cut -d' ' -f1
+            fi
+          }
 
           {
             echo "{"
@@ -178,9 +265,28 @@ jobs:
             for file in codanna-*.tar.xz codanna-*.zip; do
               [[ -f "$file" ]] || continue
 
-              # Extract platform from filename: codanna-0.8.9-linux-x64.tar.xz -> linux-x64
-              platform=$(echo "$file" | sed -n 's/codanna-[^-]*-\([^.]*\)\..*/\1/p')
-              sha256=$(shasum -a 256 "$file" | cut -d' ' -f1)
+              # Extract platform via exact prefix/suffix strip against the known
+              # sanitized asset_version, e.g. codanna-0.12.0-rcrsr.1-linux-x64.tar.xz
+              # -> linux-x64. A regex on '-' separators breaks once the version
+              # itself contains a dash (as the sanitized version now does), so
+              # this must stay a literal strip, not a pattern match.
+              platform="${file#codanna-${asset_version}-}"
+              # Guard must sit between the prefix strip and the suffix strips:
+              # the loop only ever iterates over *.tar.xz / *.zip, so a suffix
+              # strip always shortens the string and would mask a failed prefix
+              # strip. Checking here is what makes a raw '+'-bearing filename
+              # fail the job instead of silently yielding a bogus platform.
+              if [[ "$platform" == "$file" ]]; then
+                # stderr, not stdout: this runs inside the group redirected
+                # into dist-manifest.json, so an unredirected echo would land
+                # in the manifest file instead of the job log, failing the job
+                # with no visible reason.
+                echo "::error::filename does not carry the expected asset version '$asset_version': $file" >&2
+                exit 1
+              fi
+              platform="${platform%.tar.xz}"
+              platform="${platform%.zip}"
+              sha256=$(sha256_of "$file")
               url="https://github.com/${repo}/releases/download/v${version}/${file}"
 
               [[ "$first" == "false" ]] && echo ","
@@ -198,13 +304,31 @@ jobs:
             echo "}"
           } > dist-manifest.json
 
+      - name: Upload dry-run artifacts
+        if: needs.info.outputs.is_release != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: dry-run-manifest
+          retention-days: 7
+          path: |
+            dist-manifest.json
+            codanna-*.tar.xz
+            codanna-*.zip
+            *SUMS
+            *.sha256
+            *.sha512
+
       - name: Create GitHub Release
+        if: needs.info.outputs.is_release == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
           draft: false
-          generate_release_notes: true
+          # Curated CHANGELOG-derived notes (RELEASE_NOTES.md) intentionally
+          # replace GitHub's auto-generated commit/contributor shortlog here.
+          generate_release_notes: false
+          body_path: RELEASE_NOTES.md
           files: |
             dist-manifest.json
             codanna-*.tar.xz

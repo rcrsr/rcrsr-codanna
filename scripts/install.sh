@@ -3,7 +3,7 @@ set -eu
 
 # codanna installer - reads dist-manifest.json from GitHub releases
 
-REPO="bartolli/codanna"
+REPO="rcrsr/rcrsr-codanna"
 INSTALL_DIR="${CODANNA_INSTALL_DIR:-$HOME/.local/bin}"
 
 # Colors (respects NO_COLOR and non-terminal output)
@@ -38,6 +38,15 @@ detect_platform() {
         *) err "unsupported arch: $arch" ;;
     esac
 
+    # Rosetta 2: an x64 shell on Apple Silicon reports uname -m as x86_64,
+    # so detect translation and prefer the native arm64 build.
+    # sysctl.proc_translated is absent on native Intel and on Linux; the
+    # "|| echo 0" fallback covers both.
+    if [ "$os" = "macos" ] && [ "$arch" = "x64" ] &&
+       [ "$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)" = "1" ]; then
+        arch="arm64"
+    fi
+
     echo "${os}-${arch}"
 }
 
@@ -67,7 +76,22 @@ main() {
     say "platform: $platform"
 
     # Fetch manifest
-    manifest_url="https://github.com/$REPO/releases/download/$version/dist-manifest.json"
+    # CODANNA_MANIFEST_URL: test seam only. No existing knob lets this script
+    # be exercised end-to-end offline (e.g. against a local file:// manifest
+    # and stub artifacts); this override makes that possible without adding
+    # any other configuration surface.
+    #
+    # Restricted to file:// because the manifest is the sole source of BOTH the
+    # artifact URL AND its expected sha256: a remote override would redirect the
+    # install at an arbitrary binary whose checksum then validates against the
+    # attacker's own hash, so verification stops being a control instead of
+    # failing. The seam only ever needs local files, so accepting a remote URL
+    # buys nothing.
+    case "${CODANNA_MANIFEST_URL:-file://}" in
+        file://*) ;;
+        *) err "CODANNA_MANIFEST_URL only accepts file:// URLs" ;;
+    esac
+    manifest_url="${CODANNA_MANIFEST_URL:-https://github.com/$REPO/releases/download/$version/dist-manifest.json}"
     manifest=$(curl -sLf "$manifest_url") || err "failed to fetch manifest"
 
     # Find matching artifact using awk (no jq dependency)

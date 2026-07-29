@@ -10,6 +10,10 @@ upstream base. For the how, see the commit history.
 ## Contents
 
 - [Installing the fork](#installing-the-fork)
+  - [Quick install (recommended)](#quick-install-recommended)
+  - [Updating](#updating)
+  - [Alternatives](#alternatives)
+  - [PATH and shadowing](#path-and-shadowing)
 - [Improvements](#improvements)
   - [Proxy mode: one backing server per workspace](#proxy-mode-one-backing-server-per-workspace)
     - [Idle shutdown](#idle-shutdown)
@@ -42,6 +46,93 @@ The fork is distributed through its own [GitHub Releases](https://github.com/rcr
 not crates.io or Homebrew. Each release is cut by pushing a `v<version>` tag; CI
 builds Linux, macOS (x64 + arm64), and Windows binaries and attaches them.
 
+**Before tagging, prepare `CHANGELOG.md`:** rename `## [Unreleased]` to
+`## [<version>] - <date>`, where `<version>` is the *full* `Cargo.toml`
+version **including the `+rcrsr.N` suffix and its literal `+`** — e.g.
+`## [0.12.0+rcrsr.1] - 2026-07-28`. The release body is extracted from the
+section whose heading matches that version exactly, and the match is a literal
+string compare, so a bare upstream heading (`## [0.12.0]`) will not be found.
+Every heading currently in the file predates the fork's release pipeline and is
+a bare upstream version, so the file's visible convention is the wrong one to
+copy here. A tag push with no matching, non-empty section fails in CI before
+anything is built.
+
+To validate the whole pipeline locally before tagging — version derivation,
+the release build, packaging and checksums, manifest generation, and an
+offline end-to-end run of `scripts/install.sh` — run
+`contributing/scripts/test-release-workflow.sh` from the repository root. It
+mirrors `.github/workflows/release.yml` and asserts against the shipping
+workflow, so it also catches drift between the two. Running the release
+workflow via `workflow_dispatch` exercises the same pipeline on CI as a dry
+run: it builds and uploads artifacts for inspection but never publishes a
+release, even when dispatched against a tag.
+
+### Quick install (recommended)
+
+The installer script downloads the right archive for your platform from the
+latest (or a pinned) GitHub release, verifies its checksum, and puts the
+`codanna` binary on your `PATH`.
+
+macOS / Linux:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rcrsr/rcrsr-codanna/main/scripts/install.sh | sh
+```
+
+Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/rcrsr/rcrsr-codanna/main/scripts/install.ps1 | iex
+```
+
+Before running the Windows installer, stop any running `codanna serve`
+process first — the installer copies the new binary over the old one
+(`Copy-Item -Force`), which cannot overwrite a `codanna.exe` that a running
+process still has locked.
+
+The script pulls its content from the `main` branch, not a tagged commit, so
+the *installer logic* can change between the time you run it and any future
+run — only the *binary it downloads* is checksum-verified per release. If you
+want the installer script itself pinned to an immutable ref (e.g. for CI or a
+provisioning pipeline), replace `main` in the URL above with a specific tag,
+such as `v0.12.0+rcrsr.1`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rcrsr/rcrsr-codanna/v0.12.0+rcrsr.1/scripts/install.sh | sh
+```
+
+Two environment variables configure the installer; both are optional:
+
+- `CODANNA_INSTALL_DIR` — where to install the binary (default: `~/.local/bin`,
+  or `%USERPROFILE%\.local\bin` on Windows).
+- `CODANNA_VERSION` — install a specific fork version (e.g. `v0.12.0+rcrsr.1`,
+  matching the release's `tag_name`) instead of the latest release.
+
+The installer downloads a per-platform archive named
+`codanna-<sanitized-version>-<platform>.tar.xz` (`.zip` on Windows). The
+archive filename never contains a literal `+` — in the filename only, the
+`+` is replaced with `-`, so `0.12.0+rcrsr.1` becomes `0.12.0-rcrsr.1`. The
+build metadata itself is preserved; only the separator changes, since a
+literal `+` is not portable across every download/extraction tool and
+GitHub rewrites release-asset filenames containing it. (The version
+still appears with `+rcrsr.N` intact in the release tag itself, e.g.
+`v0.12.0+rcrsr.1`, and in `codanna --version` output — only the asset
+filename is sanitized.) The installer then verifies the downloaded archive's
+`sha256` checksum against the release manifest before extracting it. If
+verification fails, the install aborts instead of installing an unverified
+binary.
+
+### Updating
+
+Re-run the same install command to upgrade to the latest release — there is
+no separate `codanna update` or `codanna upgrade` subcommand. This matches the
+model used by installers like rustup, uv, and deno: the one-liner is
+idempotent, so running it again simply replaces your existing install with
+the current latest (or, with `CODANNA_VERSION` set, a specific pinned)
+release.
+
+### Alternatives
+
 Prebuilt binary via [`cargo binstall`](https://github.com/cargo-bins/cargo-binstall)
 (reads this repo's binstall metadata, so it must be pointed at the fork with `--git`):
 
@@ -59,8 +150,21 @@ cargo install --git https://github.com/rcrsr/rcrsr-codanna --all-features codann
 ```
 
 Or download a platform archive directly from the [releases page](https://github.com/rcrsr/rcrsr-codanna/releases)
-and put the `codanna` binary on your `PATH`. The binary is named `codanna` (same as
-upstream), so it will shadow an upstream install on the same `PATH`.
+and put the `codanna` binary on your `PATH` yourself; this is what the
+installer script above automates, including the checksum check.
+
+### PATH and shadowing
+
+The binary is named `codanna` (same as upstream), so it will shadow an
+upstream install on the same `PATH`. This also applies to the installer's own
+target directory: if `CODANNA_INSTALL_DIR` (or its per-platform default, such
+as `~/.local/bin`) comes earlier on your `PATH` than wherever an existing
+`codanna` lives (e.g. a Homebrew or crates.io install in `/usr/local/bin` or
+`~/.cargo/bin`), the fork build will take precedence — and vice versa if it
+comes later. Run `which codanna` (or `where.exe codanna` on Windows) after
+installing to confirm which binary resolves first, and `codanna --version`
+to confirm you're running the fork build (see
+[Identifying the fork](#identifying-the-fork)).
 
 ## Upstream base
 

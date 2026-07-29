@@ -37,26 +37,33 @@ exclude = [".github/", "contributing/", "tests/", "docs/"]
 # The `codanna` crate name is owned by upstream; block accidental `cargo publish`.
 publish = false
 
+# `{ version }` in the templates below expands to the RAW Cargo.toml version
+# (including the literal '+rcrsr.N'), so it may appear ONLY inside the
+# `download/v{ version }/` URL path segment -- that segment is the git tag,
+# which keeps the '+'. Release asset filenames and bin-dir are sanitized
+# (`+` -> `-`; see .github/workflows/release.yml's `asset_version`) and
+# binstall's templating has no transform/filter syntax to derive that from
+# `{ version }`, so the sanitized version must be a hardcoded literal here.
+# tests/binstall_metadata_tests.rs guards these literals against drift.
 [package.metadata.binstall]
 pkg-fmt = "txz"
-bin-dir = "{ name }-{ version }-{ target-family }/{ bin }{ binary-ext }"
 
 [package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
-pkg-url = "https://github.com/rcrsr/rcrsr-codanna/releases/download/v{ version }/{ name }-{ version }-linux-x64.tar.xz"
-bin-dir = "{ name }-{ version }-linux-x64/{ bin }"
+pkg-url = "https://github.com/rcrsr/rcrsr-codanna/releases/download/v{ version }/{ name }-0.12.0-rcrsr.1-linux-x64.tar.xz"
+bin-dir = "{ name }-0.12.0-rcrsr.1-linux-x64/{ bin }"
 
 [package.metadata.binstall.overrides.x86_64-apple-darwin]
-pkg-url = "https://github.com/rcrsr/rcrsr-codanna/releases/download/v{ version }/{ name }-{ version }-macos-x64.tar.xz"
-bin-dir = "{ name }-{ version }-macos-x64/{ bin }"
+pkg-url = "https://github.com/rcrsr/rcrsr-codanna/releases/download/v{ version }/{ name }-0.12.0-rcrsr.1-macos-x64.tar.xz"
+bin-dir = "{ name }-0.12.0-rcrsr.1-macos-x64/{ bin }"
 
 [package.metadata.binstall.overrides.aarch64-apple-darwin]
-pkg-url = "https://github.com/rcrsr/rcrsr-codanna/releases/download/v{ version }/{ name }-{ version }-macos-arm64.tar.xz"
-bin-dir = "{ name }-{ version }-macos-arm64/{ bin }"
+pkg-url = "https://github.com/rcrsr/rcrsr-codanna/releases/download/v{ version }/{ name }-0.12.0-rcrsr.1-macos-arm64.tar.xz"
+bin-dir = "{ name }-0.12.0-rcrsr.1-macos-arm64/{ bin }"
 
 [package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
-pkg-url = "https://github.com/rcrsr/rcrsr-codanna/releases/download/v{ version }/{ name }-{ version }-windows-x64.zip"
+pkg-url = "https://github.com/rcrsr/rcrsr-codanna/releases/download/v{ version }/{ name }-0.12.0-rcrsr.1-windows-x64.zip"
 pkg-fmt = "zip"
-bin-dir = "{ name }-{ version }-windows-x64/{ bin }{ binary-ext }"
+bin-dir = "{ name }-0.12.0-rcrsr.1-windows-x64/{ bin }{ binary-ext }"
 
 [dependencies]
 anyhow = "1.0.104"

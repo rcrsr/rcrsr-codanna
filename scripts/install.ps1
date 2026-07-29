@@ -1,9 +1,9 @@
 # codanna installer for Windows
-# Usage: irm https://codanna.dev/install.ps1 | iex
+# Usage: irm https://raw.githubusercontent.com/rcrsr/rcrsr-codanna/main/scripts/install.ps1 | iex
 
 $ErrorActionPreference = "Stop"
 
-$Repo = "bartolli/codanna"
+$Repo = "rcrsr/rcrsr-codanna"
 $InstallDir = if ($env:CODANNA_INSTALL_DIR) { $env:CODANNA_INSTALL_DIR } else { "$env:USERPROFILE\.local\bin" }
 
 function Say($msg) { Write-Host "codanna: $msg" }
