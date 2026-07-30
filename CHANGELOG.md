@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Watcher startup catch-up (opt-in):** a new `[file_watch]` key, `startup_catch_up` (default `false`), arms exactly one catch-up reindex the moment the unified watcher's event loop starts, so file changes made while the watcher was not running (a restart, a machine sleep, a deploy) are re-converged automatically instead of requiring a manual reindex. This is a distinct, independent trigger from `refresh_on_overflow` — the two keys each gate their own condition ("watcher just started" vs. "backend reported watch-queue overflow") against the same underlying catch-up machinery (debounce window, cooldown, bounded retries); enabling one does not require or imply the other, and neither depends on whether `--watch` was passed on the command line. It is opt-in and defaults to `false` because arming it means a full clear-and-rebuild of the index on every process start, not just on detected staleness — on a large index, MCP query results can be degraded or empty while it runs. In proxy mode this cost recurs on every auto-respawn of the backing server (`discover_or_spawn`, `src/serve_discovery.rs`), so a short `idle_shutdown_minutes` on a large workspace can turn into respawn-triggers-rebuild churn; leave `startup_catch_up` off unless you specifically need it. Nothing changes for existing users on upgrade. ([#59](https://github.com/rcrsr/rcrsr-codanna/pull/59))
+
+### Fixed
+
+- **Watcher contention WARN backoff:** a sustained streak of catch-up-vs-`reindex(force: true)` contention rejections no longer re-logs the same `WARN` on every rejection past the threshold — a flat once-per-5s cadence that emitted roughly 17,000 lines a day during a multi-hour wedge. Re-emission is now rate-limited on a widening interval (10 minutes, then 20, then 40, then capped at hourly), mirroring the existing wedged-reindex watchdog cadence, so a long-wedged gate holder stays visible without flooding a log aggregator and without ever going silent. ([#59](https://github.com/rcrsr/rcrsr-codanna/pull/59))
+- **`reindex(force: true)` no longer empties the index when there is nothing to rebuild from:** previously, calling the MCP `reindex` tool with `force: true` and no explicit `paths` would clear the index and then report success even when `indexing.indexed_paths` had nothing to rebuild from — either because the list had no entries, or because every registered path had since been renamed, deleted, or replaced by a broken symlink (`add_indexed_path`/`remove_indexed_path` never prune the list against disk, so a vanished directory stays registered forever). It now refuses the clear unless at least one registered path still exists on disk as a directory and, if none does, returns a typed `IndexError::ReindexHasNothingToRebuild` error and leaves the existing index untouched. ([#59](https://github.com/rcrsr/rcrsr-codanna/pull/59))
+
 ## [0.12.0+rcrsr.1] - 2026-07-29
 
 ### Added

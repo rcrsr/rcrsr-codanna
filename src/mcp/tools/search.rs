@@ -1636,77 +1636,156 @@ mod search_documents_concurrency_tests {
         // 16 distinct mock embeddings available (see fixture doc comment).
         const CHUNKS_PER_FILE: usize = 12;
         const TOTAL_CHUNKS: usize = 16 * CHUNKS_PER_FILE;
-
-        let (settings, _temp) = fixture_settings_with_varied_embeddings(CHUNKS_PER_FILE);
-        let server = build_server_with_generator(settings, Box::new(MockEmbeddingGenerator::new()));
-        let store_arc = server
-            .document_store
-            .clone()
-            .expect("server must have a document store configured");
-
-        let (search_phase_started_tx, search_phase_started_rx) = tokio::sync::oneshot::channel();
-
-        let search_server = server.clone();
-        let search_task = tokio::spawn(async move {
-            search_server
-                .search_documents_for_test(
-                    "lorem".to_string(),
-                    Vec::new(),
-                    TOTAL_CHUNKS as u32,
-                    search_phase_started_tx,
-                )
-                .await
-        });
-
-        // Wait for the auto-sync write guard to be dropped and the
-        // read-guarded `search` call to be about to start, ruling out the
-        // pre-start window where `try_read()` would trivially succeed
-        // simply because the spawned task had not yet been polled.
-        search_phase_started_rx
-            .await
-            .expect("search_documents_for_test must signal before the search phase starts");
-
-        // Sample `try_read()` while the search task is still in flight.
-        // Require several consecutive successes (rather than a single one)
-        // so a regression that re-holds the write guard across `.search()`
-        // -- which would still fire the phase-started signal, since that
-        // send is unconditional, but would keep the write guard alive
-        // during `search` -- reliably fails this assertion instead of
-        // getting lucky on a single sample.
         const REQUIRED_CONSECUTIVE_SUCCESSES: u32 = 5;
-        let mut consecutive_successes = 0u32;
-        let mut attempts = 0;
-        while !search_task.is_finished() && attempts < 200_000 {
-            if store_arc.try_read().is_ok() {
-                consecutive_successes += 1;
-                if consecutive_successes >= REQUIRED_CONSECUTIVE_SUCCESSES {
-                    break;
+
+        /// Outcome of a single sample-while-in-flight experiment.
+        ///
+        /// `try_read()` can fail to reach
+        /// `REQUIRED_CONSECUTIVE_SUCCESSES` for two causally distinct
+        /// reasons: a real regression that re-holds the write guard across
+        /// `.search()` (every sample fails, for the entire in-flight
+        /// duration), or a scheduling race where the search task simply
+        /// finished before enough samples could be taken (no sample ever
+        /// failed -- there just weren't enough of them). Only the loop that
+        /// took the samples can tell these apart; the boolean the old
+        /// version of this test collapsed them into could not.
+        enum SampleOutcome {
+            /// Reached the required number of consecutive successes while
+            /// the search task was still in flight.
+            Satisfied(Box<rmcp::model::CallToolResult>),
+            /// At least one sample was taken and `try_read()` failed on it:
+            /// a regression that re-holds the write guard across
+            /// `.search()` fails try_read() on every sample of every
+            /// attempt, so this is never worth retrying.
+            Regression,
+            /// The search task finished before any `try_read()` ever
+            /// failed and before enough consecutive successes accumulated
+            /// -- a scheduling race, not evidence about lock scoping.
+            Inconclusive,
+        }
+
+        /// Runs one full sample-while-in-flight experiment: spawns a fresh
+        /// `search_documents_for_test` call against `server`, waits for the
+        /// search phase to start, then samples `try_read()` on the document
+        /// store while the task is still in flight.
+        async fn run_sample_experiment(server: &CodeIntelligenceServer) -> SampleOutcome {
+            let store_arc = server
+                .document_store
+                .clone()
+                .expect("server must have a document store configured");
+
+            let (search_phase_started_tx, search_phase_started_rx) =
+                tokio::sync::oneshot::channel();
+
+            let search_server = server.clone();
+            let search_task = tokio::spawn(async move {
+                search_server
+                    .search_documents_for_test(
+                        "lorem".to_string(),
+                        Vec::new(),
+                        TOTAL_CHUNKS as u32,
+                        search_phase_started_tx,
+                    )
+                    .await
+            });
+
+            // Wait for the auto-sync write guard to be dropped and the
+            // read-guarded `search` call to be about to start, ruling out
+            // the pre-start window where `try_read()` would trivially
+            // succeed simply because the spawned task had not yet been
+            // polled.
+            search_phase_started_rx
+                .await
+                .expect("search_documents_for_test must signal before the search phase starts");
+
+            // Sample `try_read()` while the search task is still in flight.
+            // Require several consecutive successes (rather than a single
+            // one) so a regression that re-holds the write guard across
+            // `.search()` -- which would still fire the phase-started
+            // signal, since that send is unconditional, but would keep the
+            // write guard alive during `search` -- reliably fails instead
+            // of getting lucky on a single sample.
+            let mut consecutive_successes = 0u32;
+            let mut saw_failure = false;
+            let mut attempts = 0;
+            while !search_task.is_finished() && attempts < 200_000 {
+                if store_arc.try_read().is_ok() {
+                    consecutive_successes += 1;
+                    if consecutive_successes >= REQUIRED_CONSECUTIVE_SUCCESSES {
+                        break;
+                    }
+                } else {
+                    saw_failure = true;
+                    consecutive_successes = 0;
                 }
-            } else {
-                consecutive_successes = 0;
+                attempts += 1;
+                if attempts % 100 == 0 {
+                    tokio::time::sleep(std::time::Duration::from_micros(50)).await;
+                } else {
+                    tokio::task::yield_now().await;
+                }
             }
-            attempts += 1;
-            if attempts % 100 == 0 {
-                tokio::time::sleep(std::time::Duration::from_micros(50)).await;
+
+            let result = search_task
+                .await
+                .expect("search task must not panic")
+                .expect("search_documents_for_test must succeed");
+
+            if consecutive_successes >= REQUIRED_CONSECUTIVE_SUCCESSES {
+                SampleOutcome::Satisfied(Box::new(result))
+            } else if saw_failure {
+                SampleOutcome::Regression
             } else {
-                tokio::task::yield_now().await;
+                // Either no samples were taken at all, or samples were
+                // taken but the task finished before a failure was ever
+                // observed and before enough successes accumulated -- both
+                // are scheduling races, not regressions.
+                SampleOutcome::Inconclusive
             }
         }
 
-        let acquired_while_in_flight = consecutive_successes >= REQUIRED_CONSECUTIVE_SUCCESSES;
+        let (settings, _temp) = fixture_settings_with_varied_embeddings(CHUNKS_PER_FILE);
+        let server = build_server_with_generator(settings, Box::new(MockEmbeddingGenerator::new()));
 
-        let result = search_task
-            .await
-            .expect("search task must not panic")
-            .expect("search_documents_for_test must succeed");
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut result = None;
+        for _attempt in 1..=MAX_ATTEMPTS {
+            match run_sample_experiment(&server).await {
+                SampleOutcome::Satisfied(call_result) => {
+                    result = Some(*call_result);
+                    break;
+                }
+                SampleOutcome::Regression => {
+                    panic!(
+                        "expected try_read() on the document store to succeed \
+                         {REQUIRED_CONSECUTIVE_SUCCESSES} times in a row while \
+                         search_documents's `search` step was still in flight, but \
+                         try_read() failed at least once: a regression that \
+                         re-holds the write guard across `.search()` fails \
+                         try_read() for the search step's entire in-flight \
+                         duration, so this is not retried"
+                    );
+                }
+                SampleOutcome::Inconclusive => {
+                    // The search task finished before enough samples could
+                    // be taken; retry the whole experiment rather than
+                    // treating this as a pass or a failure.
+                    continue;
+                }
+            }
+        }
 
-        assert!(
-            acquired_while_in_flight,
-            "expected try_read() on the document store to succeed {REQUIRED_CONSECUTIVE_SUCCESSES} \
-             times in a row while search_documents's `search` step was still in flight; a \
-             regression that re-holds the write guard across `.search()` would fail try_read() \
-             for the search step's entire in-flight duration"
-        );
+        let result = result.unwrap_or_else(|| {
+            panic!(
+                "search_documents's `search` step finished before try_read() could be \
+                 sampled {REQUIRED_CONSECUTIVE_SUCCESSES} times in a row, on all \
+                 {MAX_ATTEMPTS} attempts; this is a test-design failure (an \
+                 un-samplable configuration on this runner), not evidence of a lock- \
+                 scoping regression -- consider lengthening the search phase or \
+                 revisiting the sampling strategy"
+            )
+        });
+
         assert!(
             !result.is_error.unwrap_or(false),
             "search_documents_for_test result must not be an error"

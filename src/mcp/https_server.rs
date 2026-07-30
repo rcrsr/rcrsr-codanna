@@ -81,7 +81,8 @@ pub async fn serve_https(config: crate::Settings, watch: bool, bind: String) -> 
             .index_path(config.index_path.clone())
             .workspace_root(workspace_root.clone())
             .debounce_ms(debounce_ms)
-            .refresh_on_overflow(config.file_watch.refresh_on_overflow);
+            .refresh_on_overflow(config.file_watch.refresh_on_overflow)
+            .startup_catch_up(config.file_watch.startup_catch_up);
 
         // Add code file handler
         builder = builder.handler(CodeFileHandler::new(

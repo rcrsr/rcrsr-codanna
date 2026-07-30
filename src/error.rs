@@ -118,6 +118,21 @@ pub enum IndexError {
     /// Another full reindex is already running on this facade
     #[error("Another full reindex is already in progress; retry shortly")]
     ReindexInProgress,
+
+    /// A force reindex with no explicit paths would clear the index with
+    /// nothing to rebuild it from. This covers both the empty-list case
+    /// (`indexing.indexed_paths` has no entries) and the stale-entry case
+    /// (every registered path was renamed, deleted, or replaced by a broken
+    /// symlink since it was registered — `add_indexed_path`/
+    /// `remove_indexed_path` never prune the list against disk, so a
+    /// vanished directory stays registered forever). Refusing to clear
+    /// rather than reporting success after silently emptying the index.
+    #[error(
+        "Refusing to clear the index: force reindex has no explicit paths and no \
+         configured indexed path exists on disk as a directory to rebuild from. Run \
+         'codanna index <path>' to register at least one indexed path, then retry"
+    )]
+    ReindexHasNothingToRebuild,
 }
 
 impl IndexError {
@@ -169,6 +184,7 @@ impl IndexError {
             Self::Pipeline(_) => "PIPELINE_ERROR",
             Self::InvalidIgnorePattern { .. } => "INVALID_IGNORE_PATTERN",
             Self::ReindexInProgress => "REINDEX_IN_PROGRESS",
+            Self::ReindexHasNothingToRebuild => "REINDEX_HAS_NOTHING_TO_REBUILD",
         }
         .to_string()
     }
@@ -210,6 +226,11 @@ impl IndexError {
             Self::ReindexInProgress => vec![
                 "Wait for the current reindex to finish, then retry",
                 "Avoid triggering concurrent full reindexes on the same index",
+            ],
+            Self::ReindexHasNothingToRebuild => vec![
+                "Run 'codanna index <path>' to register at least one indexed path",
+                "Check indexing.indexed_paths in .codanna/settings.toml for paths that \
+                 were renamed, deleted, or moved since being registered",
             ],
             _ => vec![],
         }

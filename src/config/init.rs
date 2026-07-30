@@ -246,6 +246,17 @@ impl Settings {
                 result
                     .push_str("\n# Force a full refresh when the OS watch event queue overflows\n");
                 result.push_str("# Default: true\n");
+            } else if line.starts_with("startup_catch_up = ") {
+                result
+                    .push_str("\n# Opt-in: arm exactly one catch-up reindex at watcher startup\n");
+                result.push_str(
+                    "# This is a full clear-and-rebuild that runs on every server start\n",
+                );
+                result.push_str(
+                    "# when enabled. Independent of refresh_on_overflow (which governs\n",
+                );
+                result.push_str("# overflow of the live watch queue, not startup).\n");
+                result.push_str("# Default: false\n");
             } else if line.starts_with("churn_threshold = ") {
                 result.push_str("\n# Reserved for future use: churn-based refresh threshold\n");
                 result.push_str("# Not yet consumed by the watcher. Default: 0 (disabled)\n");
