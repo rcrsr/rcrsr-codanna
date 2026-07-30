@@ -260,6 +260,15 @@ pub struct FileWatchConfig {
     #[serde(default = "default_true")]
     pub refresh_on_overflow: bool,
 
+    /// Opt-in: arm exactly one catch-up reindex at watcher startup, to
+    /// re-converge with any changes made while the watcher was not running.
+    /// Independent of `refresh_on_overflow` (which governs overflow of the
+    /// live watch queue, not startup). A catch-up reindex is a full
+    /// clear-and-rebuild.
+    /// (default: false, opt-in)
+    #[serde(default)]
+    pub startup_catch_up: bool,
+
     /// Reserved: number of changes within the debounce window that would
     /// trigger a churn-based refresh. Not yet consumed by the watcher.
     /// (default: 0, disabled)
@@ -451,6 +460,7 @@ impl Default for FileWatchConfig {
             enabled: true, // Default to enabled for better user experience
             debounce_ms: default_debounce_ms(),
             refresh_on_overflow: default_true(),
+            startup_catch_up: false,
             churn_threshold: 0,
         }
     }
@@ -1006,6 +1016,7 @@ test_path_patterns = ["spec/", "*_spec.rb"]
         assert!(config.enabled); // Now defaults to true
         assert_eq!(config.debounce_ms, 500);
         assert!(config.refresh_on_overflow);
+        assert!(!config.startup_catch_up);
         assert_eq!(config.churn_threshold, 0);
 
         println!(
@@ -1028,6 +1039,7 @@ test_path_patterns = ["spec/", "*_spec.rb"]
 enabled = true
 debounce_ms = 1000
 refresh_on_overflow = false
+startup_catch_up = true
 "#;
         fs::write(&config_path, config_content).unwrap();
         println!("  Created test config: {}", config_path.display());
@@ -1042,12 +1054,49 @@ refresh_on_overflow = false
         assert!(settings.file_watch.enabled);
         assert_eq!(settings.file_watch.debounce_ms, 1000);
         assert!(!settings.file_watch.refresh_on_overflow);
+        assert!(settings.file_watch.startup_catch_up);
 
         println!(
-            "  ✓ Loaded config: enabled={}, debounce_ms={}, refresh_on_overflow={}",
+            "  ✓ Loaded config: enabled={}, debounce_ms={}, refresh_on_overflow={}, startup_catch_up={}",
             settings.file_watch.enabled,
             settings.file_watch.debounce_ms,
-            settings.file_watch.refresh_on_overflow
+            settings.file_watch.refresh_on_overflow,
+            settings.file_watch.startup_catch_up
+        );
+        println!("=== TEST PASSED ===");
+    }
+
+    #[test]
+    fn file_watch_startup_catch_up_defaults_false_when_key_absent() {
+        println!(
+            "\n=== TEST: FileWatchConfig startup_catch_up defaults to false when key absent ==="
+        );
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("settings.toml");
+
+        // Deliberately omit startup_catch_up to verify backward-compat default.
+        let config_content = r#"
+[file_watch]
+enabled = true
+debounce_ms = 1000
+refresh_on_overflow = true
+"#;
+        fs::write(&config_path, config_content).unwrap();
+        println!("  Created test config: {}", config_path.display());
+
+        let settings: Settings = Figment::new()
+            .merge(Serialized::defaults(Settings::default()))
+            .merge(Toml::file(config_path))
+            .extract()
+            .unwrap();
+
+        assert!(!settings.file_watch.startup_catch_up);
+        assert!(settings.file_watch.refresh_on_overflow);
+
+        println!(
+            "  ✓ startup_catch_up={} (absent key deserializes to false), refresh_on_overflow={}",
+            settings.file_watch.startup_catch_up, settings.file_watch.refresh_on_overflow
         );
         println!("=== TEST PASSED ===");
     }

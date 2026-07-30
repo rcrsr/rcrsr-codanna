@@ -63,6 +63,12 @@ pub struct UnifiedWatcher {
     stale_since: Option<Instant>,
     /// Whether to actively refresh the index when an overflow/rescan is detected.
     refresh_on_overflow: bool,
+    /// Whether to arm a one-time catch-up reindex at watcher startup, to
+    /// re-converge with changes made while no watcher process was running.
+    /// Independent of `refresh_on_overflow`: the two flags name two
+    /// distinct triggers for the same catch-up machinery, not one trigger
+    /// gated by two conditions.
+    startup_catch_up: bool,
     /// Quiet window duration used both for debouncing individual file events
     /// and for deciding when a stale/overflow episode has settled enough to
     /// fire a catch-up reindex.
@@ -287,11 +293,17 @@ impl UnifiedWatcher {
     /// bounded-retry machinery that already handles the overflow case (see
     /// `mark_stale` above and the overflow signal handling in `watch()`):
     /// there is no separate "startup catch-up" code path, only a different
-    /// trigger for the same one. Honours `refresh_on_overflow` since that
-    /// flag is the existing, user-facing opt-out for "actively refresh the
-    /// index in response to a staleness signal" -- a no-op when `false`.
+    /// trigger for the same one.
+    ///
+    /// Gated solely by `startup_catch_up`, which defaults to `false`. This
+    /// is a distinct, independent trigger from `refresh_on_overflow`: the
+    /// two keys each name a different condition ("watcher just started" vs.
+    /// "backend reported overflow/rescan") that can arm the same underlying
+    /// machinery, not one trigger gated by both flags conjunctively. Startup
+    /// catch-up is opt-in because arming it means a full clear-and-rebuild
+    /// of the index on every process start, not just on detected staleness.
     fn arm_startup_catch_up(&mut self) {
-        if self.refresh_on_overflow {
+        if self.startup_catch_up {
             crate::log_event!(
                 "watcher",
                 "startup catch-up",
@@ -1139,9 +1151,19 @@ fn contention_warn_backoff_cap(base: Duration) -> Duration {
 
 /// Widens the contention-WARN interval by `CONTENTION_WARN_BACKOFF_MULTIPLIER`
 /// after each WARN, capped at [`contention_warn_backoff_cap`] relative to
-/// `base`. A fixed point at the cap: `widen(cap, base) == cap`. Never
-/// returns zero and never resets on its own -- only a fresh contention
-/// streak resets the interval back to `base`.
+/// `base`. A fixed point at the cap: `widen(cap, base) == cap`. Never resets
+/// on its own -- only a fresh contention streak resets the interval back to
+/// `base`.
+///
+/// For any non-zero `base`, this never returns zero (the cap is
+/// `base.saturating_mul(6)`, also non-zero, and `min` of two non-zero
+/// durations is non-zero). It *can* return zero if `base` itself is zero
+/// (`contention_warn_backoff_cap(0) == 0`, so `min(current * 2, 0) == 0`).
+/// The sole production caller always passes `CONTENTION_WARN_BASE_INTERVAL`
+/// (600s), a fixed non-zero constant, so a zero `base` is unreachable in
+/// practice; this is documented rather than enforced with a newtype or
+/// constructor validation, since introducing either for a two-line helper
+/// with one production call site would be disproportionate.
 fn widen_contention_warn_interval(current: Duration, base: Duration) -> Duration {
     std::cmp::min(
         current.saturating_mul(CONTENTION_WARN_BACKOFF_MULTIPLIER),
@@ -1193,6 +1215,7 @@ pub struct UnifiedWatcherBuilder {
     workspace_root: Option<PathBuf>,
     debounce_ms: u64,
     refresh_on_overflow: bool,
+    startup_catch_up: bool,
 }
 
 impl UnifiedWatcherBuilder {
@@ -1212,6 +1235,11 @@ impl UnifiedWatcherBuilder {
             // explicit `.refresh_on_overflow(...)` call behaves the same as
             // one built from default config.
             refresh_on_overflow: true,
+            // Mirrors `FileWatchConfig::startup_catch_up`'s default of
+            // `false`, so a builder-constructed watcher without an explicit
+            // `.startup_catch_up(...)` call behaves the same as one built
+            // from default config: startup catch-up is opt-in.
+            startup_catch_up: false,
         }
     }
 
@@ -1270,6 +1298,14 @@ impl UnifiedWatcherBuilder {
         self
     }
 
+    /// Set whether to arm a one-time catch-up reindex at watcher startup,
+    /// to re-converge with changes made while no watcher process was
+    /// running.
+    pub fn startup_catch_up(mut self, enabled: bool) -> Self {
+        self.startup_catch_up = enabled;
+        self
+    }
+
     /// Build the UnifiedWatcher.
     pub fn build(self) -> Result<UnifiedWatcher, WatchError> {
         let broadcaster = self.broadcaster.ok_or_else(|| WatchError::InitFailed {
@@ -1312,6 +1348,7 @@ impl UnifiedWatcherBuilder {
             stale: false,
             stale_since: None,
             refresh_on_overflow: self.refresh_on_overflow,
+            startup_catch_up: self.startup_catch_up,
             debounce_window: Duration::from_millis(self.debounce_ms),
             catch_up_task: None,
             catch_up_started_at: None,
@@ -1858,6 +1895,71 @@ mod tests {
             "stale must stay false when refresh_on_overflow is disabled"
         );
         assert!(watcher.stale_since.is_none());
+    }
+
+    /// `arm_startup_catch_up` takes `&mut self`, so unlike `watch()` (which
+    /// consumes `self`) it is directly callable from the module's own tests
+    /// -- the same direct-state shape already used by
+    /// `rescan_with_refresh_on_overflow_marks_stale` /
+    /// `rescan_without_refresh_on_overflow_leaves_stale_unset` above. This
+    /// covers only "does arming mark stale", not "is arming wired into
+    /// `watch()`"; that second property is covered by the e2e positive
+    /// `startup_catch_up_indexes_files_added_while_watcher_was_down` below.
+    #[tokio::test]
+    async fn arm_startup_catch_up_marks_stale_when_enabled() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut watcher = test_watcher(&tempdir);
+        watcher.startup_catch_up = true;
+
+        assert!(!watcher.stale);
+        assert!(watcher.stale_since.is_none());
+
+        watcher.arm_startup_catch_up();
+
+        assert!(watcher.stale, "startup_catch_up=true must mark stale");
+        assert!(
+            watcher.stale_since.is_some(),
+            "startup_catch_up=true must record stale_since"
+        );
+    }
+
+    /// `refresh_on_overflow` is deliberately set to `true` here (the
+    /// OR-gate trap): `startup_catch_up` and `refresh_on_overflow` are two
+    /// independent triggers for the same machinery, so a stray
+    /// `self.refresh_on_overflow || self.startup_catch_up` (or any other
+    /// accidental OR) in `arm_startup_catch_up` would arm here even though
+    /// `startup_catch_up` itself is `false`.
+    #[tokio::test]
+    async fn arm_startup_catch_up_is_noop_when_disabled() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut watcher = test_watcher(&tempdir);
+        watcher.startup_catch_up = false;
+        watcher.refresh_on_overflow = true;
+
+        watcher.arm_startup_catch_up();
+
+        assert!(
+            !watcher.stale,
+            "startup_catch_up=false must not mark stale even with refresh_on_overflow=true; \
+             an OR-gate on `refresh_on_overflow` would arm here."
+        );
+        assert!(
+            watcher.stale_since.is_none(),
+            "startup_catch_up=false must not record stale_since even with refresh_on_overflow=true; \
+             an OR-gate on `refresh_on_overflow` would arm here."
+        );
+    }
+
+    #[test]
+    fn builder_defaults_startup_catch_up_off() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let watcher = test_watcher(&tempdir);
+
+        assert!(
+            !watcher.startup_catch_up,
+            "startup_catch_up must default to false without an explicit \
+             `.startup_catch_up(true)` builder call"
+        );
     }
 
     #[tokio::test]
@@ -2941,6 +3043,7 @@ mod tests {
             .workspace_root(root.clone())
             .handler(handler)
             .debounce_ms(0)
+            .startup_catch_up(true)
             .build()
             .expect("builder has all required fields");
 
@@ -2982,6 +3085,24 @@ mod tests {
     /// rebuild actually ran rather than the index simply having been wiped
     /// wholesale: without it, a bug that dropped ALL symbols (not just the
     /// deleted file's) would also make this test pass.
+    ///
+    /// The poll loop below requires `gone_marker` absent AND `seed_marker`
+    /// present *in the same sample*, then breaks. This is deliberate:
+    /// `reindex_locked`'s phase 1 commits an emptied index before phase 2
+    /// rebuilds it (see the `clear_index()` call gated by
+    /// `paths_is_none && force` in `reindex_locked`, `src/indexing/facade.rs`
+    /// -- deliberately cited without line numbers, which rot), so there is a
+    /// real, observable window where both markers are absent at once. A poll loop that reads
+    /// `gone_marker` in one sample, latches on its absence, and only *then*
+    /// reads `seed_marker` (possibly in the very same sample, but treating
+    /// the two reads as independent) can land inside that transient
+    /// clear-window and record `seed_marker` as absent even though the
+    /// rebuild is still in flight and will restore it moments later --
+    /// producing a flaky false negative on the positive control. Requiring
+    /// both conditions jointly, and continuing to poll otherwise, makes the
+    /// loop wait out that window rather than sampling inside it. Do not
+    /// split this back into two independent reads across different
+    /// samples; that reintroduces the same race in a different shape.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn startup_catch_up_drops_symbols_for_files_deleted_while_watcher_was_down() {
         use crate::config::Settings;
@@ -3023,6 +3144,7 @@ mod tests {
             .workspace_root(root.clone())
             .handler(handler)
             .debounce_ms(0)
+            .startup_catch_up(true)
             .build()
             .expect("builder has all required fields");
 
@@ -3038,12 +3160,17 @@ mod tests {
                 .find_symbols_by_name("gone_marker", None)
                 .iter()
                 .any(|s| s.name.as_ref() == "gone_marker");
-            if !gone_found {
+            let seed_found = f
+                .find_symbols_by_name("seed_marker", None)
+                .iter()
+                .any(|s| s.name.as_ref() == "seed_marker");
+            // Both conditions must hold in this same sample (see the doc
+            // comment above): a rebuild is only "converged" once the
+            // deletion has taken effect AND the rest of the index has been
+            // restored, not merely once the deletion has taken effect.
+            if !gone_found && seed_found {
                 gone_absent = true;
-                seed_present_at_convergence = f
-                    .find_symbols_by_name("seed_marker", None)
-                    .iter()
-                    .any(|s| s.name.as_ref() == "seed_marker");
+                seed_present_at_convergence = true;
                 break;
             }
         }
@@ -3061,85 +3188,6 @@ mod tests {
             "seed_marker (positive control) must still be present at the \
              moment gone_marker disappears; its absence would mean the index \
              was wiped wholesale rather than genuinely rebuilt"
-        );
-    }
-
-    /// Negative control proving `refresh_on_overflow(false)` gates startup
-    /// catch-up entirely rather than the arming being unconditional.
-    ///
-    /// `watch()` consumes `self`, so there is no way to introspect
-    /// `stale`/`stale_since` after spawning it; the only observable surface
-    /// is index state. A negative assertion after a bounded wait is
-    /// therefore the only shape available here: there is no positive event
-    /// to poll for (catch-up never fires), so this waits a fixed span
-    /// comfortably longer than one select-loop tick (100ms) plus the
-    /// (zero, per `debounce_ms(0)`) debounce window, then asserts the file
-    /// was never picked up. A short wait risks a false pass if the
-    /// implementation is merely slow; a wait this size only risks the test
-    /// being slightly slower than strictly necessary.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn startup_without_refresh_on_overflow_does_not_arm() {
-        use crate::config::Settings;
-        use crate::indexing::facade::IndexFacade;
-        use crate::watcher::handlers::CodeFileHandler;
-
-        let tempdir = tempfile::tempdir().unwrap();
-        let root = tempdir
-            .path()
-            .canonicalize()
-            .expect("temp dir must canonicalize");
-
-        std::fs::write(root.join("seed.py"), "def seed():\n    pass\n").unwrap();
-
-        let index_dir = tempfile::tempdir().unwrap();
-        let mut settings = Settings {
-            index_path: index_dir.path().to_path_buf(),
-            workspace_root: Some(root.clone()),
-            ..Default::default()
-        };
-        settings
-            .add_indexed_path(root.clone())
-            .expect("register the indexed root");
-
-        let mut facade = IndexFacade::new(Arc::new(settings)).expect("facade over temp index");
-        facade.index_directory(&root, false).expect("seed index");
-        let facade = Arc::new(RwLock::new(facade));
-
-        std::fs::write(
-            root.join("while_down.py"),
-            "def while_down_marker():\n    pass\n",
-        )
-        .unwrap();
-
-        let handler = CodeFileHandler::new(Arc::clone(&facade), root.clone());
-        let watcher = UnifiedWatcher::builder()
-            .broadcaster(Arc::new(NotificationBroadcaster::new(16)))
-            .indexer(Arc::clone(&facade))
-            .workspace_root(root.clone())
-            .handler(handler)
-            .debounce_ms(0)
-            .refresh_on_overflow(false)
-            .build()
-            .expect("builder has all required fields");
-
-        let watch_task = tokio::spawn(watcher.watch());
-
-        tokio::time::sleep(Duration::from_secs(3)).await;
-
-        let found = {
-            let f = facade.read().await;
-            f.find_symbols_by_name("while_down_marker", None)
-                .iter()
-                .any(|s| s.name.as_ref() == "while_down_marker")
-        };
-
-        watch_task.abort();
-
-        assert!(
-            !found,
-            "with refresh_on_overflow(false), no startup catch-up must fire; \
-             finding the file means arming is unconditional rather than \
-             gated by the flag"
         );
     }
 }
