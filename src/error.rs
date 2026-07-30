@@ -118,6 +118,17 @@ pub enum IndexError {
     /// Another full reindex is already running on this facade
     #[error("Another full reindex is already in progress; retry shortly")]
     ReindexInProgress,
+
+    /// A force reindex with no explicit paths and no configured
+    /// `indexing.indexed_paths` would clear the index with nothing to
+    /// rebuild it from. Refusing to clear rather than reporting success
+    /// after silently emptying the index.
+    #[error(
+        "Refusing to clear the index: force reindex has no explicit paths and \
+         no configured indexed paths to rebuild from. Run 'codanna index <path>' \
+         to register at least one indexed path, then retry"
+    )]
+    ReindexHasNothingToRebuild,
 }
 
 impl IndexError {
@@ -169,6 +180,7 @@ impl IndexError {
             Self::Pipeline(_) => "PIPELINE_ERROR",
             Self::InvalidIgnorePattern { .. } => "INVALID_IGNORE_PATTERN",
             Self::ReindexInProgress => "REINDEX_IN_PROGRESS",
+            Self::ReindexHasNothingToRebuild => "REINDEX_HAS_NOTHING_TO_REBUILD",
         }
         .to_string()
     }
@@ -210,6 +222,10 @@ impl IndexError {
             Self::ReindexInProgress => vec![
                 "Wait for the current reindex to finish, then retry",
                 "Avoid triggering concurrent full reindexes on the same index",
+            ],
+            Self::ReindexHasNothingToRebuild => vec![
+                "Run 'codanna index <path>' to register at least one indexed path",
+                "Check indexing.indexed_paths in .codanna/settings.toml",
             ],
             _ => vec![],
         }

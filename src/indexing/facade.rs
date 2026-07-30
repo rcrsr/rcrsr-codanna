@@ -1769,8 +1769,6 @@ pub(crate) async fn reindex_locked(
     force: bool,
     phase2_started: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> FacadeResult<ReindexOutcome> {
-    let should_clear = paths.is_none() && force;
-
     // Take a brief read lock purely to clone the gate handle, then drop it
     // before acquiring the write lock below (mirrors the brief-read-lock
     // pattern in src/mcp/server.rs around the workspace-root containment
@@ -1784,16 +1782,50 @@ pub(crate) async fn reindex_locked(
         IndexError::ReindexInProgress
     })?;
 
-    // Phase 1: brief write lock to optionally clear the index and snapshot
-    // cloneable handles for the off-lock reindex walk. `clear_index()`
-    // performs blocking Tantivy IO (commit, reader reload), so the owned
-    // guard is moved into `spawn_blocking` rather than doing that work
-    // directly on the async worker while the write lock is held.
+    // Phase 1: brief write lock to snapshot cloneable handles for the
+    // off-lock reindex walk, then optionally clear the index. Handles are
+    // snapshotted FIRST so the clear decision can read
+    // `handles.pipeline.settings().indexing.indexed_paths` -- the exact
+    // collection `ReindexHandles::run` walks below when `paths` is `None`
+    // -- rather than the facade's own `indexed_paths` field, which is a
+    // different collection (always empty on a freshly constructed facade,
+    // and wiped by `clear_index()` itself; see the two-collections trap
+    // documented on `discoverable_dirs_honors_ignore_patterns` above).
+    // `snapshot_reindex_handles` only calls `ensure_embedding_pool()` and
+    // clones `Arc` handles, none of whose contents `clear_index()`
+    // invalidates, so reordering it ahead of the clear is behaviorally
+    // safe. `clear_index()` performs blocking Tantivy IO (commit, reader
+    // reload), so the owned guard is moved into `spawn_blocking` rather
+    // than doing that work directly on the async worker while the write
+    // lock is held.
+    //
+    // `paths_is_none` is captured as a plain `bool` rather than moving
+    // `paths` itself into this `move` closure, since `paths` is still
+    // needed by phase 2's `handles.run(paths, force)` call below.
+    let paths_is_none = paths.is_none();
     let owned_guard = Arc::clone(facade).write_owned().await;
     let handles = tokio::task::spawn_blocking(move || -> FacadeResult<ReindexHandles> {
         let mut indexer = owned_guard;
 
-        if should_clear {
+        let handles = indexer.snapshot_reindex_handles().inspect_err(|e| {
+            tracing::error!("Failed to snapshot reindex handles: {e}");
+        })?;
+
+        if paths_is_none && force {
+            let has_rebuild_source = !handles
+                .pipeline
+                .settings()
+                .indexing
+                .indexed_paths
+                .is_empty();
+            if !has_rebuild_source {
+                tracing::error!(
+                    "Refusing force reindex: no explicit paths and no configured \
+                     indexing.indexed_paths to rebuild from"
+                );
+                return Err(IndexError::ReindexHasNothingToRebuild);
+            }
+
             // Log per-phase context for on-call readers, but propagate the
             // original typed `IndexError` variant (e.g. `LockError`,
             // `TantivyError`) unchanged rather than flattening it into a
@@ -1804,9 +1836,7 @@ pub(crate) async fn reindex_locked(
             })?;
         }
 
-        indexer.snapshot_reindex_handles().inspect_err(|e| {
-            tracing::error!("Failed to snapshot reindex handles: {e}");
-        })
+        Ok(handles)
         // `indexer` (the owned write guard) is dropped here, releasing the
         // lock before phase 2's off-lock walk begins.
     })
@@ -4564,5 +4594,181 @@ mod tests {
             .collect();
         callers.sort();
         callers
+    }
+
+    // ── reindex_locked: clear-guard against an empty rebuild source ────────
+    //
+    // This trio is the falsifiability pair (plus a paths:Some regression
+    // lock) for the `should_clear` guard added to `reindex_locked`: the
+    // guard MUST read `pipeline.settings().indexing.indexed_paths` (what
+    // `ReindexHandles::run` actually walks for `paths: None`), not the
+    // facade's own `indexed_paths: HashSet` field, which is a different
+    // collection that starts empty on every freshly constructed facade (see
+    // `IndexFacade::new`) and is wiped by `clear_index()` itself. Reading
+    // the wrong collection would make these tests pass vacuously in one
+    // direction or the other.
+
+    // Facade built via the shared `test_facade` helper has an empty
+    // `settings.indexing.indexed_paths` (never populated by
+    // `add_indexed_path`). A `force` reindex with no explicit paths has
+    // nothing to rebuild from, so `reindex_locked` must refuse rather than
+    // clear a populated index and report success.
+    #[tokio::test]
+    async fn reindex_force_with_no_indexed_paths_does_not_clear_populated_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("seed.rs");
+        std::fs::write(&source, "pub fn seeded_symbol() {}\n").unwrap();
+
+        let mut facade = test_facade(&dir);
+        facade.index_file(&source).unwrap();
+        let before = facade.document_index().count_symbols().unwrap();
+        assert!(before > 0, "fixture must seed at least one symbol");
+        assert!(
+            facade
+                .pipeline()
+                .settings()
+                .indexing
+                .indexed_paths
+                .is_empty(),
+            "fixture must not register any indexed_paths"
+        );
+
+        let facade = Arc::new(tokio::sync::RwLock::new(facade));
+        let err = reindex_locked(&facade, None, true, None)
+            .await
+            .expect_err("force reindex with no rebuild source must be refused");
+        assert!(
+            matches!(err, IndexError::ReindexHasNothingToRebuild),
+            "unexpected error variant: {err:?}"
+        );
+
+        let indexer = facade.read().await;
+        let after = indexer.document_index().count_symbols().unwrap();
+        assert_eq!(
+            before, after,
+            "refused reindex must leave the populated index untouched"
+        );
+    }
+
+    // Same starting shape (facade's own `indexed_paths` HashSet is empty
+    // right after construction), but `settings.indexing.indexed_paths` IS
+    // non-empty, so the clear-and-rebuild path must run: symbols indexed
+    // outside the registered path are cleared, and symbols under the
+    // registered path are rebuilt in their place.
+    #[tokio::test]
+    async fn reindex_force_clears_when_settings_list_non_empty_even_if_facade_set_empty() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let stray = dir.path().join("stray");
+        std::fs::create_dir_all(&stray).unwrap();
+        let stray_file = stray.join("stray.rs");
+        std::fs::write(&stray_file, "pub fn stray_symbol() {}\n").unwrap();
+
+        let registered = dir.path().join("registered");
+        std::fs::create_dir_all(&registered).unwrap();
+        std::fs::write(registered.join("reg.rs"), "pub fn registered_symbol() {}\n").unwrap();
+
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings
+            .add_indexed_path(registered.clone())
+            .expect("register indexed path");
+
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+        // Index a file outside the registered path to prove a subsequent
+        // clear actually ran (this symbol must be gone afterward).
+        facade.index_file(&stray_file).unwrap();
+        assert!(
+            !facade.find_symbols_by_name("stray_symbol", None).is_empty(),
+            "fixture must seed the stray symbol before reindex"
+        );
+        assert!(
+            facade.get_indexed_paths().is_empty(),
+            "facade's own indexed_paths set must still be empty at this point"
+        );
+
+        let facade = Arc::new(tokio::sync::RwLock::new(facade));
+        reindex_locked(&facade, None, true, None)
+            .await
+            .expect("non-empty settings.indexing.indexed_paths must permit the clear");
+
+        let indexer = facade.read().await;
+        assert!(
+            indexer
+                .find_symbols_by_name("stray_symbol", None)
+                .is_empty(),
+            "clear-and-rebuild must drop symbols outside the registered path"
+        );
+        assert!(
+            !indexer
+                .find_symbols_by_name("registered_symbol", None)
+                .is_empty(),
+            "clear-and-rebuild must repopulate symbols under the registered path"
+        );
+    }
+
+    // Regression lock: an explicit `paths: Some(..)` reindex must never
+    // clear the whole index, force or not, and must leave symbols outside
+    // the explicit paths untouched.
+    #[tokio::test]
+    async fn reindex_with_explicit_paths_never_clears() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let untouched = dir.path().join("untouched.rs");
+        std::fs::write(&untouched, "pub fn untouched_symbol() {}\n").unwrap();
+
+        let explicit = dir.path().join("explicit");
+        std::fs::create_dir_all(&explicit).unwrap();
+        std::fs::write(explicit.join("e.rs"), "pub fn explicit_symbol() {}\n").unwrap();
+
+        let mut facade = test_facade(&dir);
+        facade.index_file(&untouched).unwrap();
+        assert!(
+            !facade
+                .find_symbols_by_name("untouched_symbol", None)
+                .is_empty(),
+            "fixture must seed the untouched symbol before reindex"
+        );
+
+        let facade = Arc::new(tokio::sync::RwLock::new(facade));
+        let explicit_str = explicit.to_string_lossy().into_owned();
+        reindex_locked(&facade, Some(vec![explicit_str]), true, None)
+            .await
+            .expect("explicit-paths reindex must succeed");
+
+        let indexer = facade.read().await;
+        assert!(
+            !indexer
+                .find_symbols_by_name("untouched_symbol", None)
+                .is_empty(),
+            "explicit-paths reindex must never clear symbols outside the given paths"
+        );
+        assert!(
+            !indexer
+                .find_symbols_by_name("explicit_symbol", None)
+                .is_empty(),
+            "explicit path must still be indexed"
+        );
+    }
+
+    // Error-surface lock for the new variant: both accessors must be wired,
+    // not just the `#[error(...)]` message, or the error is invisible to
+    // MCP clients that key off `status_code()`/`recovery_suggestions()`
+    // rather than message text.
+    #[test]
+    fn reindex_has_nothing_to_rebuild_error_surface() {
+        let err = IndexError::ReindexHasNothingToRebuild;
+        assert_eq!(err.status_code(), "REINDEX_HAS_NOTHING_TO_REBUILD");
+        assert!(
+            !err.recovery_suggestions().is_empty(),
+            "recovery_suggestions must be non-empty for the new variant"
+        );
+        assert!(
+            err.to_string().contains("codanna index"),
+            "message must name the recovery command: {err}"
+        );
     }
 }
