@@ -1782,27 +1782,73 @@ pub(crate) async fn reindex_locked(
         IndexError::ReindexInProgress
     })?;
 
-    // Phase 1: brief write lock to snapshot cloneable handles for the
-    // off-lock reindex walk, then optionally clear the index. Handles are
-    // snapshotted FIRST so the clear decision can read
-    // `handles.pipeline.settings().indexing.indexed_paths` -- the exact
-    // collection `ReindexHandles::run` walks below when `paths` is `None`
-    // -- rather than the facade's own `indexed_paths` field, which is a
-    // different collection (always empty on a freshly constructed facade,
-    // and wiped by `clear_index()` itself; see the two-collections trap
-    // documented on `discoverable_dirs_honors_ignore_patterns` above).
-    // `snapshot_reindex_handles` only calls `ensure_embedding_pool()` and
-    // clones `Arc` handles, none of whose contents `clear_index()`
-    // invalidates, so reordering it ahead of the clear is behaviorally
-    // safe. `clear_index()` performs blocking Tantivy IO (commit, reader
-    // reload), so the owned guard is moved into `spawn_blocking` rather
-    // than doing that work directly on the async worker while the write
-    // lock is held.
-    //
     // `paths_is_none` is captured as a plain `bool` rather than moving
-    // `paths` itself into this `move` closure, since `paths` is still
-    // needed by phase 2's `handles.run(paths, force)` call below.
+    // `paths` itself into the `move` closure below, since `paths` is still
+    // needed by phase 2's `handles.run(paths, force)` call.
     let paths_is_none = paths.is_none();
+
+    // Refuse-before-cost: when this is a force reindex with no explicit
+    // paths, check whether there is anything to rebuild from BEFORE paying
+    // for `snapshot_reindex_handles()` -> `ensure_embedding_pool()`, which
+    // can load a ~150MB fastembed model under the exclusive write guard.
+    // This brief read lock reads `indexer.pipeline().settings().indexing
+    // .indexed_paths` -- the exact collection `ReindexHandles::run` walks
+    // below when `paths` is `None` -- rather than the facade's own
+    // `indexed_paths` field, which is a different collection (always empty
+    // on a freshly constructed facade, and wiped by `clear_index()` itself;
+    // see the two-collections trap documented on
+    // `discoverable_dirs_honors_ignore_patterns` above). The predicate
+    // mirrors what `ReindexHandles::run`'s `paths: None` branch actually
+    // does with this list: it clones it and only rebuilds entries that pass
+    // `path.is_dir()`, so a registered directory that was later renamed,
+    // deleted, or replaced by a broken symlink -- and thus stays in the
+    // list forever, since neither `add_indexed_path` nor
+    // `remove_indexed_path` prune against disk -- must not count as "has a
+    // rebuild source". Checking `!indexed_paths.is_empty()` alone would let
+    // such stale entries pass, `clear_index()` an emptied index, and phase 2
+    // silently rebuild nothing.
+    //
+    // Hoisting this ahead of the write guard widens the check-then-act
+    // window (the read lock is released before phase 1 takes the write
+    // lock), but does not reopen the bug: the only in-process writer to
+    // `indexing.indexed_paths` while a server is running is the watcher's
+    // created-directory handler (`src/watcher/handlers/code.rs`), which is
+    // add-only, so a concurrent mutation can only turn a refusal into a
+    // valid run, never the reverse. A directory vanishing from disk between
+    // this check and the clear is a pre-existing race that no ordering here
+    // can close.
+    if paths_is_none && force {
+        let has_rebuild_source = {
+            let indexer = facade.read().await;
+            indexer
+                .pipeline()
+                .settings()
+                .indexing
+                .indexed_paths
+                .iter()
+                .any(|p| p.is_dir())
+        };
+        if !has_rebuild_source {
+            tracing::error!(
+                "Refusing force reindex: no explicit paths and no configured \
+                 indexing.indexed_paths that still exist on disk as a directory \
+                 to rebuild from"
+            );
+            return Err(IndexError::ReindexHasNothingToRebuild);
+        }
+    }
+
+    // Phase 1: brief write lock to snapshot cloneable handles for the
+    // off-lock reindex walk, then optionally clear the index. The
+    // has-rebuild-source decision was already made above (before this
+    // guard was acquired), so this closure only needs to snapshot and,
+    // when applicable, clear. `snapshot_reindex_handles` only calls
+    // `ensure_embedding_pool()` and clones `Arc` handles, none of whose
+    // contents `clear_index()` invalidates, so running it ahead of the
+    // clear is behaviorally safe. `clear_index()` performs blocking
+    // Tantivy IO (commit, reader reload), so the owned guard is moved into
+    // `spawn_blocking` rather than doing that work directly on the async
+    // worker while the write lock is held.
     let owned_guard = Arc::clone(facade).write_owned().await;
     let handles = tokio::task::spawn_blocking(move || -> FacadeResult<ReindexHandles> {
         let mut indexer = owned_guard;
@@ -1812,20 +1858,6 @@ pub(crate) async fn reindex_locked(
         })?;
 
         if paths_is_none && force {
-            let has_rebuild_source = !handles
-                .pipeline
-                .settings()
-                .indexing
-                .indexed_paths
-                .is_empty();
-            if !has_rebuild_source {
-                tracing::error!(
-                    "Refusing force reindex: no explicit paths and no configured \
-                     indexing.indexed_paths to rebuild from"
-                );
-                return Err(IndexError::ReindexHasNothingToRebuild);
-            }
-
             // Log per-phase context for on-call readers, but propagate the
             // original typed `IndexError` variant (e.g. `LockError`,
             // `TantivyError`) unchanged rather than flattening it into a
@@ -4707,6 +4739,69 @@ mod tests {
                 .find_symbols_by_name("registered_symbol", None)
                 .is_empty(),
             "clear-and-rebuild must repopulate symbols under the registered path"
+        );
+    }
+
+    // Third leg of the falsifiability trio: `settings.indexing.indexed_paths`
+    // is non-empty, but every entry is stale (registered, then removed from
+    // disk). `!indexed_paths.is_empty()` alone would pass this case and let
+    // `clear_index()` commit an emptied index with phase 2 rebuilding
+    // nothing; the guard must instead check that at least one entry still
+    // exists on disk as a directory.
+    #[tokio::test]
+    async fn reindex_force_refuses_when_all_indexed_paths_are_stale() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let seed = dir.path().join("seed.rs");
+        std::fs::write(&seed, "pub fn seeded_symbol() {}\n").unwrap();
+
+        let registered = dir.path().join("registered");
+        std::fs::create_dir_all(&registered).unwrap();
+
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings
+            .add_indexed_path(registered.clone())
+            .expect("register indexed path");
+
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+        facade.index_file(&seed).unwrap();
+        let before = facade.document_index().count_symbols().unwrap();
+        assert!(before > 0, "fixture must seed at least one symbol");
+
+        // Remove the registered directory from disk without pruning
+        // `settings.indexing.indexed_paths` -- `add_indexed_path`/
+        // `remove_indexed_path` never prune against disk, so this
+        // reproduces a renamed/deleted/broken-symlink directory that stays
+        // registered forever.
+        std::fs::remove_dir_all(&registered).unwrap();
+        assert!(
+            !facade
+                .pipeline()
+                .settings()
+                .indexing
+                .indexed_paths
+                .is_empty(),
+            "fixture must keep the now-stale path registered"
+        );
+
+        let facade = Arc::new(tokio::sync::RwLock::new(facade));
+        let err = reindex_locked(&facade, None, true, None)
+            .await
+            .expect_err("force reindex with only stale indexed_paths must be refused");
+        assert!(
+            matches!(err, IndexError::ReindexHasNothingToRebuild),
+            "unexpected error variant: {err:?}"
+        );
+
+        let indexer = facade.read().await;
+        let after = indexer.document_index().count_symbols().unwrap();
+        assert_eq!(
+            before, after,
+            "refused reindex must leave the populated index untouched"
         );
     }
 

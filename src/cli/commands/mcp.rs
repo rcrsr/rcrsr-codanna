@@ -995,8 +995,11 @@ pub async fn run(
             Ok(outcome) => Some(outcome),
             Err(e) => {
                 use crate::io::envelope::{Envelope, ResultCode};
-                let envelope: Envelope<()> =
-                    Envelope::error(ResultCode::IndexError, format!("Reindex failed: {e}"));
+                // `e` is already a fully-formed McpError message (see
+                // `run_reindex`'s `map_err` in src/mcp/server.rs, which
+                // prefixes non-contention failures with "Reindex failed: "
+                // itself); re-adding the prefix here double-stamps it.
+                let envelope: Envelope<()> = Envelope::error(ResultCode::IndexError, e.to_string());
                 println!("{}", envelope.to_json().expect("envelope serialization"));
                 std::process::exit(2);
             }

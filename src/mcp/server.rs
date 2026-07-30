@@ -399,6 +399,18 @@ impl CodeIntelligenceServer {
                     format!("{e}. {}.", e.recovery_suggestions().join(". ")),
                     None,
                 ),
+                // Same reasoning as `ReindexInProgress` above: this is a
+                // client-side configuration condition (no rebuild source
+                // configured, or every configured path has gone stale) with
+                // concrete recovery steps, not a server fault.
+                // INTERNAL_ERROR tells an agent to retry or give up;
+                // INVALID_REQUEST + "Run 'codanna index <path>'" tells it
+                // what to do instead.
+                crate::IndexError::ReindexHasNothingToRebuild => McpError::new(
+                    ErrorCode::INVALID_REQUEST,
+                    format!("{e}. {}.", e.recovery_suggestions().join(". ")),
+                    None,
+                ),
                 other => McpError::new(
                     ErrorCode::INTERNAL_ERROR,
                     format!("Reindex failed: {other}"),
@@ -979,6 +991,43 @@ mod tests {
         assert_eq!(
             second_outcome.symbols, first_outcome.symbols,
             "expected the second reindex to reproduce the same symbol count as the first"
+        );
+    }
+
+    /// Pins the `IndexError::ReindexHasNothingToRebuild` -> `McpError`
+    /// mapping added alongside the `ReindexInProgress` arm above: it must
+    /// surface as `INVALID_REQUEST` with the recovery suggestions folded
+    /// into the message, not fall through to the generic `INTERNAL_ERROR`
+    /// arm.
+    #[tokio::test]
+    async fn run_reindex_maps_nothing_to_rebuild_to_invalid_request() {
+        let temp = tempfile::tempdir().expect("create temp root");
+
+        // No `indexing.indexed_paths` registered, so a force reindex with
+        // no explicit paths has nothing to rebuild from.
+        let settings = Settings {
+            index_path: temp.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+
+        let facade =
+            IndexFacade::new(Arc::new(settings)).expect("create facade over temp index dir");
+        let server = CodeIntelligenceServer::new(facade);
+
+        let err = server
+            .run_reindex(None, true, false)
+            .await
+            .expect_err("force reindex with no rebuild source must be refused");
+
+        assert_eq!(
+            err.code,
+            ErrorCode::INVALID_REQUEST,
+            "expected INVALID_REQUEST for a reindex with nothing to rebuild, got: {err:?}"
+        );
+        assert!(
+            err.message.contains("codanna index"),
+            "expected the recovery suggestion naming 'codanna index <path>' in the message: {err:?}"
         );
     }
 }

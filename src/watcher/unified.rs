@@ -3190,4 +3190,107 @@ mod tests {
              was wiped wholesale rather than genuinely rebuilt"
         );
     }
+
+    /// Regression guard for a specific forward-looking risk in
+    /// `CatchUpFailure::is_contention()`: today it matches only
+    /// `IndexError::ReindexInProgress`, so `IndexError::
+    /// ReindexHasNothingToRebuild` (added alongside the force-reindex clear
+    /// guard) is classified as a genuine failure. That is deterministic and
+    /// retry-unfixable -- no amount of waiting makes an unregistered/stale
+    /// `indexing.indexed_paths` register itself -- so it must consume
+    /// `catch_up_attempts` and give up after `MAX_CATCH_UP_ATTEMPTS` rather
+    /// than looping forever. A future widening of `is_contention()` to also
+    /// match this variant would silently turn this bounded give-up into an
+    /// unbounded retry loop; this test pins the current (correct) behavior.
+    ///
+    /// Drives the exact private methods `watch()`'s event loop calls
+    /// (`maybe_start_catch_up` / `poll_catch_up_task`) directly against a
+    /// real facade with no `indexing.indexed_paths` registered, so every
+    /// attempt's real `reindex_locked(&facade, None, true, None)` call
+    /// refuses with `ReindexHasNothingToRebuild`. This keeps the watcher
+    /// owned by the test (rather than moved into `tokio::spawn(watcher.watch())`
+    /// as the two e2e tests above do), which is what makes the give-up
+    /// path (`catch_up_attempts`/`stale`, both private) directly observable
+    /// without needing a cross-thread log capture.
+    ///
+    /// Polls with a deadline rather than sleeping a fixed span: bounded by
+    /// `MAX_CATCH_UP_ATTEMPTS * CATCH_UP_COOLDOWN` (5 * 5s = 25s) plus
+    /// slack, not a long fixed sleep.
+    #[tokio::test]
+    async fn startup_catch_up_gives_up_when_nothing_to_rebuild_from() {
+        use crate::config::Settings;
+        use crate::indexing::facade::IndexFacade;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir
+            .path()
+            .canonicalize()
+            .expect("temp dir must canonicalize");
+
+        std::fs::write(root.join("seed.py"), "def seed_marker():\n    pass\n").unwrap();
+
+        let index_dir = tempfile::tempdir().unwrap();
+        let settings = Settings {
+            index_path: index_dir.path().to_path_buf(),
+            workspace_root: Some(root.clone()),
+            // Deliberately no `add_indexed_path` call: `indexing.indexed_paths`
+            // stays empty, so a force reindex with no explicit paths has
+            // nothing to rebuild from on every attempt.
+            ..Default::default()
+        };
+
+        let mut facade = IndexFacade::new(Arc::new(settings)).expect("facade over temp index");
+        facade.index_directory(&root, false).expect("seed index");
+        let before = facade.document_index().count_symbols().unwrap();
+        assert!(before > 0, "fixture must seed at least one symbol");
+        let facade = Arc::new(RwLock::new(facade));
+
+        let mut watcher = UnifiedWatcher::builder()
+            .broadcaster(Arc::new(NotificationBroadcaster::new(16)))
+            .indexer(Arc::clone(&facade))
+            .workspace_root(root.clone())
+            .debounce_ms(0)
+            .startup_catch_up(true)
+            .build()
+            .expect("builder has all required fields");
+
+        watcher.arm_startup_catch_up();
+        assert!(
+            watcher.stale,
+            "arming startup catch-up must mark the watcher stale"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut attempted = false;
+        let mut gave_up = false;
+        while Instant::now() < deadline {
+            watcher.maybe_start_catch_up();
+            watcher.poll_catch_up_task().await;
+
+            if watcher.catch_up_attempts > 0 {
+                attempted = true;
+            }
+            if attempted && watcher.catch_up_attempts == 0 && !watcher.stale {
+                gave_up = true;
+                break;
+            }
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        assert!(
+            gave_up,
+            "expected the catch-up episode to reach the give-up path within \
+             the deadline (catch_up_attempts back to 0 and stale cleared \
+             after at least one genuine, non-contention failure)"
+        );
+
+        let indexer = facade.read().await;
+        let after = indexer.document_index().count_symbols().unwrap();
+        assert_eq!(
+            before, after,
+            "a catch-up episode with nothing to rebuild from must never touch \
+             the pre-existing index, including after giving up"
+        );
+    }
 }

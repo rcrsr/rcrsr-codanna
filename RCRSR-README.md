@@ -24,7 +24,7 @@ upstream base. For the how, see the commit history.
     - [Arguments](#arguments)
     - [Concurrency contract](#concurrency-contract)
   - [Catch-up reindex on watch-queue overflow and after downtime](#catch-up-reindex-on-watch-queue-overflow-and-after-downtime)
-    - [Startup catch-up](#startup-catch-up)
+    - [Startup catch-up (opt-in)](#startup-catch-up-opt-in)
     - [Configuration](#configuration-1)
   - [`ignore_patterns` now excludes files during indexing](#ignore_patterns-now-excludes-files-during-indexing)
   - [Document collection controls (`search_documents`)](#document-collection-controls-search_documents)
@@ -546,6 +546,24 @@ cooldown, and bounded-retry behavior described above. As with overflow
 catch-up, this is a full clear-and-rebuild reindex, so expect degraded/empty
 MCP query results until it completes on a large index — this is why the
 feature defaults to off.
+
+The clear and the rebuild are not atomic: the reindex commits an emptied
+Tantivy index before the rebuild walk repopulates it, with no recovery point
+in between. If the process is killed in that window (OOM-kill, `kill -9`, a
+host crash, a container reschedule) the on-disk index under `.codanna/` is
+left empty permanently, with no automatic recovery and no signal on the next
+start. That window exists independent of this feature, but `startup_catch_up`
+makes it routine — it opens on every process start, and on every proxy-mode
+auto-respawn. Run `codanna index <path>` to rebuild if a start is ever
+interrupted mid-rebuild.
+
+If you enable `startup_catch_up` with no `indexing.indexed_paths` registered,
+each catch-up episode has nothing to rebuild from and takes the bounded
+give-up path: five `ERROR`-level log lines (one per attempt, per the
+`MAX_CATCH_UP_ATTEMPTS` bound above) before the watcher gives up on that
+episode. That is expected under this configuration, not a sign of a stuck or
+wedged watcher — register at least one indexed path (`codanna index <path>`)
+to avoid it.
 
 If you do enable `startup_catch_up`, it interacts with proxy mode's
 `server.idle_shutdown_minutes` (see [Idle shutdown](#idle-shutdown)): that
