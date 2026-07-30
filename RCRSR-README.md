@@ -473,8 +473,11 @@ operations above.
 
 ## Catch-up reindex on watch-queue overflow and after downtime
 
-When you run a watching server (`codanna serve --watch`, in any serve mode), the
-OS file-watch backend has a bounded event queue. A bulk operation — `git rebase`,
+The unified file watcher starts whenever `watch || config.file_watch.enabled`
+is true (`src/cli/commands/serve.rs`) — and `[file_watch].enabled` defaults to
+`true`, so a bare `codanna serve` with no `--watch` flag runs it too, in any
+serve mode. Once it is running, the OS file-watch backend has a bounded
+event queue. A bulk operation — `git rebase`,
 `git checkout` across many files, a branch switch, a large `git pull` — can change
 more files at once than the queue holds, and the backend drops events (an inotify
 `IN_Q_OVERFLOW`, or the equivalent on macOS/Windows). Upstream codanna silently
@@ -526,46 +529,60 @@ any manual step. Behavior details:
   re-open the very race the gate exists to prevent, so holding it is correct.
   Recovering a genuinely wedged reindex still requires a restart.
 
-### Startup catch-up
+### Startup catch-up (opt-in)
 
-The same overflow catch-up machinery also arms once, automatically, the moment
-a watching server's event loop starts — not only in response to a later
-overflow signal. Files may have changed while the watcher was not running (a
-process restart, a machine sleep, a deploy), so the index can already be stale
-before any filesystem event is observed; this closes that gap without a
-separate code path or a separate config key. It shares the same quiet window,
-cooldown, and bounded-retry behavior described above, and it honours the same
-`refresh_on_overflow` setting: set it to `false` and neither the overflow
-catch-up nor the startup catch-up runs. As with overflow catch-up, this is a
-full clear-and-rebuild reindex, so expect degraded/empty MCP query results
-until it completes on a large index.
+The same catch-up machinery can also be armed once, at the moment the
+watcher's event loop starts, so files changed while no watcher was running (a
+process restart, a machine sleep, a deploy) get re-converged without waiting
+for a later overflow signal. Unlike overflow catch-up, this is **off by
+default**: it is gated by its own `[file_watch]` key, `startup_catch_up`
+(default `false`), which is independent of `refresh_on_overflow` — the two
+keys name two distinct triggers ("watcher just started" vs. "backend reported
+overflow/rescan") for the same underlying machinery, not one trigger gated by
+both flags conjunctively. Setting `refresh_on_overflow = false` does not
+disable startup catch-up, and setting `startup_catch_up = true` does not
+require `refresh_on_overflow` to be enabled. It shares the same quiet window,
+cooldown, and bounded-retry behavior described above. As with overflow
+catch-up, this is a full clear-and-rebuild reindex, so expect degraded/empty
+MCP query results until it completes on a large index — this is why the
+feature defaults to off.
 
-This interacts with proxy mode's `server.idle_shutdown_minutes` (see
-[Idle shutdown](#idle-shutdown)): the setting is **`0` (never) by default, so
-it's opt-in**, but if you've set it to a positive value on a large workspace,
-every auto-respawn of the backing server (after it idles out and a new
-request wakes it back up) now also pays for a full startup catch-up rebuild.
-A short idle timeout on a large index can therefore turn into
+If you do enable `startup_catch_up`, it interacts with proxy mode's
+`server.idle_shutdown_minutes` (see [Idle shutdown](#idle-shutdown)): that
+setting is **`0` (never) by default, so it's opt-in**, but if you've set it to
+a positive value on a large workspace, every auto-respawn of the backing
+server — `discover_or_spawn` (`src/serve_discovery.rs`) launching a new
+process to answer a request after the previous one idled out — now also pays
+for a full startup catch-up rebuild. A short idle timeout on a large index
+combined with `startup_catch_up = true` can therefore turn into
 respawn-triggers-rebuild churn rather than a clean, cheap restart; size the
-timeout with that cost in mind, or leave it at the default.
+timeout with that cost in mind, or leave `startup_catch_up` at its default of
+`false`.
 
 ### Configuration
 
-It is **on by default**. Controlled by the `[file_watch]` section of
+Overflow catch-up (`refresh_on_overflow`) is **on by default**. Startup
+catch-up (`startup_catch_up`) is **off by default** — opt in explicitly if you
+want it. Both are controlled by the `[file_watch]` section of
 `.codanna/settings.toml`:
 
 ```toml
 [file_watch]
 refresh_on_overflow = true  # catch-up reindex on watch-queue overflow (default: true)
                             # set false to restore upstream behavior (missed changes stay missed)
+startup_catch_up = false   # opt-in: arm one catch-up reindex at watcher startup
+                            # (default: false); independent of refresh_on_overflow
 ```
 
 The `churn_threshold` key is parsed and accepted but **reserved** — it is not yet
 consumed by the watcher and has no effect (setting it to a non-zero value logs a
 one-time startup warning).
 
-If you don't run with `--watch`, this feature is inert; the `reindex` tool above
-is the way to re-sync on demand.
+The unified watcher (and with it, both catch-up triggers) runs whenever
+`watch || config.file_watch.enabled` is true, and `[file_watch].enabled`
+defaults to `true` — so this is not inert on a bare `codanna serve` with no
+`--watch` flag. The `reindex` tool above is still the way to re-sync on
+demand regardless.
 
 ## `ignore_patterns` now excludes files during indexing
 
