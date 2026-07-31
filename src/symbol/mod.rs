@@ -2,7 +2,7 @@ pub mod context;
 
 use crate::parsing::registry::LanguageId;
 use crate::types::{CompactString, FileId, Range, SymbolId, SymbolKind, compact_string};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 
 /// Visibility of a symbol
@@ -56,6 +56,10 @@ pub struct Symbol {
     pub name: CompactString,
     pub kind: SymbolKind,
     pub file_id: FileId,
+    #[serde(
+        serialize_with = "serialize_range_1_based",
+        deserialize_with = "deserialize_range_1_based"
+    )]
     pub range: Range,
     /// Clean file path without line numbers (e.g., "src/lib.rs")
     pub file_path: Box<str>,
@@ -76,6 +80,52 @@ pub struct Symbol {
     /// This field enables language-specific filtering in searches.
     /// It's Optional for backward compatibility - existing indexes will have None.
     pub language_id: Option<LanguageId>,
+}
+
+/// Wire shape for [`Range`] at the JSON boundary, mirroring its field names
+/// exactly so the serialized object stays a 4-key struct with unchanged keys.
+#[derive(Serialize, Deserialize)]
+struct RangeWire {
+    start_line: u32,
+    start_column: u16,
+    end_line: u32,
+    end_column: u16,
+}
+
+/// Shifts `range.start_line`/`end_line` from storage's 0-indexed convention
+/// to the 1-indexed convention every other line field uses at the MCP/CLI
+/// JSON boundary (see `serialize_call_edges` in `context.rs` for the sibling
+/// projection on relationship metadata). Columns are intentionally left
+/// unchanged. This is the single site for the shift on `Symbol::range`;
+/// `Range` itself keeps its plain, unshifted `Serialize`/`Deserialize` impl
+/// for non-Symbol uses (parsing, indexing, resolution).
+fn serialize_range_1_based<S>(range: &Range, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    RangeWire {
+        start_line: range.start_line + 1,
+        start_column: range.start_column,
+        end_line: range.end_line + 1,
+        end_column: range.end_column,
+    }
+    .serialize(serializer)
+}
+
+/// Exact inverse of [`serialize_range_1_based`]. Saturates on decode so a
+/// malformed `0` (which should never occur for a value this crate produced)
+/// decodes to `0` instead of underflowing/panicking.
+fn deserialize_range_1_based<'de, D>(deserializer: D) -> Result<Range, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let wire = RangeWire::deserialize(deserializer)?;
+    Ok(Range::new(
+        wire.start_line.saturating_sub(1),
+        wire.start_column,
+        wire.end_line.saturating_sub(1),
+        wire.end_column,
+    ))
 }
 
 #[repr(C, align(32))]
@@ -485,5 +535,26 @@ mod tests {
 
             assert_eq!(symbol.kind, restored.kind);
         }
+    }
+
+    #[test]
+    fn test_symbol_range_serializes_1_indexed_lines_and_round_trips() {
+        let symbol = Symbol::new(
+            SymbolId::new(1).unwrap(),
+            "shifted",
+            SymbolKind::Function,
+            FileId::new(1).unwrap(),
+            Range::new(5, 2, 8, 3),
+        );
+
+        let value = serde_json::to_value(&symbol).unwrap();
+        assert_eq!(value["range"]["start_line"], 6);
+        assert_eq!(value["range"]["end_line"], 9);
+        // Columns pass through unchanged (lines-only convention).
+        assert_eq!(value["range"]["start_column"], 2);
+        assert_eq!(value["range"]["end_column"], 3);
+
+        let round_tripped: Symbol = serde_json::from_value(value).unwrap();
+        assert_eq!(round_tripped, symbol);
     }
 }
