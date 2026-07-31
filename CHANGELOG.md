@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0+rcrsr.2] - 2026-07-30
+
 ### Added
 
 - **Watcher startup catch-up (opt-in):** a new `[file_watch]` key, `startup_catch_up` (default `false`), arms exactly one catch-up reindex the moment the unified watcher's event loop starts, so file changes made while the watcher was not running (a restart, a machine sleep, a deploy) are re-converged automatically instead of requiring a manual reindex. This is a distinct, independent trigger from `refresh_on_overflow` — the two keys each gate their own condition ("watcher just started" vs. "backend reported watch-queue overflow") against the same underlying catch-up machinery (debounce window, cooldown, bounded retries); enabling one does not require or imply the other, and neither depends on whether `--watch` was passed on the command line. It is opt-in and defaults to `false` because arming it means a full clear-and-rebuild of the index on every process start, not just on detected staleness — on a large index, MCP query results can be degraded or empty while it runs. In proxy mode this cost recurs on every auto-respawn of the backing server (`discover_or_spawn`, `src/serve_discovery.rs`), so a short `idle_shutdown_minutes` on a large workspace can turn into respawn-triggers-rebuild churn; leave `startup_catch_up` off unless you specifically need it. Nothing changes for existing users on upgrade. ([#59](https://github.com/rcrsr/rcrsr-codanna/pull/59))
