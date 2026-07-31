@@ -20,7 +20,7 @@ name = "codanna"
 # making a fork with strictly more code compare as older than the upstream it
 # was built from. The counter is informational, not orderable. Do not rely on
 # it for version-range gating.
-version = "0.12.0+rcrsr.1"
+version = "0.12.0+rcrsr.2"
 authors = ["Angel Bartolli <bartolli@gmail.com>"]
 edition = "2024"
 description = "Local code intelligence MCP server and CLI for AI coding agents"
@@ -49,21 +49,21 @@ publish = false
 pkg-fmt = "txz"
 
 [package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
-pkg-url = "https://github.com/rcrsr/rcrsr-codanna/releases/download/v{ version }/{ name }-0.12.0-rcrsr.1-linux-x64.tar.xz"
-bin-dir = "{ name }-0.12.0-rcrsr.1-linux-x64/{ bin }"
+pkg-url = "https://github.com/rcrsr/rcrsr-codanna/releases/download/v{ version }/{ name }-0.12.0-rcrsr.2-linux-x64.tar.xz"
+bin-dir = "{ name }-0.12.0-rcrsr.2-linux-x64/{ bin }"
 
 [package.metadata.binstall.overrides.x86_64-apple-darwin]
-pkg-url = "https://github.com/rcrsr/rcrsr-codanna/releases/download/v{ version }/{ name }-0.12.0-rcrsr.1-macos-x64.tar.xz"
-bin-dir = "{ name }-0.12.0-rcrsr.1-macos-x64/{ bin }"
+pkg-url = "https://github.com/rcrsr/rcrsr-codanna/releases/download/v{ version }/{ name }-0.12.0-rcrsr.2-macos-x64.tar.xz"
+bin-dir = "{ name }-0.12.0-rcrsr.2-macos-x64/{ bin }"
 
 [package.metadata.binstall.overrides.aarch64-apple-darwin]
-pkg-url = "https://github.com/rcrsr/rcrsr-codanna/releases/download/v{ version }/{ name }-0.12.0-rcrsr.1-macos-arm64.tar.xz"
-bin-dir = "{ name }-0.12.0-rcrsr.1-macos-arm64/{ bin }"
+pkg-url = "https://github.com/rcrsr/rcrsr-codanna/releases/download/v{ version }/{ name }-0.12.0-rcrsr.2-macos-arm64.tar.xz"
+bin-dir = "{ name }-0.12.0-rcrsr.2-macos-arm64/{ bin }"
 
 [package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
-pkg-url = "https://github.com/rcrsr/rcrsr-codanna/releases/download/v{ version }/{ name }-0.12.0-rcrsr.1-windows-x64.zip"
+pkg-url = "https://github.com/rcrsr/rcrsr-codanna/releases/download/v{ version }/{ name }-0.12.0-rcrsr.2-windows-x64.zip"
 pkg-fmt = "zip"
-bin-dir = "{ name }-0.12.0-rcrsr.1-windows-x64/{ bin }{ binary-ext }"
+bin-dir = "{ name }-0.12.0-rcrsr.2-windows-x64/{ bin }{ binary-ext }"
 
 [dependencies]
 anyhow = "1.0.104"
