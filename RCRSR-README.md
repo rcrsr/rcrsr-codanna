@@ -333,10 +333,14 @@ This has real limits, worth knowing before you rely on it:
   returned to the client as-is — there is no loop and no backoff. A second
   failure back-to-back means the backing server is not coming up, not that it
   needs another attempt.
-- **Single-flight per proxy process.** If several requests hit the dead
-  connection concurrently, only one of them actually dials a new backing
-  server; the rest wait for that dial and reuse its result rather than each
-  spawning their own.
+- **Single-flight per proxy process, including on failure.** If several
+  requests hit the dead connection concurrently, only one of them actually
+  dials a new backing server; the rest wait for that dial and reuse its
+  result rather than each spawning their own. This holds whether the dial
+  succeeds or fails — a failed dial is cached for the round too, so the
+  waiters get the same error back instead of each re-dialing (and, with
+  `auto_spawn` on, each paying a full spawn-and-health-check timeout back to
+  back).
 - **Revival is never attempted on a timeout.** A backing server that is simply
   slow to respond (a large reindex, for example) is not treated as dead and is
   not replaced — only a genuinely closed/broken transport triggers a revive.
@@ -351,6 +355,31 @@ This has real limits, worth knowing before you rely on it:
 - **No background health checks.** The proxy never polls its upstream on its
   own; revival only ever happens as a side effect of a real client request
   hitting a dead connection.
+
+### Discovery record identity
+
+`discover_or_spawn` no longer trusts a `.codanna/serve.json` record naming an
+`--http` backing server just because its PID is alive and looks like a
+`codanna serve` process. Each `--http` server now writes a fresh, random
+per-launch token into the record and echoes it back from `/health`; discovery
+re-verifies that token on every read, not just once at proxy startup — the
+fast path and the spawn-wait loop both check it, so it also applies on every
+revive. A record whose token does not match, or that has no token at all
+(written by a codanna binary older than this change), is treated the same as
+"no live server": discovery falls through to spawning a fresh one on a new
+port. This hardens `serve --proxy` against a same-user local process that
+races a plausible-looking record into place pointing at its own loopback
+listener. `--https` records are not probed this way — their identity already
+rests on the pinned certificate checked at the real connection site, and
+probing them here would fall through to spawning `--http` on a rejection,
+silently downgrading a rejected TLS connection to plaintext.
+
+One practical consequence: a backing server started by an older codanna
+binary (no token support) is no longer discovered by a proxy running this
+version — the proxy ignores that record and spawns its own server on a new
+port instead of attaching to the old one. This is self-healing and requires
+no manual migration, but it does mean an extra resident process until the
+stale one is stopped or idles out (see [Idle shutdown](#idle-shutdown)).
 
 ### Configuration
 

@@ -82,8 +82,10 @@ pub struct Symbol {
     pub language_id: Option<LanguageId>,
 }
 
-/// Wire shape for [`Range`] at the JSON boundary, mirroring its field names
-/// exactly so the serialized object stays a 4-key struct with unchanged keys.
+/// Wire shape for [`Range`] as serialized on [`Symbol::range`], mirroring its
+/// field names exactly so the serialized object stays a 4-key struct with
+/// unchanged keys, regardless of which serde format (JSON, or any other
+/// `Serializer`/`Deserializer`) is in use.
 #[derive(Serialize, Deserialize)]
 struct RangeWire {
     start_line: u32,
@@ -93,12 +95,13 @@ struct RangeWire {
 }
 
 /// Shifts `range.start_line`/`end_line` from storage's 0-indexed convention
-/// to the 1-indexed convention every other line field uses at the MCP/CLI
-/// JSON boundary (see `serialize_call_edges` in `context.rs` for the sibling
-/// projection on relationship metadata). Columns are intentionally left
-/// unchanged. This is the single site for the shift on `Symbol::range`;
-/// `Range` itself keeps its plain, unshifted `Serialize`/`Deserialize` impl
-/// for non-Symbol uses (parsing, indexing, resolution).
+/// to the 1-indexed convention every other line field uses on `Symbol::range`'s
+/// wire/serde representation, whatever the serialization format (see
+/// `serialize_call_edges` in `context.rs` for the sibling projection on
+/// relationship metadata). Columns are intentionally left unchanged. This is
+/// the single site for the shift on `Symbol::range`; `Range` itself keeps its
+/// plain, unshifted `Serialize`/`Deserialize` impl for non-Symbol uses
+/// (parsing, indexing, resolution).
 fn serialize_range_1_based<S>(range: &Range, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,

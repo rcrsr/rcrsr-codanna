@@ -363,10 +363,13 @@ pub async fn serve_http(config: crate::Settings, watch: bool, bind: String) -> a
         },
     );
 
-    // Helper function for health check endpoint
-    async fn health_check() -> &'static str {
-        "OK"
-    }
+    // Health check endpoint. Echoes back `launch_token` (generated below, once
+    // per process launch) so `serve_discovery::check_health` can bind trust in
+    // a `serve.json` record to the specific process that actually wrote it,
+    // rather than to any process that happens to answer 200 on the recorded
+    // port -- see `ServeRecord::token`'s doc comment. A plain `Fn` closure
+    // (not the previous free `async fn`) is what lets this capture the token;
+    // axum clones it once per request via its `Clone` bound on `Handler`.
 
     // Create OAuth metadata handler with the bind address
     let bind_for_metadata = bind.clone();
@@ -593,6 +596,19 @@ pub async fn serve_http(config: crate::Settings, watch: bool, bind: String) -> a
         .layer(axum::middleware::from_fn(stamp_activity))
         .layer(axum::middleware::from_fn(validate_bearer_token));
 
+    // Fresh per-launch token this process's `/health` endpoint echoes back,
+    // and that gets written into `ServeRecord::token` below. Generated once
+    // here, not derived from the pid/port/anything else an observer could
+    // predict -- see `serve_discovery::generate_launch_token`'s doc comment.
+    let launch_token = crate::serve_discovery::generate_launch_token();
+    let health_check = {
+        let launch_token = launch_token.clone();
+        move || {
+            let launch_token = launch_token.clone();
+            async move { launch_token }
+        }
+    };
+
     // Create main router - OAuth endpoints FIRST (no auth), then MCP endpoints (with auth)
     let router = Router::new()
         // OAuth endpoints - NO authentication required
@@ -634,6 +650,7 @@ pub async fn serve_http(config: crate::Settings, watch: bool, bind: String) -> a
                 pid: std::process::id(),
                 port: actual_port,
                 scheme: crate::serve_discovery::ServeScheme::Http,
+                token: Some(launch_token.clone()),
             };
             if let Err(e) = crate::serve_discovery::write_record(codanna_dir, &serve_record) {
                 tracing::warn!(target: "mcp", "failed to write serve discovery record: {e}");

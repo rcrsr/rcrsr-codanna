@@ -406,10 +406,14 @@ impl Dialer {
 }
 
 /// The current upstream connection plus a generation counter bumped on every
-/// successful revive, so a caller that observed generation `g` before a call
-/// failed can tell -- after taking the reconnect gate -- whether someone else
-/// already revived in the meantime (generation moved past `g`) or it must
-/// dial itself.
+/// COMPLETED revive round -- success or failure alike -- so a caller that
+/// observed generation `g` before a call failed can tell -- after taking the
+/// reconnect gate -- whether someone else already ran a round in the meantime
+/// (generation moved past `g`) or it must dial itself. On a failed round
+/// `service` is left unchanged (there is no new connection to install); only
+/// `generation` advances, paired with the cached failure in
+/// [`UpstreamHandle::last_failure`] that [`single_flight_revive`]'s
+/// `read_current` closure also returns.
 struct UpstreamSlot {
     service: Arc<RunningService<RoleClient, NotificationRelay>>,
     generation: u64,
@@ -417,41 +421,68 @@ struct UpstreamSlot {
 
 /// Generation-gated single-flight reconnect, generic over the async `dial`
 /// closure and over `read_current`/`store` accessors rather than a concrete
-/// slot type, so [`concurrent_revive_dials_once`] (in `tests` below) can
-/// drive it with a cheap counting closure and a plain `Mutex<(T, u64)>`
-/// instead of a real [`RunningService`] -- avoiding a `Dialer`
-/// trait with a single production implementation just to make this
-/// testable (a generic helper plus a test closure is the smaller seam).
+/// slot type, so [`concurrent_revive_dials_once`] and
+/// [`failed_revive_dials_once`] (in `tests` below) can drive it with a cheap
+/// counting closure and a plain `Mutex<(T, u64)>` instead of a real
+/// [`RunningService`] -- avoiding a `Dialer` trait with a single production
+/// implementation just to make this testable (a generic helper plus a test
+/// closure is the smaller seam).
 ///
 /// `seen_generation` is the generation the caller observed before its own
-/// delegated call failed. Under the `reconnect` gate: if the stored
-/// generation has already moved past `seen_generation`, another caller
-/// revived first while this one waited for the gate, so its result is
-/// returned directly with no second dial. Otherwise this caller dials once
-/// and stores the result at `generation + 1`.
+/// delegated call failed. Under the `reconnect` gate:
+///
+/// - If the stored generation has already moved past `seen_generation`,
+///   another caller already completed a round while this one waited for the
+///   gate. `read_current` reports both the last-good value (unchanged if that
+///   round failed) and, via its third tuple element, the error from that
+///   round IF it failed -- so this caller returns that cached error rather
+///   than re-dialing (a `None` third element means the round succeeded, so
+///   the last-good value is returned instead).
+/// - Otherwise this caller performs the one dial for the round. On success it
+///   stores the new value at `generation + 1` with no cached failure. On
+///   failure it stores the OLD value unchanged at `generation + 1` alongside
+///   the error, so any waiter arriving after this point sees the failure
+///   without dialing again -- closing the gap where only the success path
+///   was previously single-flighted.
+///
+/// `E: Clone` is required because a cached failure must be handed to every
+/// waiter of the round it belongs to, not just the caller that dialed.
 async fn single_flight_revive<T, E, D, Fut>(
     reconnect: &tokio::sync::Mutex<()>,
     seen_generation: u64,
-    read_current: impl Fn() -> (T, u64),
-    store: impl FnOnce(T, u64),
+    read_current: impl Fn() -> (T, u64, Option<E>),
+    store: impl FnOnce(T, u64, Option<E>),
     dial: D,
 ) -> Result<T, E>
 where
     T: Clone,
+    E: Clone,
     D: FnOnce() -> Fut,
     Fut: Future<Output = Result<T, E>>,
 {
     let _reconnect_guard = reconnect.lock().await;
 
-    let (current_value, current_generation) = read_current();
+    let (current_value, current_generation, current_failure) = read_current();
     if current_generation != seen_generation {
-        // Another caller already revived while we waited for the gate.
-        return Ok(current_value);
+        // Another caller already completed a round while we waited for the
+        // gate. Hand back whatever that round produced -- its cached failure
+        // if it failed, otherwise the value it installed.
+        return match current_failure {
+            Some(err) => Err(err),
+            None => Ok(current_value),
+        };
     }
 
-    let dialed = dial().await?;
-    store(dialed.clone(), current_generation + 1);
-    Ok(dialed)
+    match dial().await {
+        Ok(dialed) => {
+            store(dialed.clone(), current_generation + 1, None);
+            Ok(dialed)
+        }
+        Err(err) => {
+            store(current_value, current_generation + 1, Some(err.clone()));
+            Err(err)
+        }
+    }
 }
 
 /// Owns the live upstream connection behind a lock that is read
@@ -467,12 +498,22 @@ where
 struct UpstreamHandle {
     slot: std::sync::RwLock<UpstreamSlot>,
     /// Serializes revives so concurrent delegated calls that all observed the
-    /// same dead generation dial exactly once between them (see
-    /// [`single_flight_revive`]). Cross-process dedup for the underlying
-    /// `discover_or_spawn` call is already handled by its own `O_EXCL`
-    /// `.codanna/http.lock`; this mutex closes the *intra-process* gate that
-    /// primitive does not cover.
+    /// same dead generation dial exactly once between them, on both the
+    /// success AND failure path (see [`single_flight_revive`]). Cross-process
+    /// dedup for the underlying `discover_or_spawn` call is already handled
+    /// by its own `O_EXCL` `.codanna/http.lock`; this mutex closes the
+    /// *intra-process* gate that primitive does not cover.
     reconnect: tokio::sync::Mutex<()>,
+    /// Error from the most recently COMPLETED revive round, if that round
+    /// failed; `None` if the round at the current `slot.generation` succeeded
+    /// (or no revive has run yet). Cleared back to `None` on every successful
+    /// round so a stale failure from an earlier generation is never confused
+    /// with the current one. Read/written only under `reconnect`'s gate (via
+    /// [`single_flight_revive`]'s `read_current`/`store` closures below), so
+    /// a plain `std::sync::Mutex` -- never awaited across -- suffices; it does
+    /// not need to be part of `slot` because a failed round never touches
+    /// `slot.service`.
+    last_failure: std::sync::Mutex<Option<McpError>>,
     dial: Dialer,
 }
 
@@ -493,8 +534,10 @@ impl UpstreamHandle {
     }
 
     /// Revives the upstream connection if `seen_generation` is still current,
-    /// otherwise returns the connection someone else already revived. See
-    /// [`single_flight_revive`] for the gating logic and
+    /// otherwise returns whatever the round that already ran for that
+    /// generation produced -- the revived connection if it succeeded, or the
+    /// SAME error it failed with if it did not (rather than dialing again).
+    /// See [`single_flight_revive`] for the gating logic and
     /// [`Dialer::connect`] for the dial itself.
     async fn revive(
         &self,
@@ -510,23 +553,35 @@ impl UpstreamHandle {
                     .slot
                     .read()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                (slot.service.clone(), slot.generation)
+                let failure = self
+                    .last_failure
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                (slot.service.clone(), slot.generation, failure)
             },
-            |service, generation| {
+            |service, generation, failure| {
                 let mut slot = self
                     .slot
                     .write()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 // The previous `Arc<RunningService<..>>` is simply dropped
-                // here. `RunningService::cancel` takes `self` by value, which
-                // an `Arc` cannot yield while an in-flight retry on the old
-                // connection may still hold a clone, and rmcp's own `Drop for
-                // RunningService` already closes the connection
-                // asynchronously once the last clone goes away.
+                // here on a successful round. `RunningService::cancel` takes
+                // `self` by value, which an `Arc` cannot yield while an
+                // in-flight retry on the old connection may still hold a
+                // clone, and rmcp's own `Drop for RunningService` already
+                // closes the connection asynchronously once the last clone
+                // goes away. On a FAILED round `service` is this same old
+                // connection handed back unchanged -- there is nothing new to
+                // install, only the generation and `last_failure` advance.
                 *slot = UpstreamSlot {
                     service,
                     generation,
                 };
+                *self
+                    .last_failure
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = failure;
             },
             || async {
                 self.dial.connect().await.map_err(|err| {
@@ -873,6 +928,7 @@ pub async fn serve_proxy(
                 generation: 0,
             }),
             reconnect: tokio::sync::Mutex::new(()),
+            last_failure: std::sync::Mutex::new(None),
             dial,
         }),
         state,
@@ -1058,7 +1114,9 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let reconnect = Arc::new(tokio::sync::Mutex::new(()));
-        let slot: Arc<std::sync::Mutex<(u64, u64)>> = Arc::new(std::sync::Mutex::new((0, 0)));
+        // (value, generation, failure-from-the-round-that-produced-`generation`).
+        let slot: Arc<std::sync::Mutex<(u64, u64, Option<()>)>> =
+            Arc::new(std::sync::Mutex::new((0, 0, None)));
         let dial_count = Arc::new(AtomicUsize::new(0));
 
         const CALLERS: usize = 8;
@@ -1078,13 +1136,13 @@ mod tests {
                         let guard = slot
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        (guard.0, guard.1)
+                        (guard.0, guard.1, guard.2)
                     },
-                    |value, generation| {
+                    |value, generation, failure| {
                         let mut guard = slot
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        *guard = (value, generation);
+                        *guard = (value, generation, failure);
                     },
                     || {
                         let dial_count = dial_count.clone();
@@ -1128,8 +1186,99 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(
             final_state,
-            (42, 1),
-            "generation should have advanced by exactly one for all {CALLERS} callers combined"
+            (42, 1, None),
+            "generation should have advanced by exactly one for all {CALLERS} callers combined, \
+             with no cached failure since the round succeeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_revive_dials_once() {
+        // The failure-path sibling of `concurrent_revive_dials_once`: N
+        // concurrent callers all observing the same dead generation, but this
+        // time the dial itself always fails. Before the fix, only the caller
+        // that actually took the gate stored anything -- every OTHER caller
+        // that took the gate afterwards would see `current_generation ==
+        // seen_generation` still (nothing advanced it) and dial again itself,
+        // serializing N dials instead of sharing one failure. This test pins
+        // that the generation now advances and the failure is cached on a
+        // failed round too, so every caller shares the ONE dial's error.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let reconnect = Arc::new(tokio::sync::Mutex::new(()));
+        // (value, generation, failure-from-the-round-that-produced-`generation`).
+        let slot: Arc<std::sync::Mutex<(u64, u64, Option<&'static str>)>> =
+            Arc::new(std::sync::Mutex::new((0, 0, None)));
+        let dial_count = Arc::new(AtomicUsize::new(0));
+
+        const CALLERS: usize = 8;
+        let mut handles = Vec::with_capacity(CALLERS);
+        for _ in 0..CALLERS {
+            let reconnect = reconnect.clone();
+            let slot = slot.clone();
+            let dial_count = dial_count.clone();
+            handles.push(tokio::spawn(async move {
+                single_flight_revive::<u64, &'static str, _, _>(
+                    &reconnect,
+                    0,
+                    || {
+                        let guard = slot
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        (guard.0, guard.1, guard.2)
+                    },
+                    |value, generation, failure| {
+                        let mut guard = slot
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        *guard = (value, generation, failure);
+                    },
+                    || {
+                        let dial_count = dial_count.clone();
+                        async move {
+                            dial_count.fetch_add(1, Ordering::SeqCst);
+                            // Same rationale as `concurrent_revive_dials_once`:
+                            // yield so other waiters actually race for the
+                            // gate while this dial is "in flight", rather than
+                            // relying on scheduling luck to exercise the gate.
+                            tokio::task::yield_now().await;
+                            Err::<u64, &'static str>("dial failed: connection refused")
+                        }
+                    },
+                )
+                .await
+            }));
+        }
+
+        let mut results = Vec::with_capacity(CALLERS);
+        for handle in handles {
+            results.push(handle.await.expect("revive task should not panic"));
+        }
+
+        assert_eq!(
+            dial_count.load(Ordering::SeqCst),
+            1,
+            "exactly one dial should happen for {CALLERS} concurrent callers observing the same \
+             generation, even though that dial fails"
+        );
+        for result in &results {
+            assert_eq!(
+                result,
+                &Err("dial failed: connection refused"),
+                "every caller should observe the single failed dial's error, not succeed or \
+                 dial again themselves"
+            );
+        }
+
+        let final_state = *slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            final_state,
+            (0, 1, Some("dial failed: connection refused")),
+            "generation must still advance by exactly one on a failed round (unchanged value, \
+             cached failure), or a waiter arriving after this round would see the stale \
+             generation and dial again"
         );
     }
 

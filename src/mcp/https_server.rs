@@ -269,6 +269,20 @@ pub async fn serve_https(config: crate::Settings, watch: bool, bind: String) -> 
         .nest_service("/mcp", mcp_service)
         .layer(axum::middleware::from_fn(log_requests));
 
+    // Fresh per-launch token this process's `/health` endpoint echoes back,
+    // and that gets written into `ServeRecord::token` below. Generated once
+    // here, not derived from the pid/port/anything else an observer could
+    // predict -- see `serve_discovery::generate_launch_token`'s doc comment.
+    let launch_token = crate::serve_discovery::generate_launch_token();
+    let health_check = {
+        let launch_token = launch_token.clone();
+        move || {
+            eprintln!("Health check endpoint called");
+            let launch_token = launch_token.clone();
+            async move { launch_token }
+        }
+    };
+
     // Create main router - OAuth endpoints available but optional for HTTPS
     let router = Router::new()
         // OAuth endpoints - NO authentication required
@@ -335,6 +349,7 @@ pub async fn serve_https(config: crate::Settings, watch: bool, bind: String) -> 
                 pid: std::process::id(),
                 port: actual_port,
                 scheme: crate::serve_discovery::ServeScheme::Https,
+                token: Some(launch_token.clone()),
             };
             if let Err(e) = crate::serve_discovery::write_record(codanna_dir, &serve_record) {
                 tracing::warn!(target: "mcp", "failed to write serve discovery record: {e}");
@@ -372,13 +387,6 @@ pub async fn serve_https(config: crate::Settings, watch: bool, bind: String) -> 
 
     eprintln!("HTTPS server shut down gracefully");
     Ok(())
-}
-
-/// Helper function for health check endpoint
-#[cfg(feature = "https-server")]
-async fn health_check() -> &'static str {
-    eprintln!("Health check endpoint called");
-    "OK"
 }
 
 /// OAuth register endpoint - accepts any registration

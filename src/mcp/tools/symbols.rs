@@ -135,7 +135,8 @@ impl FileOutlineEntry {
     }
 }
 
-/// Successful `read_symbol` payload: the exact source span plus enough
+/// Successful `read_symbol` payload: the symbol's full-line source span
+/// (declaration's first line through its last, byte 0 to end) plus enough
 /// metadata to identify what was read without a second `find_symbol` call.
 ///
 /// Note on `symbol.range.start_column` (not a field here, but consulted
@@ -187,7 +188,7 @@ fn slice_line_bytes(line: &str, end: Option<usize>) -> String {
     String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
-/// Extract the exact source text covered by `range`, slicing by the
+/// Extract the source text covered by `range`, slicing by the
 /// Range's LINE and COLUMN numbers (never a byte offset into the whole
 /// file) — the file is split into lines first, then each boundary line is
 /// sliced by its own byte-column. The first line (single-line or
@@ -266,7 +267,7 @@ fn resolve_symbol_read_target(
     Ok((full_path, indexed_hash))
 }
 
-/// Read a symbol's exact source span from disk, guarded by a staleness
+/// Read a symbol's full-line source span from disk, guarded by a staleness
 /// check against the indexed file hash (W-3's `get_file_hash_for_path`
 /// facade accessor, which delegates to `DocumentIndex::get_file_info` ->
 /// `query.rs`; this function never builds its own Tantivy query).
@@ -1369,7 +1370,7 @@ impl CodeIntelligenceServer {
     }
 
     #[tool(
-        description = "Read a symbol's exact source span (sliced by line/column, not byte offset), plus kind/signature/visibility metadata. Refuses to return a span if the file has changed on disk since indexing (staleness guard via SHA256 hash comparison) since the recorded line/column range may no longer match the current file."
+        description = "Read a symbol's source span from disk — full lines from the declaration's first line through its last, so leading indentation and any modifiers on the first line are included. Refuses to return a span if the file has changed on disk since indexing (staleness guard via SHA256 hash comparison) since the recorded line/column range may no longer match the current file."
     )]
     pub async fn read_symbol(
         &self,
