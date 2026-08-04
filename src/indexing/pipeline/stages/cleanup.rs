@@ -36,6 +36,52 @@ const ALL_RELATION_KINDS: [RelationKind; 12] = [
     RelationKind::ReferencedBy,
 ];
 
+/// Unique files owning inbound edges into `paths`, excluding `in_run`
+/// members and files no longer on disk.
+///
+/// Relocation changes a target's path identity while the persisted edge
+/// carries only resolved endpoints; replaying the pick that selected the
+/// edge requires the source file itself, so its path re-enters the run.
+/// Reads through the searcher: must run BEFORE any cleanup of `paths`
+/// deletes the rows it walks.
+pub(crate) fn inbound_caller_files(
+    index: &DocumentIndex,
+    paths: &[PathBuf],
+    in_run: &std::collections::HashSet<PathBuf>,
+) -> PipelineResult<Vec<PathBuf>> {
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut callers = Vec::new();
+    for path in paths {
+        let path_str = path.to_string_lossy();
+        let Some((file_id, _hash, _mtime)) = index.get_file_info(&path_str)? else {
+            continue;
+        };
+        for symbol in index.find_symbols_by_file(file_id)? {
+            for kind in ALL_RELATION_KINDS {
+                for (from, _to, _rel) in index.get_relationships_to(symbol.id, kind)? {
+                    let Some(from_symbol) = index.find_symbol_by_id(from)? else {
+                        continue;
+                    };
+                    let Some(from_path) = index.get_file_path(from_symbol.file_id)? else {
+                        continue;
+                    };
+                    let from_path = PathBuf::from(from_path);
+                    if in_run.contains(&from_path) || !seen.insert(from_path.clone()) {
+                        continue;
+                    }
+                    // A caller recorded in the index but gone from disk is
+                    // not reintroduced; its own change event owns it.
+                    if !from_path.exists() {
+                        continue;
+                    }
+                    callers.push(from_path);
+                }
+            }
+        }
+    }
+    Ok(callers)
+}
+
 /// Containing type of a class member, when the parser recorded one.
 ///
 /// This is the identity that tells `Alpha::make` from `Beta::make`. Symbols
@@ -173,6 +219,47 @@ impl CleanupStage {
         files: &[PathBuf],
     ) -> PipelineResult<(CleanupStats, Vec<CapturedInboundEdge>)> {
         self.cleanup_files_inner(files, true)
+    }
+
+    /// Clean up the OLD paths of relocated (renamed) files, capturing the
+    /// edges that point into them with the target re-addressed to the NEW
+    /// path.
+    ///
+    /// Pairing evidence is an exact content hash (discovery), so the
+    /// replacement file's symbol layout is identical and the rebind
+    /// discriminators match exactly. `co_reindexed` names the other files
+    /// whose rows are also replaced this run: edges sourced there are
+    /// excluded from capture -- their from-ids die with the old rows, and
+    /// their own re-parse re-derives the edges.
+    pub fn cleanup_files_for_relocation(
+        &self,
+        pairs: &[(PathBuf, PathBuf)],
+        co_reindexed: &[PathBuf],
+    ) -> PipelineResult<(CleanupStats, Vec<CapturedInboundEdge>)> {
+        let mut in_flight: std::collections::HashSet<SymbolId> = std::collections::HashSet::new();
+        for (old, _) in pairs {
+            for symbol in self.symbols_of(old)? {
+                in_flight.insert(symbol.id);
+            }
+        }
+        for file in co_reindexed {
+            for symbol in self.symbols_of(file)? {
+                in_flight.insert(symbol.id);
+            }
+        }
+
+        let mut captured = Vec::new();
+        for (old, new) in pairs {
+            let mut edges = self.capture_inbound_edges(old, &in_flight)?;
+            for edge in &mut edges {
+                edge.target_file = new.clone();
+            }
+            captured.extend(edges);
+        }
+
+        let old_paths: Vec<PathBuf> = pairs.iter().map(|(old, _)| old.clone()).collect();
+        let (stats, _) = self.cleanup_files_inner(&old_paths, false)?;
+        Ok((stats, captured))
     }
 
     fn cleanup_files_inner(

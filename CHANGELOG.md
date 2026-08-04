@@ -60,6 +60,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Upstream base v0.12.0:** rebased from v0.9.23 through v0.10.0, v0.10.1, and v0.11.1 to v0.12.0 (see the version sections below for upstream's changes). Breaking on upgrade: emission semantics move from 1 to 3, so every existing index is refused — exit 7 in a terminal, or the degraded zero-tool handshake over stdio — and one `codanna index` per workspace heals it. Relationship counts drop on rebuild because upstream's fail-closed resolution no longer emits unevidenced edges; re-baseline caller and impact assertions against a fresh index rather than reading the drop as a regression. ([#48](https://github.com/rcrsr/rcrsr-codanna/pull/48))
 - **Fork build counter monotonic:** version suffix `+rcrsr.N` is now monotonic across the fork's lifetime and never resets on upstream rebases. ([#48](https://github.com/rcrsr/rcrsr-codanna/pull/48))
+## [0.13.1] - 2026-08-02
+
+Incremental-refactor and watcher-notification patch release. Renames, renames combined with edits, and deletions now converge the incremental index to the same relationship set as a fresh index: files that reference a moved or deleted target are re-analyzed in the same run, so each relationship follows the current source evidence. Applies across batch indexing, `serve --watch`, and `mcp <TOOL> --watch`. Resource subscribers receive list-change notifications when watched files are created and one list-change notification when they are deleted. Index format, emission semantics, and settings are unchanged; no automatic rebuild.
+
+If an earlier version processed a rename or deletion, relationships already lost from that index restore on the next edit of the referencing files, or all at once with `codanna index --force`.
+
+### Fixed
+
+- Byte-identical file and directory renames preserve inbound relationships; incremental discovery pairs deleted and new paths by content hash when the pairing is unique in both directions.
+- Files referencing a renamed, edited-and-renamed, or deleted target are re-analyzed in the same incremental run. A relationship survives only where the referencing file's imports and calls still support it: a rename plus content edit recovers the relationships its callers' evidence supports, and a stale import that still names the old path no longer retains its relationship.
+- `serve --watch` settles removal waves through the shared incremental lane. Directory events route by disk truth, so a directory rename reported as modify events with no per-file events still converges; genuine directory deletion still removes the subtree.
+- Watched file creation emits `notifications/resources/list_changed`; modification of a known file remains a URI-filtered `notifications/resources/updated`. Deleting a watched file emits one list-change notification, including when the file was created during the same watch session.
+- `serve --watch` no longer livelocks on Linux. inotify reports an open event for every directory read, including the watcher's own catch-up walks, so each walk triggered the next; the storm also starved the debounced-change drain, silencing reindexing and notifications. Access-class events are now ignored (they observe state, never change it), and the drain runs on a fixed cadence that sustained event streams cannot defer. The test suite now runs on Linux ahead of every release.
+
+### Known Limitations
+
+- A symbol moved between two files that are both edited in one change set can lose its callers' relationships until those callers are next re-indexed; under-report only, heals on edit or `codanna index --force`.
+- Re-indexing after a rename or deletion re-analyzes every file that referenced the target; incremental latency scales with the number of referencing files.
+- On Windows, path handling degrades symbol resolution: some relationships that resolve on Linux and macOS are under-reported. Windows now runs in the test pipeline as a non-blocking witness; fixes are tracked for a later release.
+- A delete followed by recreation inside one debounce-and-refresh window can omit the recreation's second list-change notification.
+
+## [0.13.0] - 2026-08-01
+
+MCP 2026-07-28 migration release. All transports serve the new generation — the spec revision that removes protocol-level sessions and the `initialize` handshake — alongside the legacy generation through its deprecation window: dispatch is per-session on stdio, per-request on HTTP/HTTPS. Index format, emission semantics, and settings are unchanged; no rebuild.
+
+### Added
+
+- MCP 2026-07-28 stateless generation on stdio, HTTP, and HTTPS (rmcp 3.1.0): `server/discover` answered as the required RPC and stdio back-compat probe; HTTP requests with 2026-07-28 `_meta` are served per-request without minting a session (`MCP-Protocol-Version` header required; `Mcp-Name` header required on name-bearing methods); tool results carry `resultType: "complete"` on the stateless wire and omit it for legacy peers per spec.
+- `subscriptions/listen`: stateless clients opt in to resource-change notifications with per-category and per-URI filters; notifications are tagged with the subscription id. Sessions without opt-in receive nothing unsolicited.
+- Tool and prompt list results carry the cache contract: `ttlMs` 3600000, `cacheScope` "private" (the stale server serves `ttlMs` 0).
+- Protocol conformance matrix instrument for contributors: `contributing/scripts/mcp-conformance-matrix.sh` runs the release binary across {stdio, http} x {legacy, stateless} x {fresh, stale index} plus TLS and probe-death cells in scratch workspaces.
+
+### Changed
+
+- `codanna mcp-test` connects Discover-only (2026-07-28). Against a server that dies on the probe — every shipped release up to 0.12.0 — it fails with a diagnostic naming the probe death instead of a raw connection error; the legacy `initialize` fallback is removed because no shipped server survives the probe to trigger it.
+
+### Fixed
+
+- Stdio serve no longer dies on a pre-handshake `server/discover` probe: the probe is answered with a full discover result on both the live and the stale-index server. Previously any 2026-07-28 client's first contact killed the process before serving anyone. Reported with a working fix by Vinicios Lugli (#117); both fixes carry co-author credit.
+- A fresh, never-indexed workspace serves all tools on every `serve` start: the emission gate reads only real indexes (`index.meta` present). Previously the skeleton directory that serve itself created on first start was refused as stale on the second start — zero tools, permanently, for any directory resolving to a shared unindexed `.codanna`.
+- Multiple serve processes watching one workspace: the losing watcher of the Tantivy writer logs the hot-reload convergence path at info instead of an error per edit burst, and semantic search saves stage in per-save directories — concurrent savers (a second serve, `codanna index` under a live serve) could previously destroy each other's in-flight save or promote a partially written vector file.
+
+### Removed
+
+- The `notifications/codanna/*` custom wire notifications (file-reindexed, file-created, file-deleted, index-reloaded). No wire consumer existed; standard MCP notifications carry the watch lane on both protocol generations.
 
 ## [0.12.0] - 2026-07-26
 

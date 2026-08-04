@@ -182,7 +182,8 @@ pub async fn serve_https(config: crate::Settings, watch: bool, bind: String) -> 
 
     // Create a shared service instance that all connections will use
     let shared_service =
-        CodeIntelligenceServer::new_with_facade(indexer_for_service, config_for_service);
+        CodeIntelligenceServer::new_with_facade(indexer_for_service, config_for_service)
+            .with_broadcaster(broadcaster.clone());
 
     // Attach document store if available
     let shared_service = if let Some(store_arc) = document_store_arc {
@@ -214,7 +215,7 @@ pub async fn serve_https(config: crate::Settings, watch: bool, bind: String) -> 
                 .with_cancellation_token(ct.child_token())
                 .with_sse_keep_alive(Some(Duration::from_secs(15)))
                 .with_sse_retry(None)
-                .with_stateful_mode(true)
+                .with_legacy_session_mode(true)
                 .with_json_response(false);
             let cfg = match config.mcp.allowed_hosts.clone() {
                 Some(hosts) => cfg.with_allowed_hosts(hosts),

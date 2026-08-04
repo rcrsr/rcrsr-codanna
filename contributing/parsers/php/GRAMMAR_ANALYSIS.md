@@ -1,5 +1,7 @@
 # PHP Grammar Analysis
 
+*Generated: 2026-07-24 23:20:45 UTC*
+
 ## Statistics
 - Total nodes in grammar JSON: 161
 - Nodes found in comprehensive.php: 177

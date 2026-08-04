@@ -708,6 +708,8 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let config_path = temp_dir.path().join("settings.toml");
 
+        // ignore_patterns and include_tests are stale keys (the former
+        // was removed as a dead knob); loading must tolerate them.
         let toml_content = r#"
 version = 2
 
@@ -728,9 +730,6 @@ enabled = false
         let settings = Settings::load_from(&config_path).unwrap();
         assert_eq!(settings.version, 2);
         assert_eq!(settings.indexing.parallelism, 4);
-        assert_eq!(settings.indexing.ignore_patterns, vec!["custom/**"]);
-        // Default ignore patterns should be replaced by custom ones
-        assert_eq!(settings.indexing.ignore_patterns.len(), 1);
         assert_eq!(settings.mcp.max_context_size, 200000);
         assert!(!settings.languages["rust"].enabled);
     }

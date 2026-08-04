@@ -8,7 +8,7 @@ use std::time::Instant;
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 use tokio::sync::{RwLock, mpsc};
 use tokio::task::JoinHandle;
-use tokio::time::{Duration, sleep};
+use tokio::time::Duration;
 
 use crate::documents::DocumentStore;
 use crate::documents::config::ChunkingConfig;
@@ -113,6 +113,10 @@ pub struct UnifiedWatcher {
     /// handling and stays watched even when a root holds no indexed
     /// file directly.
     handler_roots: Vec<PathBuf>,
+    /// Roots whose owning handler is covered by the batch incremental
+    /// lane. Removal waves batch-sync these so the shared discovery can
+    /// pair renames (remove + create of identical content).
+    batch_sync_roots: Vec<PathBuf>,
     /// Test-only counter of `discoverable_entries_for` invocations from the
     /// created-directory drain path, so tests can assert the number of
     /// walks a burst produces directly instead of only inferring "one walk"
@@ -183,11 +187,17 @@ impl UnifiedWatcher {
         // before the event loop begins, so `stale_since` measures quiet time
         self.arm_startup_catch_up();
 
-        loop {
-            // Periodic check for debounced events
-            let timeout = sleep(Duration::from_millis(100));
-            tokio::pin!(timeout);
+        // The drain fires on a fixed cadence, never deferred by event
+        // pressure: a per-iteration sleep resets on every received
+        // event, so any sustained stream with sub-interval arrivals
+        // starves the drain -- and with it every debounced reindex,
+        // removal wave, and notification -- for as long as the stream
+        // lasts. The debouncer's own per-path quiet windows decide
+        // what each tick actually drains.
+        let mut drain = tokio::time::interval(Duration::from_millis(100));
+        drain.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+        loop {
             tokio::select! {
                 // Handle incoming file events
                 Some(res) = self.event_rx.recv() => {
@@ -207,7 +217,7 @@ impl UnifiedWatcher {
                 }
 
                 // Process debounced changes
-                _ = &mut timeout => {
+                _ = drain.tick() => {
                     // Coalesced created-directory walks run first: this only
                     // orders the two `take_ready()` calls within the same
                     // tick (files recorded here still wait a full debounce
@@ -218,9 +228,35 @@ impl UnifiedWatcher {
                     // debouncer before deciding whether to fire.
                     self.process_pending_created_dirs().await;
 
-                    let ready = self.debouncer.take_ready();
-                    for path in ready {
-                        self.process_modification(&path).await;
+                    if self.debouncer.has_pending_removals() {
+                        // A removal may be one side of a rename. Hold the
+                        // whole burst until every side is stable, then hand
+                        // remove + create to the shared batch lane in one
+                        // wave so discovery can pair them.
+                        if let Some((removed, modified)) = self.debouncer.take_settled_burst() {
+                            self.process_removal_wave(removed, modified).await;
+                        }
+                    } else {
+                        let ready = self.debouncer.take_ready();
+                        let (vanished, alive): (Vec<PathBuf>, Vec<PathBuf>) =
+                            ready.into_iter().partition(|path| !path.exists());
+                        if vanished.is_empty() {
+                            for path in alive {
+                                self.process_modification(&path).await;
+                            }
+                        } else {
+                            // rename-as-modify (macOS): vanished paths are
+                            // removal observations, and the survivors of the
+                            // same batch must ride the same wave -- indexing
+                            // a rename's create side per-file here would
+                            // leave discovery nothing to pair.
+                            for path in vanished {
+                                self.debouncer.record_removal(path);
+                            }
+                            for path in alive {
+                                self.debouncer.record(path);
+                            }
+                        }
                     }
 
                     // Complete any in-flight catch-up reindex before
@@ -549,6 +585,17 @@ impl UnifiedWatcher {
             self.mark_stale();
         }
 
+        // Access events observe state; they never change it. inotify
+        // emits Access(Open) for every directory read -- including the
+        // watcher's OWN catch-up walks -- so routing them into the
+        // directory branch below livelocks: walk emits Open, Open
+        // triggers walk. FSEvents emits no Access events, which is why
+        // only Linux exhibits it. The file-level kind match already
+        // discards Access; state-bearing kinds are untouched.
+        if matches!(event.kind, EventKind::Access(_)) {
+            return;
+        }
+
         // Bind `kind` before the loop below moves `event.paths` out of
         // `event`; `EventKind` is `Copy`, so this avoids reading `event.kind`
         // across the partial move and makes the per-path composition below
@@ -556,17 +603,34 @@ impl UnifiedWatcher {
         let kind = event.kind;
 
         for path in event.paths {
-            // A created directory never matches a file handler (extension
-            // gate); it is the watcher's own concern: extend the watch set
-            // and catch up files that landed before the watch existed.
-            if matches!(kind, EventKind::Create(_)) && path.is_dir() {
-                // Apply the handler-root prefix gate at record time so a
-                // path outside every registered root never enters the
-                // coalescing map; the walk itself runs later, batched, in
-                // `process_pending_created_dirs`.
+            crate::trace_event!("watcher", "event", "{:?} {}", kind, path.display());
+            // A directory never matches a file handler (extension gate); it is
+            // the watcher's own concern. Disk truth decides, not event kind --
+            // a dir rename's to-side arrives as Modify(Name), never Create.
+            // The handler-root prefix gate keeps out-of-root paths out of the
+            // coalescing map; the walk itself runs later, batched, in
+            // `process_pending_created_dirs`.
+            if path.is_dir() {
                 if self.handler_roots.iter().any(|r| path.starts_with(r)) {
                     self.dir_debouncer.record(path);
                 }
+                continue;
+            }
+
+            // A vanished path that prefixes watched directories is a
+            // directory removal observation (dir-rename from-side or true
+            // dir delete). It arrives as Modify(Name) or a stale Create
+            // with NO per-file events following; one removal observation
+            // stands in for the subtree and the wave's batch sync
+            // re-derives the owning root.
+            if !path.exists()
+                && self
+                    .registry
+                    .watch_dirs()
+                    .iter()
+                    .any(|dir| dir.starts_with(&path))
+            {
+                self.debouncer.record_removal(path);
                 continue;
             }
 
@@ -585,9 +649,12 @@ impl UnifiedWatcher {
                     self.debouncer.record(path);
                 }
                 EventKind::Remove(_) => {
-                    // Handle deletions immediately
-                    self.debouncer.remove(&path);
-                    self.process_deletion(&path).await;
+                    // Deferred, not immediate: a rename arrives as
+                    // remove(old) + create(new), and only a batch holding
+                    // both sides lets the shared discovery pair them.
+                    // Genuine deletions pay one debounce window before
+                    // cleanup.
+                    self.debouncer.record_removal(path);
                 }
                 _ => {}
             }
@@ -601,24 +668,6 @@ impl UnifiedWatcher {
         // (negligibly later) `now` again. Harmless, and simpler than
         // threading a "did mark_stale fire this call" flag through.
         self.bump_stale_clock();
-    }
-
-    /// Register handler watch roots: watched directly so directory
-    /// creation at the top of a root is visible even when the root
-    /// holds no indexed file itself.
-    async fn register_handler_roots(&mut self) {
-        let mut roots = Vec::new();
-        for handler in &self.handlers {
-            roots.extend(handler.watch_roots().await);
-        }
-        for root in &roots {
-            if self.registry.add_watch_dir(root.clone()) {
-                if let Err(e) = self.watch_directory(root) {
-                    tracing::warn!("[watcher] failed to watch root: {e}");
-                }
-            }
-        }
-        self.handler_roots = roots;
     }
 
     /// Drain every created-directory scope that has settled (been quiet for
@@ -744,11 +793,36 @@ impl UnifiedWatcher {
         }
     }
 
+    /// Register handler watch roots: watched directly so directory
+    /// creation at the top of a root is visible even when the root
+    /// holds no indexed file itself.
+    async fn register_handler_roots(&mut self) {
+        let mut roots = Vec::new();
+        let mut sync_roots = Vec::new();
+        for handler in &self.handlers {
+            let handler_roots = handler.watch_roots().await;
+            if handler.covered_by_batch_sync() {
+                sync_roots.extend(handler_roots.iter().cloned());
+            }
+            roots.extend(handler_roots);
+        }
+        for root in &roots {
+            if self.registry.add_watch_dir(root.clone()) {
+                if let Err(e) = self.watch_directory(root) {
+                    tracing::warn!("[watcher] failed to watch root: {e}");
+                }
+            }
+        }
+        self.handler_roots = roots;
+        self.batch_sync_roots = sync_roots;
+    }
+
     /// Process a debounced file modification.
     async fn process_modification(&self, path: &Path) {
-        // Check if file still exists (handles rename-as-modify on macOS)
+        // Vanished since the drain: the removal lane owns it -- the
+        // caller recorded a removal observation, or the Remove event is
+        // in flight.
         if !path.exists() {
-            self.process_deletion(path).await;
             return;
         }
 
@@ -772,16 +846,93 @@ impl UnifiedWatcher {
         }
     }
 
-    /// Process a file deletion.
-    async fn process_deletion(&self, path: &Path) {
+    /// Process one settled burst that contains removal observations.
+    ///
+    /// Roots owned by a batch-sync-covered handler run the shared batch
+    /// incremental lane: its discovery re-derives new/modified/deleted
+    /// from disk-vs-index truth and pairs renames -- the one boundary
+    /// all incremental entry points share. Paths outside every synced
+    /// root keep per-file semantics.
+    async fn process_removal_wave(&mut self, removed: Vec<PathBuf>, modified: Vec<PathBuf>) {
+        let mut roots: Vec<PathBuf> = Vec::new();
+        for path in removed.iter().chain(modified.iter()) {
+            if let Some(root) = self
+                .batch_sync_roots
+                .iter()
+                .find(|root| path.starts_with(root))
+            {
+                if !roots.contains(root) {
+                    roots.push(root.clone());
+                }
+            }
+        }
+
+        for root in &roots {
+            crate::log_event!("watcher", "batch sync", "{}", root.display());
+            let mut indexer = self.facade.write().await;
+            match indexer.index_directory(root, false) {
+                Ok(stats) => {
+                    crate::log_event!(
+                        "watcher",
+                        "batch synced",
+                        "{} indexed, {} removed",
+                        stats.files_indexed,
+                        stats.files_removed
+                    );
+                }
+                Err(e) if is_writer_lock_contention(&e) => {
+                    tracing::info!(
+                        "[watcher] batch sync skipped: another serve process holds the index writer; hot-reload converges"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!("[watcher] batch sync failed: {e}");
+                }
+            }
+        }
+
+        if !roots.is_empty() {
+            // Handler caches and subscribers refresh through the same
+            // event hot-reload uses; the sync may have relocated paths.
+            self.broadcaster.send(FileChangeEvent::IndexReloaded);
+        }
+
+        // Per-file semantics for everything the batch sync does not
+        // subsume: paths outside every synced root, and handlers not
+        // covered by the batch lane even under one (document files can
+        // live inside a code root).
+        for path in &removed {
+            let covered = roots.iter().any(|root| path.starts_with(root));
+            self.process_wave_residual(path, covered, true).await;
+        }
+        for path in &modified {
+            let covered = roots.iter().any(|root| path.starts_with(root));
+            if !path.exists() {
+                continue;
+            }
+            self.process_wave_residual(path, covered, false).await;
+        }
+    }
+
+    /// Route one wave path through every handler the batch sync did not
+    /// subsume.
+    async fn process_wave_residual(&self, path: &Path, batch_covered: bool, is_removal: bool) {
         for handler in &self.handlers {
             if !handler.matches(path) {
                 continue;
             }
+            if batch_covered && handler.covered_by_batch_sync() {
+                continue;
+            }
 
-            crate::log_event!(handler.name(), "deleted", "{}", path.display());
+            let (verb, result) = if is_removal {
+                ("deleted", handler.on_delete(path).await)
+            } else {
+                ("modified", handler.on_modify(path).await)
+            };
+            crate::log_event!(handler.name(), verb, "{}", path.display());
 
-            match handler.on_delete(path).await {
+            match result {
                 Ok(action) => {
                     if let Err(e) = self.execute_action(action, handler.name()).await {
                         tracing::error!("[{}] action error: {e}", handler.name());
@@ -801,7 +952,7 @@ impl UnifiedWatcher {
         handler_name: &str,
     ) -> Result<(), WatchError> {
         match action {
-            WatchAction::ReindexCode { path } => {
+            WatchAction::ReindexCode { path, created } => {
                 let mut indexer = self.facade.write().await;
                 match indexer.index_file(&path) {
                     Ok(result) => {
@@ -820,14 +971,25 @@ impl UnifiedWatcher {
                                     }
                                 }
 
-                                // Notify
-                                self.broadcaster
-                                    .send(FileChangeEvent::FileReindexed { path: path.clone() });
+                                // A first-time file grew the resource list;
+                                // the lanes map FileCreated to list_changed
+                                // and FileReindexed to a URI-filtered update.
+                                let event = if created {
+                                    FileChangeEvent::FileCreated { path: path.clone() }
+                                } else {
+                                    FileChangeEvent::FileReindexed { path: path.clone() }
+                                };
+                                self.broadcaster.send(event);
                             }
                             IndexingResult::Cached(_) => {
                                 crate::debug_event!(handler_name, "unchanged (hash match)");
                             }
                         }
+                    }
+                    Err(e) if is_writer_lock_contention(&e) => {
+                        tracing::info!(
+                            "[{handler_name}] reindex skipped: another serve process holds the index writer; hot-reload converges"
+                        );
                     }
                     Err(e) => {
                         tracing::error!("[{handler_name}] reindex failed: {e}");
@@ -838,7 +1000,13 @@ impl UnifiedWatcher {
             WatchAction::RemoveCode { path } => {
                 let mut indexer = self.facade.write().await;
                 if let Err(e) = indexer.remove_file(&path) {
-                    tracing::error!("[{handler_name}] failed to remove: {e}");
+                    if is_writer_lock_contention(&e) {
+                        tracing::info!(
+                            "[{handler_name}] remove skipped: another serve process holds the index writer; hot-reload converges"
+                        );
+                    } else {
+                        tracing::error!("[{handler_name}] failed to remove: {e}");
+                    }
                 } else {
                     crate::log_event!(handler_name, "removed");
                     self.broadcaster
@@ -1358,6 +1526,7 @@ impl UnifiedWatcherBuilder {
             contention_warn_last_at: None,
             contention_warn_interval: CONTENTION_WARN_BASE_INTERVAL,
             handler_roots: Vec::new(),
+            batch_sync_roots: Vec::new(),
             #[cfg(test)]
             walk_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
@@ -1368,6 +1537,15 @@ impl Default for UnifiedWatcherBuilder {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Another serve process holds the Tantivy index writer for this
+/// workspace: its watcher indexes the change and this process
+/// converges via hot-reload. Tantivy surfaces the contention as a
+/// lockfile-acquire failure in the storage error chain; that text is
+/// the only marker crossing the boxed layers.
+fn is_writer_lock_contention(e: &crate::IndexError) -> bool {
+    e.to_string().contains("Failed to acquire Lockfile")
 }
 
 #[cfg(test)]
@@ -3292,5 +3470,149 @@ mod tests {
             "a catch-up episode with nothing to rebuild from must never touch \
              the pre-existing index, including after giving up"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_v013 {
+    use super::*;
+    use crate::config::Settings;
+    use crate::watcher::handlers::CodeFileHandler;
+    use notify::event::{AccessKind, AccessMode, ModifyKind, RenameMode};
+    use std::path::Path;
+
+    async fn watcher_over(dir: &Path, root: &Path) -> UnifiedWatcher {
+        let mut settings = Settings {
+            index_path: dir.join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings
+            .add_indexed_path(root.to_path_buf())
+            .expect("register indexed path");
+        let facade = Arc::new(RwLock::new(IndexFacade::new(Arc::new(settings)).unwrap()));
+        let handler = CodeFileHandler::new(Arc::clone(&facade), dir.to_path_buf());
+        handler.init_cache().await;
+        UnifiedWatcher::builder()
+            .handler(handler)
+            .broadcaster(Arc::new(NotificationBroadcaster::new(16)))
+            .indexer(facade)
+            .workspace_root(dir.to_path_buf())
+            .build()
+            .unwrap()
+    }
+
+    // A dir rename's from-side arrives as Modify(Name) on a path that no
+    // longer exists, and no per-file events follow. A vanished path that
+    // prefixes watched directories is a directory removal observation:
+    // it must enter the removal wave, not fall to the unmatched trace.
+    #[tokio::test]
+    async fn vanished_watched_dir_records_a_removal_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(root.join("pkg")).unwrap();
+        std::fs::write(root.join("pkg/a.py"), "def a():\n    pass\n").unwrap();
+        let canonical_root = root.canonicalize().unwrap();
+        let pkg = canonical_root.join("pkg");
+
+        let mut watcher = watcher_over(dir.path(), &root).await;
+        watcher.registry.add_watch_dir(pkg.clone());
+
+        std::fs::remove_dir_all(&pkg).unwrap();
+        watcher
+            .handle_event(Event {
+                kind: EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+                paths: vec![pkg],
+                attrs: Default::default(),
+            })
+            .await;
+
+        assert!(
+            watcher.debouncer.has_pending_removals(),
+            "a vanished watched directory must record a removal observation"
+        );
+    }
+
+    // A dir rename's to-side arrives as Modify(Name) on a path that IS a
+    // directory -- never as Create. Disk truth decides the route: an
+    // existing directory under a handler root runs created-directory
+    // catch-up regardless of event kind.
+    #[tokio::test]
+    async fn existing_dir_routes_to_catchup_regardless_of_event_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(root.join("pkg_renamed")).unwrap();
+        std::fs::write(root.join("pkg_renamed/a.py"), "def a():\n    pass\n").unwrap();
+        let canonical_root = root.canonicalize().unwrap();
+
+        let mut watcher = watcher_over(dir.path(), &root).await;
+        watcher.handler_roots = vec![canonical_root.clone()];
+
+        watcher
+            .handle_event(Event {
+                kind: EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+                paths: vec![canonical_root.join("pkg_renamed")],
+                attrs: Default::default(),
+            })
+            .await;
+
+        // The fork coalesces created/renamed directories into `dir_debouncer`
+        // (records at event time, batched walk deferred to the drain tick),
+        // rather than walking inline. The routing still happens on any event
+        // kind -- the directory is queued for catch-up, just not yet walked.
+        assert!(
+            watcher.dir_debouncer.has_pending(),
+            "an existing directory must enter the created-directory catch-up debounce on any event kind"
+        );
+    }
+
+    // inotify emits Access(Open) for every directory read, including
+    // the catch-up walk's own opens; routing those into the directory
+    // branch livelocks (walk emits Open, Open triggers walk), which
+    // starves the debounce drain and silences every notification.
+    // Access observes state and never changes it: dropped before any
+    // routing. FSEvents emits no Access events, so only Linux
+    // exercises this.
+    #[tokio::test]
+    async fn access_events_route_nowhere() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(root.join("pkg")).unwrap();
+        std::fs::write(root.join("pkg/a.py"), "def a():\n    pass\n").unwrap();
+        let canonical_root = root.canonicalize().unwrap();
+
+        let mut watcher = watcher_over(dir.path(), &root).await;
+        watcher.handler_roots = vec![canonical_root.clone()];
+
+        watcher
+            .handle_event(Event {
+                kind: EventKind::Access(AccessKind::Open(AccessMode::Any)),
+                paths: vec![canonical_root.join("pkg")],
+                attrs: Default::default(),
+            })
+            .await;
+
+        assert!(
+            !watcher.debouncer.has_pending(),
+            "an Access event on a directory must not enter catch-up"
+        );
+        assert!(
+            !watcher.debouncer.has_pending_removals(),
+            "an Access event must not record a removal observation"
+        );
+    }
+
+    #[test]
+    fn writer_lock_contention_is_classified_from_the_error_chain() {
+        let contended = crate::IndexError::General(
+            "Pipeline error: Storage error: Tantivy error: \
+             Failed to acquire Lockfile: LockBusy. \
+             Some(\"Failed to acquire index lock.\")"
+                .to_string(),
+        );
+        assert!(is_writer_lock_contention(&contended));
+
+        let unrelated = crate::IndexError::General("Pipeline error: parse failed".to_string());
+        assert!(!is_writer_lock_contention(&unrelated));
     }
 }

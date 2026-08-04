@@ -37,12 +37,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ClientRequest, CompleteRequestParams, CompleteResult,
+    CallToolRequestParams, CallToolResponse, ClientRequest, CompleteRequestParams, CompleteResult,
     CustomNotification, CustomRequest, CustomResult, ErrorData as McpError, GetPromptRequestParams,
-    GetPromptResult, Implementation, InitializeRequestParams, InitializeResult, ListPromptsResult,
-    ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
+    GetPromptResponse, Implementation, InitializeRequestParams, InitializeResult,
+    ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
     LoggingMessageNotificationParam, PaginatedRequestParams, ProgressNotificationParam,
-    ReadResourceRequestParams, ReadResourceResult, ResourceUpdatedNotificationParam,
+    ReadResourceRequestParams, ReadResourceResponse, ResourceUpdatedNotificationParam,
     ServerCapabilities, ServerInfo, ServerNotification, ServerResult, SetLevelRequestParams,
     SubscribeRequestParams, UnsubscribeRequestParams,
 };
@@ -681,18 +681,28 @@ impl ServerHandler for DelegatingProxyHandler {
         // the current connection synchronously via `UpstreamHandle::current`
         // -- this method is NOT `async` and cannot await a revive, so it
         // always reflects whatever connection is live right now.
-        self.upstream
-            .current()
-            .0
-            .peer_info()
-            .map(|info| (*info).clone())
-            .unwrap_or_else(|| {
-                ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-                    .with_server_info(Implementation::new(
-                        "codanna-proxy",
-                        env!("CARGO_PKG_VERSION"),
-                    ))
-            })
+        // rmcp 3.x exposes the negotiated backing-server info as
+        // `ServerPeerInfo`, a distinct type from `InitializeResult`
+        // (`ServerInfo`), so its fields are copied across into a fresh
+        // `ServerInfo` rather than cloned wholesale.
+        match self.upstream.current().0.peer_info() {
+            Some(peer) => {
+                let info = ServerInfo::new(peer.capabilities.clone()).with_server_info(
+                    peer.server_info.clone().unwrap_or_else(|| {
+                        Implementation::new("codanna-proxy", env!("CARGO_PKG_VERSION"))
+                    }),
+                );
+                match peer.instructions.clone() {
+                    Some(instructions) => info.with_instructions(instructions),
+                    None => info,
+                }
+            }
+            None => ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+                .with_server_info(Implementation::new(
+                    "codanna-proxy",
+                    env!("CARGO_PKG_VERSION"),
+                )),
+        }
     }
 
     async fn initialize(
@@ -739,12 +749,13 @@ impl ServerHandler for DelegatingProxyHandler {
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResponse, McpError> {
         self.delegate(|up| {
             let request = request.clone();
             async move { up.call_tool(request).await }
         })
         .await
+        .map(Into::into)
     }
 
     async fn list_resources(
@@ -775,12 +786,13 @@ impl ServerHandler for DelegatingProxyHandler {
         &self,
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, McpError> {
+    ) -> Result<ReadResourceResponse, McpError> {
         self.delegate(|up| {
             let request = request.clone();
             async move { up.read_resource(request).await }
         })
         .await
+        .map(Into::into)
     }
 
     async fn list_prompts(
@@ -799,12 +811,13 @@ impl ServerHandler for DelegatingProxyHandler {
         &self,
         request: GetPromptRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<GetPromptResult, McpError> {
+    ) -> Result<GetPromptResponse, McpError> {
         self.delegate(|up| {
             let request = request.clone();
             async move { up.get_prompt(request).await }
         })
         .await
+        .map(Into::into)
     }
 
     async fn complete(

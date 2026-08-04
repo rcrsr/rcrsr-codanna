@@ -1344,7 +1344,10 @@ impl IndexFacade {
         self.add_indexed_path(path);
 
         Ok(IndexingStats {
-            files_indexed: stats.new_files + stats.modified_files,
+            files_indexed: stats.new_files
+                + stats.modified_files
+                + stats.renamed_files
+                + stats.invalidated_caller_files,
             symbols_found: stats.index_stats.symbols_found,
             relationships_resolved: stats.phase2_stats.defines_resolved
                 + stats.phase2_stats.calls_resolved
@@ -1451,7 +1454,10 @@ impl IndexFacade {
 
         // Convert to IndexStats format using pipeline's actual timing
         let mut stats = IndexStats::default();
-        stats.files_indexed = pipeline_stats.new_files + pipeline_stats.modified_files;
+        stats.files_indexed = pipeline_stats.new_files
+            + pipeline_stats.modified_files
+            + pipeline_stats.renamed_files
+            + pipeline_stats.invalidated_caller_files;
         stats.symbols_found = pipeline_stats.index_stats.symbols_found;
         stats.files_removed = pipeline_stats.deleted_files;
         stats.symbols_removed = pipeline_stats.deleted_symbols;
@@ -1515,7 +1521,10 @@ impl IndexFacade {
                 progress,
                 file_count,
             )?;
-            stats.files_indexed += result.new_files + result.modified_files;
+            stats.files_indexed += result.new_files
+                + result.modified_files
+                + result.renamed_files
+                + result.invalidated_caller_files;
             stats.symbols_found += result.index_stats.symbols_found;
         }
         stats.added_dirs = to_add.len();
