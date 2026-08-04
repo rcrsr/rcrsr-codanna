@@ -1257,3 +1257,261 @@ fn proxy_mode_is_exempt_from_the_emission_gate_that_refuses_plain_serve() {
          out in await_upstream"
     );
 }
+
+/// Deadline-bounded wait for `pid` to actually stop RUNNING -- either
+/// exited outright or reduced to a zombie (`Z` state in `/proc/<pid>/stat`).
+///
+/// `serve_discovery::pid_is_alive` (mere `/proc/<pid>` existence) is
+/// deliberately NOT used here: in the two tests below, the process doing the
+/// killing is a still-live `codanna serve --proxy` process that is the
+/// PARENT of the backing server being killed (via `spawn_detached`) and,
+/// unlike the OTHER `kill_pid`-based tests in this file, is never itself
+/// killed-and-`wait()`-ed first. A killed child whose parent never reaps it
+/// stays a zombie -- present in the process table, so `pid_is_alive` would
+/// wait past `DEADLINE` and never observe it as gone. `discover_or_spawn`'s
+/// own `decide()` already treats a zombie correctly regardless (a zombie's
+/// `/proc/<pid>/cmdline` reads back empty, so `pid_looks_like_codanna_serve`
+/// returns `false` and `decide()` returns `Spawn`); this helper mirrors that
+/// same "exited or zombie" liveness definition for the test's own polling.
+fn wait_until_dead_or_zombie(pid: u32, deadline: Duration) {
+    wait_until(
+        || !process_is_running(pid),
+        deadline,
+        &format!("pid {pid} to stop running (exit or zombie)"),
+    );
+}
+
+/// Linux-specific (this suite runs on Linux): reads `/proc/<pid>/stat`'s
+/// state field. Returns `false` if the process is gone entirely OR is a
+/// zombie (`Z`) -- i.e. "no longer doing anything", regardless of whether
+/// its process-table entry has been reaped yet.
+fn process_is_running(pid: u32) -> bool {
+    let Ok(contents) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    // Format: "pid (comm) state ...". `comm` can itself contain spaces or
+    // parentheses, so find the LAST ')' to skip past it before reading the
+    // state field that immediately follows.
+    let Some((_, after_comm)) = contents.rsplit_once(')') else {
+        return false;
+    };
+    !matches!(after_comm.trim_start().chars().next(), Some('Z') | None)
+}
+
+/// Like [`prepare_workspace`], but with `[server] auto_spawn = false` so the
+/// proxy may attach to an already-live backing server but must never spawn
+/// one of its own.
+fn prepare_workspace_with_auto_spawn_disabled() -> TempDir {
+    let workspace = prepare_workspace();
+    let codanna_dir = workspace.path().join(".codanna");
+    std::fs::write(
+        codanna_dir.join("settings.toml"),
+        r#"
+index_path = ".codanna/index"
+
+[semantic_search]
+enabled = false
+
+[server]
+auto_spawn = false
+"#,
+    )
+    .expect("rewrite settings.toml with auto_spawn = false");
+    workspace
+}
+
+/// Start `codanna serve --http --bind 127.0.0.1:0` rooted at `ws` directly
+/// (bypassing `discover_or_spawn`), so a test can control exactly when a
+/// backing server exists independent of a proxy's own spawn decision --
+/// needed by [`proxy_revive_respects_auto_spawn_disabled`], where the proxy
+/// itself must never be the one to spawn it.
+fn start_http_server(ws: &Path) -> Child {
+    let test_home = ws.join(".home");
+    std::fs::create_dir_all(&test_home).expect("create test home");
+
+    Command::new(codanna_binary())
+        .args(["serve", "--http", "--bind", "127.0.0.1:0"])
+        .current_dir(ws)
+        .env("HOME", &test_home)
+        .env("XDG_CONFIG_HOME", &test_home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn codanna serve --http")
+}
+
+/// Deadline-bounded wait for `<ws>/.codanna/serve.json` to exist at all,
+/// returning the converged record.
+fn wait_for_record(ws: &Path) -> codanna::serve_discovery::ServeRecord {
+    let codanna_dir = ws.join(".codanna");
+    wait_until(
+        || codanna::serve_discovery::read_record(&codanna_dir).is_some(),
+        DEADLINE,
+        "serve.json to exist",
+    );
+    codanna::serve_discovery::read_record(&codanna_dir)
+        .expect("serve.json should exist once wait_until above observed it")
+}
+
+/// THE PROXY-LEVEL REVIVE REGRESSION TEST.
+///
+/// Drives a single long-lived stdio client connection through a real
+/// `codanna serve --proxy` process: a first tool call proves the initial
+/// connection is live, then the backing `serve --http` process is SIGKILLed
+/// out from under it (skipping graceful shutdown, so `serve.json` is left
+/// stale -- the scenario `UpstreamHandle::revive` exists to recover from), and
+/// a second tool call is made ON THE SAME CLIENT CONNECTION. That second call
+/// must succeed transparently (one dead-transport failure, one revive, one
+/// retry -- see `DelegatingProxyHandler::delegate` in `src/mcp/proxy.rs`) and
+/// the backing server it lands on must be a genuinely new process.
+///
+/// Notification continuity after a revive (e.g. a `notifications/codanna/*`
+/// hot-reload signal still reaching the stdio client post-revive) is NOT
+/// exercised end-to-end here: reliably triggering a server-initiated custom
+/// notification from a fresh, just-revived backing server within this
+/// harness's deadline was impractical to wire up alongside the kill/respawn
+/// timing this test already needs. That continuity invariant is instead
+/// covered by the unit test `revive_preserves_downstream_state` in
+/// `src/mcp/proxy.rs`, which proves every dial (initial connect or later
+/// revive) reads the identical `state` `Arc`, rather than
+/// `NotificationRelay::default()`'s fresh, forever-undrained one.
+#[tokio::test]
+async fn proxy_revives_dead_upstream_mid_session() {
+    let workspace = prepare_workspace();
+    let _reaper = Reaper(workspace.path().to_path_buf());
+    let codanna_dir = workspace.path().join(".codanna");
+
+    let client = tokio::time::timeout(DEADLINE, connect_proxy_client(workspace.path()))
+        .await
+        .expect("proxy client should connect within the deadline");
+
+    // First call: proves the initial connection is live before anything is
+    // killed.
+    let tools_before = tokio::time::timeout(DEADLINE, client.list_tools(Default::default()))
+        .await
+        .expect("first list_tools should complete within the deadline")
+        .expect("first list_tools should succeed through the freshly-dialed upstream");
+    assert!(
+        !tools_before.tools.is_empty(),
+        "first list_tools should relay a non-empty tool list from the live upstream"
+    );
+
+    let record_before = codanna::serve_discovery::read_record(&codanna_dir)
+        .expect("serve.json should exist once the proxy has converged on a backing server");
+    let pid_before = record_before.pid;
+
+    // SIGKILL (not graceful shutdown) so the killed process cannot run its
+    // own `remove_record` cleanup: serve.json is left naming a now-dead pid,
+    // exactly the stale-record scenario `discover_or_spawn` (driven here via
+    // `UpstreamHandle::revive`) must recover from.
+    kill_pid(pid_before);
+    wait_until_dead_or_zombie(pid_before, DEADLINE);
+
+    // Second call, ON THE SAME CLIENT CONNECTION -- the proxy's stdio session
+    // is never restarted. The delegated call against the dead backing server
+    // observes a dead transport, `DelegatingProxyHandler::delegate` revives
+    // the upstream (respawning a fresh backing server, since the stale record
+    // is unusable), and the single retry succeeds -- transparently to this
+    // client.
+    let tools_after = tokio::time::timeout(DEADLINE, client.list_tools(Default::default()))
+        .await
+        .expect("second list_tools should complete within the deadline")
+        .expect(
+            "second list_tools should succeed after the proxy transparently revives its upstream",
+        );
+    assert!(
+        !tools_after.tools.is_empty(),
+        "second list_tools should relay a non-empty tool list from the revived upstream"
+    );
+
+    let record_after = codanna::serve_discovery::read_record(&codanna_dir)
+        .expect("serve.json should exist again after the proxy revived its upstream");
+    assert_ne!(
+        record_after.pid, pid_before,
+        "the revived backing server must be a genuinely new process, not the killed one"
+    );
+    assert!(
+        codanna::serve_discovery::pid_is_alive(record_after.pid),
+        "the revived backing server's recorded pid should actually be alive"
+    );
+
+    client
+        .cancel()
+        .await
+        .expect("proxy client should shut down cleanly");
+}
+
+/// THE AUTO-SPAWN-DISABLED REVIVE REGRESSION TEST.
+///
+/// With `[server] auto_spawn = false`, the FIRST call through the proxy must
+/// still succeed by discovering an already-live backing server started
+/// manually (discovery of a live record is not subject to the auto_spawn
+/// guard; only spawning a new one is -- see `discover_or_spawn`'s "Guard 2"
+/// in `src/serve_discovery.rs`). Once that backing server is killed, the
+/// SECOND call must fail with an actionable error naming auto-spawn as the
+/// fix, rather than silently spawning a server anyway or hanging.
+#[tokio::test]
+async fn proxy_revive_respects_auto_spawn_disabled() {
+    let workspace = prepare_workspace_with_auto_spawn_disabled();
+    let _reaper = Reaper(workspace.path().to_path_buf());
+
+    // Start the backing server manually: with `auto_spawn = false` the proxy
+    // itself would refuse to create one, so the first call below can only
+    // succeed by discovering this already-live process.
+    let mut http_server = start_http_server(workspace.path());
+    let record = wait_for_record(workspace.path());
+    let pid_before = record.pid;
+
+    let client = tokio::time::timeout(DEADLINE, connect_proxy_client(workspace.path()))
+        .await
+        .expect("proxy client should connect within the deadline");
+
+    let tools_before = tokio::time::timeout(DEADLINE, client.list_tools(Default::default()))
+        .await
+        .expect("first list_tools should complete within the deadline")
+        .expect("first list_tools should succeed against the manually-started backing server");
+    assert!(
+        !tools_before.tools.is_empty(),
+        "first list_tools should relay a non-empty tool list from the manually-started server"
+    );
+
+    kill_pid(pid_before);
+    wait_until_dead_or_zombie(pid_before, DEADLINE);
+    let _ = http_server.wait();
+
+    // The second call must fail with an actionable error, and must do so
+    // within the deadline rather than hanging or panicking -- a `delegate`
+    // that looped on `AutoSpawnDisabled` instead of surfacing it would hang
+    // here.
+    let second_call = tokio::time::timeout(DEADLINE, client.list_tools(Default::default()))
+        .await
+        .expect("second list_tools must not hang -- it should return promptly with an error");
+
+    let err = second_call.expect_err(
+        "second list_tools must fail once the backing server is dead and auto_spawn = false",
+    );
+    let message = format!("{err:?}").to_lowercase();
+    assert!(
+        message.contains("auto-spawn") || message.contains("auto_spawn"),
+        "the revive failure should name auto-spawn as the actionable fix, got: {err:?}"
+    );
+    let workspace_name = workspace
+        .path()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("temp workspace path should have a directory name")
+        .to_lowercase();
+    assert!(
+        message.contains(&workspace_name),
+        "the revive failure should name the workspace root, got: {err:?}"
+    );
+
+    // The proxy process itself must still be alive and responsive to a clean
+    // shutdown, not have panicked or wedged while handling the failed
+    // revive.
+    client
+        .cancel()
+        .await
+        .expect("proxy client should shut down cleanly even after a failed delegated call");
+}

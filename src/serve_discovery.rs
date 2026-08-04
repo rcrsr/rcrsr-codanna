@@ -44,12 +44,42 @@ impl ServeScheme {
 }
 
 /// Discovery record written to `.codanna/serve.json`.
+///
+/// `token` binds the record to the specific process launch that wrote it: a
+/// fresh random value generated once at server startup (see
+/// [`generate_launch_token`]) and echoed back verbatim by that same process's
+/// `/health` endpoint. `check_health` compares the two, so a `serve.json`
+/// naming a port that the real server never claimed -- written or raced into
+/// place by an unrelated local process -- fails the probe even if that
+/// process's cmdline and `/health` status both look plausible. `#[serde(default)]`
+/// lets a record written before this field existed still deserialize (as
+/// `None`), rather than erroring; `check_health` treats a missing token as an
+/// automatic reject, never as "trust it anyway" (see the rejection site).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServeRecord {
     pub pid: u32,
     pub port: u16,
     #[serde(default)]
     pub scheme: ServeScheme,
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
+/// Generate a fresh, unpredictable per-launch token for [`ServeRecord::token`].
+///
+/// Deliberately NOT derived from the pid, port, or anything else an observer
+/// could predict or reproduce -- the whole point is that a record naming a
+/// port this exact process launch did not open cannot also guess the token
+/// that launch's `/health` endpoint will echo. Uses the `rand` crate (already
+/// a dependency, see `src/init.rs`'s `ProjectId::new`) rather than adding a
+/// new one; 16 random bytes (128 bits) hex-encoded, the same width `ProjectId`
+/// uses.
+pub fn generate_launch_token() -> String {
+    use rand::RngExt;
+
+    let mut rng = rand::rng();
+    let random_bytes: [u8; 16] = rng.random();
+    hex::encode(random_bytes)
 }
 
 /// Errors from reading/writing the serve discovery record.
@@ -393,18 +423,37 @@ impl Drop for PidLockGuard {
     }
 }
 
-/// Best-effort HTTP health probe against `127.0.0.1:{port}/health`.
+/// Best-effort HTTP health probe against `127.0.0.1:{port}/health`, gated on
+/// the launch token echoed back in the response body matching
+/// `expected_token` (see [`ServeRecord::token`]).
 ///
-/// Scheme-aware: an `Http` record is probed with a raw `TcpStream` (this
-/// module only needs to know whether *some* response comes back promptly, not
-/// to parse a body); an `Https` record is probed through
-/// [`crate::serve_tls::pinned_client`], the SAME cert-pinning client used by
-/// `mcp::proxy` -- this is deliberately not a second, hand-rolled TLS path.
-/// Any connect/read/TLS failure or non-2xx status (including the client
-/// being unavailable, e.g. `HttpsSupportNotCompiled`) is treated as "not yet
+/// `expected_token: None` means `record.token` was absent -- either a legacy
+/// pre-token record or one written by a process that omitted the field. Both
+/// are rejected outright, with no network probe at all: accepting a tokenless
+/// record here would defeat the token check entirely, since an attacker
+/// wanting to bypass it would simply not write the field. Rejection is safe
+/// because [`discover_or_spawn`] falls through to its existing spawn path on
+/// an unhealthy record, bringing up a fresh backing server on a new port --
+/// self-healing, not a breaking migration for anyone upgrading from a
+/// pre-token `serve.json`.
+///
+/// Scheme-aware: an `Http` record is probed with a raw `TcpStream`, reading
+/// the full response (status line, headers, and body) so the echoed token in
+/// the body can be compared, not just the status line; an `Https` record is
+/// probed through [`crate::serve_tls::pinned_client`], the SAME cert-pinning
+/// client used by `mcp::proxy` -- this is deliberately not a second,
+/// hand-rolled TLS path. Any connect/read/TLS failure, non-2xx status
+/// (including the client being unavailable, e.g. `HttpsSupportNotCompiled`),
+/// or a body that does not match `expected_token` is treated as "not yet
 /// healthy" rather than an error, since this is called in a poll loop where
 /// transient failures during server startup are expected.
-async fn check_health(port: u16, scheme: ServeScheme) -> bool {
+async fn check_health(port: u16, scheme: ServeScheme, expected_token: Option<&str>) -> bool {
+    let Some(expected_token) = expected_token else {
+        // See the rejection-rationale doc comment above: a missing token is
+        // rejected unconditionally, never treated as "trust it anyway".
+        return false;
+    };
+
     match scheme {
         ServeScheme::Http => {
             let addr = format!("127.0.0.1:{port}");
@@ -425,19 +474,21 @@ async fn check_health(port: u16, scheme: ServeScheme) -> bool {
                 return false;
             }
 
-            // Read in a loop until the status line (terminated by "\r\n") has
-            // been fully received or the timeout budget expires -- a single
-            // `read` call is not guaranteed to return the whole status line
-            // under a fragmented delivery.
-            let mut buf = Vec::with_capacity(64);
-            let read_status_line = async {
-                let mut chunk = [0u8; 64];
+            // Read the full response -- status line, headers, and the body
+            // carrying the echoed token -- until the connection closes or the
+            // timeout budget expires. The response is small (a status line, a
+            // couple of headers, and a short hex token), so a bounded read
+            // (4 KiB) comfortably covers it without risking an unbounded read
+            // against a misbehaving peer.
+            let mut buf = Vec::with_capacity(256);
+            let read_response = async {
+                let mut chunk = [0u8; 256];
                 loop {
                     match stream.read(&mut chunk).await {
                         Ok(0) => break,
                         Ok(n) => {
                             buf.extend_from_slice(&chunk[..n]);
-                            if buf.windows(2).any(|w| w == b"\r\n") || buf.len() >= 256 {
+                            if buf.len() >= 4096 {
                                 break;
                             }
                         }
@@ -445,10 +496,19 @@ async fn check_health(port: u16, scheme: ServeScheme) -> bool {
                     }
                 }
             };
-            let _ = tokio::time::timeout(budget, read_status_line).await;
+            let _ = tokio::time::timeout(budget, read_response).await;
 
-            let status_line = String::from_utf8_lossy(&buf);
-            status_line.starts_with("HTTP/1.0 200") || status_line.starts_with("HTTP/1.1 200")
+            let response = String::from_utf8_lossy(&buf);
+            let status_ok =
+                response.starts_with("HTTP/1.0 200") || response.starts_with("HTTP/1.1 200");
+            if !status_ok {
+                return false;
+            }
+
+            match response.split_once("\r\n\r\n") {
+                Some((_, body)) => body.trim() == expected_token,
+                None => false,
+            }
         }
         ServeScheme::Https => {
             let Ok(client) = crate::serve_tls::pinned_client() else {
@@ -456,16 +516,71 @@ async fn check_health(port: u16, scheme: ServeScheme) -> bool {
             };
             let url = format!("https://127.0.0.1:{port}/health");
             match client.get(url).send().await {
-                Ok(response) => response.status().is_success(),
-                Err(_) => false,
+                Ok(response) if response.status().is_success() => match response.text().await {
+                    Ok(body) => body.trim() == expected_token,
+                    Err(_) => false,
+                },
+                _ => false,
             }
         }
     }
 }
 
+/// Read the current discovery record and return it only if it names a
+/// process this call can actually trust: a live, cmdline-plausible PID
+/// (`decide`) AND -- for `Http`-scheme records only -- a `/health` probe that
+/// echoes back the record's own launch token (`check_health`). `decide`
+/// alone is not sufficient for `Http`: see [`check_health`]'s doc comment for
+/// what a bare PID-and-cmdline check leaves open there -- a same-user process
+/// racing a plausible-looking record into place with the right argv but no
+/// way to reproduce the real server's per-launch token.
+///
+/// `Https`-scheme records deliberately skip the token probe and are trusted
+/// on `decide` alone, exactly as before this identity gate existed. Their
+/// identity is established out-of-band by the pinned certificate at the real
+/// connection site (`mcp::proxy::Dialer::connect`'s `Https` arm via
+/// `serve_tls::pinned_client`), matching the design already documented on
+/// `pid_looks_like_codanna_serve`. Running the token probe here too would be
+/// redundant at best -- and actively harmful at worst: `check_health`
+/// treats a failed probe as "not live", so a record whose backing server
+/// simply rotated its cert (a legitimate, non-malicious case the pinned
+/// client is designed to fail closed on, not paper over) would fall through
+/// to `spawn_detached`, which unconditionally spawns `--http` -- silently
+/// downgrading a rejected HTTPS connection into a plaintext one instead of
+/// surfacing the cert mismatch as the connection failure it should be.
+///
+/// Every "is there already a live server?" read in [`discover_or_spawn`]
+/// goes through this one function: the initial fast path, and the lock
+/// winner's post-acquire re-check. Both are re-entered on every `mcp::proxy`
+/// revive (via `Dialer::connect`'s repeated calls to `discover_or_spawn`), so
+/// re-verifying an `Http` record's token on every call -- not just once at
+/// proxy startup -- is what actually closes the window a dead backing server
+/// (or a malicious same-user process) would otherwise reopen on each revive.
+///
+/// Returns `None` on ANY failure to trust the record (no record, dead PID,
+/// implausible cmdline, or -- for `Http` only -- an unreachable `/health` or
+/// a token mismatch) so the caller always falls through to the guarded spawn
+/// path -- never an error -- matching `check_health`'s
+/// reject-tokenless-means-self-heal rationale.
+async fn discover_live(codanna_dir: &Path) -> Option<ServeRecord> {
+    let record = read_record(codanna_dir)?;
+    if decide(Some(&record)) != Decision::Discover {
+        return None;
+    }
+    if record.scheme == ServeScheme::Http
+        && !check_health(record.port, record.scheme, record.token.as_deref()).await
+    {
+        return None;
+    }
+    Some(record)
+}
+
 /// Poll `codanna_dir` for a discovery record whose PID is alive and whose
-/// `/health` endpoint responds, up to `timeout`. Used by both the lock
-/// winner (after spawning) and the lock loser (waiting on the winner).
+/// `/health` endpoint responds with the record's own launch token, up to
+/// `timeout`. Used by both the lock winner (after spawning) and the lock
+/// loser (waiting on the winner). The token check is what distinguishes the
+/// server this record actually names from any other process that happens to
+/// answer on that port -- see `check_health`.
 async fn wait_until_healthy(
     codanna_dir: &Path,
     lock_path: &Path,
@@ -477,7 +592,7 @@ async fn wait_until_healthy(
         if let Some(record) = read_record(codanna_dir) {
             if pid_is_alive(record.pid)
                 && pid_looks_like_codanna_serve(&record)
-                && check_health(record.port, record.scheme).await
+                && check_health(record.port, record.scheme, record.token.as_deref()).await
             {
                 return Ok(record);
             }
@@ -585,15 +700,41 @@ pub async fn discover_or_spawn(
 
     // Fast path: an already-live server, no lock needed.
     //
-    // Discovery is deliberately permissive: if a server is already serving this
-    // tree we attach to it regardless of the guards below. Those guards gate the
-    // decision to *create* a server, not the decision to *use* one.
-    if decide(read_record(&codanna_dir).as_ref()) == Decision::Discover {
-        // Safe to unwrap the option here only via re-match, not `.unwrap()`:
-        // `decide` returning `Discover` implies `Some` with a live PID.
-        if let Some(record) = read_record(&codanna_dir) {
-            return Ok(record);
-        }
+    // Discovery is deliberately permissive about WHICH server to attach to:
+    // if a server is already serving this tree we use it regardless of the
+    // creation guards below -- those gate the decision to *create* a server,
+    // not the decision to *use* one, and that stays true here.
+    //
+    // It is NOT permissive about IDENTITY for `Http`-scheme records.
+    // `discover_live` requires an `Http` record to pass the token-gated
+    // `check_health` probe (see its doc comment), not just `decide`'s
+    // live-PID-and-plausible-cmdline check, before this process ever attaches
+    // to it. Attaching to a server that proves -- via the probe -- that it is
+    // the exact launch which wrote the record is still "using", not
+    // "creating"; the probe is an identity check layered on top of the
+    // permissive-use policy, not a new creation guard. This runs on every
+    // call to `discover_or_spawn`, including every `mcp::proxy` revive via
+    // `Dialer::connect`, so an `Http` `serve.json` naming a port this exact
+    // launch never claimed is never silently trusted no matter how many
+    // times or how long after startup it is re-read. An `Http` record that
+    // fails the probe (bad token, tokenless, or simply unreachable) is
+    // treated exactly like "no live server" and falls through to the guarded
+    // spawn path below -- self-healing rather than an error, matching
+    // `check_health`'s reject-tokenless rationale.
+    //
+    // `Https`-scheme records deliberately skip this probe -- see
+    // `discover_live`'s doc comment for why folding them in here would
+    // silently downgrade a legitimate cert-mismatch/rotation into a
+    // plaintext `--http` respawn instead of the TLS connection failure it
+    // should surface as.
+    //
+    // For `Http` records the probe is a loopback round trip within the same
+    // 500ms budget `check_health` already uses, so it adds real (if small)
+    // latency to every proxy startup and every revive, not just to the
+    // spawn-wait loop it originally guarded -- accepted here as the cost of
+    // actually closing the identity gap, not an oversight.
+    if let Some(record) = discover_live(&codanna_dir).await {
+        return Ok(record);
     }
 
     // From here on the only way forward is to spawn (or to wait on a peer that
@@ -627,11 +768,11 @@ pub async fn discover_or_spawn(
     match PidLockGuard::acquire(&lock_path) {
         Ok(_guard) => {
             // WINNER. Re-check: another process may have finished spawning
-            // between our fast-path read and winning the lock.
-            if decide(read_record(&codanna_dir).as_ref()) == Decision::Discover {
-                if let Some(record) = read_record(&codanna_dir) {
-                    return Ok(record);
-                }
+            // between our fast-path read and winning the lock. Same identity
+            // gate as the fast path above (`discover_live`, not bare
+            // `decide`) -- see that comment for why.
+            if let Some(record) = discover_live(&codanna_dir).await {
+                return Ok(record);
             }
 
             spawn_detached(workspace_root, original_config_path)?;
@@ -656,9 +797,37 @@ pub async fn discover_or_spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
+    use std::io::{Read, Write};
     use std::net::TcpListener;
     use tempfile::TempDir;
+
+    /// Spawns a background thread serving `/health` on an OS-assigned
+    /// loopback port, answering every accepted connection with a plaintext
+    /// 200 whose body is `token`. Returns the bound port.
+    ///
+    /// Established by `http_health_probe_rejects_token_mismatch` and reused
+    /// here by every `discover_or_spawn` fast-path test that needs a REAL
+    /// listener behind the recorded port -- not just a live PID -- now that
+    /// the fast path runs the token-gated `check_health` probe. The thread is
+    /// deliberately not joined: it keeps accepting connections for the life
+    /// of the test process, and the OS reclaims the socket on exit.
+    fn spawn_health_listener(token: &str) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let token = token.to_string();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut stream = stream;
+                let mut buf = [0u8; 512];
+                let _ = stream.read(&mut buf);
+                let body = token.as_bytes();
+                let header = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+        port
+    }
 
     /// Spawns a short-lived process whose cmdline contains "codanna", "serve"
     /// and "--http" tokens, satisfying `pid_looks_like_codanna_serve` without
@@ -743,6 +912,7 @@ mod tests {
             pid: std::process::id(),
             port: 8080,
             scheme: ServeScheme::Http,
+            token: None,
         };
 
         write_record(dir.path(), &record).expect("write_record should succeed");
@@ -762,6 +932,7 @@ mod tests {
             pid: std::process::id(),
             port: 9090,
             scheme: ServeScheme::Http,
+            token: None,
         };
 
         write_record(dir.path(), &record).expect("write_record should succeed");
@@ -792,7 +963,8 @@ mod tests {
     #[tokio::test]
     async fn discover_or_spawn_returns_live_record_without_spawning() {
         // Given a workspace with a serve.json whose PID is a live process
-        // whose cmdline matches a codanna HTTP serve process,
+        // whose cmdline matches a codanna HTTP serve process AND whose
+        // recorded port answers `/health` with the record's own token,
         // discover_or_spawn must return it directly. If it instead fell
         // through to spawning, this test would hang (or fail) trying to
         // launch a real `codanna serve` child, since `current_exe()` in a
@@ -800,10 +972,13 @@ mod tests {
         let mut fake_server = spawn_fake_http_serve_process();
         let workspace = TempDir::new().unwrap();
         let codanna_dir = workspace.path().join(crate::init::local_dir_name());
+        let token = "fast-path-token-1";
+        let port = spawn_health_listener(token);
         let record = ServeRecord {
             pid: fake_server.id(),
-            port: 12345,
+            port,
             scheme: ServeScheme::Http,
+            token: Some(token.to_string()),
         };
         write_record(&codanna_dir, &record).expect("write_record should succeed");
         wait_until_decide_ready(&record);
@@ -817,6 +992,62 @@ mod tests {
         assert_eq!(discovered.port, record.port);
         // No lock should have been created on the fast path.
         assert!(!codanna_dir.join("http.lock").exists());
+        let _ = fake_server.kill();
+        let _ = fake_server.wait();
+    }
+
+    /// THE FAST-PATH REGRESSION TEST FOR THE REPORTED VULNERABILITY.
+    ///
+    /// A `serve.json` naming a live, cmdline-plausible PID is NOT enough for
+    /// `discover_or_spawn`'s fast path to trust it: the recorded port must
+    /// also answer `/health` with the record's own token. This models a
+    /// same-user process racing a plausible-looking record into place --
+    /// argv containing "codanna" and "serve", a live PID -- but unable to
+    /// reproduce the real server's per-launch secret. Before `check_health`
+    /// was wired into the fast path (as opposed to only `wait_until_healthy`)
+    /// this record would have been returned as-is, no probe at all.
+    ///
+    /// `auto_spawn = false` on a genuinely configured tree isolates the
+    /// assertion: if the fast path wrongly trusted the mismatched-token
+    /// record, this returns `Ok(record)`; if it correctly falls through, the
+    /// auto_spawn guard fires with an actionable error instead of attempting
+    /// to spawn a real `codanna` binary the test harness does not have.
+    #[tokio::test]
+    async fn fast_path_rejects_live_record_with_wrong_token() {
+        let mut fake_server = spawn_fake_http_serve_process();
+        let workspace = TempDir::new().unwrap();
+        let codanna_dir = workspace.path().join(crate::init::local_dir_name());
+        std::fs::create_dir_all(&codanna_dir).unwrap();
+        std::fs::write(codanna_dir.join("settings.toml"), "").unwrap();
+
+        let real_port = spawn_health_listener("real-launch-token");
+        let record = ServeRecord {
+            pid: fake_server.id(),
+            port: real_port,
+            scheme: ServeScheme::Http,
+            token: Some("attacker-guessed-wrong".to_string()),
+        };
+        write_record(&codanna_dir, &record).expect("write_record should succeed");
+        wait_until_decide_ready(&record);
+
+        let mut settings = Settings::default();
+        settings.server.auto_spawn = false;
+
+        let err = discover_or_spawn(workspace.path(), &settings, None)
+            .await
+            .expect_err(
+                "a record whose token does not match what /health echoes must never be \
+                 returned by the fast path",
+            );
+
+        match err {
+            DiscoveryError::AutoSpawnDisabled { .. } => {}
+            other => panic!(
+                "expected AutoSpawnDisabled (proving the fast path correctly fell through \
+                 instead of trusting the mismatched-token record), got: {other:?}"
+            ),
+        }
+
         let _ = fake_server.kill();
         let _ = fake_server.wait();
     }
@@ -881,10 +1112,13 @@ mod tests {
         let mut fake_server = spawn_fake_http_serve_process();
         let workspace = TempDir::new().unwrap();
         let codanna_dir = workspace.path().join(crate::init::local_dir_name());
+        let token = "fast-path-token-2";
+        let port = spawn_health_listener(token);
         let record = ServeRecord {
             pid: fake_server.id(),
-            port: 12345,
+            port,
             scheme: ServeScheme::Http,
+            token: Some(token.to_string()),
         };
         write_record(&codanna_dir, &record).expect("write_record should succeed");
         wait_until_decide_ready(&record);
@@ -1033,6 +1267,7 @@ mod tests {
             pid: 0,
             port: 8080,
             scheme: ServeScheme::Http,
+            token: None,
         };
         assert!(!pid_is_alive(0), "PID 0 must read as dead for this test");
 
@@ -1047,6 +1282,7 @@ mod tests {
             pid: fake_server.id(),
             port: 8080,
             scheme: ServeScheme::Http,
+            token: None,
         };
         wait_until_decide_ready(&live);
         assert_eq!(decide(Some(&live)), Decision::Discover);
@@ -1067,6 +1303,7 @@ mod tests {
             pid: fake_server.id(),
             port: 8080,
             scheme: ServeScheme::Http,
+            token: None,
         };
         wait_until_decide_ready(&live);
         assert_eq!(decide(Some(&live)), Decision::Discover);
@@ -1141,10 +1378,13 @@ mod tests {
         let resolved_root = resolve_workspace_root(&settings).unwrap();
         let codanna_dir = discovery_dir(&resolved_root);
 
+        let token = "fast-path-token-3";
+        let port = spawn_health_listener(token);
         let record = ServeRecord {
             pid: fake_server.id(),
-            port: 12345,
+            port,
             scheme: ServeScheme::Http,
+            token: Some(token.to_string()),
         };
         write_record(&codanna_dir, &record).expect("write_record should succeed");
         wait_until_decide_ready(&record);
@@ -1196,6 +1436,7 @@ mod tests {
             pid: std::process::id(),
             port: 8443,
             scheme: ServeScheme::Https,
+            token: None,
         };
 
         write_record(dir.path(), &record).expect("write_record should succeed");
@@ -1224,29 +1465,31 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
 
-        // The listener must serve a genuine plaintext 200 -- the same shape
+        // The listener must serve a genuine plaintext 200 carrying the
+        // expected token in its body -- the same shape
         // `http_health_probe_still_succeeds` relies on. A listener that merely
         // accepted and dropped the connection would make this test vacuous:
         // the plaintext probe would report unhealthy against it too, so the
         // assertion below would hold even if the `Https` arm were wired back
-        // to the plaintext probe. Answering 200 is what gives it teeth -- the
-        // plaintext probe reports *healthy* here, so only a real TLS handshake
-        // (which a plaintext peer cannot complete) yields the expected `false`.
+        // to the plaintext probe. Answering 200 with a matching body is what
+        // gives it teeth -- the plaintext probe reports *healthy* here, so
+        // only a real TLS handshake (which a plaintext peer cannot complete)
+        // yields the expected `false`.
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 let mut stream = stream;
                 let mut buf = [0u8; 512];
                 let _ = stream.read(&mut buf);
-                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\ntoken");
             }
         });
 
-        assert!(!check_health(port, ServeScheme::Https).await);
+        assert!(!check_health(port, ServeScheme::Https, Some("token")).await);
     }
 
-    /// Guards the untouched `Http` arm: a trivial plaintext 200 response
-    /// must still be recognized as healthy after the scheme-aware,
-    /// async conversion.
+    /// Guards the untouched `Http` arm: a plaintext 200 response whose body
+    /// echoes the expected token must still be recognized as healthy after
+    /// the scheme-aware, token-checking, async conversion.
     #[tokio::test]
     async fn http_health_probe_still_succeeds() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1256,10 +1499,41 @@ mod tests {
             if let Ok((mut stream, _)) = listener.accept() {
                 let mut buf = [0u8; 512];
                 let _ = stream.read(&mut buf);
-                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nsecret-42");
             }
         });
 
-        assert!(check_health(port, ServeScheme::Http).await);
+        assert!(check_health(port, ServeScheme::Http, Some("secret-42")).await);
+    }
+
+    /// A record whose token does not match what `/health` actually echoes
+    /// must be rejected -- this is the core of the fix: a plausible-looking
+    /// listener that cannot reproduce the real server's per-launch token
+    /// fails the probe even though it answers 200 promptly.
+    #[tokio::test]
+    async fn http_health_probe_rejects_token_mismatch() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 512];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nattackers");
+            }
+        });
+
+        assert!(!check_health(port, ServeScheme::Http, Some("secret-42")).await);
+    }
+
+    /// A tokenless (legacy pre-token, or deliberately omitted) record is
+    /// rejected unconditionally -- see the rejection-rationale doc comment on
+    /// `check_health`. No listener is bound: rejection must happen before any
+    /// network probe, so this test would hang/fail on a real connection
+    /// attempt if that guard regressed.
+    #[tokio::test]
+    async fn tokenless_record_is_rejected_without_probing() {
+        assert!(!check_health(0, ServeScheme::Http, None).await);
+        assert!(!check_health(0, ServeScheme::Https, None).await);
     }
 }

@@ -280,7 +280,15 @@ The backing server is started as a detached background process and keeps running
 after the clients disconnect, so the next client reattaches to the warm index
 instead of paying startup again. By default it stays up until you stop it (or the
 host reboots); set `idle_shutdown_minutes` (see below) to have it exit on its own
-after a spell of inactivity — the next tool call transparently respawns it.
+after a spell of inactivity.
+
+A `codanna serve --proxy` process that is already running and connected does
+not need to be restarted when its backing server goes away (idle shutdown, a
+crash, a manual kill): the NEXT tool call over that same connection notices the
+upstream connection is dead and transparently revives it (rediscovering or
+respawning a backing server, then retrying the call once) before the client
+sees any error. See [Upstream revival](#upstream-revival) below for exactly
+what that does and does not cover.
 
 ### Idle shutdown
 
@@ -296,14 +304,82 @@ By default a backing server runs indefinitely, so every workspace you touch
 accumulates a resident process. Set `idle_shutdown_minutes` in `[server]` to a
 non-zero value and the (`--http`) server exits cleanly after that many minutes
 with no MCP request activity, removing its `.codanna/serve.json` record exactly
-as a Ctrl+C shutdown does. The next tool call through the proxy finds no record
-and auto-spawns a fresh server (paying only startup latency), so idle shutdown
-is transparent to clients.
+as a Ctrl+C shutdown does. The next tool call through a proxy connection finds
+no record and auto-spawns a fresh server (paying only startup latency); on an
+already-connected proxy that is exactly the same [upstream revival](#upstream-revival)
+path any other dead-transport failure goes through, so idle shutdown is
+transparent to clients either way.
 
 Only real inbound MCP requests count as activity — SSE keep-alive pings do not
 reset the idle clock, so a merely *connected* client does not keep the server
 alive forever. The default is `0` (never shut down), preserving upstream
 behavior.
+
+### Upstream revival
+
+A live `codanna serve --proxy` process holds one connection to its backing
+server for as long as it runs. If that connection dies (the backing server was
+idle-shut-down, crashed, or was killed) it is not detected until the NEXT tool
+call is delegated to it — the proxy does not poll or health-check its upstream
+in the background. That next call observes the dead connection, transparently
+re-runs the same discover-or-spawn logic used at proxy startup (reusing an
+already-live backing server if one now exists, or spawning a fresh one), and
+retries the call exactly once against the revived connection before returning
+a result to the client.
+
+This has real limits, worth knowing before you rely on it:
+
+- **Exactly one retry.** If the revived connection also fails, the error is
+  returned to the client as-is — there is no loop and no backoff. A second
+  failure back-to-back means the backing server is not coming up, not that it
+  needs another attempt.
+- **Single-flight per proxy process, including on failure.** If several
+  requests hit the dead connection concurrently, only one of them actually
+  dials a new backing server; the rest wait for that dial and reuse its
+  result rather than each spawning their own. This holds whether the dial
+  succeeds or fails — a failed dial is cached for the round too, so the
+  waiters get the same error back instead of each re-dialing (and, with
+  `auto_spawn` on, each paying a full spawn-and-health-check timeout back to
+  back).
+- **Revival is never attempted on a timeout.** A backing server that is simply
+  slow to respond (a large reindex, for example) is not treated as dead and is
+  not replaced — only a genuinely closed/broken transport triggers a revive.
+  Spawning a second server underneath a merely-slow one would be strictly
+  worse than waiting.
+- **`auto_spawn = false` fails closed, not silently.** If no live backing
+  server can be discovered and the proxy is not allowed to spawn one, the
+  delegated call fails with an actionable error naming the workspace and
+  pointing at `codanna serve --http --watch` / `auto_spawn = true` — the same
+  message `discover_or_spawn` already gives a proxy at cold start, not a
+  generic "delegation failed".
+- **No background health checks.** The proxy never polls its upstream on its
+  own; revival only ever happens as a side effect of a real client request
+  hitting a dead connection.
+
+### Discovery record identity
+
+`discover_or_spawn` no longer trusts a `.codanna/serve.json` record naming an
+`--http` backing server just because its PID is alive and looks like a
+`codanna serve` process. Each `--http` server now writes a fresh, random
+per-launch token into the record and echoes it back from `/health`; discovery
+re-verifies that token on every read, not just once at proxy startup — the
+fast path and the spawn-wait loop both check it, so it also applies on every
+revive. A record whose token does not match, or that has no token at all
+(written by a codanna binary older than this change), is treated the same as
+"no live server": discovery falls through to spawning a fresh one on a new
+port. This hardens `serve --proxy` against a same-user local process that
+races a plausible-looking record into place pointing at its own loopback
+listener. `--https` records are not probed this way — their identity already
+rests on the pinned certificate checked at the real connection site, and
+probing them here would fall through to spawning `--http` on a rejection,
+silently downgrading a rejected TLS connection to plaintext.
+
+One practical consequence: a backing server started by an older codanna
+binary (no token support) is no longer discovered by a proxy running this
+version — the proxy ignores that record and spawns its own server on a new
+port instead of attaching to the old one. This is self-healing and requires
+no manual migration, but it does mean an extra resident process until the
+stale one is stopped or idles out (see [Idle shutdown](#idle-shutdown)).
 
 ### Configuration
 

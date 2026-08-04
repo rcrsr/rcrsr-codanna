@@ -135,8 +135,16 @@ impl FileOutlineEntry {
     }
 }
 
-/// Successful `read_symbol` payload: the exact source span plus enough
+/// Successful `read_symbol` payload: the symbol's full-line source span
+/// (declaration's first line through its last, byte 0 to end) plus enough
 /// metadata to identify what was read without a second `find_symbol` call.
+///
+/// Note on `symbol.range.start_column` (not a field here, but consulted
+/// when deriving `source`): it describes the column of the declaration
+/// keyword itself (e.g. `class`, `def`), NOT where `source` begins.
+/// `source` always starts at byte 0 of the declaration's first line —
+/// see [`extract_span`]'s doc comment for why, and the trade-offs that
+/// choice implies.
 #[derive(Debug, Clone, Serialize)]
 struct ReadSymbolData {
     location: String,
@@ -171,20 +179,41 @@ enum ReadSymbolOutcome {
     },
 }
 
-/// Slice a single source line by byte column, defensively clamping to the
-/// line's byte length and falling back to a lossy UTF-8 decode rather than
-/// panicking if a column ever lands off a char boundary.
-fn slice_line_bytes(line: &str, start: usize, end: Option<usize>) -> String {
+/// Slice a single source line from byte 0 up to `end`, defensively clamping
+/// to the line's byte length and falling back to a lossy UTF-8 decode
+/// rather than panicking if `end` ever lands off a char boundary.
+fn slice_line_bytes(line: &str, end: Option<usize>) -> String {
     let bytes = line.as_bytes();
-    let start = start.min(bytes.len());
-    let end = end.unwrap_or(bytes.len()).clamp(start, bytes.len());
-    String::from_utf8_lossy(&bytes[start..end]).into_owned()
+    let end = end.unwrap_or(bytes.len()).min(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
-/// Extract the exact source text covered by `range`, slicing by the
+/// Extract the source text covered by `range`, slicing by the
 /// Range's LINE and COLUMN numbers (never a byte offset into the whole
 /// file) — the file is split into lines first, then each boundary line is
-/// sliced by its own byte-column.
+/// sliced by its own byte-column. The first line (single-line or
+/// multi-line) is always sliced starting at byte 0, the same convention
+/// already used for interior lines and the last line; `range.start_column`
+/// is not consulted at all — only `end_column` bounds the first line
+/// (single-line case) or the last line.
+///
+/// Two accepted trade-offs follow from that fixed rule:
+///
+/// 1. Leading indentation is now included on the first line, since it sits
+///    to the left of `start_column` but slicing from byte 0 is the same
+///    convention interior lines already used. A Python method now returns
+///    `"    def m(self):\n        pass"` instead of
+///    `"def m(self):\n        pass"` — more correct (consistent with
+///    interior lines) but a visible change for every indented symbol in
+///    every language, and far more common than the export-modifier case
+///    below.
+/// 2. A symbol whose declaration does not begin its own line absorbs the
+///    preceding text of that line. `export class A {} export class B {}`
+///    read for `B` yields the whole line, not just `class B {}`. This is
+///    an unavoidable consequence of always slicing the first line from
+///    byte 0 rather than reconstructing "the start of the statement"; it
+///    is documented here as a known limit rather than papered over with a
+///    language-specific heuristic.
 fn extract_span(content: &str, range: &crate::types::Range) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let start_line = range.start_line as usize;
@@ -197,14 +226,10 @@ fn extract_span(content: &str, range: &crate::types::Range) -> String {
     }
 
     if start_line == end_line {
-        return slice_line_bytes(
-            lines[start_line],
-            range.start_column as usize,
-            Some(range.end_column as usize),
-        );
+        return slice_line_bytes(lines[start_line], Some(range.end_column as usize));
     }
 
-    let mut result = slice_line_bytes(lines[start_line], range.start_column as usize, None);
+    let mut result = slice_line_bytes(lines[start_line], None);
     result.push('\n');
     for line in &lines[start_line + 1..end_line] {
         result.push_str(line);
@@ -212,7 +237,6 @@ fn extract_span(content: &str, range: &crate::types::Range) -> String {
     }
     result.push_str(&slice_line_bytes(
         lines[end_line],
-        0,
         Some(range.end_column as usize),
     ));
     result
@@ -243,7 +267,7 @@ fn resolve_symbol_read_target(
     Ok((full_path, indexed_hash))
 }
 
-/// Read a symbol's exact source span from disk, guarded by a staleness
+/// Read a symbol's full-line source span from disk, guarded by a staleness
 /// check against the indexed file hash (W-3's `get_file_hash_for_path`
 /// facade accessor, which delegates to `DocumentIndex::get_file_info` ->
 /// `query.rs`; this function never builds its own Tantivy query).
@@ -1346,7 +1370,7 @@ impl CodeIntelligenceServer {
     }
 
     #[tool(
-        description = "Read a symbol's exact source span (sliced by line/column, not byte offset), plus kind/signature/visibility metadata. Refuses to return a span if the file has changed on disk since indexing (staleness guard via SHA256 hash comparison) since the recorded line/column range may no longer match the current file."
+        description = "Read a symbol's source span from disk — full lines from the declaration's first line through its last, so leading indentation and any modifiers on the first line are included. Refuses to return a span if the file has changed on disk since indexing (staleness guard via SHA256 hash comparison) since the recorded line/column range may no longer match the current file."
     )]
     pub async fn read_symbol(
         &self,
