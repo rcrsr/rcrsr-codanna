@@ -1,8 +1,8 @@
 {
   "version": 3,
-  "pluginVersion": "1.54.3",
+  "pluginVersion": "1.55.0",
   "conductProjectPath": "${CONDUCT_PROJECT_ROOT}/rcrsr-codanna",
-  "updated": "2026-07-14T00:15:03.168Z",
+  "updated": "2026-08-04T05:18:40.859Z",
   "domains": {
     "CDNA": {
       "name": "Codanna",
@@ -29,7 +29,8 @@
     "RS": {
       "type": "generic",
       "name": "Rust",
-      "policy": "policy-artifact-rust.md"
+      "policy": "policy-artifact-rust.md",
+      "extensions": []
     }
   },
   "products": {},
