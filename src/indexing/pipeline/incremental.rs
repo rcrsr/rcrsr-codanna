@@ -534,6 +534,7 @@ impl Pipeline {
                 let stats = cleanup_stage.cleanup_files(&discover_result.deleted_files)?;
                 cleanup_stats.files_cleaned += stats.files_cleaned;
                 cleanup_stats.symbols_removed += stats.symbols_removed;
+                cleanup_stats.embeddings_removed += stats.embeddings_removed;
                 deleted_symbols = stats.symbols_removed;
             }
             // Relocation cleanup runs BEFORE the modified capture: edges
@@ -547,6 +548,7 @@ impl Pipeline {
                 )?;
                 cleanup_stats.files_cleaned += stats.files_cleaned;
                 cleanup_stats.symbols_removed += stats.symbols_removed;
+                cleanup_stats.embeddings_removed += stats.embeddings_removed;
                 captured_inbound.extend(captured);
             }
             if !discover_result.modified_files.is_empty() {
@@ -554,6 +556,7 @@ impl Pipeline {
                     cleanup_stage.cleanup_files_for_reindex(&discover_result.modified_files)?;
                 cleanup_stats.files_cleaned += stats.files_cleaned;
                 cleanup_stats.symbols_removed += stats.symbols_removed;
+                cleanup_stats.embeddings_removed += stats.embeddings_removed;
                 captured_inbound.extend(captured);
             }
 

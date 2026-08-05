@@ -687,7 +687,22 @@ impl ServerHandler for DelegatingProxyHandler {
         // `ServerInfo` rather than cloned wholesale.
         match self.upstream.current().0.peer_info() {
             Some(peer) => {
-                let info = ServerInfo::new(peer.capabilities.clone()).with_server_info(
+                // `resources.subscribe = true` advertises support for the
+                // 2026-07-28 `subscriptions/listen` request, which this
+                // handler cannot honor: it overrides neither
+                // `accepted_subscription_filter` nor `listen`, so the SDK's
+                // default implementation rejects every such request with
+                // `method_not_found` regardless of what capabilities claim.
+                // Strip the flag so advertised capabilities never promise
+                // more than the proxy actually serves; the legacy
+                // `resources/subscribe`/`unsubscribe` RPCs (forwarded above
+                // in `subscribe`/`unsubscribe`) are unaffected by this field
+                // and keep working for peers that call them directly.
+                let mut capabilities = peer.capabilities.clone();
+                if let Some(resources) = capabilities.resources.as_mut() {
+                    resources.subscribe = None;
+                }
+                let info = ServerInfo::new(capabilities).with_server_info(
                     peer.server_info.clone().unwrap_or_else(|| {
                         Implementation::new("codanna-proxy", env!("CARGO_PKG_VERSION"))
                     }),
