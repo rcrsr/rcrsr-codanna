@@ -19,6 +19,7 @@ use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::config::Settings;
+pub use crate::io::process::pid_is_alive;
 
 /// Scheme of the backing MCP server named by a [`ServeRecord`].
 ///
@@ -243,19 +244,6 @@ pub fn read_record(codanna_dir: &Path) -> Option<ServeRecord> {
 /// meaningful to do about a failed removal.
 pub fn remove_record(codanna_dir: &Path) {
     let _ = std::fs::remove_file(record_path(codanna_dir));
-}
-
-/// Check whether a process with the given PID is currently alive.
-pub fn pid_is_alive(pid: u32) -> bool {
-    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
-    let mut sys = System::new();
-    let pid = Pid::from_u32(pid);
-    sys.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[pid]),
-        true,
-        ProcessRefreshKind::nothing(),
-    );
-    sys.process(pid).is_some()
 }
 
 /// Decision produced by inspecting the current discovery record: whether an
