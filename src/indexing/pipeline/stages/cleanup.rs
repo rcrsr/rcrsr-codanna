@@ -14,7 +14,8 @@ use crate::indexing::pipeline::types::{PipelineError, PipelineResult};
 use crate::relationship::{RelationKind, Relationship};
 use crate::semantic::SimpleSemanticSearch;
 use crate::storage::DocumentIndex;
-use crate::types::{SymbolId, SymbolKind};
+use crate::types::{FileId, SymbolId, SymbolKind};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -51,6 +52,8 @@ pub(crate) fn inbound_caller_files(
 ) -> PipelineResult<Vec<PathBuf>> {
     let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     let mut callers = Vec::new();
+    let mut symbol_file: HashMap<SymbolId, Option<FileId>> = HashMap::new();
+    let mut file_path: HashMap<FileId, Option<PathBuf>> = HashMap::new();
     for path in paths {
         let path_str = path.to_string_lossy();
         let Some((file_id, _hash, _mtime)) = index.get_file_info(&path_str)? else {
@@ -59,13 +62,30 @@ pub(crate) fn inbound_caller_files(
         for symbol in index.find_symbols_by_file(file_id)? {
             for kind in ALL_RELATION_KINDS {
                 for (from, _to, _rel) in index.get_relationships_to(symbol.id, kind)? {
-                    let Some(from_symbol) = index.find_symbol_by_id(from)? else {
+                    let from_file_id = match symbol_file.get(&from) {
+                        Some(cached) => *cached,
+                        None => {
+                            let resolved = index
+                                .find_symbol_by_id(from)?
+                                .map(|from_symbol| from_symbol.file_id);
+                            symbol_file.insert(from, resolved);
+                            resolved
+                        }
+                    };
+                    let Some(from_file_id) = from_file_id else {
                         continue;
                     };
-                    let Some(from_path) = index.get_file_path(from_symbol.file_id)? else {
+                    let from_path = match file_path.get(&from_file_id) {
+                        Some(cached) => cached.clone(),
+                        None => {
+                            let resolved = index.get_file_path(from_file_id)?.map(PathBuf::from);
+                            file_path.insert(from_file_id, resolved.clone());
+                            resolved
+                        }
+                    };
+                    let Some(from_path) = from_path else {
                         continue;
                     };
-                    let from_path = PathBuf::from(from_path);
                     if in_run.contains(&from_path) || !seen.insert(from_path.clone()) {
                         continue;
                     }
