@@ -752,10 +752,9 @@ impl ServerHandler for DelegatingProxyHandler {
     ) -> Result<CallToolResponse, McpError> {
         self.delegate(|up| {
             let request = request.clone();
-            async move { up.call_tool(request).await }
+            async move { up.call_tool_once(request).await }
         })
         .await
-        .map(Into::into)
     }
 
     async fn list_resources(
@@ -789,10 +788,9 @@ impl ServerHandler for DelegatingProxyHandler {
     ) -> Result<ReadResourceResponse, McpError> {
         self.delegate(|up| {
             let request = request.clone();
-            async move { up.read_resource(request).await }
+            async move { up.read_resource_once(request).await }
         })
         .await
-        .map(Into::into)
     }
 
     async fn list_prompts(
@@ -814,10 +812,9 @@ impl ServerHandler for DelegatingProxyHandler {
     ) -> Result<GetPromptResponse, McpError> {
         self.delegate(|up| {
             let request = request.clone();
-            async move { up.get_prompt(request).await }
+            async move { up.get_prompt_once(request).await }
         })
         .await
-        .map(Into::into)
     }
 
     async fn complete(
@@ -947,9 +944,13 @@ pub async fn serve_proxy(
         state,
     };
 
-    use rmcp::transport::stdio;
+    let discover_result = serde_json::to_value(rmcp::model::DiscoverResult::from_server_info(
+        handler.supported_protocol_versions().into_owned(),
+        handler.get_info(),
+    ))
+    .expect("DiscoverResult serializes: closed struct of strings and maps");
     let service = handler
-        .serve(stdio())
+        .serve(crate::mcp::probe_tolerant_stdio(discover_result))
         .await
         .map_err(|e| ProxyError::Stdio(e.to_string()))?;
 

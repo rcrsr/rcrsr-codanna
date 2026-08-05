@@ -23,6 +23,7 @@ pub mod http_server;
 pub mod https_server;
 pub mod notifications;
 pub(crate) mod paths;
+mod probe_stdio;
 pub mod proxy;
 pub mod requests;
 pub mod server;
@@ -30,6 +31,7 @@ pub mod service;
 pub mod stale_server;
 pub mod tools;
 
+pub(crate) use probe_stdio::probe_tolerant_stdio;
 pub use proxy::{ProxyError, ProxyResult, serve_proxy};
 pub use requests::*;
 pub use server::{CodeIntelligenceServer, format_relative_time};
