@@ -232,10 +232,15 @@ fn http_request(
 /// stripping the hex chunk-size lines. Stops at the terminating `0` chunk
 /// or once the input is exhausted (a body cut short by the read loop).
 fn dechunk(body: &str) -> String {
-    let mut out = String::new();
-    let mut rest = body;
-    while let Some((size_line, after)) = rest.split_once("\r\n") {
-        let size_hex = size_line.split(';').next().unwrap_or("").trim();
+    let mut out: Vec<u8> = Vec::new();
+    let mut rest: &[u8] = body.as_bytes();
+    while let Some(pos) = rest.windows(2).position(|w| w == b"\r\n") {
+        let size_line = &rest[..pos];
+        let after = &rest[pos + 2..];
+        let Ok(size_str) = std::str::from_utf8(size_line) else {
+            break;
+        };
+        let size_hex = size_str.split(';').next().unwrap_or("").trim();
         let Ok(size) = usize::from_str_radix(size_hex, 16) else {
             break;
         };
@@ -244,13 +249,15 @@ fn dechunk(body: &str) -> String {
         }
         if after.len() < size {
             // Truncated final chunk: keep what arrived.
-            out.push_str(after);
+            out.extend_from_slice(after);
             break;
         }
-        out.push_str(&after[..size]);
-        rest = after[size..].strip_prefix("\r\n").unwrap_or(&after[size..]);
+        out.extend_from_slice(&after[..size]);
+        rest = after[size..]
+            .strip_prefix(b"\r\n")
+            .unwrap_or(&after[size..]);
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// ASCII-case-insensitive header lookup preserving the value's case.

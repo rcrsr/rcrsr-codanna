@@ -153,7 +153,7 @@ stdio_session "$WS_FRESH" "$A1" <<EOF
 {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_index_info","arguments":{}}}
 EOF
 
-if assert_jsonl "$A1" 'by_id[1]["result"]["serverInfo"]["name"] and len(by_id[2]["result"]["tools"]) == 9 and by_id[3]["result"]["content"][0]["text"]'; then
+if assert_jsonl "$A1" 'by_id[1]["result"]["serverInfo"]["name"] and len(by_id[2]["result"]["tools"]) == 13 and by_id[3]["result"]["content"][0]["text"]'; then
     pass "stdio x legacy x fresh"
 else
     fail "stdio x legacy x fresh" "handshake/list/call assertions (see $A1)"
@@ -171,7 +171,7 @@ stdio_session "$WS_FRESH" "$A2" <<EOF
 {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"_meta":$META,"name":"get_index_info","arguments":{}}}
 EOF
 
-if assert_jsonl "$A2" '"2026-07-28" in by_id[1]["result"]["supportedVersions"] and len(by_id[2]["result"]["tools"]) == 9 and by_id[3]["result"]["content"][0]["text"]'; then
+if assert_jsonl "$A2" '"2026-07-28" in by_id[1]["result"]["supportedVersions"] and len(by_id[2]["result"]["tools"]) == 13 and by_id[3]["result"]["content"][0]["text"]'; then
     pass "stdio x stateless x fresh"
 else
     fail "stdio x stateless x fresh" "discover/list/call assertions (see $A2)"
@@ -331,7 +331,7 @@ for line in open(sys.argv[1]):
         curl_mcp http "$B_PORT" tools/call \
             '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_index_info","arguments":{}}}' \
             "$B1_CALL" "$ROOT/b1-call.hdrs" -H "Mcp-Session-Id: $SID"
-        if assert_json "$B1_LIST" 'len(m["result"]["tools"]) == 9' \
+        if assert_json "$B1_LIST" 'len(m["result"]["tools"]) == 13' \
             && assert_json "$B1_CALL" 'm["result"]["content"][0]["text"]'; then
             pass "http x legacy x fresh"
         else
@@ -353,7 +353,7 @@ for line in open(sys.argv[1]):
         "$B2_CALL" "$ROOT/b2-call.hdrs" \
         -H "MCP-Protocol-Version: 2026-07-28" -H "Mcp-Name: get_index_info"
 
-    if assert_json "$B2_LIST" 'len(m["result"]["tools"]) == 9' \
+    if assert_json "$B2_LIST" 'len(m["result"]["tools"]) == 13' \
         && assert_json "$B2_CALL" 'm["result"]["content"][0]["text"]'; then
         pass "http x stateless x fresh"
     else
@@ -410,7 +410,7 @@ C1="$ROOT/c1-pipelined.jsonl"
     sleep 2
 ) | (cd "$WS_FRESH" && timeout 30 "$BIN" serve 2>/dev/null) > "$C1"
 
-if assert_jsonl "$C1" '"2026-07-28" in by_id[1]["result"]["supportedVersions"] and len(by_id[2]["result"]["tools"]) == 9'; then
+if assert_jsonl "$C1" '"2026-07-28" in by_id[1]["result"]["supportedVersions"] and len(by_id[2]["result"]["tools"]) == 13'; then
     pass "pipelined first write: discover + stateless request in one write"
 else
     fail "pipelined first write" "responses missing or unparseable (see $C1)"
@@ -441,7 +441,7 @@ sleep 6
 exec 3>&-
 wait "$C2_PID" 2>/dev/null
 
-if assert_jsonl "$C2" 'any(m.get("method") == "notifications/subscriptions/acknowledged" for m in msgs) and len(by_id[3]["result"]["tools"]) == 9'; then
+if assert_jsonl "$C2" 'any(m.get("method") == "notifications/subscriptions/acknowledged" for m in msgs) and len(by_id[3]["result"]["tools"]) == 13'; then
     pass "cancelled-on-listen: session keeps serving after cancel"
 else
     fail "cancelled-on-listen" "ack or post-cancel request missing (see $C2)"
@@ -462,7 +462,7 @@ if http_start "$WS_FRESH" "$C3_PORT" "https" --https; then
     curl_mcp https "$C3_PORT" tools/list \
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{\"_meta\":$META}}" \
         "$C3" "$ROOT/c3.hdrs" -H "MCP-Protocol-Version: 2026-07-28"
-    if assert_json "$C3" 'len(m["result"]["tools"]) == 9'; then
+    if assert_json "$C3" 'len(m["result"]["tools"]) == 13'; then
         pass "https x stateless x fresh: TLS cell"
     else
         fail "https x stateless x fresh" "sessionless list over TLS (see $C3)"
