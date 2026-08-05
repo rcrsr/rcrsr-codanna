@@ -232,8 +232,14 @@ impl UnifiedWatcher {
                         // A removal may be one side of a rename. Hold the
                         // whole burst until every side is stable, then hand
                         // remove + create to the shared batch lane in one
-                        // wave so discovery can pair them.
-                        if let Some((removed, modified)) = self.debouncer.take_settled_burst() {
+                        // wave so discovery can pair them. Bounded by
+                        // `max_hold` so a sustained stream of unrelated
+                        // modifications cannot starve a removal that has
+                        // been ready to drain since its own window closed.
+                        let max_hold = self.debounce_window * MAX_REMOVAL_BURST_HOLD_WINDOWS;
+                        if let Some((removed, modified)) =
+                            self.debouncer.take_settled_burst(max_hold)
+                        {
                             self.process_removal_wave(removed, modified).await;
                         }
                     } else {
@@ -867,11 +873,21 @@ impl UnifiedWatcher {
             }
         }
 
+        let mut any_ok = false;
         for root in &roots {
             crate::log_event!("watcher", "batch sync", "{}", root.display());
-            let mut indexer = self.facade.write().await;
-            match indexer.index_directory(root, false) {
+            // Off-reactor via spawn_blocking; guard still held during sync.
+            let facade = Arc::clone(&self.facade);
+            let root_owned = root.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let mut indexer = facade.blocking_write();
+                indexer.index_directory(&root_owned, false)
+            })
+            .await
+            .expect("index_directory spawn_blocking task must not panic");
+            match result {
                 Ok(stats) => {
+                    any_ok = true;
                     crate::log_event!(
                         "watcher",
                         "batch synced",
@@ -891,7 +907,7 @@ impl UnifiedWatcher {
             }
         }
 
-        if !roots.is_empty() {
+        if any_ok {
             // Handler caches and subscribers refresh through the same
             // event hot-reload uses; the sync may have relocated paths.
             self.broadcaster.send(FileChangeEvent::IndexReloaded);
@@ -1231,6 +1247,14 @@ const CATCH_UP_COOLDOWN: Duration = Duration::from_secs(5);
 /// episode before staleness tracking is cleared, to avoid hot-looping
 /// forever on a permanent failure.
 const MAX_CATCH_UP_ATTEMPTS: u32 = 5;
+
+/// Factor applied to `debounce_window` to bound how long a removal-burst
+/// hold (see the `has_pending_removals()` drain arm) may wait for every
+/// side of a rename to settle before being force-drained. Must exceed any
+/// real rename's remove->create gap (which is sub-window, so a genuine
+/// pairing is never force-split) while still bounding worst-case
+/// starvation of an unrelated, long-settled removal to N debounce windows.
+const MAX_REMOVAL_BURST_HOLD_WINDOWS: u32 = 20;
 
 /// Threshold of *consecutive* reindex-gate contention rejections (each
 /// re-fired after `CATCH_UP_COOLDOWN`) past which `handle_catch_up_failure`
