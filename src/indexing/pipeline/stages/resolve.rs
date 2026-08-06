@@ -241,6 +241,45 @@ impl ResolveStage {
             }
         }
 
+        // Self-aliased receivers (self/this/cls) name their container: the
+        // caller's own enclosing type, evidenced by its ClassMember scope.
+        // Resolve within that type's direct members before the scope
+        // lookup, whose frozen winner may be a same-name member of a
+        // sibling type. A miss falls through — implicit-this languages
+        // emit the alias for free-function calls too.
+        if self.is_self_form_instance_call(unresolved, &caller.language_id) {
+            if let Some(resolved) = self.resolve_self_form_member(from_id, unresolved) {
+                return Some(resolved);
+            }
+            // Lexical-this boundary: where the behavior vouches the alias
+            // is an explicit source token, a caller without ClassMember
+            // evidence must not reach scope lookup — the caller's locals
+            // can shadow the member (the arrow self-loop class). The
+            // innermost this-barrier owning the call site resolves it, or
+            // the row fails closed.
+            if self
+                .get_behavior(&caller.language_id)
+                .is_some_and(|b| b.self_alias_receiver_is_explicit())
+                && !self.caller_has_member_scope(from_id)
+            {
+                return self.resolve_lexical_this_member(from_id, unresolved, context);
+            }
+            // A self-alias receiver names the caller's own instance, so an
+            // inherited member is in reach: walk the enclosing class's
+            // Extends rows before the ladder, whose single-survivor pick
+            // carries no class evidence. Applies to every language — the
+            // receiver is explicit here, unlike the bare-call arm below.
+            if let Some(resolved) = self.resolve_inherited_member(
+                from_id,
+                unresolved,
+                context,
+                &caller,
+                extends_by_from,
+            ) {
+                return Some(resolved);
+            }
+        }
+
         if let Some(to_id) = context.resolve(&unresolved.to_name) {
             if self.is_compatible(
                 from_kind,

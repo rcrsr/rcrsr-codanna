@@ -376,7 +376,7 @@ impl Default for EmbeddingBatch {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// File content read from disk, ready for parsing.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FileContent {
     pub path: PathBuf,
     pub content: String,
@@ -1095,22 +1095,37 @@ pub struct DiscoverResult {
     pub modified_files: Vec<PathBuf>,
     /// Files that exist in the index but not on disk.
     pub deleted_files: Vec<PathBuf>,
+    /// Relocated files as `(old_path, new_path)`: a deleted and a new path
+    /// whose exact content hash matched one-to-one. The old path's inbound
+    /// edges are captured and rebound against the new path instead of dying
+    /// with genuine-deletion semantics.
+    pub renamed_files: Vec<(PathBuf, PathBuf)>,
+    /// Content already read (and hashed) at discover time for new-file
+    /// candidates, keyed by the same normalized path form carried through
+    /// the READ channel. READ consults this before touching disk so a file
+    /// discovered here is never read+hashed a second time. Not consulted by
+    /// `is_empty()` -- categorization stays vec-based so observable
+    /// emptiness is unchanged.
+    pub preloaded_content: HashMap<PathBuf, FileContent>,
 }
 
 impl DiscoverResult {
     /// Total number of files that need processing.
     pub fn files_to_process(&self) -> usize {
-        self.new_files.len() + self.modified_files.len()
+        self.new_files.len() + self.modified_files.len() + self.renamed_files.len()
     }
 
     /// Total number of files that need cleanup.
     pub fn files_to_cleanup(&self) -> usize {
-        self.deleted_files.len() + self.modified_files.len()
+        self.deleted_files.len() + self.modified_files.len() + self.renamed_files.len()
     }
 
     /// Check if there's any work to do.
     pub fn is_empty(&self) -> bool {
-        self.new_files.is_empty() && self.modified_files.is_empty() && self.deleted_files.is_empty()
+        self.new_files.is_empty()
+            && self.modified_files.is_empty()
+            && self.deleted_files.is_empty()
+            && self.renamed_files.is_empty()
     }
 }
 
@@ -1151,6 +1166,13 @@ pub struct EmbedOptions {
 pub struct Phase1Options {
     pub progress: ProgressSink,
     pub embed: Option<EmbedOptions>,
+    /// Content already read+hashed at discover time, keyed by the same
+    /// normalized path form READ receives on its path channel. READ checks
+    /// this map before touching disk; a miss falls back to the existing
+    /// read (an empty map behaves identically to today). Threaded through
+    /// so incremental runs skip a second read+SHA256 of files DISCOVER
+    /// already paired for rename detection.
+    pub preloaded: Arc<HashMap<PathBuf, FileContent>>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

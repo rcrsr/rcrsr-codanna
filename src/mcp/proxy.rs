@@ -37,12 +37,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ClientRequest, CompleteRequestParams, CompleteResult,
+    CallToolRequestParams, CallToolResponse, ClientRequest, CompleteRequestParams, CompleteResult,
     CustomNotification, CustomRequest, CustomResult, ErrorData as McpError, GetPromptRequestParams,
-    GetPromptResult, Implementation, InitializeRequestParams, InitializeResult, ListPromptsResult,
-    ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
+    GetPromptResponse, Implementation, InitializeRequestParams, InitializeResult,
+    ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
     LoggingMessageNotificationParam, PaginatedRequestParams, ProgressNotificationParam,
-    ReadResourceRequestParams, ReadResourceResult, ResourceUpdatedNotificationParam,
+    ReadResourceRequestParams, ReadResourceResponse, ResourceUpdatedNotificationParam,
     ServerCapabilities, ServerInfo, ServerNotification, ServerResult, SetLevelRequestParams,
     SubscribeRequestParams, UnsubscribeRequestParams,
 };
@@ -681,18 +681,43 @@ impl ServerHandler for DelegatingProxyHandler {
         // the current connection synchronously via `UpstreamHandle::current`
         // -- this method is NOT `async` and cannot await a revive, so it
         // always reflects whatever connection is live right now.
-        self.upstream
-            .current()
-            .0
-            .peer_info()
-            .map(|info| (*info).clone())
-            .unwrap_or_else(|| {
-                ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-                    .with_server_info(Implementation::new(
-                        "codanna-proxy",
-                        env!("CARGO_PKG_VERSION"),
-                    ))
-            })
+        // rmcp 3.x exposes the negotiated backing-server info as
+        // `ServerPeerInfo`, a distinct type from `InitializeResult`
+        // (`ServerInfo`), so its fields are copied across into a fresh
+        // `ServerInfo` rather than cloned wholesale.
+        match self.upstream.current().0.peer_info() {
+            Some(peer) => {
+                // `resources.subscribe = true` advertises support for the
+                // 2026-07-28 `subscriptions/listen` request, which this
+                // handler cannot honor: it overrides neither
+                // `accepted_subscription_filter` nor `listen`, so the SDK's
+                // default implementation rejects every such request with
+                // `method_not_found` regardless of what capabilities claim.
+                // Strip the flag so advertised capabilities never promise
+                // more than the proxy actually serves; the legacy
+                // `resources/subscribe`/`unsubscribe` RPCs (forwarded above
+                // in `subscribe`/`unsubscribe`) are unaffected by this field
+                // and keep working for peers that call them directly.
+                let mut capabilities = peer.capabilities.clone();
+                if let Some(resources) = capabilities.resources.as_mut() {
+                    resources.subscribe = None;
+                }
+                let info = ServerInfo::new(capabilities).with_server_info(
+                    peer.server_info.clone().unwrap_or_else(|| {
+                        Implementation::new("codanna-proxy", env!("CARGO_PKG_VERSION"))
+                    }),
+                );
+                match peer.instructions.clone() {
+                    Some(instructions) => info.with_instructions(instructions),
+                    None => info,
+                }
+            }
+            None => ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+                .with_server_info(Implementation::new(
+                    "codanna-proxy",
+                    env!("CARGO_PKG_VERSION"),
+                )),
+        }
     }
 
     async fn initialize(
@@ -739,10 +764,10 @@ impl ServerHandler for DelegatingProxyHandler {
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResponse, McpError> {
         self.delegate(|up| {
             let request = request.clone();
-            async move { up.call_tool(request).await }
+            async move { up.call_tool_once(request).await }
         })
         .await
     }
@@ -775,10 +800,10 @@ impl ServerHandler for DelegatingProxyHandler {
         &self,
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, McpError> {
+    ) -> Result<ReadResourceResponse, McpError> {
         self.delegate(|up| {
             let request = request.clone();
-            async move { up.read_resource(request).await }
+            async move { up.read_resource_once(request).await }
         })
         .await
     }
@@ -799,10 +824,10 @@ impl ServerHandler for DelegatingProxyHandler {
         &self,
         request: GetPromptRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<GetPromptResult, McpError> {
+    ) -> Result<GetPromptResponse, McpError> {
         self.delegate(|up| {
             let request = request.clone();
-            async move { up.get_prompt(request).await }
+            async move { up.get_prompt_once(request).await }
         })
         .await
     }
@@ -934,9 +959,13 @@ pub async fn serve_proxy(
         state,
     };
 
-    use rmcp::transport::stdio;
+    let discover_result = serde_json::to_value(rmcp::model::DiscoverResult::from_server_info(
+        handler.supported_protocol_versions().into_owned(),
+        handler.get_info(),
+    ))
+    .expect("DiscoverResult serializes: closed struct of strings and maps");
     let service = handler
-        .serve(stdio())
+        .serve(crate::mcp::probe_tolerant_stdio(discover_result))
         .await
         .map_err(|e| ProxyError::Stdio(e.to_string()))?;
 

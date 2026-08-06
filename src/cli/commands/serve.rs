@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use crate::config::Settings;
 use crate::indexing::facade::IndexFacade;
+use crate::mcp::probe_tolerant_stdio;
 use crate::serve_discovery::{PidLockError, PidLockGuard};
 
 /// Arguments for the serve command.
@@ -227,7 +228,9 @@ async fn run_stdio_server(
         facade.symbol_count(),
         facade.has_semantic_search()
     );
-    let server = crate::mcp::CodeIntelligenceServer::new(facade);
+    let broadcaster = Arc::new(crate::mcp::notifications::NotificationBroadcaster::new(100));
+    let server =
+        crate::mcp::CodeIntelligenceServer::new(facade).with_broadcaster(broadcaster.clone());
 
     // Load document store and attach to server (shared with watcher later)
     let document_store_arc = crate::documents::load_from_settings(&config);
@@ -260,11 +263,8 @@ async fn run_stdio_server(
 
     // Start unified file watcher if enabled
     if watch || config.file_watch.enabled {
-        use crate::mcp::notifications::NotificationBroadcaster;
         use crate::watcher::UnifiedWatcher;
         use crate::watcher::handlers::{CodeFileHandler, ConfigFileHandler, DocumentFileHandler};
-
-        let broadcaster = Arc::new(NotificationBroadcaster::new(100));
 
         let workspace_root = config
             .workspace_root
@@ -341,8 +341,13 @@ async fn run_stdio_server(
     }
 
     // Start server with stdio transport
-    use rmcp::{ServiceExt, transport::stdio};
-    let service = match server.serve(stdio()).await {
+    use rmcp::{ServerHandler, ServiceExt};
+    let discover_result = serde_json::to_value(rmcp::model::DiscoverResult::from_server_info(
+        server.supported_protocol_versions().into_owned(),
+        server.get_info(),
+    ))
+    .expect("DiscoverResult serializes: closed struct of strings and maps");
+    let service = match server.serve(probe_tolerant_stdio(discover_result)).await {
         Ok(service) => service,
         Err(e) => {
             eprintln!("Failed to start MCP server: {e}");
@@ -364,10 +369,15 @@ async fn run_stdio_server(
 /// never touches the index, so no serve lock is taken and no watcher
 /// starts. The caller exits with the gate code when this returns.
 pub async fn run_stale_stdio(stored: Option<u32>, current: u32) {
-    use rmcp::{ServiceExt, transport::stdio};
+    use rmcp::{ServerHandler, ServiceExt};
 
     let server = crate::mcp::StaleIndexServer::new(stored, current);
-    match server.serve(stdio()).await {
+    let discover_result = serde_json::to_value(rmcp::model::DiscoverResult::from_server_info(
+        server.supported_protocol_versions().into_owned(),
+        server.get_info(),
+    ))
+    .expect("DiscoverResult serializes: closed struct of strings and maps");
+    match server.serve(probe_tolerant_stdio(discover_result)).await {
         Ok(service) => {
             if let Err(e) = service.waiting().await {
                 eprintln!("Degraded MCP server error: {e}");
@@ -376,29 +386,6 @@ pub async fn run_stale_stdio(stored: Option<u32>, current: u32) {
         Err(e) => {
             eprintln!("Failed to start degraded MCP server: {e}");
         }
-    }
-}
-
-/// Run the MCP test command.
-pub async fn run_mcp_test(
-    server_binary: Option<PathBuf>,
-    cli_config: Option<PathBuf>,
-    tool: Option<String>,
-    args: Option<String>,
-    delay: Option<u64>,
-) {
-    use crate::mcp::client::CodeIntelligenceClient;
-
-    // Get server binary path (default to current executable)
-    let server_path = server_binary
-        .unwrap_or_else(|| std::env::current_exe().expect("Failed to get current executable path"));
-
-    // Run the test
-    if let Err(e) =
-        CodeIntelligenceClient::test_server(server_path, cli_config, tool, args, delay).await
-    {
-        eprintln!("MCP test failed: {e}");
-        std::process::exit(1);
     }
 }
 

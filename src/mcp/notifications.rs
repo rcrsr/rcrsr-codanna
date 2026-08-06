@@ -57,8 +57,7 @@ impl super::CodeIntelligenceServer {
         // compatibility until rmcp removes the API.
         #[allow(deprecated)]
         use rmcp::model::{
-            CustomNotification, LoggingLevel, LoggingMessageNotificationParam,
-            ResourceUpdatedNotificationParam, ServerNotification,
+            LoggingLevel, LoggingMessageNotificationParam, ResourceUpdatedNotificationParam,
         };
 
         crate::debug_event!("mcp-notify", "listening");
@@ -70,6 +69,25 @@ impl super::CodeIntelligenceServer {
 
                     let peer_guard = self.peer.lock().await;
                     if let Some(peer) = peer_guard.as_ref() {
+                        // `listen()` (server.rs) already delivers these same
+                        // events over `subscriptions/listen` for peers that
+                        // negotiated protocol 2026-07-28+ and subscribed
+                        // through it. Sending the legacy notification here
+                        // too would double-deliver the same wire
+                        // notification to that peer. Peers on an older
+                        // protocol version have no `subscriptions/listen` to
+                        // fall back on, so they still need this legacy path.
+                        let is_legacy_peer = peer.peer_info().is_none_or(|info| {
+                            info.protocol_version < rmcp::model::ProtocolVersion::V_2026_07_28
+                        });
+                        if !is_legacy_peer {
+                            crate::debug_event!(
+                                "mcp-notify",
+                                "skipped",
+                                "peer negotiated subscriptions/listen; {event:?} delivered via listen() instead"
+                            );
+                            continue;
+                        }
                         match event {
                             FileChangeEvent::FileReindexed { path } => {
                                 let path_str = path.display().to_string();
@@ -96,18 +114,6 @@ impl super::CodeIntelligenceServer {
                                     )
                                     .await;
 
-                                // Send custom notification (new)
-                                let _ = peer
-                                    .send_notification(ServerNotification::CustomNotification(
-                                        CustomNotification::new(
-                                            "notifications/codanna/file-reindexed",
-                                            Some(serde_json::json!({
-                                                "path": path_str
-                                            })),
-                                        ),
-                                    ))
-                                    .await;
-
                                 crate::debug_event!(
                                     "mcp-notify",
                                     "sent",
@@ -115,20 +121,7 @@ impl super::CodeIntelligenceServer {
                                 );
                             }
                             FileChangeEvent::FileCreated { path } => {
-                                let path_str = path.display().to_string();
                                 let _ = peer.notify_resource_list_changed().await;
-
-                                // Send custom notification
-                                let _ = peer
-                                    .send_notification(ServerNotification::CustomNotification(
-                                        CustomNotification::new(
-                                            "notifications/codanna/file-created",
-                                            Some(serde_json::json!({
-                                                "path": path_str
-                                            })),
-                                        ),
-                                    ))
-                                    .await;
 
                                 crate::debug_event!(
                                     "mcp-notify",
@@ -138,20 +131,7 @@ impl super::CodeIntelligenceServer {
                                 );
                             }
                             FileChangeEvent::FileDeleted { path } => {
-                                let path_str = path.display().to_string();
                                 let _ = peer.notify_resource_list_changed().await;
-
-                                // Send custom notification
-                                let _ = peer
-                                    .send_notification(ServerNotification::CustomNotification(
-                                        CustomNotification::new(
-                                            "notifications/codanna/file-deleted",
-                                            Some(serde_json::json!({
-                                                "path": path_str
-                                            })),
-                                        ),
-                                    ))
-                                    .await;
 
                                 crate::debug_event!(
                                     "mcp-notify",
@@ -162,16 +142,6 @@ impl super::CodeIntelligenceServer {
                             }
                             FileChangeEvent::IndexReloaded => {
                                 let _ = peer.notify_resource_list_changed().await;
-
-                                // Send custom notification
-                                let _ = peer
-                                    .send_notification(ServerNotification::CustomNotification(
-                                        CustomNotification::new(
-                                            "notifications/codanna/index-reloaded",
-                                            Some(serde_json::json!({})),
-                                        ),
-                                    ))
-                                    .await;
 
                                 crate::debug_event!("mcp-notify", "sent", "IndexReloaded");
                             }

@@ -608,7 +608,11 @@ async fn proxy_serves_real_mcp_traffic_from_shared_upstream() {
     let server_info = client
         .peer_info()
         .expect("proxy should have negotiated peer info during initialize");
-    let server_name = server_info.server_info.name.as_str();
+    let server_name = server_info
+        .server_info
+        .as_ref()
+        .map(|impl_| impl_.name.as_str())
+        .expect("negotiated peer info should carry a server implementation identity");
     assert_eq!(
         server_name, "codanna",
         "proxy should relay the upstream server's negotiated name, not answer locally"
@@ -1409,21 +1413,19 @@ async fn proxy_revives_dead_upstream_mid_session() {
     wait_until_dead_or_zombie(pid_before, DEADLINE);
 
     // Second call, ON THE SAME CLIENT CONNECTION -- the proxy's stdio session
-    // is never restarted. The delegated call against the dead backing server
-    // observes a dead transport, `DelegatingProxyHandler::delegate` revives
-    // the upstream (respawning a fresh backing server, since the stale record
-    // is unusable), and the single retry succeeds -- transparently to this
-    // client.
-    let tools_after = tokio::time::timeout(DEADLINE, client.list_tools(Default::default()))
-        .await
-        .expect("second list_tools should complete within the deadline")
-        .expect(
-            "second list_tools should succeed after the proxy transparently revives its upstream",
-        );
-    assert!(
-        !tools_after.tools.is_empty(),
-        "second list_tools should relay a non-empty tool list from the revived upstream"
-    );
+    // is never restarted. A tool CALL (not `list_tools`, which rmcp 3.x serves
+    // from the client-side tool-list cache for its advertised TTL and so would
+    // never reach the dead backing) delegates to the backing server, observes
+    // a dead transport, and `DelegatingProxyHandler::delegate` revives the
+    // upstream (respawning a fresh backing server, since the stale record is
+    // unusable); the single retry succeeds -- transparently to this client.
+    tokio::time::timeout(
+        DEADLINE,
+        client.call_tool(rmcp::model::CallToolRequestParams::new("get_index_info")),
+    )
+    .await
+    .expect("second call should complete within the deadline")
+    .expect("the tool call should succeed after the proxy transparently revives its upstream");
 
     let record_after = codanna::serve_discovery::read_record(&codanna_dir)
         .expect("serve.json should exist again after the proxy revived its upstream");
@@ -1484,12 +1486,18 @@ async fn proxy_revive_respects_auto_spawn_disabled() {
     // within the deadline rather than hanging or panicking -- a `delegate`
     // that looped on `AutoSpawnDisabled` instead of surfacing it would hang
     // here.
-    let second_call = tokio::time::timeout(DEADLINE, client.list_tools(Default::default()))
-        .await
-        .expect("second list_tools must not hang -- it should return promptly with an error");
+    // A tool CALL, not `list_tools`: rmcp 3.x serves `list_tools` from the
+    // client-side cache for its advertised TTL, so it would never reach the
+    // dead backing to observe the revive failure.
+    let second_call = tokio::time::timeout(
+        DEADLINE,
+        client.call_tool(rmcp::model::CallToolRequestParams::new("get_index_info")),
+    )
+    .await
+    .expect("second call must not hang -- it should return promptly with an error");
 
     let err = second_call.expect_err(
-        "second list_tools must fail once the backing server is dead and auto_spawn = false",
+        "second tool call must fail once the backing server is dead and auto_spawn = false",
     );
     let message = format!("{err:?}").to_lowercase();
     assert!(

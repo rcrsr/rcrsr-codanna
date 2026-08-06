@@ -6,6 +6,7 @@
 use crate::indexing::file_info::calculate_hash;
 use crate::indexing::pipeline::types::{FileContent, PipelineError, PipelineResult};
 use crossbeam_channel::{Receiver, Sender};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,6 +18,12 @@ pub struct ReadStage {
     threads: usize,
     /// Workspace root for path normalization (stores relative paths)
     workspace_root: Option<PathBuf>,
+    /// Content already read (and hashed) upstream, keyed by the same
+    /// normalized path form this stage receives on its path channel. A hit
+    /// clones the cached `FileContent` instead of touching disk again; a
+    /// miss falls back to the existing read. Empty by default, so behavior
+    /// is unchanged unless a caller opts in via `with_preloaded`.
+    preloaded: Arc<HashMap<PathBuf, FileContent>>,
 }
 
 impl ReadStage {
@@ -25,6 +32,7 @@ impl ReadStage {
         Self {
             threads: threads.max(1),
             workspace_root: None,
+            preloaded: Arc::new(HashMap::new()),
         }
     }
 
@@ -33,7 +41,15 @@ impl ReadStage {
         Self {
             threads: threads.max(1),
             workspace_root,
+            preloaded: Arc::new(HashMap::new()),
         }
+    }
+
+    /// Supply content already read+hashed upstream. A cache hit avoids a
+    /// second disk read and SHA256 of the same file.
+    pub fn with_preloaded(mut self, preloaded: Arc<HashMap<PathBuf, FileContent>>) -> Self {
+        self.preloaded = preloaded;
+        self
     }
 
     /// Read a single file directly (for incremental mode).
@@ -65,6 +81,7 @@ impl ReadStage {
 
         let workspace_root = self.workspace_root.clone();
         let workspace_root = Arc::new(workspace_root);
+        let preloaded = self.preloaded.clone();
 
         let handles: Vec<_> = (0..self.threads)
             .map(|_| {
@@ -75,6 +92,7 @@ impl ReadStage {
                 let input_wait_ns = input_wait_ns.clone();
                 let output_wait_ns = output_wait_ns.clone();
                 let workspace_root = workspace_root.clone();
+                let preloaded = preloaded.clone();
 
                 thread::spawn(move || {
                     loop {
@@ -87,34 +105,42 @@ impl ReadStage {
                         input_wait_ns
                             .fetch_add(recv_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
-                        // Resolve against workspace_root before opening. The
-                        // two lanes feeding this stage disagree on path form:
-                        // a full run gets absolute paths from the walker,
-                        // while an incremental run gets paths DiscoverStage
-                        // already normalized to relative (it has to, to
-                        // compare them against the index's stored rows). A
-                        // relative path opened as-is resolves against the
-                        // process CWD, so an embedder whose CWD is not the
-                        // workspace root read nothing and got an empty index
-                        // with no error -- the CLI only escaped it by always
-                        // running from the workspace root.
-                        let read_result = match *workspace_root {
-                            Some(ref root) if path.is_relative() => read_file(&root.join(&path))
-                                .map(|mut content| {
-                                    content.path = path.clone();
+                        // Preloaded hit: DISCOVER already read+hashed this
+                        // file while pairing renames. Clone the cached
+                        // content instead of reading+hashing it again.
+                        let read_result = if let Some(content) = preloaded.get(&path) {
+                            Ok(content.clone())
+                        } else {
+                            // Resolve against workspace_root before opening. The
+                            // two lanes feeding this stage disagree on path form:
+                            // a full run gets absolute paths from the walker,
+                            // while an incremental run gets paths DiscoverStage
+                            // already normalized to relative (it has to, to
+                            // compare them against the index's stored rows). A
+                            // relative path opened as-is resolves against the
+                            // process CWD, so an embedder whose CWD is not the
+                            // workspace root read nothing and got an empty index
+                            // with no error -- the CLI only escaped it by always
+                            // running from the workspace root.
+                            match *workspace_root {
+                                Some(ref root) if path.is_relative() => {
+                                    read_file(&root.join(&path)).map(|mut content| {
+                                        content.path = path.clone();
+                                        content
+                                    })
+                                }
+                                // Absolute lane: read_file returns an absolute
+                                // path, which must still be normalized to
+                                // workspace-relative when workspace_root is set.
+                                _ => read_file(&path).map(|mut content| {
+                                    if let Some(ref root) = *workspace_root {
+                                        if let Ok(relative) = content.path.strip_prefix(root) {
+                                            content.path = relative.to_path_buf();
+                                        }
+                                    }
                                     content
                                 }),
-                            // Absolute lane: read_file returns an absolute
-                            // path, which must still be normalized to
-                            // workspace-relative when workspace_root is set.
-                            _ => read_file(&path).map(|mut content| {
-                                if let Some(ref root) = *workspace_root {
-                                    if let Ok(relative) = content.path.strip_prefix(root) {
-                                        content.path = relative.to_path_buf();
-                                    }
-                                }
-                                content
-                            }),
+                            }
                         };
 
                         match read_result {
@@ -292,6 +318,61 @@ mod tests {
         assert_eq!(read, 0, "No files should be read");
         assert_eq!(failed, 2, "Both files should fail");
         assert!(contents.is_empty(), "No content should be produced");
+    }
+
+    #[test]
+    fn test_read_stage_reuses_preloaded_content_without_disk_read() {
+        let temp = TempDir::new().unwrap();
+
+        // P is in the preloaded map with sentinel content, then deleted from
+        // disk. If the stage fell back to disk it would error; success with
+        // the sentinel content proves the cache was consulted and reused.
+        let p_path = temp.path().join("preloaded.rs");
+        fs::write(&p_path, "fn original() {}").unwrap();
+        let sentinel_content = "X".to_string();
+        let sentinel_hash = calculate_hash(&sentinel_content);
+        let mut preloaded = HashMap::new();
+        preloaded.insert(
+            p_path.clone(),
+            FileContent::new(p_path.clone(), sentinel_content.clone(), sentinel_hash),
+        );
+        fs::remove_file(&p_path).unwrap();
+
+        // Q is NOT in the preloaded map, so it must still read real disk
+        // content -- this discriminates a "build the map but never consult
+        // it" dead-code implementation.
+        let q_path = temp.path().join("on_disk.rs");
+        let q_content = "fn real() {}";
+        fs::write(&q_path, q_content).unwrap();
+
+        let (path_tx, path_rx) = bounded(10);
+        let (content_tx, content_rx) = bounded(10);
+        path_tx.send(p_path.clone()).unwrap();
+        path_tx.send(q_path.clone()).unwrap();
+        drop(path_tx);
+
+        let stage = ReadStage::new(1).with_preloaded(Arc::new(preloaded));
+        let result = stage.run(path_rx, content_tx);
+
+        assert!(result.is_ok());
+        let (read, failed, _, _, _) = result.unwrap();
+        assert_eq!(read, 2, "Both preloaded and on-disk paths should succeed");
+        assert_eq!(failed, 0);
+
+        let contents: HashMap<PathBuf, FileContent> =
+            content_rx.iter().map(|fc| (fc.path.clone(), fc)).collect();
+
+        let p_result = contents.get(&p_path).expect("preloaded path missing");
+        assert_eq!(
+            p_result.content, "X",
+            "preloaded content should be reused, not read from disk"
+        );
+
+        let q_result = contents.get(&q_path).expect("on-disk path missing");
+        assert_eq!(
+            q_result.content, q_content,
+            "path absent from the preloaded map should still read its real disk content"
+        );
     }
 
     #[test]

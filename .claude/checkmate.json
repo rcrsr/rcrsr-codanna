@@ -53,6 +53,13 @@
       "action": "review",
       "message": "Invoke conduct:policy-reviewer to validate the policy file.",
       "_conduct": true
+    },
+    {
+      "name": "codanna-code-reviewer",
+      "match": "codanna-engineer",
+      "action": "review",
+      "message": "Invoke codanna-code-reviewer to validate the implementation.",
+      "_conduct": true
     }
   ]
 }

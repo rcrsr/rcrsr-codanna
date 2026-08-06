@@ -59,6 +59,7 @@ impl Pipeline {
                 Phase1Options {
                     progress: progress.map_or(ProgressSink::Silent, ProgressSink::Bar),
                     embed,
+                    ..Default::default()
                 },
             )?;
 
@@ -85,6 +86,8 @@ impl Pipeline {
             new_files: index_stats.files_indexed,
             modified_files: 0,
             deleted_files: 0,
+            renamed_files: 0,
+            invalidated_caller_files: 0,
             deleted_symbols: 0,
             index_stats,
             cleanup_stats: CleanupStats::default(),
