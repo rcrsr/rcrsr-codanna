@@ -118,35 +118,6 @@ impl CodeIntelligenceServer {
     pub fn get_facade_arc(&self) -> Arc<RwLock<IndexFacade>> {
         self.facade.clone()
     }
-
-    /// Send a notification when a file is re-indexed
-    pub async fn notify_file_reindexed(&self, file_path: &str) {
-        let peer_guard = self.peer.lock().await;
-        if let Some(peer) = peer_guard.as_ref() {
-            // Send a resource updated notification
-            let _ = peer
-                .notify_resource_updated(ResourceUpdatedNotificationParam::new(format!(
-                    "file://{file_path}"
-                )))
-                .await;
-
-            // Also send a logging message for visibility. Logging is deprecated by
-            // SEP-2577; keep emitting it for client compatibility until rmcp removes it.
-            #[allow(deprecated)]
-            let _ = peer
-                .notify_logging_message(
-                    LoggingMessageNotificationParam::new(
-                        LoggingLevel::Info,
-                        serde_json::json!({
-                            "action": "re-indexed",
-                            "file": file_path
-                        }),
-                    )
-                    .with_logger("codanna"),
-                )
-                .await;
-        }
-    }
 }
 
 /// Cache lifetime for list results. The tool list is static per
