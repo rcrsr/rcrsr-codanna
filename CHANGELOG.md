@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.1+rcrsr.3] - 2026-08-05
+
 ### Breaking Changes
 
 - **`Symbol.range.start_line`/`end_line` are now 1-indexed everywhere they were previously 0-indexed** — see the matching `### Fixed` entry below for the full surface list. If your integration added its own `+1` to compensate, remove it or every reported line will silently double-shift.
