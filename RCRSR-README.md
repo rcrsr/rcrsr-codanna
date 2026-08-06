@@ -169,7 +169,7 @@ to confirm you're running the fork build (see
 
 ## Upstream base
 
-The fork now tracks upstream **v0.12.0** (merged from the prior v0.11.1 base).
+The fork now tracks upstream **v0.13.1** (merged from the prior v0.12.0 base).
 Moving the upstream base does not touch the fork build counter, which only ever
 counts up (see [Identifying the fork](#identifying-the-fork)).
 
@@ -263,6 +263,49 @@ before the stamp existed. **Fork note:** upstream declares this field on its
 own `IndexInfo` in `cli/commands/mcp.rs`; the fork long ago relocated that
 struct to `mcp/service.rs`, so the field is carried there instead. The emitted
 JSON is the same either way.
+
+**Upstream v0.13.0 migrates every transport to the MCP 2026-07-28 spec
+revision (rmcp 3.1.0).** All transports (stdio, HTTP, HTTPS) now serve the new
+stateless generation — the revision that removes protocol-level sessions and
+the `initialize` handshake — alongside the legacy generation through its
+deprecation window: dispatch is per-session on stdio, per-request on
+HTTP/HTTPS. New surface for 2026-07-28 clients: `server/discover` is answered
+as the required RPC and as the stdio back-compat probe; HTTP requests carrying
+2026-07-28 `_meta` are served per-request without minting a session (the
+`MCP-Protocol-Version` header is required, and `Mcp-Name` is required on
+name-bearing methods); `subscriptions/listen` lets a stateless client opt into
+resource-change notifications with per-category and per-URI filters; and tool
+and prompt list results carry a cache contract (`ttlMs` 3600000, `cacheScope`
+"private"). `codanna mcp-test` now connects Discover-only — against a server
+that dies on the probe (every release up to 0.12.0) it fails with a diagnostic
+naming the probe death instead of a raw connection error. Index format,
+emission semantics, and settings are unchanged; no rebuild. **Fork note:**
+upstream also *removed* its custom `notifications/codanna/*` wire notifications
+(file-reindexed, file-created, file-deleted, index-reloaded), moving the watch
+lane onto standard MCP notifications — and the fork followed. The proxy
+hot-reload section below now describes the standard `notifications/resources/*`
+signals the watch lane actually emits; the old custom-notification names no
+longer appear on the wire.
+
+**Upstream v0.13.1 is an incremental-refactor and watcher-notification patch.**
+Renames, renames combined with edits, and deletions now converge the
+incremental index to the same relationship set as a fresh index: a file that
+references a moved or deleted target is re-analyzed in the same run, so each
+relationship follows the current source evidence — across batch indexing,
+`serve --watch`, and `mcp <tool> --watch`. If an earlier version processed a
+rename or deletion, relationships already lost from that index restore on the
+next edit of the referencing files, or all at once with `codanna index
+--force`. On the notification side, watched file *creation* emits
+`notifications/resources/list_changed`, *modification* of a known file remains
+a URI-filtered `notifications/resources/updated`, and *deletion* emits one
+list-change notification. `serve --watch` also no longer livelocks on Linux
+(inotify access-class events are ignored, and the debounced drain runs on a
+fixed cadence sustained event streams cannot defer). Index format, emission
+semantics, and settings are unchanged; no automatic rebuild. One upstream
+known limitation carries forward: on Windows, path handling degrades symbol
+resolution — some relationships that resolve on Linux and macOS are
+under-reported — so Windows runs in the test pipeline as a non-blocking
+witness, with fixes tracked for a later release.
 
 # Improvements
 
@@ -425,13 +468,18 @@ against codanna's own certificate.
 
 ### Hot-reload notifications through the proxy
 
-Codanna's custom hot-reload notifications (`notifications/codanna/file-reindexed`,
-`file-created`, `file-deleted`, `index-reloaded`) are forwarded verbatim from the
-backing server to each stdio client, so a client behind the proxy stays as
-hot-reload-aware as one connected directly. Notifications the backing server
-emits before a client finishes its `initialize` handshake are buffered (up to the
-last 100, oldest dropped on overflow) and flushed once the client is ready,
-rather than being lost in the connection window.
+Since the v0.13.1 base, the watch lane rides **standard MCP notifications**
+rather than the fork's old custom `notifications/codanna/*` wire (which upstream
+retired — see the upstream-base note above). A watched file that is *modified*
+emits a URI-filtered `notifications/resources/updated`; a file *created* or
+*deleted* emits `notifications/resources/list_changed`. The proxy forwards these
+server-initiated notifications — along with tool/prompt list-changed, progress,
+and logging notifications — verbatim from the backing server to each stdio
+client, so a client behind the proxy stays as hot-reload-aware as one connected
+directly. A bounded, drop-oldest buffer still guards the narrow
+pre-`initialize` window on the legacy custom-notification forwarding path
+(retained for backward compatibility), flushing once the downstream client is
+ready.
 
 If you only ever run a single client, you don't need this — plain `codanna serve`
 is unchanged.
