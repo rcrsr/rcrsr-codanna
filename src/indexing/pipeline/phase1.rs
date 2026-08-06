@@ -106,7 +106,11 @@ impl Pipeline {
         }
 
         let start = Instant::now();
-        let Phase1Options { progress, embed } = opts;
+        let Phase1Options {
+            progress,
+            embed,
+            preloaded,
+        } = opts;
 
         // Create metrics collector if tracing is enabled
         let metrics = if self.config.pipeline_tracing {
@@ -193,8 +197,10 @@ impl Pipeline {
                 let rx = path_rx.clone();
                 let tx = content_tx.clone();
                 let workspace_root = workspace_root.clone();
+                let preloaded = preloaded.clone();
                 thread::spawn(move || {
-                    let stage = ReadStage::with_workspace_root(1, workspace_root);
+                    let stage =
+                        ReadStage::with_workspace_root(1, workspace_root).with_preloaded(preloaded);
                     stage.run(rx, tx)
                 })
             })

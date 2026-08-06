@@ -413,6 +413,7 @@ impl Pipeline {
                                     .expect("has_embedding checked semantic.is_some()"),
                             ),
                         }),
+                        ..Default::default()
                     },
                 )?;
 
@@ -455,6 +456,7 @@ impl Pipeline {
                     Phase1Options {
                         progress: ProgressSink::Bar(phase1_bar.clone()),
                         embed: None,
+                        ..Default::default()
                     },
                 )?;
 
@@ -585,6 +587,7 @@ impl Pipeline {
                 Phase1Options {
                     progress: ProgressSink::Bar(phase1_bar.clone()),
                     embed,
+                    preloaded: Arc::new(std::mem::take(&mut discover_result.preloaded_content)),
                 },
             )?;
 
@@ -796,6 +799,7 @@ impl Pipeline {
                 Phase1Options {
                     progress: progress.map_or(ProgressSink::Silent, ProgressSink::Bar),
                     embed,
+                    preloaded: Arc::new(std::mem::take(&mut discover_result.preloaded_content)),
                 },
             )?;
 

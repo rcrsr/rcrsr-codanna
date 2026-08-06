@@ -376,7 +376,7 @@ impl Default for EmbeddingBatch {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// File content read from disk, ready for parsing.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FileContent {
     pub path: PathBuf,
     pub content: String,
@@ -1100,6 +1100,13 @@ pub struct DiscoverResult {
     /// edges are captured and rebound against the new path instead of dying
     /// with genuine-deletion semantics.
     pub renamed_files: Vec<(PathBuf, PathBuf)>,
+    /// Content already read (and hashed) at discover time for new-file
+    /// candidates, keyed by the same normalized path form carried through
+    /// the READ channel. READ consults this before touching disk so a file
+    /// discovered here is never read+hashed a second time. Not consulted by
+    /// `is_empty()` -- categorization stays vec-based so observable
+    /// emptiness is unchanged.
+    pub preloaded_content: HashMap<PathBuf, FileContent>,
 }
 
 impl DiscoverResult {
@@ -1159,6 +1166,13 @@ pub struct EmbedOptions {
 pub struct Phase1Options {
     pub progress: ProgressSink,
     pub embed: Option<EmbedOptions>,
+    /// Content already read+hashed at discover time, keyed by the same
+    /// normalized path form READ receives on its path channel. READ checks
+    /// this map before touching disk; a miss falls back to the existing
+    /// read (an empty map behaves identically to today). Threaded through
+    /// so incremental runs skip a second read+SHA256 of files DISCOVER
+    /// already paired for rename detection.
+    pub preloaded: Arc<HashMap<PathBuf, FileContent>>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

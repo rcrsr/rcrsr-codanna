@@ -59,6 +59,7 @@ impl Pipeline {
                 Phase1Options {
                     progress: progress.map_or(ProgressSink::Silent, ProgressSink::Bar),
                     embed,
+                    ..Default::default()
                 },
             )?;
 
