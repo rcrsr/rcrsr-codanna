@@ -114,14 +114,14 @@ fn write_settings(workspace: &Path, base_url: &str) {
         .join("src")
         .canonicalize()
         .expect("src dir should exist and be resolvable");
-    let src_path = src_abs.to_str().expect("src path should be valid UTF-8");
+    let src_path = crate::common::toml_path_literal(&src_abs);
 
     let settings = format!(
         r#"
 index_path = ".codanna/index"
 
 [indexing]
-indexed_paths = ["{src_path}"]
+indexed_paths = [{src_path}]
 
 [semantic_search]
 enabled = true
@@ -176,8 +176,8 @@ fn mcp_get_index_info_reports_remote_semantic_status_and_model() {
     assert_eq!(indexed_paths.len(), 1);
     let first_path = indexed_paths[0].as_str().expect("path should be a string");
     assert!(
-        first_path == "src" || first_path.ends_with("/src"),
-        "indexed path should be 'src' or end with '/src', got: {first_path}"
+        std::path::Path::new(first_path).ends_with("src"),
+        "indexed path should be 'src' or end in a 'src' component, got: {first_path}"
     );
 
     let (info_code, info_stdout, info_stderr) =

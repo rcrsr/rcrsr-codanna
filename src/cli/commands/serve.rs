@@ -191,7 +191,7 @@ async fn run_stdio_server(
         Err(PidLockError::Held { pid, lock_path }) => {
             eprintln!(
                 "Another codanna serve is already running for this index (PID {pid}, lock at {}).",
-                lock_path.display()
+                crate::parsing::paths::render_absolute_path(&lock_path).display()
             );
             eprintln!();
             eprintln!("Subagents and other AI tools may have spawned a duplicate. To run multiple");
@@ -201,14 +201,14 @@ async fn run_stdio_server(
             eprintln!();
             eprintln!(
                 "If you are sure no other codanna serve is running, remove {} and retry.",
-                lock_path.display()
+                crate::parsing::paths::render_absolute_path(&lock_path).display()
             );
             std::process::exit(1);
         }
         Err(PidLockError::Io(e)) => {
             eprintln!(
                 "Failed to acquire serve lock under {}: {e}",
-                index_path.display()
+                crate::parsing::paths::render_absolute_path(&index_path).display()
             );
             std::process::exit(1);
         }
@@ -324,7 +324,7 @@ async fn run_stdio_server(
                 });
                 eprintln!(
                     "Unified watcher started (debounce: {debounce_ms}ms, config: {})",
-                    settings_path.display()
+                    crate::parsing::paths::render_absolute_path(&settings_path).display()
                 );
 
                 // Start notification listener to forward events to MCP client

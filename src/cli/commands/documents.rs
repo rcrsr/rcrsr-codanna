@@ -200,7 +200,8 @@ pub fn run(action: DocumentAction, config: &Settings, cli_config: Option<&PathBu
                             println!(
                                 "\n{}. {} (score: {:.3})",
                                 i + 1,
-                                result.source_path.display(),
+                                crate::parsing::paths::render_absolute_path(&result.source_path)
+                                    .display(),
                                 result.similarity
                             );
                             if !result.heading_context.is_empty() {
@@ -517,7 +518,10 @@ fn run_add_collection(
 
     // Check if path exists
     if !canonical_path.exists() {
-        eprintln!("Error: Path does not exist: {}", canonical_path.display());
+        eprintln!(
+            "Error: Path does not exist: {}",
+            crate::parsing::paths::render_absolute_path(&canonical_path).display()
+        );
         std::process::exit(1);
     }
 
@@ -537,7 +541,7 @@ fn run_add_collection(
         if collection.paths.contains(&canonical_path) {
             eprintln!(
                 "Path already in collection '{name}': {}",
-                canonical_path.display()
+                crate::parsing::paths::render_absolute_path(&canonical_path).display()
             );
             std::process::exit(1);
         }
@@ -549,7 +553,7 @@ fn run_add_collection(
         }
         println!(
             "Added path to existing collection '{name}': {}",
-            canonical_path.display()
+            crate::parsing::paths::render_absolute_path(&canonical_path).display()
         );
     } else {
         // Create new collection
@@ -569,7 +573,7 @@ fn run_add_collection(
             .insert(name.clone(), collection_config);
         println!(
             "Created collection '{name}' with path: {}",
-            canonical_path.display()
+            crate::parsing::paths::render_absolute_path(&canonical_path).display()
         );
     }
 

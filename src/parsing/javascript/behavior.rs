@@ -168,17 +168,21 @@ impl LanguageBehavior for JavaScriptBehavior {
                         "[javascript] module_path_from_file jsconfig_dir={jsconfig_dir:?}"
                     );
 
-                    // Compute path relative to the jsconfig's directory
-                    if let Ok(relative_path) = file_path.strip_prefix(&jsconfig_dir) {
-                        if let Some(path) = relative_path.to_str() {
-                            // Strip extension using the provided extensions list
-                            let path_without_ext =
-                                strip_extension(path.trim_start_matches("./"), extensions);
+                    // Compute segments relative to the jsconfig's directory
+                    if let Some(mut segments) =
+                        crate::parsing::paths::relative_segments(file_path, &jsconfig_dir)
+                    {
+                        if let Some(last) = segments.pop() {
+                            let stem = strip_extension(&last, extensions);
+                            segments.push(stem.to_string());
 
-                            // Handle /index suffix (directory imports)
-                            let module_path = path_without_ext.trim_end_matches("/index");
-
-                            let result = module_path.replace('/', ".");
+                            // index collapses to its directory (directory imports)
+                            while segments.len() > 1
+                                && segments.last().is_some_and(|s| s == "index")
+                            {
+                                segments.pop();
+                            }
+                            let result = segments.join(".");
 
                             tracing::debug!(
                                 "[javascript] module_path_from_file file_path={file_path:?} -> module_path={result}"
@@ -191,18 +195,17 @@ impl LanguageBehavior for JavaScriptBehavior {
             }
         }
 
-        // Fallback: simple path-based module resolution
-        let relative_path = file_path.strip_prefix(project_root).ok()?;
-        let path = relative_path.to_str()?;
+        // Fallback: simple segment-based module resolution
+        let mut segments = crate::parsing::paths::relative_segments(file_path, project_root)?;
+        let last = segments.pop()?;
+        let stem = strip_extension(&last, extensions);
+        segments.push(stem.to_string());
 
-        // Strip extension using the provided extensions list
-        let path_without_ext = strip_extension(path.trim_start_matches("./"), extensions);
-
-        // Handle /index suffix (directory imports)
-        let module_path = path_without_ext.trim_end_matches("/index");
-
-        // Replace path separators with module separators
-        let result = module_path.replace('/', ".");
+        // index collapses to its directory (directory imports)
+        while segments.len() > 1 && segments.last().is_some_and(|s| s == "index") {
+            segments.pop();
+        }
+        let result = segments.join(".");
 
         tracing::debug!(
             "[javascript] module_path_from_file file_path={file_path:?} -> module_path={result}"
@@ -285,8 +288,10 @@ impl LanguageBehavior for JavaScriptBehavior {
     /// Uses jsconfig path aliases via JavaScriptProjectEnhancer.
     /// Returns (scope, enhanced_imports) where enhanced_imports have path aliases resolved.
     ///
-    /// CRITICAL: Symbols from pipeline have `module_path: None`.
-    /// We compute module_path on-the-fly from `symbol.file_path` using rules.
+    /// Module identity comes from the cache symbols' `module_path`, derived
+    /// once at parse through the strip-base ladder. Re-deriving here from
+    /// `file_path` has no root to strip against and fails closed on
+    /// absolute stored paths (out-of-tree indexing).
     fn build_resolution_context_with_pipeline_cache(
         &self,
         file_id: FileId,
@@ -299,24 +304,17 @@ impl LanguageBehavior for JavaScriptBehavior {
     ) {
         use crate::parsing::ScopeLevel;
         use crate::parsing::resolution::{ImportBinding, ImportOrigin, ProjectResolutionEnhancer};
-        use std::path::PathBuf;
 
         let mut context = JavaScriptResolutionContext::new(file_id);
 
-        // Helper to compute module_path from file_path using rules
-        // Rules contain jsconfig paths; module_path_from_file extracts canonical module path
-        let compute_module_path = |file_path: &str| -> Option<String> {
-            let path = PathBuf::from(file_path);
-            // project_root is unused by JavaScript's module_path_from_file (uses rules instead)
-            self.module_path_from_file(&path, &PathBuf::new(), extensions)
-        };
-
-        // Compute importing module from current file
-        let importing_module = cache
+        let importing_symbol = cache
             .symbols_in_file(file_id)
             .first()
-            .and_then(|id| cache.get(*id))
-            .and_then(|sym| compute_module_path(&sym.file_path));
+            .and_then(|id| cache.get(*id));
+        let importing_file = importing_symbol
+            .as_ref()
+            .map(|sym| sym.file_path.to_string());
+        let importing_module = importing_symbol.and_then(|sym| sym.module_path.map(String::from));
 
         // Load project rules for path alias enhancement
         let maybe_enhancer = self
@@ -338,8 +336,22 @@ impl LanguageBehavior for JavaScriptBehavior {
                     .to_string()
             });
 
+            // Path-domain arm first: relative specifiers resolve by file
+            // identity (trait default). Module-string normalization cannot
+            // represent the navigation when stems contain dots.
+            let file_resolved = importing_file.as_deref().and_then(|f| {
+                self.resolve_relative_import(cache, &local_name, &import.path, f, extensions)
+            });
+            let file_resolved_module = file_resolved
+                .and_then(|id| cache.get(id))
+                .and_then(|s| s.module_path.map(String::from));
+
             // Enhance import path if we have jsconfig rules
-            let target_module = if let Some(ref enhancer) = maybe_enhancer {
+            let target_module = if let Some(module) = file_resolved_module {
+                // The resolved file's parse-derived module is the truth the
+                // string normalization approximates.
+                module
+            } else if let Some(ref enhancer) = maybe_enhancer {
                 if let Some(enhanced_path) = enhancer.enhance_import_path(&import.path, file_id) {
                     // Jsconfig alias - convert enhanced path to module format
                     enhanced_path.trim_start_matches("./").replace('/', ".")
@@ -373,21 +385,22 @@ impl LanguageBehavior for JavaScriptBehavior {
             // suffix matches bind only an exactly-one survivor (candidate
             // order is file-processing order, not identity; raw ends_with
             // also admitted mid-segment captures).
-            let mut resolved_symbol: Option<SymbolId> = None;
+            let mut resolved_symbol: Option<SymbolId> = file_resolved;
             let mut suffix_matches: Vec<SymbolId> = Vec::new();
-            for id in cache.lookup_candidates(&local_name) {
-                if let Some(symbol) = cache.get(id) {
-                    // Compute module_path from file_path using rules
-                    if let Some(computed_module) = compute_module_path(&symbol.file_path) {
-                        if computed_module == target_module {
-                            resolved_symbol = Some(id);
-                            break;
-                        }
-                        if crate::indexing::pipeline::types::segment_suffix_match(
-                            &computed_module,
-                            &target_module,
-                        ) {
-                            suffix_matches.push(id);
+            if resolved_symbol.is_none() {
+                for id in cache.lookup_candidates(&local_name) {
+                    if let Some(symbol) = cache.get(id) {
+                        if let Some(module) = symbol.module_path.as_deref() {
+                            if module == target_module {
+                                resolved_symbol = Some(id);
+                                break;
+                            }
+                            if crate::indexing::pipeline::types::segment_suffix_match(
+                                module,
+                                &target_module,
+                            ) {
+                                suffix_matches.push(id);
+                            }
                         }
                     }
                 }
@@ -421,14 +434,13 @@ impl LanguageBehavior for JavaScriptBehavior {
         // Populate context with enhanced imports
         context.populate_imports(&enhanced_imports);
 
-        // Add local symbols from this file with computed module_path
+        // Add local symbols from this file under their module identity
         for sym_id in cache.symbols_in_file(file_id) {
             if let Some(symbol) = cache.get(sym_id) {
                 if self.is_resolvable_symbol(&symbol) {
                     context.add_symbol(symbol.name.to_string(), symbol.id, ScopeLevel::Module);
-                    // Compute module_path from file_path using rules
-                    if let Some(computed_module) = compute_module_path(&symbol.file_path) {
-                        context.add_symbol(computed_module, symbol.id, ScopeLevel::Module);
+                    if let Some(module) = symbol.module_path.as_deref() {
+                        context.add_symbol(module.to_string(), symbol.id, ScopeLevel::Module);
                     }
                 }
             }
@@ -552,5 +564,35 @@ impl LanguageBehavior for JavaScriptBehavior {
         }
 
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Fallback module derivation must segment on path components, not
+    // the '/' literal: native separators otherwise survive into the
+    // module path and import bindings starve against it.
+    #[test]
+    fn fallback_module_segmentation_is_separator_agnostic() {
+        let behavior = JavaScriptBehavior::new();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        assert_eq!(
+            behavior.module_path_from_file(&root.join("components").join("App.js"), root, &["js"]),
+            Some("components.App".to_string()),
+            "fallback segmentation is component-wise on every platform"
+        );
+        assert_eq!(
+            behavior.module_path_from_file(
+                &root.join("components").join("index.js"),
+                root,
+                &["js"]
+            ),
+            Some("components".to_string()),
+            "index collapses to its directory on every platform"
+        );
     }
 }

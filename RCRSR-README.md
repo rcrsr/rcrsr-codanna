@@ -169,9 +169,29 @@ to confirm you're running the fork build (see
 
 ## Upstream base
 
-The fork now tracks upstream **v0.13.1** (merged from the prior v0.12.0 base).
+The fork now tracks upstream **v0.16.0** (merged from the prior v0.13.1 base).
 Moving the upstream base does not touch the fork build counter, which only ever
 counts up (see [Identifying the fork](#identifying-the-fork)).
+
+**v0.13.1 → v0.16.0 reconciliation.** Two fork-private capabilities now sit
+alongside upstream's own, newer equivalents rather than being retired:
+
+- **Writer transient-error retry** (`storage/tantivy/writer.rs`). Upstream
+  shipped its own `create_writer_with_retry` in this range, but it classifies
+  transient errors via `source().downcast::<io::Error>()`, which never matches
+  `LockError::LockBusy` on tantivy 0.26 — the exact case the fork's retry
+  exists to survive. The fork's `is_transient_writer_error` (matching the
+  concrete `LockFailure(LockBusy, _)` / `LockFailure(IoError)` / `IoError`
+  variants, with capped backoff) stays the live retry path; upstream's
+  0.13.3 segment-merge-wait fix (`wait_merging_threads()` before releasing the
+  writer) was adopted as an additional layer on top, not a replacement.
+- **JSON envelope** (`io/envelope.rs`). Upstream added `begin`/`summary`
+  dump-streaming markers in 0.14.0; the fork's pre-existing `ambiguous(message,
+  data)` constructor (and its `ResultCode` handling) is kept alongside them.
+
+The fork's inline 1-indexed JSON range convention in `search.rs`/`symbols.rs`
+was retired in this pass — upstream converged on the same 1-indexed boundary,
+so the fork's duplicate logic was removed in favor of upstream's.
 
 One upstream v0.10.0 change is user-visible for existing MCP clients:
 **unknown `key:value` arguments on an MCP tool call now reject** instead of

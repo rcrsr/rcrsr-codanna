@@ -89,7 +89,11 @@ fn initialize_providers(
         if !invalid_paths.is_empty() {
             // Collect all invalid paths for error reporting
             for path in &invalid_paths {
-                eprintln!("  - {} config file not found: {}", lang_id, path.display());
+                eprintln!(
+                    "  - {} config file not found: {}",
+                    lang_id,
+                    codanna::parsing::paths::render_absolute_path(path).display()
+                );
             }
             validation_errors.push((lang_id.to_string(), invalid_paths));
             continue;
@@ -116,7 +120,10 @@ fn initialize_providers(
         for (lang, paths) in &validation_errors {
             error_details.push_str(&format!("\n{lang} configuration:\n"));
             for path in paths {
-                error_details.push_str(&format!("  - {} not found\n", path.display()));
+                error_details.push_str(&format!(
+                    "  - {} not found\n",
+                    codanna::parsing::paths::render_absolute_path(path).display()
+                ));
             }
         }
         error_details.push_str("\nSuggestion: Check paths in .codanna/settings.toml");
@@ -388,20 +395,15 @@ async fn main() {
     // `codanna index` heals by full rebuild; everything else (including
     // dry-run, whose pre-dispatch path sync can write) refuses with the
     // heal command. `--force` clears unconditionally and needs no gate.
-    //
-    // `persistence.exists()` keys on `tantivy/meta.json`, which merely
-    // constructing an `IndexFacade` creates -- a dry run materializes it
-    // without ever saving. Such a directory holds no saved rows, so it has
-    // no emission semantics to be stale about, and `IndexMetadata::load`
-    // cannot tell it apart from a saved-but-unstamped index (both yield
-    // `emission_version: None`). Require `index.meta` on disk so the gate
-    // judges only indexes some binary actually wrote; otherwise a first dry
-    // run on a never-indexed workspace would refuse every command after it,
-    // against an index the user never built (tests/ignore_surface_tests.rs).
+    // Gate only real indexes: serve's own startup manufactures a bare
+    // tantivy skeleton with no index.meta, and a skeleton is empty,
+    // not stale. Every index written since stamping began has
+    // index.meta (pre-stamping ones carry it without the version
+    // field and keep gating).
     let mut emission_heal = false;
     if needs_indexer
         && persistence.exists()
-        && config.index_path.join("index.meta").exists()
+        && IndexMetadata::exists(&config.index_path)
         && !matches!(cli.command, Commands::Index { force: true, .. })
     {
         let stored = IndexMetadata::load(&config.index_path)
@@ -450,6 +452,36 @@ async fn main() {
     // index directory, so persistence.exists() afterwards cannot tell a
     // real index from one this process just created.
     let index_preexisted = persistence.exists();
+
+    // The force and emission-heal lanes clear the persisted index during
+    // facade creation, before the rebuild sources are validated; a
+    // mistyped CLI path — or a configured root set with no surviving
+    // entry on the bare lane — would destroy the index and rebuild
+    // nothing. Existence is checked here, ahead of any destructive clear.
+    if let Commands::Index { paths, force, .. } = &cli.command {
+        if *force || emission_heal {
+            if !paths.is_empty() {
+                let mut missing = false;
+                for path in paths.iter().filter(|p| !p.exists()) {
+                    missing = true;
+                    eprintln!("Error: Path does not exist: {}", path.display());
+                }
+                if missing {
+                    std::process::exit(1);
+                }
+            } else if index_preexisted && !config.indexing.indexed_paths.iter().any(|p| p.exists())
+            {
+                for path in &config.indexing.indexed_paths {
+                    eprintln!(
+                        "Error: Configured path does not exist: {}",
+                        codanna::parsing::paths::render_absolute_path(path).display()
+                    );
+                }
+                eprintln!("Error: --force would clear the index with nothing to rebuild");
+                std::process::exit(1);
+            }
+        }
+    }
     let mut indexer: Option<IndexFacade> = if !needs_indexer {
         None
     } else {
@@ -458,7 +490,7 @@ async fn main() {
             let force_recreate_index =
                 matches!(cli.command, Commands::Index { force: true, .. }) || emission_heal;
             if persistence.exists() && !force_recreate_index {
-                tracing::debug!(target: "cli", "found existing index at {}", config.index_path.display());
+                tracing::debug!(target: "cli", "found existing index at {}", codanna::parsing::paths::render_absolute_path(&config.index_path).display());
                 // Use lazy loading for simple commands to improve startup time
                 let skip_trait_resolver = !needs_trait_resolver;
                 if skip_trait_resolver {
@@ -496,7 +528,7 @@ async fn main() {
                     tracing::debug!(
                         target: "cli",
                         "no existing index found at {}",
-                        config.index_path.display()
+                        codanna::parsing::paths::render_absolute_path(&config.index_path).display()
                     );
                 }
                 tracing::debug!(target: "cli", "creating new index");
@@ -587,7 +619,11 @@ async fn main() {
                             .iter()
                             .any(|c| canon.starts_with(c) || c.starts_with(&canon))
                     })
-                    .map(|p| p.display().to_string())
+                    .map(|p| {
+                        codanna::parsing::paths::render_absolute_path(p)
+                            .display()
+                            .to_string()
+                    })
                     .collect();
                 if !not_rebuilt.is_empty() {
                     eprintln!(
@@ -600,7 +636,11 @@ async fn main() {
                 let roots: Vec<String> = report
                     .newly_seeded
                     .iter()
-                    .map(|p| p.display().to_string())
+                    .map(|p| {
+                        codanna::parsing::paths::render_absolute_path(p)
+                            .display()
+                            .to_string()
+                    })
                     .collect();
                 println!(
                     "Rebuilding index for configured roots: {}",
@@ -611,7 +651,11 @@ async fn main() {
                     .indexing
                     .indexed_paths
                     .iter()
-                    .map(|p| p.display().to_string())
+                    .map(|p| {
+                        codanna::parsing::paths::render_absolute_path(p)
+                            .display()
+                            .to_string()
+                    })
                     .collect();
                 println!(
                     "Rebuilding index for configured roots: {}",
@@ -626,13 +670,18 @@ async fn main() {
             if report.missing_paths.len() == 1 {
                 eprintln!(
                     "Warning: Skipping configured path (not found): {}",
-                    report.missing_paths[0].display()
+                    codanna::parsing::paths::render_absolute_path(&report.missing_paths[0])
+                        .display()
                 );
             } else {
                 let listed: Vec<String> = report
                     .missing_paths
                     .iter()
-                    .map(|p| p.display().to_string())
+                    .map(|p| {
+                        codanna::parsing::paths::render_absolute_path(p)
+                            .display()
+                            .to_string()
+                    })
                     .collect();
                 eprintln!(
                     "Warning: Skipping {} configured paths (not found): {}",
@@ -721,7 +770,10 @@ async fn main() {
                     tracing::debug!(
                         target: "cli",
                         "expected path: {}",
-                        config.index_path.join("metadata.json").display()
+                        codanna::parsing::paths::render_absolute_path(
+                            &config.index_path.join("metadata.json")
+                        )
+                        .display()
                     );
 
                     eprintln!("\nRecovery steps:");
@@ -883,6 +935,29 @@ async fn main() {
             std::process::exit(exit_code as i32);
         }
 
+        Commands::Dump {
+            symbols,
+            edges,
+            relation,
+            kind,
+        } => {
+            let filter = codanna::dump::DumpFilter {
+                rows: match (symbols, edges) {
+                    (true, _) => codanna::dump::Rows::Symbols,
+                    (_, true) => codanna::dump::Rows::Relationships,
+                    _ => codanna::dump::Rows::All,
+                },
+                relation,
+                kind,
+            };
+            let exit_code = codanna::cli::commands::dump::run(
+                indexer.as_ref().expect("dump requires indexer"),
+                &config,
+                &filter,
+            );
+            std::process::exit(exit_code as i32);
+        }
+
         Commands::Mcp {
             tool,
             positional,
@@ -911,7 +986,7 @@ async fn main() {
                             ) {
                                 Ok(stats) => total_indexed += stats.files_indexed,
                                 Err(e) => {
-                                    tracing::warn!(target: "mcp", "watch reindex failed for {}: {e}", path.display());
+                                    tracing::warn!(target: "mcp", "watch reindex failed for {}: {e}", codanna::parsing::paths::render_absolute_path(path).display());
                                 }
                             }
                         }

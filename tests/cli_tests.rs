@@ -3,6 +3,9 @@
 #[path = "cli/support.rs"]
 mod support;
 
+#[path = "cli/common.rs"]
+mod common;
+
 #[path = "cli/test_plugin_commands.rs"]
 mod test_plugin_commands;
 
@@ -36,6 +39,9 @@ mod test_index_seed_ownership;
 #[path = "cli/test_fields_projection.rs"]
 mod test_fields_projection;
 
+#[path = "cli/test_index_force_invalid_path.rs"]
+mod test_index_force_invalid_path;
+
 #[path = "cli/test_serve_stdio_dual_generation.rs"]
 mod test_serve_stdio_dual_generation;
 
@@ -44,3 +50,10 @@ mod test_serve_http_sessionless;
 
 #[path = "cli/test_mcp_test_client_generation.rs"]
 mod test_mcp_test_client_generation;
+
+#[path = "cli/test_version_stamp.rs"]
+mod test_version_stamp;
+
+/// `codanna dump` envelope stream and stale gate
+#[path = "cli/test_dump.rs"]
+mod test_dump;

@@ -167,17 +167,26 @@ impl DocumentIndex {
     /// already-relative and unmatched absolute paths return None and the
     /// caller keeps the stored form (fail-safe, never mangles).
     pub fn to_portable_file_path(&self, stored: &str) -> Option<String> {
+        // Emission contract: every emitted relative path is portable-form
+        // (`/`) on every platform; stored bytes stay native. Base matching
+        // is the storage-coupled half; the formatting policy is
+        // `parsing::paths::portable_join`.
         let path = Path::new(stored);
         if path.is_relative() {
-            return None;
+            return crate::parsing::paths::portable_join(path);
         }
         for base in &self.strip_bases {
             if let Ok(rel) = path.strip_prefix(base) {
-                if rel.as_os_str().is_empty() {
-                    continue;
+                if let Some(portable) = crate::parsing::paths::portable_join(rel) {
+                    return Some(portable);
                 }
-                return Some(rel.to_string_lossy().into_owned());
             }
+        }
+        // Unmatched absolutes render verbatim-free; the identity case
+        // stays None so callers keep the zero-copy stored fallback.
+        let rendered = crate::parsing::paths::render_absolute_path(path);
+        if rendered.as_os_str() != path.as_os_str() {
+            return Some(rendered.to_string_lossy().into_owned());
         }
         None
     }

@@ -2,7 +2,7 @@
 name = "codanna"
 # Fork version: <upstream base>+rcrsr.<private addition counter>
 #
-#   0.13.1   -- the upstream release this fork is built from. Bump ONLY when
+#   0.16.0   -- the upstream release this fork is built from. Bump ONLY when
 #               rebasing/merging onto a new upstream release. Moving the base
 #               does NOT touch the counter.
 #   +rcrsr.N -- N counts private additions across the fork's whole life, NOT
@@ -14,12 +14,12 @@ name = "codanna"
 #               connected client reports exactly which build it is talking to.
 #
 # `+` is BUILD METADATA, which semver ignores in precedence: every +rcrsr.N
-# compares EQUAL to a bare 0.13.1, and +rcrsr.7 does NOT sort above +rcrsr.1.
-# That is deliberate -- a `-rcrsr` pre-release would instead sort BELOW 0.13.1,
+# compares EQUAL to a bare 0.16.0, and +rcrsr.7 does NOT sort above +rcrsr.1.
+# That is deliberate -- a `-rcrsr` pre-release would instead sort BELOW 0.16.0,
 # making a fork with strictly more code compare as older than the upstream it
 # was built from. The counter is informational, not orderable. Do not rely on
 # it for version-range gating.
-version = "0.13.1+rcrsr.3"
+version = "0.16.0+rcrsr.4"
 authors = ["Angel Bartolli <bartolli@gmail.com>"]
 edition = "2024"
 description = "Local code intelligence MCP server and CLI for AI coding agents"
@@ -31,7 +31,7 @@ readme = "README.md"
 keywords = ["code-indexing", "code-intelligence", "mcp-server", "semantic-search", "ai-agents"]
 categories = ["development-tools", "command-line-utilities", "parsing", "text-processing", "compilers"]
 autoexamples = false
-exclude = [".github/", "contributing/", "tests/", "docs/"]
+exclude = [".github/", "contributing/", "tests/", "docs/", "agents/", ".claude-plugin/", "assets/"]
 # This fork is distributed via GitHub Releases + `cargo binstall`, not crates.io.
 # The `codanna` crate name is owned by upstream; block accidental `cargo publish`.
 publish = false
@@ -48,31 +48,31 @@ publish = false
 pkg-fmt = "txz"
 
 [package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
-pkg-url = "https://github.com/rcrsr/rcrsr-codanna/releases/download/v{ version }/{ name }-0.13.1-rcrsr.3-linux-x64.tar.xz"
-bin-dir = "{ name }-0.13.1-rcrsr.3-linux-x64/{ bin }"
+pkg-url = "https://github.com/rcrsr/rcrsr-codanna/releases/download/v{ version }/{ name }-0.16.0-rcrsr.4-linux-x64.tar.xz"
+bin-dir = "{ name }-0.16.0-rcrsr.4-linux-x64/{ bin }"
 
 [package.metadata.binstall.overrides.x86_64-apple-darwin]
-pkg-url = "https://github.com/rcrsr/rcrsr-codanna/releases/download/v{ version }/{ name }-0.13.1-rcrsr.3-macos-x64.tar.xz"
-bin-dir = "{ name }-0.13.1-rcrsr.3-macos-x64/{ bin }"
+pkg-url = "https://github.com/rcrsr/rcrsr-codanna/releases/download/v{ version }/{ name }-0.16.0-rcrsr.4-macos-x64.tar.xz"
+bin-dir = "{ name }-0.16.0-rcrsr.4-macos-x64/{ bin }"
 
 [package.metadata.binstall.overrides.aarch64-apple-darwin]
-pkg-url = "https://github.com/rcrsr/rcrsr-codanna/releases/download/v{ version }/{ name }-0.13.1-rcrsr.3-macos-arm64.tar.xz"
-bin-dir = "{ name }-0.13.1-rcrsr.3-macos-arm64/{ bin }"
+pkg-url = "https://github.com/rcrsr/rcrsr-codanna/releases/download/v{ version }/{ name }-0.16.0-rcrsr.4-macos-arm64.tar.xz"
+bin-dir = "{ name }-0.16.0-rcrsr.4-macos-arm64/{ bin }"
 
 [package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
-pkg-url = "https://github.com/rcrsr/rcrsr-codanna/releases/download/v{ version }/{ name }-0.13.1-rcrsr.3-windows-x64.zip"
+pkg-url = "https://github.com/rcrsr/rcrsr-codanna/releases/download/v{ version }/{ name }-0.16.0-rcrsr.4-windows-x64.zip"
 pkg-fmt = "zip"
-bin-dir = "{ name }-0.13.1-rcrsr.3-windows-x64/{ bin }{ binary-ext }"
+bin-dir = "{ name }-0.16.0-rcrsr.4-windows-x64/{ bin }{ binary-ext }"
 
 [dependencies]
 anyhow = "1.0.104"
 bitflags = "2.13.1"
-clap = { version = "4.6.4", features = ["derive", "color", "env"] }
+clap = { version = "4.6.6", features = ["derive", "color", "env"] }
 crossbeam-channel = "0.5.16"
 dashmap = "6.2.1"
 dirs = "6.0.0"
 figment = { version = "0.10.19", features = ["toml", "env"] }
-ignore = "0.4.31"
+ignore = "0.4.33"
 memmap2 = "0.9.11"
 notify = "8.2.0"
 num_cpus = "1.17.0"
@@ -81,18 +81,18 @@ rayon = "1.12.0"
 # transport-streamable-http-client-reqwest gives the stdio<->HTTP proxy (src/mcp/proxy.rs) a
 # reqwest::Client that implements rmcp's StreamableHttpClient trait, so it can dial the loopback
 # backing "codanna serve --http" without a hand-rolled HTTP client (pulls in rmcp's own reqwest dep).
-rmcp = { version = "3.1.0", features = ["server", "client", "transport-io", "transport-child-process", "transport-streamable-http-server", "transport-streamable-http-client", "transport-streamable-http-client-reqwest", "transport-worker"] }
+rmcp = { version = "3.1.4", features = ["server", "client", "transport-io", "transport-child-process", "transport-streamable-http-server", "transport-streamable-http-client", "transport-streamable-http-client-reqwest", "transport-worker"] }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = "1.0.151"
 sha2 = "0.11.0"
 hex = "0.4"
 tantivy = "0.26.1"
-thiserror = "2.0.19"
+thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["full"] }
 toml = { version = "1.1.4", features = ["preserve_order"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-tree-sitter = "0.26.11"
+tree-sitter = "0.26.13"
 tree-sitter-go = "0.25.0"
 tree-sitter-gdscript = "6.1.0"
 tree-sitter-java = "0.23.5"
@@ -120,7 +120,7 @@ serde_urlencoded = "0.7"
 tokio-util = "0.7.19"
 axum-server = { version = "0.8.0", features = ["tls-rustls-no-provider"], optional = true }
 rustls = { version = "0.23.43", default-features = false, features = ["ring"], optional = true }
-rcgen = { version = "0.14.8", optional = true }
+rcgen = { version = "0.14.9", optional = true }
 is-terminal = "0.4.17"
 regex = "1.13.1"
 tree-sitter-c = "0.24.2"
@@ -133,7 +133,7 @@ tree-sitter-swift = "0.7.3"
 tree-sitter-lua = "0.5.0"
 tree-sitter-clojure-orchard = "0.2.8"
 glob = "0.3.4"
-async-trait = "0.1.91"
+async-trait = "0.1.92"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # rmcp's `impl StreamableHttpClient for reqwest::Client` is against reqwest 0.13
 # (rmcp 3.1.0 -> reqwest 0.13.x). The 0.12 dep above is a DIFFERENT crate instance
@@ -145,7 +145,7 @@ indexmap = { version = "2.14.0", features = ["serde"] }
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["html_reports"] }
 ort = { version = "=2.0.0-rc.10", default-features = false }
-testcontainers = "0.27.3"
+testcontainers = "0.28.0"
 thread-id = "5.1.0"
 # test-util (paused/virtual clock: tokio::time::pause/advance) is only used
 # under #[cfg(test)]; kept as a dev-dependency addition rather than enabling
@@ -208,7 +208,7 @@ path = "examples/parser_census.rs"
 
 [[example]]
 name = "resolution_precision"
-path = "examples/resolution_precision.rs"
+path = "examples/resolution_precision/main.rs"
 
 [[bench]]
 name = "unified_output_bench"
@@ -217,3 +217,6 @@ harness = false
 [[bench]]
 name = "kotlin_parser_bench"
 harness = false
+
+[target."cfg(windows)".dependencies]
+dunce = "1.0.5"

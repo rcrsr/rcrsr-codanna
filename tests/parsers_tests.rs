@@ -216,3 +216,36 @@ mod test_java_extract_parameter_type;
 
 #[path = "parsers/java/test_method_kind.rs"]
 mod test_java_method_kind;
+
+#[path = "parsers/php/test_variable_binding_sigil.rs"]
+mod test_php_variable_binding_sigil;
+
+#[path = "parsers/java/test_variable_bindings.rs"]
+mod test_java_variable_bindings;
+
+#[path = "parsers/php/test_variable_binding_assignments.rs"]
+mod test_php_variable_binding_assignments;
+
+#[path = "parsers/kotlin/test_variable_bindings.rs"]
+mod test_kotlin_variable_bindings;
+
+#[path = "parsers/go/test_variable_bindings.rs"]
+mod test_go_variable_bindings;
+
+#[path = "parsers/swift/test_variable_bindings.rs"]
+mod test_swift_variable_bindings;
+
+#[path = "parsers/swift/test_extract_parameter_type.rs"]
+mod test_swift_extract_parameter_type;
+
+#[path = "parsers/gdscript/test_variable_bindings.rs"]
+mod test_gdscript_variable_bindings;
+
+#[path = "parsers/gdscript/test_extract_parameter_type.rs"]
+mod test_gdscript_extract_parameter_type;
+
+#[path = "parsers/csharp/test_extract_parameter_type.rs"]
+mod test_csharp_extract_parameter_type;
+
+#[path = "parsers/csharp/test_variable_bindings.rs"]
+mod test_csharp_variable_bindings;

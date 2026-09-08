@@ -500,6 +500,23 @@ impl IndexFacade {
             })
     }
 
+    /// Visit every symbol row once (bulk read; ordering unspecified).
+    pub fn for_each_symbol<E: From<crate::storage::StorageError>>(
+        &self,
+        visit: impl FnMut(Symbol) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.document_index.for_each_symbol(visit)
+    }
+
+    /// Visit every relationship row once as `(from, to, relationship)`
+    /// (bulk read; ordering unspecified).
+    pub fn for_each_relationship<E: From<crate::storage::StorageError>>(
+        &self,
+        visit: impl FnMut(SymbolId, SymbolId, crate::relationship::Relationship) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.document_index.for_each_relationship(visit)
+    }
+
     /// Get symbols by file ID.
     ///
     /// Returns empty vec on error for SimpleIndexer API compatibility.
@@ -1357,6 +1374,65 @@ impl IndexFacade {
         })
     }
 
+    /// `index_directory` with resolution deferred into `pending`.
+    ///
+    /// For per-root loops that must keep warn-and-continue semantics
+    /// (serve batch sync, watcher config handler, MCP reindex): call
+    /// this per root, then `resolve_deferred` once so cross-root
+    /// imports bind regardless of loop order. `relationships_resolved`
+    /// in the returned stats is 0 by construction.
+    pub fn index_directory_deferred(
+        &mut self,
+        path: &Path,
+        force: bool,
+        pending: &mut crate::indexing::pipeline::PendingResolution,
+    ) -> FacadeResult<IndexingStats> {
+        let path = &Self::canonical_or_raw(path);
+        if self.has_semantic_search() {
+            if let Err(e) = self.ensure_embedding_pool() {
+                tracing::warn!("Failed to initialize embedding pool: {e}");
+            }
+        }
+        let stats = self.pipeline.index_incremental_deferred(
+            path,
+            Arc::clone(&self.document_index),
+            self.semantic_search.clone(),
+            self.embedding_pool.clone(),
+            force,
+            false,
+            0,
+            pending,
+        )?;
+
+        // Update tracked paths
+        self.add_indexed_path(path);
+
+        Ok(IndexingStats {
+            files_indexed: stats.new_files
+                + stats.modified_files
+                + stats.renamed_files
+                + stats.invalidated_caller_files,
+            symbols_found: stats.index_stats.symbols_found,
+            relationships_resolved: 0,
+            files_removed: stats.deleted_files,
+            symbols_removed: stats.deleted_symbols,
+        })
+    }
+
+    /// Resolve everything accumulated by `index_directory_deferred` calls.
+    pub fn resolve_deferred(
+        &mut self,
+        pending: crate::indexing::pipeline::PendingResolution,
+    ) -> FacadeResult<()> {
+        self.pipeline.resolve_pending(
+            pending,
+            Arc::clone(&self.document_index),
+            self.semantic_search.clone(),
+            false,
+        )?;
+        Ok(())
+    }
+
     /// Index a directory with advanced options.
     ///
     /// Provides options for progress reporting, dry-run mode, force re-indexing,
@@ -1370,100 +1446,149 @@ impl IndexFacade {
         max_files: Option<usize>,
         dry_run_output: DryRunOutput,
     ) -> crate::IndexResult<crate::indexing::progress::IndexStats> {
+        let dirs = [dir.as_ref().to_path_buf()];
+        let mut stats = self.index_directories_with_options(
+            &dirs,
+            progress,
+            dry_run,
+            force,
+            max_files,
+            dry_run_output,
+        )?;
+        Ok(stats.pop().unwrap_or_default())
+    }
+
+    /// Index multiple directories as one run: Phase 1 walks each root in
+    /// order, resolution runs once after the last root so cross-root
+    /// imports bind regardless of registration order. Returns per-root
+    /// stats aligned with `dirs`.
+    pub fn index_directories_with_options(
+        &mut self,
+        dirs: &[PathBuf],
+        progress: bool,
+        dry_run: bool,
+        force: bool,
+        max_files: Option<usize>,
+        dry_run_output: DryRunOutput,
+    ) -> crate::IndexResult<Vec<crate::indexing::progress::IndexStats>> {
         use crate::indexing::FileWalker;
+        use crate::indexing::pipeline::PendingResolution;
         use crate::indexing::progress::IndexStats;
 
-        let dir = &Self::canonical_or_raw(dir.as_ref());
-        let walker = FileWalker::new(Arc::clone(&self.settings));
-        let files: Vec<_> = walker.walk(dir)?.collect();
+        let mut pending = PendingResolution::default();
+        let mut all_stats = Vec::with_capacity(dirs.len());
 
-        // Apply max_files limit if specified
-        let files = if let Some(max) = max_files {
-            files.into_iter().take(max).collect()
-        } else {
-            files
-        };
+        for dir in dirs {
+            let dir = &Self::canonical_or_raw(dir);
+            let walker = FileWalker::new(Arc::clone(&self.settings));
+            let files: Vec<_> = walker.walk(dir)?.collect();
 
-        let total_files = files.len();
+            // Apply max_files limit if specified
+            let files = if let Some(max) = max_files {
+                files.into_iter().take(max).collect()
+            } else {
+                files
+            };
 
-        // Handle dry-run mode
-        if dry_run {
-            match dry_run_output {
-                DryRunOutput::Json => {
-                    // `--json` prints nothing but the array itself: a truncated
-                    // JSON array would repeat the very bug this flag exists to fix.
-                    let paths: Vec<String> =
-                        files.iter().map(|p| p.display().to_string()).collect();
-                    // Never substitute an empty array on failure: printing "no
-                    // files" when the walk found some is the class of silent lie
-                    // this flag exists to eliminate.
-                    let json = serde_json::to_string(&paths).map_err(|e| {
-                        IndexError::General(format!(
-                            "failed to serialize dry-run file list as JSON: {e}"
-                        ))
-                    })?;
-                    println!("{json}");
-                }
-                DryRunOutput::ListAll => {
-                    println!("Would index {total_files} files:");
-                    for file_path in &files {
-                        println!("  {}", file_path.display());
+            let total_files = files.len();
+
+            // Handle dry-run mode
+            if dry_run {
+                match dry_run_output {
+                    DryRunOutput::Json => {
+                        // `--json` prints nothing but the array itself: a truncated
+                        // JSON array would repeat the very bug this flag exists to fix.
+                        let paths: Vec<String> =
+                            files.iter().map(|p| p.display().to_string()).collect();
+                        // Never substitute an empty array on failure: printing "no
+                        // files" when the walk found some is the class of silent lie
+                        // this flag exists to eliminate.
+                        let json = serde_json::to_string(&paths).map_err(|e| {
+                            IndexError::General(format!(
+                                "failed to serialize dry-run file list as JSON: {e}"
+                            ))
+                        })?;
+                        println!("{json}");
                     }
-                }
-                DryRunOutput::Summary => {
-                    println!("Would index {total_files} files:");
-                    for (i, file_path) in files.iter().enumerate() {
-                        if i < 5 {
-                            println!("  {}", file_path.display());
-                        } else if i == 5 && total_files > 5 {
-                            println!("  ... and {} more files", total_files - 5);
-                            break;
+                    DryRunOutput::ListAll => {
+                        println!("Would index {total_files} files:");
+                        for file_path in &files {
+                            println!(
+                                "  {}",
+                                crate::parsing::paths::render_absolute_path(file_path).display()
+                            );
+                        }
+                    }
+                    DryRunOutput::Summary => {
+                        println!("Would index {total_files} files:");
+                        for (i, file_path) in files.iter().enumerate() {
+                            if i < 5 {
+                                println!(
+                                    "  {}",
+                                    crate::parsing::paths::render_absolute_path(file_path)
+                                        .display()
+                                );
+                            } else if i == 5 && total_files > 5 {
+                                println!("  ... and {} more files", total_files - 5);
+                                break;
+                            }
                         }
                     }
                 }
+
+                let mut stats = IndexStats::new();
+                stats.files_indexed = total_files;
+                all_stats.push(stats);
+                continue;
             }
 
-            let mut stats = IndexStats::new();
-            stats.files_indexed = total_files;
-            return Ok(stats);
-        }
+            // Auto-force mode for empty indexes (clean index behaves like --force)
+            let force = force || self.document_count().unwrap_or(0) == 0;
 
-        // Auto-force mode for empty indexes (clean index behaves like --force)
-        let force = force || self.document_count().unwrap_or(0) == 0;
-
-        if self.has_semantic_search() {
-            if let Err(e) = self.ensure_embedding_pool() {
-                tracing::warn!("Failed to initialize embedding pool: {e}");
+            if self.has_semantic_search() {
+                if let Err(e) = self.ensure_embedding_pool() {
+                    tracing::warn!("Failed to initialize embedding pool: {e}");
+                }
             }
+
+            // Phase 1 only; resolution is deferred until every root walked
+            let pipeline_stats = self.pipeline.index_incremental_deferred(
+                dir,
+                Arc::clone(&self.document_index),
+                self.semantic_search.clone(),
+                self.embedding_pool.clone(),
+                force,
+                progress && total_files > 0,
+                total_files,
+                &mut pending,
+            )?;
+
+            // Update tracked paths
+            self.add_indexed_path(dir);
+
+            // Convert to IndexStats format using pipeline's actual timing
+            let mut stats = IndexStats::default();
+            stats.files_indexed = pipeline_stats.new_files
+                + pipeline_stats.modified_files
+                + pipeline_stats.renamed_files
+                + pipeline_stats.invalidated_caller_files;
+            stats.symbols_found = pipeline_stats.index_stats.symbols_found;
+            stats.files_removed = pipeline_stats.deleted_files;
+            stats.symbols_removed = pipeline_stats.deleted_symbols;
+            stats.elapsed = pipeline_stats.elapsed;
+            all_stats.push(stats);
         }
 
-        // Use Pipeline for indexing with progress flag
-        // The pipeline manages progress bars internally for clean sequential display
-        let pipeline_stats = self.pipeline.index_incremental_with_progress_flag(
-            dir,
-            Arc::clone(&self.document_index),
-            self.semantic_search.clone(),
-            self.embedding_pool.clone(),
-            force,
-            progress && total_files > 0,
-            total_files,
-        )?;
+        if !dry_run {
+            self.pipeline.resolve_pending(
+                pending,
+                Arc::clone(&self.document_index),
+                self.semantic_search.clone(),
+                progress,
+            )?;
+        }
 
-        // Update tracked paths
-        self.add_indexed_path(dir);
-
-        // Convert to IndexStats format using pipeline's actual timing
-        let mut stats = IndexStats::default();
-        stats.files_indexed = pipeline_stats.new_files
-            + pipeline_stats.modified_files
-            + pipeline_stats.renamed_files
-            + pipeline_stats.invalidated_caller_files;
-        stats.symbols_found = pipeline_stats.index_stats.symbols_found;
-        stats.files_removed = pipeline_stats.deleted_files;
-        stats.symbols_removed = pipeline_stats.deleted_symbols;
-        stats.elapsed = pipeline_stats.elapsed;
-
-        Ok(stats)
+        Ok(all_stats)
     }
 
     /// Sync with configuration (compare stored vs config paths).
@@ -1491,12 +1616,18 @@ impl IndexFacade {
             }
         }
 
-        // Index new directories with progress if enabled
-        // Use force=true since these are new directories being indexed for the first time
+        // Index new directories with progress if enabled.
+        // Use force=true since these are new directories being indexed for
+        // the first time; resolution is deferred until every new root has
+        // walked so cross-root imports bind regardless of add order.
+        let mut pending = crate::indexing::pipeline::PendingResolution::default();
         for path in &to_add {
             // Visual separator and directory label (stderr syncs with progress bars)
             eprintln!();
-            eprintln!("Indexing directory: {}", path.display());
+            eprintln!(
+                "Indexing directory: {}",
+                crate::parsing::paths::render_absolute_path(path).display()
+            );
 
             // Count files first for accurate progress bar. Uses `walk_quiet`
             // rather than `walk` because `index_incremental_with_progress_flag`
@@ -1512,7 +1643,7 @@ impl IndexFacade {
                 0
             };
 
-            let result = self.pipeline.index_incremental_with_progress_flag(
+            let result = self.pipeline.index_incremental_deferred(
                 path,
                 Arc::clone(&self.document_index),
                 self.semantic_search.clone(),
@@ -1520,6 +1651,7 @@ impl IndexFacade {
                 true, // force: new directories should be fully indexed
                 progress,
                 file_count,
+                &mut pending,
             )?;
             stats.files_indexed += result.new_files
                 + result.modified_files
@@ -1527,6 +1659,12 @@ impl IndexFacade {
                 + result.invalidated_caller_files;
             stats.symbols_found += result.index_stats.symbols_found;
         }
+        self.pipeline.resolve_pending(
+            pending,
+            Arc::clone(&self.document_index),
+            self.semantic_search.clone(),
+            progress,
+        )?;
         stats.added_dirs = to_add.len();
 
         // Remove files from removed directories
@@ -3372,7 +3510,8 @@ mod tests {
             );
             let path = facade.get_file_path(callees[0].file_id).unwrap_or_default();
             assert!(
-                callees[0].name.as_ref() == "helper" && path.ends_with("z/Base.java"),
+                callees[0].name.as_ref() == "helper"
+                    && std::path::Path::new(&path).ends_with("z/Base.java"),
                 "must resolve to the inherited parent's member, not the decoy \
                  (force={force}), got: {picked:?}"
             );
@@ -4372,17 +4511,14 @@ mod tests {
         let facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
 
         let canonical_root = root.canonicalize().unwrap();
-        let names = |scope: &std::path::Path| -> Vec<String> {
-            let mut v: Vec<String> = facade
+        // Compare PathBufs, not display strings: component-wise equality is
+        // separator-agnostic where a `/`-joined string compare is not.
+        let names = |scope: &std::path::Path| -> Vec<std::path::PathBuf> {
+            let mut v: Vec<std::path::PathBuf> = facade
                 .discoverable_files(scope)
                 .unwrap()
                 .into_iter()
-                .map(|p| {
-                    p.strip_prefix(&canonical_root)
-                        .unwrap()
-                        .to_string_lossy()
-                        .into_owned()
-                })
+                .map(|p| p.strip_prefix(&canonical_root).unwrap().to_path_buf())
                 .collect();
             v.sort();
             v
@@ -4390,23 +4526,26 @@ mod tests {
 
         assert_eq!(
             names(&root),
-            vec!["pkg/a.py", "pkg/newmod/e.py"],
+            vec![
+                std::path::PathBuf::from("pkg/a.py"),
+                std::path::PathBuf::from("pkg/newmod/e.py")
+            ],
             "root scope: ignore chains, dot-files, and extensions filter"
         );
         assert_eq!(
             names(&pkg.join("newmod")),
-            vec!["pkg/newmod/e.py"],
+            vec![std::path::PathBuf::from("pkg/newmod/e.py")],
             "subtree scope restricts to the subtree"
         );
         assert_eq!(
             names(&pkg.join("generated")),
-            Vec::<String>::new(),
+            Vec::<std::path::PathBuf>::new(),
             "a scope inside an ignored directory is empty because the \
              chain anchors at the registered root"
         );
         assert_eq!(
             names(&dir.path().join("outside")),
-            Vec::<String>::new(),
+            Vec::<std::path::PathBuf>::new(),
             "a scope outside every registered root is empty"
         );
     }
@@ -4434,21 +4573,19 @@ mod tests {
         let facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
         let canonical_root = root.canonicalize().unwrap();
 
-        let mut dirs: Vec<String> = facade
+        let mut dirs: Vec<std::path::PathBuf> = facade
             .discoverable_dirs(&root.join("newmod"))
             .unwrap()
             .into_iter()
-            .map(|p| {
-                p.strip_prefix(&canonical_root)
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned()
-            })
+            .map(|p| p.strip_prefix(&canonical_root).unwrap().to_path_buf())
             .collect();
         dirs.sort();
         assert_eq!(
             dirs,
-            vec!["newmod", "newmod/empty_sub"],
+            vec![
+                std::path::PathBuf::from("newmod"),
+                std::path::PathBuf::from("newmod/empty_sub")
+            ],
             "empty dirs watched, ignored subtree pruned by the root-anchored chain"
         );
     }
@@ -4617,6 +4754,622 @@ mod tests {
 
     /// Names of symbols holding an inbound edge to the (single) symbol
     /// called `name`. Sorted so comparisons are order-independent.
+    // A pure rename is a relocation, not delete+create: the byte-identical
+    // replacement carries the same symbols, so edges owned by unchanged
+    // callers must survive, re-pointed at the new file's ids. Pairing
+    // evidence is the stored content hash; go makes the rename semantically
+    // neutral because package identity comes from the directory, not the
+    // file name.
+    #[test]
+    fn renaming_a_file_relocates_inbound_edges_from_unchanged_callers() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("pkg");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("callee.go"),
+            "package pkg\n\nfunc Helper() int {\n\treturn 1\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("caller.go"),
+            "package pkg\n\nfunc Run() int {\n\treturn Helper()\n}\n",
+        )
+        .unwrap();
+
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(src.clone()).unwrap();
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        facade.index_directory(&src, false).unwrap();
+        let fresh = facade.relationship_count();
+        let inbound_before = inbound_edge_names(&facade, "Helper");
+        assert!(
+            !inbound_before.is_empty(),
+            "fixture must produce a caller of Helper before the rename"
+        );
+
+        std::fs::rename(src.join("callee.go"), src.join("callee_renamed.go")).unwrap();
+        facade.index_directory(&src, false).unwrap();
+
+        assert_eq!(
+            inbound_edge_names(&facade, "Helper"),
+            inbound_before,
+            "a pure rename must relocate inbound edges owned by the unchanged caller"
+        );
+        assert_eq!(
+            facade.relationship_count(),
+            fresh,
+            "a pure rename must not shed edges"
+        );
+    }
+
+    // Rename plus content edit forms no exact-hash pair: it enters the
+    // run as an unpaired deleted-plus-new set. No rebind occurs -- the
+    // deleted target's callers re-enter the parse-and-resolve lane, and
+    // source evidence selects the destination. Go package identity is
+    // path-independent, so the unchanged caller's bare call resolves to
+    // the edited destination exactly as a fresh index does.
+    #[test]
+    fn renaming_with_a_content_edit_restores_supported_caller_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("pkg");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("callee.go"),
+            "package pkg\n\nfunc Helper() int {\n\treturn 1\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("caller.go"),
+            "package pkg\n\nfunc Run() int {\n\treturn Helper()\n}\n",
+        )
+        .unwrap();
+
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(src.clone()).unwrap();
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        facade.index_directory(&src, false).unwrap();
+        assert_eq!(inbound_edge_names(&facade, "Helper"), vec!["Run:Calls"]);
+
+        std::fs::remove_file(src.join("callee.go")).unwrap();
+        std::fs::write(
+            src.join("callee_renamed.go"),
+            "package pkg\n\nfunc Helper() int {\n\treturn 2\n}\n",
+        )
+        .unwrap();
+        facade.index_directory(&src, false).unwrap();
+
+        assert_eq!(
+            inbound_edge_names(&facade, "Helper"),
+            vec!["Run:Calls"],
+            "an edited relocation must re-resolve the caller to the edited \
+             destination when source evidence supports it"
+        );
+
+        let oracle_dir = tempfile::tempdir().unwrap();
+        let mut oracle_settings = Settings {
+            index_path: oracle_dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        oracle_settings.add_indexed_path(src.clone()).unwrap();
+        let mut oracle = IndexFacade::new(std::sync::Arc::new(oracle_settings)).unwrap();
+        oracle.index_directory(&src, false).unwrap();
+        assert_eq!(
+            facade.relationship_count(),
+            oracle.relationship_count(),
+            "incremental edge set must match the fresh oracle after an \
+             edited relocation"
+        );
+    }
+
+    // Genuine-deletion control: a change set with no new files keeps
+    // die-with-target semantics -- no caller invalidation fires, and
+    // the result still matches the fresh oracle because the caller's
+    // evidence has no surviving referent.
+    #[test]
+    fn genuine_deletion_kills_inbound_edges_and_matches_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("pkg");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("callee.go"),
+            "package pkg\n\nfunc Helper() int {\n\treturn 1\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("caller.go"),
+            "package pkg\n\nfunc Run() int {\n\treturn Helper()\n}\n",
+        )
+        .unwrap();
+
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(src.clone()).unwrap();
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        facade.index_directory(&src, false).unwrap();
+        assert_eq!(inbound_edge_names(&facade, "Helper"), vec!["Run:Calls"]);
+
+        std::fs::remove_file(src.join("callee.go")).unwrap();
+        facade.index_directory(&src, false).unwrap();
+
+        assert!(
+            facade.find_symbols_by_name("Helper", None).is_empty(),
+            "a genuinely deleted target must not resurrect"
+        );
+
+        let oracle_dir = tempfile::tempdir().unwrap();
+        let mut oracle_settings = Settings {
+            index_path: oracle_dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        oracle_settings.add_indexed_path(src.clone()).unwrap();
+        let mut oracle = IndexFacade::new(std::sync::Arc::new(oracle_settings)).unwrap();
+        oracle.index_directory(&src, false).unwrap();
+        assert_eq!(
+            facade.relationship_count(),
+            oracle.relationship_count(),
+            "incremental edge set must match the fresh oracle after a \
+             genuine deletion"
+        );
+    }
+
+    // Unrelated delete-plus-new control: the deleted target's callers
+    // re-enter the run, but the unrelated new file is not a
+    // destination -- resolution finds no referent and the edge dies,
+    // matching the fresh oracle.
+    #[test]
+    fn unrelated_delete_plus_new_drops_edges_without_false_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("pkg");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("callee.go"),
+            "package pkg\n\nfunc Helper() int {\n\treturn 1\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("caller.go"),
+            "package pkg\n\nfunc Run() int {\n\treturn Helper()\n}\n",
+        )
+        .unwrap();
+
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(src.clone()).unwrap();
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        facade.index_directory(&src, false).unwrap();
+        assert_eq!(inbound_edge_names(&facade, "Helper"), vec!["Run:Calls"]);
+
+        std::fs::remove_file(src.join("callee.go")).unwrap();
+        std::fs::write(
+            src.join("other.go"),
+            "package pkg\n\nfunc Other() int {\n\treturn 9\n}\n",
+        )
+        .unwrap();
+        facade.index_directory(&src, false).unwrap();
+
+        assert!(
+            facade.find_symbols_by_name("Helper", None).is_empty(),
+            "the deleted target must not resurrect"
+        );
+        let runs = facade.find_symbols_by_name("Run", None);
+        assert_eq!(runs.len(), 1);
+        assert!(
+            facade.get_called_functions(runs[0].id).is_empty(),
+            "the re-resolved caller must not bind to the unrelated new file"
+        );
+
+        let oracle_dir = tempfile::tempdir().unwrap();
+        let mut oracle_settings = Settings {
+            index_path: oracle_dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        oracle_settings.add_indexed_path(src.clone()).unwrap();
+        let mut oracle = IndexFacade::new(std::sync::Arc::new(oracle_settings)).unwrap();
+        oracle.index_directory(&src, false).unwrap();
+        assert_eq!(
+            facade.relationship_count(),
+            oracle.relationship_count(),
+            "incremental edge set must match the fresh oracle after an \
+             unrelated delete-plus-new batch"
+        );
+    }
+
+    // The drop side of edited relocation: a path-coupled import is dead
+    // evidence, and re-resolution must fail closed rather than select a
+    // destination -- no pairing, no fuzzy pick. Same decoy discipline as
+    // the pure-rename stale-import lock.
+    #[test]
+    fn edited_relocation_drops_stale_import_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let pkg = src.join("pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("__init__.py"), "").unwrap();
+        std::fs::write(pkg.join("util.py"), "def helper():\n    pass\n").unwrap();
+        std::fs::write(pkg.join("decoy.py"), "def helper():\n    return 1\n").unwrap();
+        std::fs::write(
+            pkg.join("main.py"),
+            "from pkg.util import helper\n\n\ndef run():\n    return helper()\n",
+        )
+        .unwrap();
+
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(src.clone()).unwrap();
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        let helper_callee_count = |facade: &IndexFacade| -> usize {
+            let runs = facade.find_symbols_by_name("run", None);
+            assert_eq!(runs.len(), 1, "fixture expects exactly one `run`");
+            facade
+                .get_called_functions(runs[0].id)
+                .iter()
+                .filter(|s| s.name.as_ref() == "helper")
+                .count()
+        };
+
+        facade.index_directory(&src, true).unwrap();
+        assert_eq!(helper_callee_count(&facade), 1);
+
+        std::fs::remove_file(pkg.join("util.py")).unwrap();
+        std::fs::write(pkg.join("util_renamed.py"), "def helper():\n    return 3\n").unwrap();
+        facade.index_directory(&src, false).unwrap();
+
+        assert_eq!(
+            helper_callee_count(&facade),
+            0,
+            "a dead import after an edited relocation must fail closed, \
+             not pick a destination"
+        );
+
+        let oracle_dir = tempfile::tempdir().unwrap();
+        let mut oracle_settings = Settings {
+            index_path: oracle_dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        oracle_settings.add_indexed_path(src.clone()).unwrap();
+        let mut oracle = IndexFacade::new(std::sync::Arc::new(oracle_settings)).unwrap();
+        oracle.index_directory(&src, true).unwrap();
+        assert_eq!(
+            facade.relationship_count(),
+            oracle.relationship_count(),
+            "incremental edge set must match the fresh oracle after an \
+             edited relocation with a stale import"
+        );
+    }
+
+    // Relocation changes the target's path identity; the persisted edge
+    // carries only resolved endpoints, so unchanged callers re-enter the
+    // parse-and-resolve lane and source evidence decides survival. The
+    // decoy makes the fail-closed arm deterministic: with the import
+    // dead, two same-named candidates and no evidence must drop the
+    // edge, exactly as a fresh index of the renamed tree does.
+    #[test]
+    fn renaming_a_file_drops_stale_import_edges_via_caller_reresolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let pkg = src.join("pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("__init__.py"), "").unwrap();
+        std::fs::write(pkg.join("util.py"), "def helper():\n    pass\n").unwrap();
+        std::fs::write(pkg.join("decoy.py"), "def helper():\n    return 1\n").unwrap();
+        std::fs::write(
+            pkg.join("main.py"),
+            "from pkg.util import helper\n\n\ndef run():\n    return helper()\n",
+        )
+        .unwrap();
+
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(src.clone()).unwrap();
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        let helper_callees = |facade: &IndexFacade| -> Vec<String> {
+            let runs = facade.find_symbols_by_name("run", None);
+            assert_eq!(runs.len(), 1, "fixture expects exactly one `run`");
+            facade
+                .get_called_functions(runs[0].id)
+                .iter()
+                .filter(|s| s.name.as_ref() == "helper")
+                .map(|s| facade.get_file_path(s.file_id).unwrap_or_default())
+                .collect()
+        };
+
+        facade.index_directory(&src, true).unwrap();
+        let before = helper_callees(&facade);
+        assert_eq!(
+            before.len(),
+            1,
+            "import-bound call must resolve pre-rename, got: {before:?}"
+        );
+        assert!(before[0].ends_with("util.py"), "got: {before:?}");
+
+        std::fs::rename(pkg.join("util.py"), pkg.join("util_renamed.py")).unwrap();
+        facade.index_directory(&src, false).unwrap();
+        let incremental = helper_callees(&facade);
+        let incremental_count = facade.relationship_count();
+
+        let oracle_dir = tempfile::tempdir().unwrap();
+        let mut oracle_settings = Settings {
+            index_path: oracle_dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        oracle_settings.add_indexed_path(src.clone()).unwrap();
+        let mut oracle = IndexFacade::new(std::sync::Arc::new(oracle_settings)).unwrap();
+        oracle.index_directory(&src, true).unwrap();
+
+        assert!(
+            helper_callees(&oracle).is_empty(),
+            "oracle premise: a fresh index must fail closed on the dead import"
+        );
+        assert!(
+            incremental.is_empty(),
+            "a relocation must re-resolve the caller; the stale-import edge \
+             drops, got: {incremental:?}"
+        );
+        assert_eq!(
+            incremental_count,
+            oracle.relationship_count(),
+            "incremental edge set must match the fresh oracle after relocation"
+        );
+    }
+
+    // A caller that is itself modified in the relocation's change set
+    // enters the run exactly once: discovery already carries it, so
+    // invalidation must not add it again. Double-entry would parse the
+    // file twice in one batch and duplicate its rows.
+    #[test]
+    fn relocation_with_a_co_modified_caller_indexes_the_caller_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("pkg");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("callee.go"),
+            "package pkg\n\nfunc Helper() int {\n\treturn 1\n}\n",
+        )
+        .unwrap();
+        let caller = "package pkg\n\nfunc Run() int {\n\treturn Helper()\n}\n";
+        std::fs::write(src.join("caller.go"), caller).unwrap();
+
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(src.clone()).unwrap();
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        facade.index_directory(&src, false).unwrap();
+        let fresh = facade.relationship_count();
+        assert_eq!(inbound_edge_names(&facade, "Helper"), vec!["Run:Calls"]);
+
+        std::fs::rename(src.join("callee.go"), src.join("callee_renamed.go")).unwrap();
+        std::fs::write(src.join("caller.go"), format!("// touched\n{caller}")).unwrap();
+        facade.index_directory(&src, false).unwrap();
+
+        assert_eq!(
+            inbound_edge_names(&facade, "Helper"),
+            vec!["Run:Calls"],
+            "the co-modified caller's edge must survive exactly once"
+        );
+        assert_eq!(
+            facade.relationship_count(),
+            fresh,
+            "one relocation plus one semantics-preserving edit must not \
+             change the edge count"
+        );
+        let runs = facade.find_symbols_by_name("Run", None);
+        assert_eq!(
+            runs.len(),
+            1,
+            "double-entry would duplicate the caller's rows"
+        );
+    }
+
+    // Out-of-tree lock: the fixture root is an external tempdir, so stored
+    // file paths are ABSOLUTE -- the lane every in-tree suite misses. The
+    // shape is the three.js drop signature: a typed-receiver member call
+    // whose receiver type arrives through a parent-relative import from a
+    // file TWO levels deep. Normalizing `../math/Vector4.js` without the
+    // importing file's module identity yields `math.Vector4`, not
+    // `app.math.Vector4`, and the mirrored decoy tree makes every suffix
+    // rescue ambiguous -- only a builder that consumes the parse-derived
+    // module_path can bind the import. A fabricated-root re-derivation
+    // starves the binding and the member edge fails closed.
+    #[test]
+    fn js_out_of_tree_import_bound_receiver_member_call_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("lib");
+        std::fs::create_dir_all(src.join("app/sub")).unwrap();
+        std::fs::create_dir_all(src.join("app/math")).unwrap();
+        std::fs::create_dir_all(src.join("legacy/math")).unwrap();
+        std::fs::write(
+            src.join("app/math/Vector4.js"),
+            "export class Vector4 {\n  set(x, y, z, w) {\n    return this;\n  }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("legacy/math/Vector4.js"),
+            "export class Vector4 {\n  set(x, y, z, w) {\n    return null;\n  }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("app/sub/main.js"),
+            "import { Vector4 } from '../math/Vector4.js';\n\n\
+             export function setup() {\n  const color = new Vector4();\n  return color.set(1, 2, 3, 4);\n}\n",
+        )
+        .unwrap();
+
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(src.clone()).unwrap();
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        // force: the full lane resolves on the run-scoped cache, whose
+        // symbols carry the collect-stage ABSOLUTE paths -- the lane the
+        // battery witnesses. The non-force lane re-reads symbols through
+        // the decode boundary, which relativizes paths and masks the
+        // fabricated-root failure.
+        facade.index_directory(&src, true).unwrap();
+
+        let setup = facade
+            .find_symbols_by_name("setup", None)
+            .into_iter()
+            .next()
+            .expect("setup indexed");
+        let callees = facade.get_called_functions(setup.id);
+        let set_callees: Vec<_> = callees.iter().filter(|c| &*c.name == "set").collect();
+        assert_eq!(
+            set_callees.len(),
+            1,
+            "setup must resolve its import-anchored receiver member call: {callees:?}"
+        );
+        assert!(
+            set_callees[0].file_path.ends_with("app/math/Vector4.js"),
+            "the binding must anchor the receiver to the imported class, got {}",
+            set_callees[0].file_path
+        );
+    }
+
+    // Dotted-stem lock: module strings cannot distinguish a stem dot
+    // (`app.web`) from a path separator, so string-domain normalization
+    // of `./app.core.js` against module `build.app.web` yields a module
+    // that matches no candidate and the import binding starves. The twin
+    // file makes the ladder's exactly-one rescue ambiguous, so only a
+    // path-domain resolution of the relative specifier can bind. force:
+    // the full lane resolves on the run-scoped cache (see the
+    // out-of-tree lock above).
+    #[test]
+    fn js_relative_import_between_dotted_stem_files_binds() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("lib");
+        std::fs::create_dir_all(src.join("build")).unwrap();
+        std::fs::write(
+            src.join("build/app.core.js"),
+            "export function warn(msg) {\n  return msg;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("build/app.cjs"),
+            "function warn(msg) {\n  return msg;\n}\nmodule.exports = { warn };\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("build/app.web.js"),
+            "import { warn } from './app.core.js';\n\nexport function generate() {\n  return warn(1);\n}\n",
+        )
+        .unwrap();
+
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(src.clone()).unwrap();
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        facade.index_directory(&src, true).unwrap();
+
+        let generate = facade
+            .find_symbols_by_name("generate", None)
+            .into_iter()
+            .next()
+            .expect("generate indexed");
+        let callees = facade.get_called_functions(generate.id);
+        assert_eq!(
+            callees.len(),
+            1,
+            "generate must bind its relative import despite the twin: {callees:?}"
+        );
+        assert!(
+            callees[0].file_path.ends_with("app.core.js"),
+            "the binding must pick the imported file, got {}",
+            callees[0].file_path
+        );
+    }
+
+    // TypeScript twin of the dotted-stem lock.
+    #[test]
+    fn ts_relative_import_between_dotted_stem_files_binds() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("lib");
+        std::fs::create_dir_all(src.join("build")).unwrap();
+        std::fs::write(
+            src.join("build/app.core.ts"),
+            "export function warn(msg: string): string {\n  return msg;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("build/app.legacy.ts"),
+            "export function warn(msg: string): string {\n  return msg + '!';\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("build/app.web.ts"),
+            "import { warn } from './app.core';\n\nexport function generate(): string {\n  return warn('x');\n}\n",
+        )
+        .unwrap();
+
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(src.clone()).unwrap();
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        facade.index_directory(&src, true).unwrap();
+
+        let generate = facade
+            .find_symbols_by_name("generate", None)
+            .into_iter()
+            .next()
+            .expect("generate indexed");
+        let callees = facade.get_called_functions(generate.id);
+        assert_eq!(
+            callees.len(),
+            1,
+            "generate must bind its relative import despite the twin: {callees:?}"
+        );
+        assert!(
+            callees[0].file_path.ends_with("app.core.ts"),
+            "the binding must pick the imported file, got {}",
+            callees[0].file_path
+        );
+    }
+
     fn inbound_edge_names(facade: &IndexFacade, name: &str) -> Vec<String> {
         let targets = facade.find_symbols_by_name(name, None);
         assert_eq!(targets.len(), 1, "fixture expects exactly one `{name}`");
@@ -4874,5 +5627,238 @@ mod tests {
             err.to_string().contains("codanna index"),
             "message must name the recovery command: {err}"
         );
+    }
+
+    // Cross-root resolution locks: a tests-root import binding into a
+    // src-root symbol must produce its Calls edge in every walk order
+    // and lane. Per-root resolution with a run-scoped candidate table
+    // lost the edge under force and under reversed registration order,
+    // and the sync lane (new dir added to an existing index) lost it
+    // always.
+    fn write_two_root_python_fixture(root: &Path) -> (PathBuf, PathBuf) {
+        let src = root.join("src");
+        let tests = root.join("tests");
+        std::fs::create_dir_all(src.join("pkg")).unwrap();
+        std::fs::create_dir_all(&tests).unwrap();
+        std::fs::write(src.join("pkg/__init__.py"), "").unwrap();
+        std::fs::write(
+            src.join("pkg/mod.py"),
+            "def target_function():\n    return 42\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tests.join("test_mod.py"),
+            "from pkg.mod import target_function\n\ndef test_target_function():\n    assert target_function() == 42\n",
+        )
+        .unwrap();
+        (src, tests)
+    }
+
+    fn two_root_facade(index_root: &Path, src: &Path, tests: &Path) -> IndexFacade {
+        let mut settings = Settings {
+            index_path: index_root.join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(src.to_path_buf()).unwrap();
+        settings.add_indexed_path(tests.to_path_buf()).unwrap();
+        IndexFacade::new(std::sync::Arc::new(settings)).unwrap()
+    }
+
+    fn assert_cross_root_edge(facade: &IndexFacade, label: &str) {
+        let callers = facade.find_symbols_by_name("test_target_function", None);
+        assert_eq!(callers.len(), 1, "one test symbol expected ({label})");
+        let callees = facade.get_called_functions(callers[0].id);
+        let picked: Vec<String> = callees
+            .iter()
+            .map(|s| {
+                format!(
+                    "{}@{}",
+                    s.name,
+                    facade.get_file_path(s.file_id).unwrap_or_default()
+                )
+            })
+            .collect();
+        assert_eq!(
+            callees.len(),
+            1,
+            "cross-root call must resolve ({label}), got: {picked:?}"
+        );
+        let path = facade.get_file_path(callees[0].file_id).unwrap_or_default();
+        assert!(
+            callees[0].name.as_ref() == "target_function"
+                && std::path::Path::new(&path).ends_with("pkg/mod.py"),
+            "edge must land on the src-root symbol ({label}), got: {picked:?}"
+        );
+    }
+
+    #[test]
+    fn multi_root_force_lane_resolves_cross_root_import_in_either_order() {
+        for reversed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (src, tests) = write_two_root_python_fixture(dir.path());
+            let mut facade = two_root_facade(dir.path(), &src, &tests);
+            let dirs = if reversed {
+                [tests.clone(), src.clone()]
+            } else {
+                [src.clone(), tests.clone()]
+            };
+            facade
+                .index_directories_with_options(
+                    &dirs,
+                    false,
+                    false,
+                    true,
+                    None,
+                    DryRunOutput::default(),
+                )
+                .unwrap();
+            assert_cross_root_edge(&facade, &format!("force, reversed={reversed}"));
+        }
+    }
+
+    #[test]
+    fn multi_root_incremental_lane_resolves_cross_root_import_in_either_order() {
+        for reversed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (src, tests) = write_two_root_python_fixture(dir.path());
+            let mut facade = two_root_facade(dir.path(), &src, &tests);
+            let dirs = if reversed {
+                [tests.clone(), src.clone()]
+            } else {
+                [src.clone(), tests.clone()]
+            };
+            facade
+                .index_directories_with_options(
+                    &dirs,
+                    false,
+                    false,
+                    false,
+                    None,
+                    DryRunOutput::default(),
+                )
+                .unwrap();
+            assert_cross_root_edge(&facade, &format!("incremental, reversed={reversed}"));
+        }
+    }
+
+    #[test]
+    fn sync_added_root_resolves_cross_root_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let (src, tests) = write_two_root_python_fixture(dir.path());
+        let src = src.canonicalize().unwrap();
+        let tests = tests.canonicalize().unwrap();
+        let mut facade = two_root_facade(dir.path(), &src, &tests);
+
+        // First session: only src registered and indexed.
+        facade.index_directory(&src, false).unwrap();
+
+        // Second session: tests added to config; sync indexes the new
+        // root through its force lane.
+        facade
+            .sync_with_config(
+                Some(vec![src.clone()]),
+                &[src.clone(), tests.clone()],
+                false,
+            )
+            .unwrap();
+        assert_cross_root_edge(&facade, "sync-added root");
+    }
+
+    // Serve-lane shape: a settled burst creates the importing and the
+    // imported file in DIFFERENT roots, and the batch sync loops the
+    // covered roots through per-root incremental runs — importing root
+    // first (the order that lost the edge when each run resolved
+    // against itself).
+
+    #[test]
+    fn deferred_directory_sync_resolves_cross_root_new_file_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let tests = dir.path().join("tests");
+        std::fs::create_dir_all(src.join("pkg")).unwrap();
+        std::fs::create_dir_all(&tests).unwrap();
+        std::fs::write(src.join("pkg/__init__.py"), "").unwrap();
+        let mut facade = two_root_facade(dir.path(), &src, &tests);
+        facade
+            .index_directories_with_options(
+                &[src.clone(), tests.clone()],
+                false,
+                false,
+                false,
+                None,
+                DryRunOutput::default(),
+            )
+            .unwrap();
+
+        // The burst: both endpoint files appear at once.
+        std::fs::write(
+            src.join("pkg/mod.py"),
+            "def target_function():\n    return 42\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tests.join("test_mod.py"),
+            "from pkg.mod import target_function\n\ndef test_target_function():\n    assert target_function() == 42\n",
+        )
+        .unwrap();
+
+        let mut pending = crate::indexing::pipeline::PendingResolution::default();
+        facade
+            .index_directory_deferred(&tests, false, &mut pending)
+            .unwrap();
+        facade
+            .index_directory_deferred(&src, false, &mut pending)
+            .unwrap();
+        facade.resolve_deferred(pending).unwrap();
+        assert_cross_root_edge(&facade, "deferred burst sync, tests root first");
+    }
+
+    // Modification lane under deferral: both endpoint files content-edit
+    // in one multi-root run, so cleanup captures the tests-root inbound
+    // edge, root B's cleanup runs between root A's Phase 1 and the
+    // single Phase 2, and the rebind re-points after resolution. The
+    // edge must survive exactly once.
+    #[test]
+    fn multi_root_incremental_edit_preserves_cross_root_edge() {
+        let dir = tempfile::tempdir().unwrap();
+        let (src, tests) = write_two_root_python_fixture(dir.path());
+        let mut facade = two_root_facade(dir.path(), &src, &tests);
+        let dirs = [src.clone(), tests.clone()];
+        facade
+            .index_directories_with_options(
+                &dirs,
+                false,
+                false,
+                false,
+                None,
+                DryRunOutput::default(),
+            )
+            .unwrap();
+        assert_cross_root_edge(&facade, "pre-edit");
+
+        // Prepend into the imported file (shifts ranges), append into
+        // the importer; both roots carry a modified file in one run.
+        std::fs::write(
+            src.join("pkg/mod.py"),
+            "# shifted\ndef target_function():\n    return 42\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tests.join("test_mod.py"),
+            "from pkg.mod import target_function\n\ndef test_target_function():\n    assert target_function() == 42\n# touched\n",
+        )
+        .unwrap();
+        facade
+            .index_directories_with_options(
+                &dirs,
+                false,
+                false,
+                false,
+                None,
+                DryRunOutput::default(),
+            )
+            .unwrap();
+        assert_cross_root_edge(&facade, "post-edit");
     }
 }

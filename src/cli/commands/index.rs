@@ -87,7 +87,7 @@ pub fn run(
                         SkipReason::CoveredBy(parent) => eprintln!(
                             "{}: Included in indexed directory {}",
                             skipped.path.display(),
-                            parent.display()
+                            crate::parsing::paths::render_absolute_path(parent).display()
                         ),
                         // Registration state, not index state: the path is
                         // already in indexed_paths. Saying "already indexed"
@@ -146,8 +146,12 @@ pub fn run(
         config_paths
     };
 
-    // Process each path, tracking total changes
+    // Process each path, tracking total changes. Directories index as
+    // ONE run: Phase 1 walks each root, resolution runs once after the
+    // last root so cross-root imports bind regardless of registration
+    // order.
     let mut total_indexed = 0usize;
+    let mut dirs: Vec<PathBuf> = Vec::new();
     for path in &paths_to_index {
         if path.is_file() {
             if dry_run {
@@ -156,19 +160,25 @@ pub fn run(
                 total_indexed += 1;
             }
         } else if path.is_dir() {
-            total_indexed += index_directory(
-                indexer,
-                path,
-                progress,
-                dry_run,
-                force,
-                max_files,
-                dry_run_output,
-            );
+            dirs.push(path.clone());
         } else {
-            eprintln!("Error: Path does not exist: {}", path.display());
+            eprintln!(
+                "Error: Path does not exist: {}",
+                crate::parsing::paths::render_absolute_path(path).display()
+            );
             std::process::exit(1);
         }
+    }
+    if !dirs.is_empty() {
+        total_indexed += index_directories(
+            indexer,
+            &dirs,
+            progress,
+            dry_run,
+            force,
+            max_files,
+            dry_run_output,
+        );
     }
 
     // Only save if changes were made and not in dry-run mode
@@ -224,13 +234,13 @@ fn index_single_file(indexer: &mut IndexFacade, path: &PathBuf, force: bool) -> 
             if result.is_cached() {
                 println!(
                     "Successfully loaded from cache: {} [{}]",
-                    path.display(),
+                    crate::parsing::paths::render_absolute_path(path).display(),
                     language_name
                 );
             } else {
                 println!(
                     "Successfully indexed: {} [{}]",
-                    path.display(),
+                    crate::parsing::paths::render_absolute_path(path).display(),
                     language_name
                 );
             }
@@ -267,7 +277,10 @@ fn index_single_file(indexer: &mut IndexFacade, path: &PathBuf, force: bool) -> 
             was_indexed
         }
         Err(e) => {
-            eprintln!("Error indexing file {}: {e}", path.display());
+            eprintln!(
+                "Error indexing file {}: {e}",
+                crate::parsing::paths::render_absolute_path(path).display()
+            );
 
             let suggestions = e.recovery_suggestions();
             if !suggestions.is_empty() {
@@ -282,56 +295,62 @@ fn index_single_file(indexer: &mut IndexFacade, path: &PathBuf, force: bool) -> 
     }
 }
 
-/// Index a directory. Returns the number of files indexed.
-fn index_directory(
+/// Index directories as one run. Returns the number of files indexed.
+fn index_directories(
     indexer: &mut IndexFacade,
-    path: &PathBuf,
+    dirs: &[PathBuf],
     progress: bool,
     dry_run: bool,
     force: bool,
     max_files: Option<usize>,
     dry_run_output: DryRunOutput,
 ) -> usize {
-    // Visual separator between directory cycles (use stderr to sync with progress bars)
+    // Visual separator before directory cycles (use stderr to sync with progress bars)
     eprintln!();
 
     // Show pre-indexing message only if we have a file limit (implies actual work)
     if let Some(max) = max_files {
-        eprintln!(
-            "Indexing directory: {} (limited to {} files)",
-            path.display(),
-            max
-        );
+        for dir in dirs {
+            eprintln!(
+                "Indexing directory: {} (limited to {} files)",
+                crate::parsing::paths::render_absolute_path(dir).display(),
+                max
+            );
+        }
     }
 
-    // Track this directory as indexed
-    indexer.add_indexed_path(path);
-
-    match indexer.index_directory_with_options(
-        path,
+    match indexer.index_directories_with_options(
+        dirs,
         progress,
         dry_run,
         force,
         max_files,
         dry_run_output,
     ) {
-        Ok(stats) => {
-            // Deletions leave the progress trace at zero width; report them
-            // explicitly so a cleanup-only run does not read as a no-op.
-            if stats.files_removed > 0 {
-                eprintln!(
-                    "Removed {} deleted file(s), {} symbol(s) from index",
-                    stats.files_removed, stats.symbols_removed
-                );
+        Ok(all_stats) => {
+            let mut files_indexed = 0;
+            for (dir, stats) in dirs.iter().zip(&all_stats) {
+                // Deletions leave the progress trace at zero width; report them
+                // explicitly so a cleanup-only run does not read as a no-op.
+                if stats.files_removed > 0 {
+                    eprintln!(
+                        "Removed {} deleted file(s), {} symbol(s) from index",
+                        stats.files_removed, stats.symbols_removed
+                    );
+                }
+                // Print message only when no work happened (pipeline trace handles the rest)
+                if stats.files_indexed == 0 && stats.files_removed == 0 {
+                    eprintln!(
+                        "Index up to date: {}",
+                        crate::parsing::paths::render_absolute_path(dir).display()
+                    );
+                }
+                files_indexed += stats.files_indexed;
             }
-            // Print message only when no work happened (pipeline trace handles the rest)
-            if stats.files_indexed == 0 && stats.files_removed == 0 {
-                eprintln!("Index up to date: {}", path.display());
-            }
-            stats.files_indexed
+            files_indexed
         }
         Err(e) => {
-            eprintln!("Error indexing directory {}: {e}", path.display());
+            eprintln!("Error indexing directories: {e}");
 
             let suggestions = e.recovery_suggestions();
             if !suggestions.is_empty() {
@@ -355,7 +374,10 @@ fn save_index(indexer: &mut IndexFacade, persistence: &IndexPersistence, config:
     );
     match persistence.save_facade(indexer) {
         Ok(_) => {
-            println!("Index saved to: {}", config.index_path.display());
+            println!(
+                "Index saved to: {}",
+                crate::parsing::paths::render_absolute_path(&config.index_path).display()
+            );
         }
         Err(e) => {
             eprintln!("Error: Could not save index: {e}");

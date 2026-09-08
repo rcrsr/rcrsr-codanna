@@ -73,6 +73,9 @@ mod test_resolve_kind_filter;
 #[path = "integration/test_resolve_static_call.rs"]
 mod test_resolve_static_call;
 
+#[path = "integration/test_resolve_module_path_receiver.rs"]
+mod test_resolve_module_path_receiver;
+
 #[path = "integration/test_resolve_param_type_inference.rs"]
 mod test_resolve_param_type_inference;
 
@@ -93,3 +96,9 @@ mod test_read_symbol_and_outline_mcp;
 
 #[path = "integration/test_analyze_impact_grouping.rs"]
 mod test_analyze_impact_grouping;
+
+#[path = "integration/test_resolve_shadowed_instance_call.rs"]
+mod test_resolve_shadowed_instance_call;
+
+#[path = "integration/test_resolve_php_binding_receiver.rs"]
+mod test_resolve_php_binding_receiver;
