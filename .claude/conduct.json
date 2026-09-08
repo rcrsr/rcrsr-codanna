@@ -1,8 +1,8 @@
 {
   "version": 3,
-  "pluginVersion": "1.55.0",
+  "pluginVersion": "1.58.0",
   "conductProjectPath": "${CONDUCT_PROJECT_ROOT}/rcrsr-codanna",
-  "updated": "2026-08-04T05:18:40.859Z",
+  "updated": "2026-09-08T15:49:32.851Z",
   "domains": {
     "CDNA": {
       "name": "Codanna",

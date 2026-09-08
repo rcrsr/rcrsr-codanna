@@ -241,45 +241,6 @@ impl ResolveStage {
             }
         }
 
-        // Self-aliased receivers (self/this/cls) name their container: the
-        // caller's own enclosing type, evidenced by its ClassMember scope.
-        // Resolve within that type's direct members before the scope
-        // lookup, whose frozen winner may be a same-name member of a
-        // sibling type. A miss falls through — implicit-this languages
-        // emit the alias for free-function calls too.
-        if self.is_self_form_instance_call(unresolved, &caller.language_id) {
-            if let Some(resolved) = self.resolve_self_form_member(from_id, unresolved) {
-                return Some(resolved);
-            }
-            // Lexical-this boundary: where the behavior vouches the alias
-            // is an explicit source token, a caller without ClassMember
-            // evidence must not reach scope lookup — the caller's locals
-            // can shadow the member (the arrow self-loop class). The
-            // innermost this-barrier owning the call site resolves it, or
-            // the row fails closed.
-            if self
-                .get_behavior(&caller.language_id)
-                .is_some_and(|b| b.self_alias_receiver_is_explicit())
-                && !self.caller_has_member_scope(from_id)
-            {
-                return self.resolve_lexical_this_member(from_id, unresolved, context);
-            }
-            // A self-alias receiver names the caller's own instance, so an
-            // inherited member is in reach: walk the enclosing class's
-            // Extends rows before the ladder, whose single-survivor pick
-            // carries no class evidence. Applies to every language — the
-            // receiver is explicit here, unlike the bare-call arm below.
-            if let Some(resolved) = self.resolve_inherited_member(
-                from_id,
-                unresolved,
-                context,
-                &caller,
-                extends_by_from,
-            ) {
-                return Some(resolved);
-            }
-        }
-
         if let Some(to_id) = context.resolve(&unresolved.to_name) {
             if self.is_compatible(
                 from_kind,
@@ -344,48 +305,64 @@ impl ResolveStage {
             &context.imports,
         );
 
+        // A tier pick the guards reject is not evidence that the call has no
+        // target. The tier returns the caller-local same-name candidate first,
+        // and for an instance call that candidate is often a free function —
+        // never a member of the receiver's type. The receiver-typed arm still
+        // owns the evidence, so every arm ends there rather than at None. It
+        // re-filters to Method-kind candidates on the receiver's chain, so a
+        // rejected candidate cannot come back through it.
         match result {
             ResolveResult::Found(to_id) => {
-                if !self.is_compatible(
+                if self.is_compatible(
                     from_kind,
                     to_id,
                     unresolved.kind,
                     caller.file_id,
                     &caller.language_id,
-                ) {
-                    return None;
-                }
-                if !self.is_instance_type_compatible(
+                ) && self.is_instance_type_compatible(
                     unresolved,
                     to_id,
                     &caller.language_id,
                     context,
                     extends_by_from,
-                ) {
-                    return None;
-                }
-                if self.is_file_scoped_private_member_cross_file(
+                ) && !self.is_file_scoped_private_member_cross_file(
                     to_id,
                     caller.file_id,
                     &caller.language_id,
-                ) {
-                    return None;
+                ) && !self
+                    .is_unevidenced_cross_file_member_pick(to_id, unresolved, &caller, context)
+                {
+                    return self.accept_unwitnessed_pick(from_id, to_id, unresolved);
                 }
-                if self.is_unevidenced_cross_file_member_pick(to_id, unresolved, &caller, context) {
-                    return None;
-                }
-                self.accept_unwitnessed_pick(from_id, to_id, unresolved)
+                self.resolve_typed_receiver_global(
+                    from_id,
+                    from_kind,
+                    unresolved,
+                    &caller,
+                    context,
+                    extends_by_from,
+                )
             }
             ResolveResult::Ambiguous(candidates) => {
-                let to_id = self.disambiguate(
+                if let Some(to_id) = self.disambiguate(
                     &candidates,
                     unresolved,
                     &caller,
                     context,
                     false,
                     extends_by_from,
-                )?;
-                self.accept_unwitnessed_pick(from_id, to_id, unresolved)
+                ) {
+                    return self.accept_unwitnessed_pick(from_id, to_id, unresolved);
+                }
+                self.resolve_typed_receiver_global(
+                    from_id,
+                    from_kind,
+                    unresolved,
+                    &caller,
+                    context,
+                    extends_by_from,
+                )
             }
             ResolveResult::NotFound => self.resolve_typed_receiver_global(
                 from_id,

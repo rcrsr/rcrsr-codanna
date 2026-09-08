@@ -49,6 +49,113 @@ pub fn strip_source_root_owned(path: &Path, source_roots: &[&str]) -> PathBuf {
     strip_source_root(path, source_roots).to_path_buf()
 }
 
+/// Resolve a relative import specifier (`./x`, `../y/z`) against the
+/// importing file's directory, in the path domain.
+///
+/// Module strings cannot represent this navigation: a dot in a file
+/// stem (`app.web`) is indistinguishable from a module separator, so
+/// string-domain normalization of relative specifiers derives paths
+/// that exist nowhere. Returns `None` for non-relative specifiers and
+/// for `..` underflow past the importing path's stored root — callers
+/// keep their module-domain arms for those.
+pub fn resolve_relative_specifier(importing_file: &Path, specifier: &str) -> Option<PathBuf> {
+    if !specifier.starts_with("./") && !specifier.starts_with("../") {
+        return None;
+    }
+    let mut resolved: Vec<std::path::Component> = importing_file.parent()?.components().collect();
+    for segment in specifier.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => match resolved.pop() {
+                Some(std::path::Component::Normal(_)) => {}
+                _ => return None,
+            },
+            name => resolved.push(std::path::Component::Normal(name.as_ref())),
+        }
+    }
+    Some(resolved.iter().map(|c| c.as_os_str()).collect())
+}
+
+/// Relative path segments of `path` below `base`, split by the OS
+/// path parser.
+///
+/// The language-agnostic half of module derivation: behaviors apply
+/// their conventions (join separator, package-file collapse,
+/// source-root names) over these segments and never over path text.
+/// Returns `None` when `path` is not below `base` or escapes it;
+/// `Some(vec![])` when `path` equals `base`.
+pub fn relative_segments(path: &Path, base: &Path) -> Option<Vec<String>> {
+    let rel = path.strip_prefix(base).ok()?;
+    let mut segments = Vec::new();
+    for component in rel.components() {
+        match component {
+            std::path::Component::Normal(seg) => segments.push(seg.to_string_lossy().into_owned()),
+            _ => return None,
+        }
+    }
+    Some(segments)
+}
+
+/// Portable-form rendering of a relative path: `Normal` components
+/// joined with `/` on every platform. `None` when the path is empty
+/// or carries non-`Normal` components (`./`, `..`, roots) — callers
+/// keep their stored fallback for those.
+pub fn portable_join(path: &Path) -> Option<String> {
+    let mut segments = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(seg) => segments.push(seg.to_string_lossy()),
+            _ => return None,
+        }
+    }
+    if segments.is_empty() {
+        return None;
+    }
+    Some(segments.join("/"))
+}
+
+/// User-facing rendering of an ABSOLUTE path: the Windows verbatim
+/// prefix is stripped when the path is losslessly representable in
+/// legacy form (`\\?\C:\x` renders `C:\x`). Only
+/// `Prefix::VerbatimDisk` simplifies; every other prefix kind and
+/// every path dunce judges unrepresentable (length, reserved names,
+/// trailing dots/spaces, control characters) passes through
+/// unchanged. Internal comparison surfaces keep canonical paths;
+/// this applies only where a path is formatted for output.
+#[cfg(windows)]
+pub fn render_absolute_path(path: &Path) -> &Path {
+    use std::path::{Component, Prefix};
+    let Some(Component::Prefix(prefix)) = path.components().next() else {
+        return path;
+    };
+    if !matches!(prefix.kind(), Prefix::VerbatimDisk(_)) {
+        return path;
+    }
+    // dunce 1.0.5's reserved-name table lists the ASCII DOS device
+    // names but not the superscript aliases; preserve those verbatim.
+    let has_superscript_device = path.components().any(|component| {
+        if let Component::Normal(seg) = component {
+            let seg = seg.to_string_lossy();
+            let stem = seg.split('.').next().unwrap_or(&seg).to_lowercase();
+            (stem.starts_with("com") || stem.starts_with("lpt"))
+                && matches!(&stem[3..], "\u{b9}" | "\u{b2}" | "\u{b3}")
+        } else {
+            false
+        }
+    });
+    if has_superscript_device {
+        return path;
+    }
+    dunce::simplified(path)
+}
+
+/// Non-Windows: verbatim prefixes do not exist, and a filename
+/// literally spelled `\\?\...` is legal — identity by construction.
+#[cfg(not(windows))]
+pub fn render_absolute_path(path: &Path) -> &Path {
+    path
+}
+
 /// Strip file extension from a path string.
 ///
 /// Extensions from the registry do NOT include the dot (e.g., "rs", "py").
@@ -140,6 +247,71 @@ mod tests {
     }
 
     #[test]
+    fn render_absolute_path_is_identity_off_windows() {
+        // A unix filename literally spelled like a verbatim prefix is
+        // legal and must never be rewritten.
+        let path = Path::new(r"/tmp/\\?\literal/x.rs");
+        assert_eq!(render_absolute_path(path), path);
+        let plain = Path::new("/tmp/x.rs");
+        assert_eq!(render_absolute_path(plain), plain);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn render_absolute_path_simplifies_verbatim_disk_only() {
+        assert_eq!(
+            render_absolute_path(Path::new(r"\\?\C:\Users\x")),
+            Path::new(r"C:\Users\x")
+        );
+        // Non-VerbatimDisk prefixes pass through.
+        let unc = Path::new(r"\\?\UNC\server\share\x");
+        assert_eq!(render_absolute_path(unc), unc);
+        // Superscript DOS device aliases stay verbatim.
+        let dev = Path::new("\\\\?\\C:\\x\\com\u{b9}.txt");
+        assert_eq!(render_absolute_path(dev), dev);
+    }
+
+    #[test]
+    fn test_relative_segments_below_base() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path();
+        let path = base.join("pkg").join("util.py");
+
+        assert_eq!(
+            relative_segments(&path, base),
+            Some(vec!["pkg".to_string(), "util.py".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_relative_segments_outside_base_is_none() {
+        let temp_dir = TempDir::new().unwrap();
+        let other = TempDir::new().unwrap();
+
+        assert_eq!(
+            relative_segments(&other.path().join("x.rs"), temp_dir.path()),
+            None
+        );
+    }
+
+    #[test]
+    fn test_relative_segments_at_base_is_empty() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path();
+
+        assert_eq!(relative_segments(base, base), Some(vec![]));
+    }
+
+    #[test]
+    fn test_relative_segments_traversal_is_none() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path();
+        let path = base.join("..").join("x.rs");
+
+        assert_eq!(relative_segments(&path, base), None);
+    }
+
+    #[test]
     fn test_strip_extension_simple() {
         assert_eq!(strip_extension("foo.rs", &["rs"]), "foo");
         assert_eq!(strip_extension("bar.py", &["py", "pyi"]), "bar");
@@ -178,5 +350,49 @@ mod tests {
         // Correct order: longer extensions first
         let extensions = &["d.ts", "ts"];
         assert_eq!(strip_extension("types.d.ts", extensions), "types");
+    }
+
+    #[test]
+    fn resolve_relative_specifier_sibling_with_dotted_stems() {
+        // The stem dots that break string-domain normalization are inert
+        // in the path domain.
+        assert_eq!(
+            resolve_relative_specifier(Path::new("build/app.web.js"), "./app.core.js"),
+            Some(PathBuf::from("build/app.core.js"))
+        );
+        assert_eq!(
+            resolve_relative_specifier(Path::new("/abs/build/three.webgpu.js"), "./three.core.js"),
+            Some(PathBuf::from("/abs/build/three.core.js"))
+        );
+    }
+
+    #[test]
+    fn resolve_relative_specifier_parent_navigation() {
+        assert_eq!(
+            resolve_relative_specifier(Path::new("src/app/sub/main.js"), "../math/Vector4.js"),
+            Some(PathBuf::from("src/app/math/Vector4.js"))
+        );
+        assert_eq!(
+            resolve_relative_specifier(Path::new("a/b.js"), ".././c/./d.js"),
+            Some(PathBuf::from("c/d.js"))
+        );
+    }
+
+    #[test]
+    fn resolve_relative_specifier_fails_closed() {
+        // Non-relative specifiers keep their module-domain arms.
+        assert_eq!(
+            resolve_relative_specifier(Path::new("a/b.js"), "three/tsl"),
+            None
+        );
+        // Underflow past the stored root is unanswerable.
+        assert_eq!(
+            resolve_relative_specifier(Path::new("b.js"), "../c.js"),
+            None
+        );
+        assert_eq!(
+            resolve_relative_specifier(Path::new("/b.js"), "../c.js"),
+            None
+        );
     }
 }

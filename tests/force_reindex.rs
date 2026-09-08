@@ -459,3 +459,117 @@ fn off_lock_reindex_force_bypasses_hash_skip_for_unchanged_file() {
          hitting the unchanged-hash cache skip"
     );
 }
+
+// =============================================================================
+// Group 3d: scoped multi-path force reindex on a single registered root
+//
+// Regression coverage for the single-root `SymbolLookupCache` reuse fast
+// path in `Pipeline::index_full`: it must be gated on the number of
+// directories being processed in the CURRENT reindex batch, not merely on
+// `settings.indexing.indexed_paths.len()`. A single registered root force
+// reindexed over several explicit sub-paths in one `ReindexHandles::run`
+// call must still resolve cross-directory symbols between those sub-paths.
+// =============================================================================
+
+/// Discriminating: a scoped force reindex over two explicit sub-paths of one
+/// registered root must resolve a call from a symbol in one sub-path to a
+/// symbol imported from the other, even though neither sub-path has ever
+/// been indexed together with the other before this batch. A buggy
+/// implementation that gates the single-root cache-reuse fast path on
+/// `indexed_paths.len() == 1` alone (ignoring how many paths are in the
+/// current batch) scopes each walk's symbol cache to only that walk's own
+/// files, silently dropping the cross-directory call edge -- moduleB is
+/// walked and force-reindexed FIRST so `target_func` is freshly persisted
+/// before moduleA's walk, but moduleA's own run-scoped cache never contains
+/// `target_func` at all (it isn't defined in moduleA), so only a
+/// symbol_cache built from the persisted index (not the fast path's
+/// walk-scoped cache) can resolve moduleA's import of it.
+#[test]
+fn scoped_multi_path_force_reindex_resolves_cross_directory_import() {
+    let temp = tempfile::tempdir().expect("create temp root");
+    let source_dir = temp.path().join("src");
+    let module_a_dir = source_dir.join("moduleA");
+    let module_b_dir = source_dir.join("moduleB");
+    std::fs::create_dir_all(&module_a_dir).expect("create moduleA dir");
+    std::fs::create_dir_all(&module_b_dir).expect("create moduleB dir");
+
+    // moduleB.b defines target_func. Module paths are computed relative to
+    // `workspace_root`, so they stay stable (`moduleA.a` / `moduleB.b`)
+    // whether the whole tree or just one sub-directory is walked in a given
+    // call.
+    std::fs::write(module_b_dir.join("b.py"), "def target_func():\n    pass\n")
+        .expect("write moduleB/b.py");
+
+    // Single registered root over the whole tree, matching the bug report's
+    // `indexed_paths == ["src"]` scenario.
+    let mut settings = settings_for(&temp.path().join("index"));
+    settings.workspace_root = Some(source_dir.clone());
+    settings.indexing.indexed_paths = vec![source_dir.clone()];
+    let mut facade = IndexFacade::new(Arc::new(settings)).expect("create facade");
+
+    // Seed ONLY moduleB, so moduleA and moduleB have never been indexed
+    // together: the only way `caller_func` (added below, indexed for the
+    // first time in the scoped batch) can resolve `target_func` is via
+    // symbol data visible during THIS batch's Phase 2, not via any
+    // pre-existing cross-directory edge left over from an earlier combined
+    // index run.
+    facade
+        .index_directory(&module_b_dir, false)
+        .expect("seed index over moduleB only");
+    assert!(
+        facade.find_symbol("target_func").is_some(),
+        "target_func must resolve after seeding moduleB"
+    );
+
+    // moduleA.a is only written now, and only ever indexed via the scoped
+    // batch below.
+    std::fs::write(
+        module_a_dir.join("a.py"),
+        "from moduleB.b import target_func\n\ndef caller_func():\n    target_func()\n",
+    )
+    .expect("write moduleA/a.py");
+
+    // Scoped force reindex over BOTH sub-paths in one batch: this is the
+    // MCP `reindex(paths: ["src/moduleA", "src/moduleB"], force: true)`
+    // seam (`ReindexHandles::run`'s explicit-paths branch), which walks
+    // each path with its own `index_incremental`/`index_full` call.
+    let handles = facade
+        .snapshot_reindex_handles()
+        .expect("snapshot reindex handles");
+    let module_a_str = module_a_dir
+        .to_str()
+        .expect("utf8 moduleA path")
+        .to_string();
+    let module_b_str = module_b_dir
+        .to_str()
+        .expect("utf8 moduleB path")
+        .to_string();
+    // moduleB first, moduleA second: moduleA's own walk-scoped Phase 1
+    // never touches b.py at all, so its cache can only ever resolve
+    // target_func by seeing the persisted index built up so far in this
+    // batch -- which is exactly what the single-root fast path skips.
+    handles
+        .run(Some(vec![module_b_str, module_a_str]), true)
+        .expect("run scoped multi-path force reindex");
+
+    let caller_id = facade
+        .find_symbol("caller_func")
+        .expect("caller_func must resolve after the scoped force reindex indexes moduleA");
+
+    assert!(
+        facade
+            .find_symbols_by_name("target_func", None)
+            .into_iter()
+            .any(|target| {
+                facade
+                    .get_calling_functions(target.id)
+                    .iter()
+                    .any(|s| s.id == caller_id)
+            }),
+        "caller_func (indexed for the first time by this scoped batch) must resolve as a \
+         caller of SOME target_func symbol, even though only one root (src) is registered in \
+         indexed_paths: gating the single-root cache-reuse fast path on indexed_paths.len() \
+         alone (ignoring the current batch's path count) scopes each walk's symbol cache to \
+         only that walk's own files, dropping this cross-directory edge entirely"
+    );
+}

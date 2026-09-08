@@ -120,6 +120,35 @@ impl Default for GdscriptBehavior {
     }
 }
 
+/// Type of the `typed_parameter` / `typed_default_parameter` whose
+/// identifier is `var_name`. An untyped parameter is a bare identifier
+/// and stays unbound.
+fn find_parameter_type(node: tree_sitter::Node, code: &str, var_name: &str) -> Option<String> {
+    if matches!(node.kind(), "typed_parameter" | "typed_default_parameter") {
+        let mut cursor = node.walk();
+        let ident = node
+            .named_children(&mut cursor)
+            .find(|c| c.kind() == "identifier")?;
+        if &code[ident.byte_range()] == var_name {
+            let ty = node.child_by_field_name("type")?;
+            let mut ty_cursor = ty.walk();
+            return ty
+                .named_children(&mut ty_cursor)
+                .find(|c| c.kind() == "identifier")
+                .map(|c| code[c.byte_range()].to_string());
+        }
+        return None;
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if let Some(found) = find_parameter_type(child, code, var_name) {
+            return Some(found);
+        }
+    }
+    None
+}
+
 impl LanguageBehavior for GdscriptBehavior {
     fn language_id(&self) -> crate::parsing::registry::LanguageId {
         crate::parsing::registry::LanguageId::new("gdscript")
@@ -192,14 +221,32 @@ impl LanguageBehavior for GdscriptBehavior {
         extensions: &[&str],
     ) -> Option<String> {
         let relative = file_path.strip_prefix(project_root).ok()?;
-        let path = relative.to_string_lossy().replace('\\', "/");
 
-        // Strip file extension using the provided extensions list
-        let path_without_ext = strip_extension(&path, extensions);
+        let mut segments: Vec<String> = Vec::new();
+        for component in relative.components() {
+            match component {
+                std::path::Component::Normal(seg) => {
+                    segments.push(seg.to_string_lossy().into_owned())
+                }
+                std::path::Component::CurDir => {}
+                _ => return None,
+            }
+        }
+        if let Some(last) = segments.pop() {
+            segments.push(strip_extension(&last, extensions).to_string());
+        }
 
-        let normalized = path_without_ext.trim_start_matches('/');
+        // res:// resource paths are '/'-joined on every platform
+        Some(format!("res://{}", segments.join("/")))
+    }
 
-        Some(format!("res://{normalized}"))
+    fn extract_parameter_type(&self, signature: &str, var_name: &str) -> Option<String> {
+        // Stored signatures (`func name(params) -> ret`, no body, no
+        // trailing colon) parse clean as a function_definition.
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&self.get_language()).ok()?;
+        let tree = parser.parse(signature, None)?;
+        find_parameter_type(tree.root_node(), signature, var_name)
     }
 
     fn get_language(&self) -> Language {
@@ -326,5 +373,25 @@ impl LanguageBehavior for GdscriptBehavior {
 
         // Public symbols are visible
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // res:// derivation must segment on path components, not path
+    // text: resource paths are '/'-joined on every platform.
+    #[test]
+    fn module_segmentation_is_separator_agnostic() {
+        let behavior = GdscriptBehavior::new();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        assert_eq!(
+            behavior.module_path_from_file(&root.join("scripts").join("player.gd"), root, &["gd"]),
+            Some("res://scripts/player".to_string()),
+            "resource-path segmentation is component-wise on every platform"
+        );
     }
 }

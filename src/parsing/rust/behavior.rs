@@ -42,6 +42,36 @@ fn reduce_type_to_name(node: Node, code: &str) -> Option<String> {
     }
 }
 
+/// Resolve an anchored receiver path (`crate::a::b`, `super::x`, `self::m`,
+/// or a bare anchor) to an absolute module path against the caller's module.
+/// `None` when the anchor cannot resolve: `self`/`super` without a caller
+/// module, or `super` walking above the crate root.
+fn resolve_anchored_module_path(receiver: &str, caller_module: Option<&str>) -> Option<String> {
+    let mut segs = receiver.split("::").peekable();
+    let mut parts: Vec<&str> = match segs.peek().copied()? {
+        "crate" => {
+            segs.next();
+            vec!["crate"]
+        }
+        "self" => {
+            segs.next();
+            caller_module?.split("::").collect()
+        }
+        // Leading (possibly repeated) `super` segments are consumed below.
+        "super" => caller_module?.split("::").collect(),
+        _ => return None,
+    };
+    while segs.peek() == Some(&"super") {
+        segs.next();
+        if parts.len() <= 1 {
+            return None;
+        }
+        parts.pop();
+    }
+    parts.extend(segs);
+    Some(parts.join("::"))
+}
+
 /// Rust language behavior implementation
 #[derive(Clone)]
 pub struct RustBehavior {
@@ -185,6 +215,26 @@ impl LanguageBehavior for RustBehavior {
                 .module_path
                 .as_deref()
                 .is_some_and(|path| path.ends_with(&suffix));
+        }
+        // Anchored module paths (`crate::a::b`, `super::x`, `self::m`, bare
+        // `super`/`crate`/`self`) name a module, not a type: the anchor
+        // resolves against the caller's own module identity and the candidate
+        // must live in that module or a descendant of it (the six-file
+        // language layout defines behind a re-export one level down). An
+        // unresolvable anchor (no caller module, `super` above the crate
+        // root) fails closed; same-name descendants in different submodules
+        // survive into the existing disambiguation gate.
+        if matches!(
+            receiver.split("::").next(),
+            Some("crate" | "super" | "self")
+        ) {
+            let caller_module = caller.and_then(|c| c.module_path.as_deref());
+            let Some(target) = resolve_anchored_module_path(receiver, caller_module) else {
+                return false;
+            };
+            return candidate.module_path.as_deref().is_some_and(|m| {
+                m == target || (m.starts_with(&target) && m[target.len()..].starts_with("::"))
+            });
         }
         // Default match for all other receivers.
         if let Some(crate::symbol::ScopeContext::ClassMember {
@@ -527,6 +577,26 @@ impl LanguageBehavior for RustBehavior {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Pins the trait-default derivation rust inherits: segmentation is
+    // component-wise, so foreign separators in path text never survive
+    // into a module path (the `crate::widget/paint` class).
+    #[test]
+    fn default_module_segmentation_is_separator_agnostic() {
+        let behavior = RustBehavior::new();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        assert_eq!(
+            behavior.module_path_from_file(
+                &root.join("src").join("widget").join("paint.rs"),
+                root,
+                &["rs"]
+            ),
+            Some("crate::widget::paint".to_string()),
+            "trait-default segmentation is component-wise on every platform"
+        );
+    }
 
     #[test]
     fn test_format_module_path() {

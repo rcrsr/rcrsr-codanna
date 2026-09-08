@@ -296,11 +296,19 @@ impl UnifiedWatcher {
             .watch(&watch_path, RecursiveMode::NonRecursive)
         {
             Ok(_) => {
-                crate::debug_event!("watcher", "watching", "{}", watch_path.display());
+                crate::debug_event!(
+                    "watcher",
+                    "watching",
+                    "{}",
+                    crate::parsing::paths::render_absolute_path(&watch_path).display()
+                );
                 Ok(())
             }
             Err(e) => {
-                tracing::warn!("[watcher] failed to watch {}: {e}", watch_path.display());
+                tracing::warn!(
+                    "[watcher] failed to watch {}: {e}",
+                    crate::parsing::paths::render_absolute_path(&watch_path).display()
+                );
                 // Continue - don't fail completely
                 Ok(())
             }
@@ -609,7 +617,13 @@ impl UnifiedWatcher {
         let kind = event.kind;
 
         for path in event.paths {
-            crate::trace_event!("watcher", "event", "{:?} {}", kind, path.display());
+            crate::trace_event!(
+                "watcher",
+                "event",
+                "{:?} {}",
+                kind,
+                crate::parsing::paths::render_absolute_path(&path).display()
+            );
             // A directory never matches a file handler (extension gate); it is
             // the watcher's own concern. Disk truth decides, not event kind --
             // a dir rename's to-side arrives as Modify(Name), never Create.
@@ -643,7 +657,13 @@ impl UnifiedWatcher {
             // Check if any handler cares about this path
             let matched = self.handlers.iter().any(|h| h.matches(&path));
             if !matched {
-                crate::trace_event!("watcher", "unmatched", "{:?} {}", kind, path.display());
+                crate::trace_event!(
+                    "watcher",
+                    "unmatched",
+                    "{:?} {}",
+                    kind,
+                    crate::parsing::paths::render_absolute_path(&path).display()
+                );
                 continue;
             }
 
@@ -837,7 +857,12 @@ impl UnifiedWatcher {
                 continue;
             }
 
-            crate::log_event!(handler.name(), "modified", "{}", path.display());
+            crate::log_event!(
+                handler.name(),
+                "modified",
+                "{}",
+                crate::parsing::paths::render_absolute_path(path).display()
+            );
 
             match handler.on_modify(path).await {
                 Ok(action) => {
@@ -874,35 +899,64 @@ impl UnifiedWatcher {
         }
 
         let mut any_ok = false;
-        for root in &roots {
-            crate::log_event!("watcher", "batch sync", "{}", root.display());
+        if !roots.is_empty() {
             // Off-reactor via spawn_blocking; guard still held during sync.
+            // Resolution defers across the covered roots so a burst whose
+            // importing and imported files land in different roots binds
+            // its cross-root edges regardless of loop order.
             let facade = Arc::clone(&self.facade);
-            let root_owned = root.clone();
-            let result = tokio::task::spawn_blocking(move || {
+            let roots_owned = roots.clone();
+            let (results, resolve_result) = tokio::task::spawn_blocking(move || {
                 let mut indexer = facade.blocking_write();
-                indexer.index_directory(&root_owned, false)
+                let mut pending = crate::indexing::pipeline::PendingResolution::default();
+                let mut results = Vec::with_capacity(roots_owned.len());
+                for root in &roots_owned {
+                    crate::log_event!(
+                        "watcher",
+                        "batch sync",
+                        "{}",
+                        crate::parsing::paths::render_absolute_path(root).display()
+                    );
+                    results.push(indexer.index_directory_deferred(root, false, &mut pending));
+                }
+                let resolve_result = indexer.resolve_deferred(pending);
+                (results, resolve_result)
             })
             .await
             .expect("index_directory spawn_blocking task must not panic");
-            match result {
-                Ok(stats) => {
-                    any_ok = true;
-                    crate::log_event!(
-                        "watcher",
-                        "batch synced",
-                        "{} indexed, {} removed",
-                        stats.files_indexed,
-                        stats.files_removed
-                    );
+
+            for result in results {
+                match result {
+                    Ok(stats) => {
+                        any_ok = true;
+                        crate::log_event!(
+                            "watcher",
+                            "batch synced",
+                            "{} indexed, {} removed",
+                            stats.files_indexed,
+                            stats.files_removed
+                        );
+                    }
+                    Err(e) if is_writer_lock_contention(&e) => {
+                        tracing::info!(
+                            "[watcher] batch sync skipped: another serve process holds the index writer; hot-reload converges"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!("[watcher] batch sync failed: {e}");
+                    }
                 }
+            }
+
+            match resolve_result {
+                Ok(()) => {}
                 Err(e) if is_writer_lock_contention(&e) => {
                     tracing::info!(
-                        "[watcher] batch sync skipped: another serve process holds the index writer; hot-reload converges"
+                        "[watcher] batch sync resolution skipped: another serve process holds the index writer; hot-reload converges"
                     );
                 }
                 Err(e) => {
-                    tracing::error!("[watcher] batch sync failed: {e}");
+                    tracing::error!("[watcher] batch sync resolution failed: {e}");
                 }
             }
         }
@@ -946,7 +1000,12 @@ impl UnifiedWatcher {
             } else {
                 ("modified", handler.on_modify(path).await)
             };
-            crate::log_event!(handler.name(), verb, "{}", path.display());
+            crate::log_event!(
+                handler.name(),
+                verb,
+                "{}",
+                crate::parsing::paths::render_absolute_path(path).display()
+            );
 
             match result {
                 Ok(action) => {
@@ -969,65 +1028,89 @@ impl UnifiedWatcher {
     ) -> Result<(), WatchError> {
         match action {
             WatchAction::ReindexCode { path, created } => {
-                let mut indexer = self.facade.write().await;
-                match indexer.index_file(&path) {
-                    Ok(result) => {
-                        use crate::IndexingResult;
-                        match result {
-                            IndexingResult::Indexed(_) => {
-                                crate::log_event!(handler_name, "reindexed");
+                // `index_file` can commit a batch, which blocks the exclusive
+                // writer lock across Tantivy's `wait_merging_threads()` --
+                // potentially a long wait. Run it off the tokio worker so a
+                // slow merge cannot stall the whole watch loop (matches the
+                // pattern used for batch sync above).
+                let facade = Arc::clone(&self.facade);
+                let index_path = self.index_path.clone();
+                let broadcaster = Arc::clone(&self.broadcaster);
+                let handler_name = handler_name.to_string();
+                tokio::task::spawn_blocking(move || {
+                    let mut indexer = facade.blocking_write();
+                    match indexer.index_file(&path) {
+                        Ok(result) => {
+                            use crate::IndexingResult;
+                            match result {
+                                IndexingResult::Indexed(_) => {
+                                    crate::log_event!(handler_name, "reindexed");
 
-                                // Save semantic search
-                                if indexer.has_semantic_search() {
-                                    let semantic_path = self.index_path.join("semantic");
-                                    if let Err(e) = indexer.save_semantic_search(&semantic_path) {
-                                        tracing::warn!(
-                                            "[{handler_name}] failed to save semantic search: {e}"
-                                        );
+                                    // Save semantic search
+                                    if indexer.has_semantic_search() {
+                                        let semantic_path = index_path.join("semantic");
+                                        if let Err(e) =
+                                            indexer.save_semantic_search(&semantic_path)
+                                        {
+                                            tracing::warn!(
+                                                "[{handler_name}] failed to save semantic search: {e}"
+                                            );
+                                        }
                                     }
-                                }
 
-                                // A first-time file grew the resource list;
-                                // the lanes map FileCreated to list_changed
-                                // and FileReindexed to a URI-filtered update.
-                                let event = if created {
-                                    FileChangeEvent::FileCreated { path: path.clone() }
-                                } else {
-                                    FileChangeEvent::FileReindexed { path: path.clone() }
-                                };
-                                self.broadcaster.send(event);
-                            }
-                            IndexingResult::Cached(_) => {
-                                crate::debug_event!(handler_name, "unchanged (hash match)");
+                                    // A first-time file grew the resource list;
+                                    // the lanes map FileCreated to list_changed
+                                    // and FileReindexed to a URI-filtered update.
+                                    let event = if created {
+                                        FileChangeEvent::FileCreated { path: path.clone() }
+                                    } else {
+                                        FileChangeEvent::FileReindexed { path: path.clone() }
+                                    };
+                                    broadcaster.send(event);
+                                }
+                                IndexingResult::Cached(_) => {
+                                    crate::debug_event!(handler_name, "unchanged (hash match)");
+                                }
                             }
                         }
+                        Err(e) if is_writer_lock_contention(&e) => {
+                            tracing::info!(
+                                "[{handler_name}] reindex skipped: another serve process holds the index writer; hot-reload converges"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!("[{handler_name}] reindex failed: {e}");
+                        }
                     }
-                    Err(e) if is_writer_lock_contention(&e) => {
-                        tracing::info!(
-                            "[{handler_name}] reindex skipped: another serve process holds the index writer; hot-reload converges"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::error!("[{handler_name}] reindex failed: {e}");
-                    }
-                }
+                })
+                .await
+                .expect("index_file spawn_blocking task must not panic");
             }
 
             WatchAction::RemoveCode { path } => {
-                let mut indexer = self.facade.write().await;
-                if let Err(e) = indexer.remove_file(&path) {
-                    if is_writer_lock_contention(&e) {
-                        tracing::info!(
-                            "[{handler_name}] remove skipped: another serve process holds the index writer; hot-reload converges"
-                        );
+                // Same rationale as `ReindexCode`: `remove_file` commits a
+                // batch and can block on merge threads while holding the
+                // exclusive writer lock.
+                let facade = Arc::clone(&self.facade);
+                let broadcaster = Arc::clone(&self.broadcaster);
+                let handler_name = handler_name.to_string();
+                tokio::task::spawn_blocking(move || {
+                    let mut indexer = facade.blocking_write();
+                    if let Err(e) = indexer.remove_file(&path) {
+                        if is_writer_lock_contention(&e) {
+                            tracing::info!(
+                                "[{handler_name}] remove skipped: another serve process holds the index writer; hot-reload converges"
+                            );
+                        } else {
+                            tracing::error!("[{handler_name}] failed to remove: {e}");
+                        }
                     } else {
-                        tracing::error!("[{handler_name}] failed to remove: {e}");
+                        crate::log_event!(handler_name, "removed");
+                        broadcaster.send(FileChangeEvent::FileDeleted { path: path.clone() });
                     }
-                } else {
-                    crate::log_event!(handler_name, "removed");
-                    self.broadcaster
-                        .send(FileChangeEvent::FileDeleted { path: path.clone() });
-                }
+                })
+                .await
+                .expect("remove_file spawn_blocking task must not panic");
             }
 
             WatchAction::ReindexDocument { path } => {
@@ -1072,13 +1155,24 @@ impl UnifiedWatcher {
                 if !added.is_empty() {
                     crate::log_event!("config", "adding directories", "{}", added.len());
                     for path in &added {
-                        tracing::info!("  + {}", path.display());
+                        tracing::info!(
+                            "  + {}",
+                            crate::parsing::paths::render_absolute_path(path).display()
+                        );
                     }
 
                     let mut indexer = self.facade.write().await;
+                    // Resolution defers across the added dirs so one new
+                    // root's imports into another bind regardless of order.
+                    let mut pending = crate::indexing::pipeline::PendingResolution::default();
                     for path in &added {
-                        crate::log_event!("config", "indexing", "{}", path.display());
-                        match indexer.index_directory(path, false) {
+                        crate::log_event!(
+                            "config",
+                            "indexing",
+                            "{}",
+                            crate::parsing::paths::render_absolute_path(path).display()
+                        );
+                        match indexer.index_directory_deferred(path, false, &mut pending) {
                             Ok(stats) => {
                                 tracing::info!(
                                     "  indexed {} files, {} symbols",
@@ -1091,12 +1185,18 @@ impl UnifiedWatcher {
                             }
                         }
                     }
+                    if let Err(e) = indexer.resolve_deferred(pending) {
+                        tracing::error!("  resolution failed: {e}");
+                    }
                 }
 
                 if !removed.is_empty() {
                     crate::log_event!("config", "removed directories", "{}", removed.len());
                     for path in &removed {
-                        tracing::info!("  - {}", path.display());
+                        tracing::info!(
+                            "  - {}",
+                            crate::parsing::paths::render_absolute_path(path).display()
+                        );
                     }
                     tracing::info!("Run 'codanna clean' to remove symbols from these directories");
                 }

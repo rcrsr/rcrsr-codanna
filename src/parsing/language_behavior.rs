@@ -235,20 +235,27 @@ pub trait LanguageBehavior: Send + Sync {
         // Step 1: Get relative path from workspace root
         let relative_path = file_path.strip_prefix(workspace_root).ok()?;
 
-        // Step 2: Strip source root directories (OS-agnostic)
+        // Step 2: Strip source root directories (component-wise)
         let path_without_src = strip_source_root(relative_path, self.source_roots());
 
-        // Step 3: Strip extension using passed extensions list
-        let path_str = path_without_src.to_str()?;
-        let path_without_ext = strip_extension(path_str, extensions);
-
-        // Step 4: Split into components using OS path separator
-        let components: Vec<&str> = path_without_ext
-            .split(std::path::MAIN_SEPARATOR)
-            .filter(|s| !s.is_empty())
-            .collect();
+        // Steps 3-4: segments via the OS path parser, extension
+        // stripped from the stem. Splitting path TEXT on a separator
+        // literal leaves foreign separators inside a segment.
+        let mut segments: Vec<String> = Vec::new();
+        for component in path_without_src.components() {
+            match component {
+                std::path::Component::Normal(seg) => {
+                    segments.push(seg.to_string_lossy().into_owned())
+                }
+                _ => return None,
+            }
+        }
+        if let Some(last) = segments.pop() {
+            segments.push(strip_extension(&last, extensions).to_string());
+        }
 
         // Step 5: Format using language-specific rules
+        let components: Vec<&str> = segments.iter().map(String::as_str).collect();
         self.format_path_as_module(&components)
     }
 
@@ -418,6 +425,73 @@ pub trait LanguageBehavior: Send + Sync {
             "calls" => RelationKind::Calls,
             "defines" => RelationKind::Defines,
             _ => RelationKind::References,
+        }
+    }
+
+    /// Resolve a relative import specifier to a candidate symbol by FILE
+    /// identity.
+    ///
+    /// The language-agnostic arm for `./x` / `../y` specifiers: the
+    /// specifier resolves against the importing file's directory in the
+    /// path domain (`paths::resolve_relative_specifier`), and candidates
+    /// match on their stored file path, with extension and index-file
+    /// completion from the language's configured extensions. Module
+    /// strings cannot represent this navigation — a stem dot is
+    /// indistinguishable from a module separator — so the mechanism
+    /// never leaves the path domain. Exactly-one discipline: multiple
+    /// same-name matches across the accepted paths fail closed.
+    ///
+    /// Returns `None` for non-relative specifiers; callers fall through
+    /// to their module-domain arms.
+    fn resolve_relative_import(
+        &self,
+        cache: &dyn PipelineSymbolCache,
+        local_name: &str,
+        specifier: &str,
+        importing_file: &str,
+        extensions: &[&str],
+    ) -> Option<SymbolId> {
+        let expected = crate::parsing::paths::resolve_relative_specifier(
+            Path::new(importing_file),
+            specifier,
+        )?;
+
+        // A specifier stem can contain dots that are not an extension at
+        // all (e.g. `./app.core` resolving to `app.core.ts`), so bare
+        // `Path::extension()` can't gate this -- only a stem whose
+        // extension is itself one of the language's configured extensions
+        // (e.g. `./foo.ts`) is already resolved and must skip completion,
+        // or `.ts` would be appended again (`foo.ts.ts`) and an impossible
+        // `foo.ts/index.ts` would be generated.
+        let already_has_known_extension = expected
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| extensions.contains(&e));
+
+        let mut accepted: Vec<PathBuf> = vec![expected.clone()];
+        if !already_has_known_extension {
+            if let Some(name) = expected.file_name().and_then(|n| n.to_str()) {
+                for ext in extensions {
+                    accepted.push(expected.with_file_name(format!("{name}.{ext}")));
+                }
+            }
+            for ext in extensions {
+                accepted.push(expected.join(format!("index.{ext}")));
+            }
+        }
+
+        let mut matched: Vec<SymbolId> = Vec::new();
+        for id in cache.lookup_candidates(local_name) {
+            if let Some(sym) = cache.get(id) {
+                let candidate = Path::new(&*sym.file_path);
+                if accepted.iter().any(|p| candidate == p.as_path()) {
+                    matched.push(id);
+                }
+            }
+        }
+        match matched.as_slice() {
+            [id] => Some(*id),
+            _ => None,
         }
     }
 
