@@ -798,7 +798,7 @@ impl Pipeline {
 
     /// Index a directory with optional progress bar.
     ///
-    /// `single_root_batch` is forwarded to [`Pipeline::index_full`] for
+    /// `single_root_batch` is forwarded to `Pipeline::index_full` for
     /// force-mode runs; see that method's docs for the precise contract.
     #[allow(clippy::too_many_arguments)]
     pub fn index_incremental_with_progress(
