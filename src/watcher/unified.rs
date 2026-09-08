@@ -1028,65 +1028,89 @@ impl UnifiedWatcher {
     ) -> Result<(), WatchError> {
         match action {
             WatchAction::ReindexCode { path, created } => {
-                let mut indexer = self.facade.write().await;
-                match indexer.index_file(&path) {
-                    Ok(result) => {
-                        use crate::IndexingResult;
-                        match result {
-                            IndexingResult::Indexed(_) => {
-                                crate::log_event!(handler_name, "reindexed");
+                // `index_file` can commit a batch, which blocks the exclusive
+                // writer lock across Tantivy's `wait_merging_threads()` --
+                // potentially a long wait. Run it off the tokio worker so a
+                // slow merge cannot stall the whole watch loop (matches the
+                // pattern used for batch sync above).
+                let facade = Arc::clone(&self.facade);
+                let index_path = self.index_path.clone();
+                let broadcaster = Arc::clone(&self.broadcaster);
+                let handler_name = handler_name.to_string();
+                tokio::task::spawn_blocking(move || {
+                    let mut indexer = facade.blocking_write();
+                    match indexer.index_file(&path) {
+                        Ok(result) => {
+                            use crate::IndexingResult;
+                            match result {
+                                IndexingResult::Indexed(_) => {
+                                    crate::log_event!(handler_name, "reindexed");
 
-                                // Save semantic search
-                                if indexer.has_semantic_search() {
-                                    let semantic_path = self.index_path.join("semantic");
-                                    if let Err(e) = indexer.save_semantic_search(&semantic_path) {
-                                        tracing::warn!(
-                                            "[{handler_name}] failed to save semantic search: {e}"
-                                        );
+                                    // Save semantic search
+                                    if indexer.has_semantic_search() {
+                                        let semantic_path = index_path.join("semantic");
+                                        if let Err(e) =
+                                            indexer.save_semantic_search(&semantic_path)
+                                        {
+                                            tracing::warn!(
+                                                "[{handler_name}] failed to save semantic search: {e}"
+                                            );
+                                        }
                                     }
-                                }
 
-                                // A first-time file grew the resource list;
-                                // the lanes map FileCreated to list_changed
-                                // and FileReindexed to a URI-filtered update.
-                                let event = if created {
-                                    FileChangeEvent::FileCreated { path: path.clone() }
-                                } else {
-                                    FileChangeEvent::FileReindexed { path: path.clone() }
-                                };
-                                self.broadcaster.send(event);
-                            }
-                            IndexingResult::Cached(_) => {
-                                crate::debug_event!(handler_name, "unchanged (hash match)");
+                                    // A first-time file grew the resource list;
+                                    // the lanes map FileCreated to list_changed
+                                    // and FileReindexed to a URI-filtered update.
+                                    let event = if created {
+                                        FileChangeEvent::FileCreated { path: path.clone() }
+                                    } else {
+                                        FileChangeEvent::FileReindexed { path: path.clone() }
+                                    };
+                                    broadcaster.send(event);
+                                }
+                                IndexingResult::Cached(_) => {
+                                    crate::debug_event!(handler_name, "unchanged (hash match)");
+                                }
                             }
                         }
+                        Err(e) if is_writer_lock_contention(&e) => {
+                            tracing::info!(
+                                "[{handler_name}] reindex skipped: another serve process holds the index writer; hot-reload converges"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!("[{handler_name}] reindex failed: {e}");
+                        }
                     }
-                    Err(e) if is_writer_lock_contention(&e) => {
-                        tracing::info!(
-                            "[{handler_name}] reindex skipped: another serve process holds the index writer; hot-reload converges"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::error!("[{handler_name}] reindex failed: {e}");
-                    }
-                }
+                })
+                .await
+                .expect("index_file spawn_blocking task must not panic");
             }
 
             WatchAction::RemoveCode { path } => {
-                let mut indexer = self.facade.write().await;
-                if let Err(e) = indexer.remove_file(&path) {
-                    if is_writer_lock_contention(&e) {
-                        tracing::info!(
-                            "[{handler_name}] remove skipped: another serve process holds the index writer; hot-reload converges"
-                        );
+                // Same rationale as `ReindexCode`: `remove_file` commits a
+                // batch and can block on merge threads while holding the
+                // exclusive writer lock.
+                let facade = Arc::clone(&self.facade);
+                let broadcaster = Arc::clone(&self.broadcaster);
+                let handler_name = handler_name.to_string();
+                tokio::task::spawn_blocking(move || {
+                    let mut indexer = facade.blocking_write();
+                    if let Err(e) = indexer.remove_file(&path) {
+                        if is_writer_lock_contention(&e) {
+                            tracing::info!(
+                                "[{handler_name}] remove skipped: another serve process holds the index writer; hot-reload converges"
+                            );
+                        } else {
+                            tracing::error!("[{handler_name}] failed to remove: {e}");
+                        }
                     } else {
-                        tracing::error!("[{handler_name}] failed to remove: {e}");
+                        crate::log_event!(handler_name, "removed");
+                        broadcaster.send(FileChangeEvent::FileDeleted { path: path.clone() });
                     }
-                } else {
-                    crate::log_event!(handler_name, "removed");
-                    self.broadcaster
-                        .send(FileChangeEvent::FileDeleted { path: path.clone() });
-                }
+                })
+                .await
+                .expect("remove_file spawn_blocking task must not panic");
             }
 
             WatchAction::ReindexDocument { path } => {

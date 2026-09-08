@@ -173,6 +173,19 @@ impl DocumentIndex {
         // `parsing::paths::portable_join`.
         let path = Path::new(stored);
         if path.is_relative() {
+            // On Unix the native separator is already `/`, so a clean
+            // relative stored path (only `Normal` components, no `.`/`..`)
+            // is already byte-identical to its portable form. Skip the
+            // `portable_join` allocation (`Vec<Cow<str>>` + `join`) that
+            // this hot path -- every Tantivy read via
+            // `document_to_symbol` -- would otherwise pay per symbol.
+            #[cfg(not(windows))]
+            if path
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)))
+            {
+                return Some(stored.to_string());
+            }
             return crate::parsing::paths::portable_join(path);
         }
         for base in &self.strip_bases {
@@ -235,4 +248,44 @@ mod tests {
 
     // ==================== Language Filtering Tests ====================
     // TDD tests for Sprint 4: Task 4.1 - Language filtering support
+
+    #[cfg(not(windows))]
+    #[test]
+    fn to_portable_file_path_unix_fast_path_returns_stored_bytes_unchanged() {
+        let temp_dir = TempDir::new().unwrap();
+        let settings = crate::config::Settings::default();
+        let index = DocumentIndex::new(temp_dir.path(), &settings).unwrap();
+
+        // A clean relative path with only `Normal` components is already
+        // portable-form on Unix, so the fast path must return it verbatim
+        // without going through `portable_join`.
+        let stored = "src/parsing/rust/mod.rs";
+        assert_eq!(
+            index.to_portable_file_path(stored),
+            Some(stored.to_string()),
+            "a clean relative Unix path must round-trip byte-identically through the fast path"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn to_portable_file_path_unix_skips_fast_path_for_parent_dir_components() {
+        let temp_dir = TempDir::new().unwrap();
+        let settings = crate::config::Settings::default();
+        let index = DocumentIndex::new(temp_dir.path(), &settings).unwrap();
+
+        // Unlike a single `.` (which `Path::components()` elides on its
+        // own, leaving only `Normal` components), a `..` component is
+        // preserved as `Component::ParentDir` and is not `Normal`-only, so
+        // it must not take the byte-identical fast path. It falls through
+        // to `portable_join`, which (correctly) refuses to guess a
+        // normalized form for non-`Normal` components and returns `None`
+        // rather than silently reformatting `stored`.
+        let stored = "src/../parsing/rust/mod.rs";
+        assert_eq!(
+            index.to_portable_file_path(stored),
+            None,
+            "a relative path with a `..` component must not take the Normal-only fast path"
+        );
+    }
 }

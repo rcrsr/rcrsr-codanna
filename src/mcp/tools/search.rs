@@ -37,7 +37,7 @@ impl CodeIntelligenceServer {
 
         let mut kinds_display = String::new();
         for (kind, count) in &kind_counts {
-            kinds_display.push_str(&format!("\n  - {kind}s: {count}"));
+            kinds_display.push_str(&format!("\n  - {kind}: {count}"));
         }
 
         let mut languages_display = String::new();

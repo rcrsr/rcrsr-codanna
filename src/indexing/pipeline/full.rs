@@ -32,6 +32,16 @@ impl Pipeline {
     }
 
     /// Full index (force mode): index all files without incremental detection.
+    ///
+    /// `single_root_batch` must be true only when this walk is BOTH the
+    /// sole directory being processed in the current caller's batch AND
+    /// the sole registered root overall (`settings.indexing.indexed_paths`
+    /// has exactly one entry). A caller processing several explicit
+    /// sub-paths of one registered root (e.g. a scoped force reindex)
+    /// must pass `false`, even though `indexed_paths.len() == 1`, or
+    /// cross-directory symbols outside the current walk are hidden from
+    /// resolution.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn index_full(
         &self,
         root: &Path,
@@ -40,6 +50,7 @@ impl Pipeline {
         embedding_pool: Option<Arc<crate::semantic::EmbeddingBackend>>,
         semantic_path: &Path,
         progress: Option<Arc<crate::io::status_line::ProgressBar>>,
+        single_root_batch: bool,
     ) -> PipelineResult<IncrementalStats> {
         let start = Instant::now();
         let show_progress = progress.is_some();
@@ -52,7 +63,7 @@ impl Pipeline {
             }),
             _ => None,
         };
-        let (index_stats, unresolved, bindings, barriers, _run_cache, metrics) = self.run_phase1(
+        let (index_stats, unresolved, bindings, barriers, run_cache, metrics) = self.run_phase1(
             FileSource::Walk(root.to_path_buf()),
             Arc::clone(&index),
             Phase1Options {
@@ -68,10 +79,19 @@ impl Pipeline {
         }
 
         // Run Phase 2 resolution with progress if Phase 1 had progress.
-        // Seed from the persisted index: the run-scoped cache holds only
-        // this walk's files, hiding other registered roots' symbols from
-        // resolution.
-        let symbol_cache = Arc::new(super::SymbolLookupCache::from_index(&index)?);
+        // Unless this walk is the sole directory in the current batch
+        // *and* the sole registered root overall, the run-scoped cache
+        // holds only this walk's files, hiding other roots'/paths'
+        // symbols from resolution -- seed from the persisted index
+        // instead. Only the true single-root, single-walk case already
+        // has everything resolution needs in the free in-memory cache
+        // Phase 1 just built, so only then can we skip the unbounded
+        // Tantivy re-scan.
+        let symbol_cache = if single_root_batch {
+            Arc::new(run_cache)
+        } else {
+            Arc::new(super::SymbolLookupCache::from_index(&index)?)
+        };
         let phase2_stats = self.run_phase2_maybe_bar(
             unresolved,
             bindings,

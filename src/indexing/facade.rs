@@ -1477,6 +1477,10 @@ impl IndexFacade {
 
         let mut pending = PendingResolution::default();
         let mut all_stats = Vec::with_capacity(dirs.len());
+        // Accumulated across every `dir` so a multi-root `--dry-run --json`
+        // invocation emits one parseable top-level array instead of N
+        // concatenated arrays (one per directory).
+        let mut json_dry_run_paths: Vec<String> = Vec::new();
 
         for dir in dirs {
             let dir = &Self::canonical_or_raw(dir);
@@ -1496,19 +1500,11 @@ impl IndexFacade {
             if dry_run {
                 match dry_run_output {
                     DryRunOutput::Json => {
-                        // `--json` prints nothing but the array itself: a truncated
-                        // JSON array would repeat the very bug this flag exists to fix.
-                        let paths: Vec<String> =
-                            files.iter().map(|p| p.display().to_string()).collect();
-                        // Never substitute an empty array on failure: printing "no
-                        // files" when the walk found some is the class of silent lie
-                        // this flag exists to eliminate.
-                        let json = serde_json::to_string(&paths).map_err(|e| {
-                            IndexError::General(format!(
-                                "failed to serialize dry-run file list as JSON: {e}"
-                            ))
-                        })?;
-                        println!("{json}");
+                        // Accumulate rather than print per-directory: a
+                        // consumer piping `--json` across multiple roots
+                        // expects one parseable top-level array, not N
+                        // concatenated arrays.
+                        json_dry_run_paths.extend(files.iter().map(|p| p.display().to_string()));
                     }
                     DryRunOutput::ListAll => {
                         println!("Would index {total_files} files:");
@@ -1577,6 +1573,18 @@ impl IndexFacade {
             stats.symbols_removed = pipeline_stats.deleted_symbols;
             stats.elapsed = pipeline_stats.elapsed;
             all_stats.push(stats);
+        }
+
+        if dry_run && dry_run_output == DryRunOutput::Json {
+            // Never substitute an empty array on failure: printing "no
+            // files" when the walk found some is the class of silent lie
+            // this flag exists to eliminate.
+            let json = serde_json::to_string(&json_dry_run_paths).map_err(|e| {
+                IndexError::General(format!(
+                    "failed to serialize dry-run file list as JSON: {e}"
+                ))
+            })?;
+            println!("{json}");
         }
 
         if !dry_run {
@@ -1771,6 +1779,19 @@ impl ReindexHandles {
         let mut indexed_dirs = Vec::new();
 
         let reindexed = if let Some(paths) = paths {
+            // The single-root symbol-cache fast path in `index_full` is
+            // only safe when the walk it applies to is both the sole
+            // directory being processed in *this* batch and the sole
+            // registered root overall -- otherwise cross-directory
+            // symbols outside the current walk (e.g. another explicit
+            // path in this same scoped reindex) are hidden from
+            // resolution. `indexed_paths.len() <= 1` alone is not enough
+            // signal here: a single registered root can still be
+            // force-reindexed over several explicit sub-paths in one
+            // call.
+            let dir_path_count = paths.iter().filter(|p| Path::new(p).is_dir()).count();
+            let single_root_batch =
+                dir_path_count <= 1 && pipeline.settings().indexing.indexed_paths.len() <= 1;
             let mut total_reindexed = 0;
             for path in &paths {
                 let path = Path::new(path);
@@ -1818,12 +1839,13 @@ impl ReindexHandles {
                         }
                     }
                 } else if path.is_dir() {
-                    match pipeline.index_incremental(
+                    match pipeline.index_incremental_scoped(
                         path,
                         Arc::clone(&document_index),
                         semantic_search.clone(),
                         embedding_pool.clone(),
                         force,
+                        single_root_batch,
                     ) {
                         Ok(stats) => {
                             total_reindexed += stats.new_files + stats.modified_files;
@@ -5362,6 +5384,54 @@ mod tests {
             callees.len(),
             1,
             "generate must bind its relative import despite the twin: {callees:?}"
+        );
+        assert!(
+            callees[0].file_path.ends_with("app.core.ts"),
+            "the binding must pick the imported file, got {}",
+            callees[0].file_path
+        );
+    }
+
+    // A specifier that already spells out the language's own extension
+    // (`./app.core.ts`) must resolve directly, not have `.ts` appended
+    // again (`app.core.ts.ts`) or an `index.ts` join attempted underneath
+    // it (`app.core.ts/index.ts`).
+    #[test]
+    fn ts_relative_import_with_explicit_extension_binds_without_double_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("lib");
+        std::fs::create_dir_all(src.join("build")).unwrap();
+        std::fs::write(
+            src.join("build/app.core.ts"),
+            "export function warn(msg: string): string {\n  return msg;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("build/app.web.ts"),
+            "import { warn } from './app.core.ts';\n\nexport function generate(): string {\n  return warn('x');\n}\n",
+        )
+        .unwrap();
+
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(src.clone()).unwrap();
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        facade.index_directory(&src, true).unwrap();
+
+        let generate = facade
+            .find_symbols_by_name("generate", None)
+            .into_iter()
+            .next()
+            .expect("generate indexed");
+        let callees = facade.get_called_functions(generate.id);
+        assert_eq!(
+            callees.len(),
+            1,
+            "generate must bind its relative import with an explicit extension: {callees:?}"
         );
         assert!(
             callees[0].file_path.ends_with("app.core.ts"),

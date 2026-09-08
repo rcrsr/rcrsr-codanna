@@ -356,7 +356,51 @@ impl Pipeline {
         embedding_pool: Option<Arc<crate::semantic::EmbeddingBackend>>,
         force: bool,
     ) -> PipelineResult<IncrementalStats> {
-        self.index_incremental_with_progress(root, index, semantic, embedding_pool, force, None)
+        // Callers of this entry point always process exactly one root per
+        // call and, for force mode, either walk every registered root
+        // (`indexed_paths.len() == 1` implies this is the only one) or a
+        // single new directory being folded into an existing single-root
+        // workspace. Batches that force-reindex several explicit
+        // sub-paths of one registered root in the same call must use
+        // `index_incremental_scoped` instead, or the fast path wrongly
+        // scopes symbol resolution to just this walk.
+        let single_root_batch = self.settings.indexing.indexed_paths.len() <= 1;
+        self.index_incremental_with_progress(
+            root,
+            index,
+            semantic,
+            embedding_pool,
+            force,
+            single_root_batch,
+            None,
+        )
+    }
+
+    /// Like [`Pipeline::index_incremental`], but lets the caller state
+    /// explicitly whether `root` is the sole directory being processed in
+    /// the current reindex batch. Use this when force-reindexing several
+    /// explicit paths in one logical operation (e.g. the MCP `reindex`
+    /// tool's `paths` argument) so a scoped force reindex covering more
+    /// than one sub-path never wrongly takes the single-root fast path,
+    /// even when only one root is registered in settings.
+    pub fn index_incremental_scoped(
+        &self,
+        root: &Path,
+        index: Arc<DocumentIndex>,
+        semantic: Option<Arc<Mutex<SimpleSemanticSearch>>>,
+        embedding_pool: Option<Arc<crate::semantic::EmbeddingBackend>>,
+        force: bool,
+        single_root_batch: bool,
+    ) -> PipelineResult<IncrementalStats> {
+        self.index_incremental_with_progress(
+            root,
+            index,
+            semantic,
+            embedding_pool,
+            force,
+            single_root_batch,
+            None,
+        )
     }
 
     /// Index a directory with progress bars managed internally.
@@ -753,6 +797,10 @@ impl Pipeline {
     }
 
     /// Index a directory with optional progress bar.
+    ///
+    /// `single_root_batch` is forwarded to [`Pipeline::index_full`] for
+    /// force-mode runs; see that method's docs for the precise contract.
+    #[allow(clippy::too_many_arguments)]
     pub fn index_incremental_with_progress(
         &self,
         root: &Path,
@@ -760,6 +808,7 @@ impl Pipeline {
         semantic: Option<Arc<Mutex<SimpleSemanticSearch>>>,
         embedding_pool: Option<Arc<crate::semantic::EmbeddingBackend>>,
         force: bool,
+        single_root_batch: bool,
         progress: Option<Arc<crate::io::status_line::ProgressBar>>,
     ) -> PipelineResult<IncrementalStats> {
         let start = Instant::now();
@@ -774,6 +823,7 @@ impl Pipeline {
                 embedding_pool,
                 &semantic_path,
                 progress,
+                single_root_batch,
             );
         }
 

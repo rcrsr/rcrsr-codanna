@@ -456,14 +456,28 @@ pub trait LanguageBehavior: Send + Sync {
             specifier,
         )?;
 
+        // A specifier stem can contain dots that are not an extension at
+        // all (e.g. `./app.core` resolving to `app.core.ts`), so bare
+        // `Path::extension()` can't gate this -- only a stem whose
+        // extension is itself one of the language's configured extensions
+        // (e.g. `./foo.ts`) is already resolved and must skip completion,
+        // or `.ts` would be appended again (`foo.ts.ts`) and an impossible
+        // `foo.ts/index.ts` would be generated.
+        let already_has_known_extension = expected
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| extensions.contains(&e));
+
         let mut accepted: Vec<PathBuf> = vec![expected.clone()];
-        if let Some(name) = expected.file_name().and_then(|n| n.to_str()) {
-            for ext in extensions {
-                accepted.push(expected.with_file_name(format!("{name}.{ext}")));
+        if !already_has_known_extension {
+            if let Some(name) = expected.file_name().and_then(|n| n.to_str()) {
+                for ext in extensions {
+                    accepted.push(expected.with_file_name(format!("{name}.{ext}")));
+                }
             }
-        }
-        for ext in extensions {
-            accepted.push(expected.join(format!("index.{ext}")));
+            for ext in extensions {
+                accepted.push(expected.join(format!("index.{ext}")));
+            }
         }
 
         let mut matched: Vec<SymbolId> = Vec::new();
