@@ -80,6 +80,7 @@ pub fn run(action: DocumentAction, config: &Settings, cli_config: Option<&PathBu
             collection,
             exclude_collection,
             limit,
+            threshold,
             json,
             fields,
         } => {
@@ -120,6 +121,9 @@ pub fn run(action: DocumentAction, config: &Settings, cli_config: Option<&PathBu
                     .unwrap_or(10)
             });
 
+            let final_threshold =
+                threshold.or_else(|| params.get("threshold").and_then(|s| s.parse::<f32>().ok()));
+
             // Collection can come from repeatable --collection flags or a
             // single collection:name key:value pair.
             let final_collections = if !collection.is_empty() {
@@ -147,6 +151,34 @@ pub fn run(action: DocumentAction, config: &Settings, cli_config: Option<&PathBu
                 }
             };
 
+            let query_text = final_query.clone();
+
+            // Validate caller-supplied inputs (unknown collection names,
+            // limit:0) before any config-sourced defaults are merged in,
+            // mirroring the MCP tool (`mcp/tools/search.rs`) and
+            // `codanna mcp search_documents` (`cli/commands/mcp.rs`) call
+            // sites.
+            if let Err(e) = config.documents.validate_search_inputs(
+                &final_collections,
+                &exclude_collection,
+                final_limit,
+            ) {
+                let code = if e.is_invalid_input() {
+                    ResultCode::InvalidQuery
+                } else {
+                    ResultCode::IndexError
+                };
+                if json {
+                    let envelope: Envelope<()> = Envelope::error(code, e.to_string())
+                        .with_entity_type(EnvelopeEntityType::Document)
+                        .with_query(&query_text);
+                    print_json(&envelope);
+                    std::process::exit(2);
+                }
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+
             // When the caller named no collections, merge in every collection
             // whose `default` flag opts it out of unscoped search. Explicitly
             // named collections are always searched regardless of the flag.
@@ -157,7 +189,14 @@ pub fn run(action: DocumentAction, config: &Settings, cli_config: Option<&PathBu
                     .default_visibility_exclusions(&final_collections),
             );
 
-            let query_text = final_query.clone();
+            // Preserved for the response envelope's `meta.collections` /
+            // `meta.excluded_collections` (post-merge, i.e. what was
+            // actually searched/excluded), since `final_collections`/
+            // `final_exclude_collections` are moved into `search_query`
+            // below.
+            let resolved_collections = final_collections.clone();
+            let resolved_excludes = final_exclude_collections.clone();
+
             let search_query = SearchQuery {
                 text: final_query,
                 collections: final_collections,
@@ -165,7 +204,7 @@ pub fn run(action: DocumentAction, config: &Settings, cli_config: Option<&PathBu
                 document: None,
                 limit: final_limit,
                 preview_config: Some(config.documents.search.clone()),
-                threshold: None,
+                threshold: final_threshold,
             };
 
             let start = Instant::now();
@@ -181,6 +220,8 @@ pub fn run(action: DocumentAction, config: &Settings, cli_config: Option<&PathBu
                                 .with_duration_ms(duration_ms)
                                 .with_entity_type(EnvelopeEntityType::Document)
                                 .with_hint("Try a different query or check indexed collections with 'codanna documents list'")
+                                .with_collections(resolved_collections)
+                                .with_excluded_collections(resolved_excludes)
                         } else {
                             Envelope::success(results)
                                 .with_message(format!("Found {count} matching documents"))
@@ -191,6 +232,8 @@ pub fn run(action: DocumentAction, config: &Settings, cli_config: Option<&PathBu
                                 .with_hint(
                                     "Use the file paths and byte ranges to read specific sections",
                                 )
+                                .with_collections(resolved_collections)
+                                .with_excluded_collections(resolved_excludes)
                         };
                         let output = super::mcp::render_envelope_json(&envelope, fields.as_ref());
                         println!("{output}");
@@ -213,11 +256,14 @@ pub fn run(action: DocumentAction, config: &Settings, cli_config: Option<&PathBu
                     }
                 }
                 Err(e) => {
+                    let code = if e.is_invalid_input() {
+                        ResultCode::InvalidQuery
+                    } else {
+                        ResultCode::IndexError
+                    };
                     if json {
-                        let envelope: Envelope<()> = Envelope::error(
-                            ResultCode::InternalError,
-                            format!("Search failed: {e}"),
-                        );
+                        let envelope: Envelope<()> =
+                            Envelope::error(code, format!("Search failed: {e}"));
                         print_json(&envelope);
                         std::process::exit(2);
                     }

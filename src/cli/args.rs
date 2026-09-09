@@ -579,6 +579,10 @@ pub enum DocumentAction {
         #[arg(short, long)]
         limit: Option<usize>,
 
+        /// Minimum similarity score (cosine similarity, range -1 to 1)
+        #[arg(long)]
+        threshold: Option<f32>,
+
         /// Output in JSON format
         #[arg(long)]
         json: bool,

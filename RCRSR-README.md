@@ -950,9 +950,10 @@ stricter, more informative contract for agent callers:
   convention `get_file_outline`'s `max_results` uses; rejecting the
   degenerate value fails loudly instead of returning a plausible wrong
   answer.)
-- **`threshold` (optional, 0-1)** is a minimum similarity score with the same
-  meaning as `semantic_search_docs`'s parameter. Scored hits below it are
-  dropped before `limit` applies; if nothing clears it the result is
+- **`threshold` (optional, cosine similarity, range [-1, 1])** is a minimum
+  similarity score with the same meaning as `semantic_search_docs`'s
+  parameter. Scored hits below it are dropped before `limit` applies; if
+  nothing clears it the result is
   `status: not_found`. Omit it for the previous behavior. It has no effect on
   the no-embedding fallback path, which scores every hit at 0.0.
 - **`meta.collections` / `meta.excluded_collections`** on every JSON `success`

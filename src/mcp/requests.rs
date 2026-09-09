@@ -311,7 +311,7 @@ pub struct SearchDocumentsRequest {
     /// rejected with `INVALID_QUERY` rather than treated as unlimited.
     #[serde(default = "default_context_limit")]
     pub limit: u32,
-    /// Minimum similarity score (0-1)
+    /// Minimum similarity score (cosine similarity, range [-1, 1])
     #[serde(skip_serializing_if = "Option::is_none")]
     pub threshold: Option<f32>,
     /// Output rendering: "text" (default) or "json"

@@ -371,6 +371,27 @@ pub async fn run(
             }
         }
 
+        // `search_documents`'s `threshold` (unlike `semantic_search_docs`'s,
+        // whose non-numeric values are silently treated as "no threshold")
+        // must reject a present-but-non-numeric value here, before either
+        // downstream call site (the JSON pre-collection block and the text
+        // dispatch match below) parses it with `.and_then(|v| v.as_f64())`
+        // and would otherwise silently drop it as `None`.
+        if tool == "search_documents" {
+            if let Some(map) = arguments.as_ref() {
+                if let Some(v) = map.get("threshold") {
+                    if v.as_f64().is_none() {
+                        exit_invalid_args(
+                            &tool,
+                            "search_documents: 'threshold' must be a number",
+                            accepted,
+                            json,
+                        );
+                    }
+                }
+            }
+        }
+
         if !requires_one_of.is_empty() {
             let satisfied = arguments
                 .as_ref()

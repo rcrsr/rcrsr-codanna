@@ -76,9 +76,10 @@ pub struct SearchQuery {
     pub limit: usize,
     /// Preview configuration (KWIC, highlighting, etc.).
     pub preview_config: Option<super::config::SearchConfig>,
-    /// Minimum similarity score (0-1). Applies only to the vector-scored
-    /// search branch; the no-embedding fallback (which scores results at
-    /// 0.0) is intentionally unaffected by this filter.
+    /// Minimum similarity score (cosine similarity, range [-1, 1]). Applies
+    /// only to the vector-scored search branch; the no-embedding fallback
+    /// (which scores results at 0.0) is intentionally unaffected by this
+    /// filter.
     pub threshold: Option<f32>,
 }
 
@@ -737,12 +738,15 @@ impl DocumentStore {
         // Score candidates by vector similarity
         let mut scored_candidates = self.score_by_similarity(&candidates, &query_vec)?;
 
-        // Sort by similarity (highest first) and limit
-        scored_candidates
-            .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Filter by threshold before sorting, so low-signal queries with
+        // many low-similarity candidates don't pay to sort elements that
+        // will be dropped anyway. Then sort by similarity (highest first)
+        // and limit.
         if let Some(t) = query.threshold {
             scored_candidates.retain(|(_, sim)| *sim >= t);
         }
+        scored_candidates
+            .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scored_candidates.truncate(query.limit);
 
         // Enrich with full metadata and KWIC preview
