@@ -24,6 +24,9 @@ mod test_serve_registry;
 #[path = "cli/test_spawn_timeout_dedup.rs"]
 mod test_spawn_timeout_dedup;
 
+#[path = "cli/test_spawn_exit_detection.rs"]
+mod test_spawn_exit_detection;
+
 #[path = "cli/test_workspace_disappears.rs"]
 mod test_workspace_disappears;
 
@@ -69,3 +72,7 @@ mod test_version_stamp;
 /// `codanna dump` envelope stream and stale gate
 #[path = "cli/test_dump.rs"]
 mod test_dump;
+
+/// `codanna ls` merged server/proxy listing
+#[path = "cli/test_ls.rs"]
+mod test_ls;

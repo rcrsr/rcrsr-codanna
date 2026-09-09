@@ -24,6 +24,11 @@ pub struct ServeArgs {
     pub reap: bool,
     /// With `stop`, send SIGKILL instead of the default SIGTERM.
     pub force: bool,
+    /// With `stop`, also allow a numeric pid selector that is not present in
+    /// the per-user server registry, as long as it still independently
+    /// passes `looks_like_codanna_serve`. Absent, `stop`'s selector
+    /// resolution is registered-pids-only (today's behavior, unchanged).
+    pub include_rogue: bool,
 }
 
 /// Resolve which server transport `codanna serve` should start.
@@ -77,6 +82,7 @@ pub async fn run(
         stop,
         reap,
         force,
+        include_rogue,
     } = args;
 
     // Registry lifecycle operations (--list/--stop/--reap) are never
@@ -86,7 +92,7 @@ pub async fn run(
     // `cli::args::Commands::Serve`) already guarantees `http`/`https`/`proxy`/
     // `bind` are all still at their defaults whenever one of these is set.
     if list || stop.is_some() || reap {
-        run_registry_management(list, stop, reap, force).await;
+        run_registry_management(list, stop, reap, force, include_rogue).await;
         return;
     }
 
@@ -140,12 +146,18 @@ pub async fn run(
 /// Dispatch `codanna serve --list`/`--stop`/`--reap`. Runs each requested
 /// operation in turn (reap, then stop, then list) so `--stop --list` reflects
 /// the post-stop state and `--reap --list` reflects the post-reap state.
-async fn run_registry_management(list: bool, stop: Option<String>, reap: bool, force: bool) {
+async fn run_registry_management(
+    list: bool,
+    stop: Option<String>,
+    reap: bool,
+    force: bool,
+    include_rogue: bool,
+) {
     if reap {
         reap_stale_entries();
     }
     if let Some(selector) = stop {
-        stop_server(&selector, force).await;
+        stop_server(&selector, force, include_rogue).await;
     }
     if list {
         print_registry_list();
@@ -171,59 +183,61 @@ fn reap_stale_entries() {
 }
 
 /// Print a table of every registered server whose process is currently
-/// alive. Stale entries (dead pid, or a pid reused by a process that no
-/// longer looks like `codanna serve` -- see
-/// [`crate::serve_registry::entry_is_stale`]) are skipped from the printed
-/// list, but -- unlike `--reap` -- are NOT deleted here; pruning is
-/// `--reap`'s job alone.
+/// alive.
+///
+/// `codanna serve --list` is deprecated in favor of `codanna ls`, which owns
+/// the sole merge/table-building logic for this listing (see the module doc
+/// on `crate::cli::commands::ls`). This prints a one-line deprecation notice
+/// to stderr, then delegates entirely to `ls::run` so there is exactly one
+/// source of listing logic -- this function must never rebuild the table
+/// itself.
 fn print_registry_list() {
-    let mut entries: Vec<_> = crate::serve_registry::list_entries()
-        .into_iter()
-        .filter(|entry| !crate::serve_registry::entry_is_stale(entry))
-        .collect();
-    entries.sort_by_key(|entry| entry.pid);
-
-    if entries.is_empty() {
-        println!("No running codanna servers registered.");
-        return;
-    }
-
-    println!(
-        "{:<10} {:<7} {:<7} {:<10} {:<12} WORKSPACE",
-        "PID", "PORT", "SCHEME", "STATUS", "STARTED"
+    eprintln!(
+        "DEPRECATION: `codanna serve --list` is deprecated in favor of `codanna ls`; it will be removed in a future release."
     );
-    for entry in entries {
-        let status = match entry.status {
-            crate::serve_registry::ServerStatus::Spawning => "spawning",
-            crate::serve_registry::ServerStatus::Healthy => "healthy",
-        };
-        println!(
-            "{:<10} {:<7} {:<7} {:<10} {:<12} {}",
-            entry.pid,
-            entry.port,
-            entry.scheme.as_str(),
-            status,
-            entry.start_time,
-            entry.workspace_root.display()
-        );
-    }
+    crate::cli::commands::ls::run();
 }
 
 /// Resolve a `--stop` selector to a pid: either a literal pid, or a
 /// workspace-root path matched (exactly, or after canonicalization) against
 /// every registered entry's `workspace_root`.
 ///
-/// A numeric selector must name a pid that is both registered (present in
-/// the per-user server registry) and still looks like a `codanna serve`
-/// process -- otherwise `codanna serve --stop <pid>` would SIGTERM/SIGKILL
-/// any process the invoking user can signal, not just a registered codanna
-/// server, contradicting the "Stop a registered server..." help text.
-fn resolve_selector_to_pid(selector: &str) -> Option<u32> {
+/// A numeric selector must name a pid that still looks like a `codanna
+/// serve` process -- otherwise `codanna serve --stop <pid>` would
+/// SIGTERM/SIGKILL any process the invoking user can signal, not just a
+/// codanna server, contradicting the "Stop a registered server..." help
+/// text. By default it must additionally be registered (present in the
+/// per-user server registry); `allow_rogue` is an explicit, non-default
+/// opt-in (`--include-rogue`) that waives the registry-membership check but
+/// never an identity check, so this can never become a generic kill-any-pid
+/// primitive.
+///
+/// The identity check itself is stricter for an unregistered pid than a
+/// registered one. A registered pid is already vouched for by the registry
+/// (this process itself wrote that entry), so the lenient
+/// `looks_like_codanna_serve` (`cmd` contains "codanna" as a substring
+/// anywhere) suffices to confirm the same process is still there. An
+/// unregistered pid reached only via `--include-rogue` has no such
+/// vouching, so it is checked against the stricter, basename-anchored
+/// `scan_codanna_serve_pids` predicate instead, to minimize the chance of
+/// signaling an unrelated process that merely mentions "codanna" on its
+/// command line.
+fn resolve_selector_to_pid(selector: &str, allow_rogue: bool) -> Option<u32> {
     if let Ok(pid) = selector.parse::<u32>() {
-        return crate::serve_registry::list_entries()
+        let is_registered = crate::serve_registry::list_entries()
             .iter()
-            .any(|entry| entry.pid == pid && crate::serve_registry::looks_like_codanna_serve(pid))
-            .then_some(pid);
+            .any(|entry| entry.pid == pid);
+
+        let looks_like_codanna_serve = if is_registered {
+            crate::serve_registry::looks_like_codanna_serve(pid)
+        } else {
+            crate::io::process::scan_codanna_serve_pids().contains(&pid)
+        };
+        if !looks_like_codanna_serve {
+            return None;
+        }
+
+        return (allow_rogue || is_registered).then_some(pid);
     }
 
     let path = PathBuf::from(selector);
@@ -242,12 +256,22 @@ fn resolve_selector_to_pid(selector: &str) -> Option<u32> {
 /// SIGKILL with `force`), then poll -- bounded, a few seconds -- for the
 /// target to exit. SIGTERM is the default; SIGKILL is only ever sent when
 /// `force` is set explicitly.
-async fn stop_server(selector: &str, force: bool) {
+async fn stop_server(selector: &str, force: bool, include_rogue: bool) {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System};
 
-    let Some(pid) = resolve_selector_to_pid(selector) else {
+    let Some(pid) = resolve_selector_to_pid(selector, include_rogue) else {
         if let Ok(pid) = selector.parse::<u32>() {
-            eprintln!("No registered server with pid {pid}.");
+            // With `--include-rogue`, registry membership is already waived
+            // by `resolve_selector_to_pid`, so reaching here means the pid
+            // failed the identity check instead -- report that distinctly
+            // rather than the registry-membership wording below, which
+            // would be misleading given `--include-rogue` explicitly waived
+            // that requirement.
+            if include_rogue {
+                eprintln!("pid {pid} does not look like a codanna serve process.");
+            } else {
+                eprintln!("No registered server with pid {pid}.");
+            }
         } else {
             eprintln!(
                 "No registered server matches '{selector}' (expected a pid or a workspace-root path)."

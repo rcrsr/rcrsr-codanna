@@ -48,6 +48,21 @@ pub enum ServerStatus {
     Healthy,
 }
 
+/// Whether a registry entry names a backing MCP server or a stdio proxy.
+///
+/// Defaults to `Server` so that legacy registry entries written before this
+/// field existed (no `role` key at all) deserialize as `Server` via
+/// `#[serde(default)]` on `RegistryEntry::role`, rather than failing to
+/// parse -- every entry the registry has ever written prior to this field's
+/// introduction named a backing server, never a proxy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServerRole {
+    #[default]
+    Server,
+    Proxy,
+}
+
 /// One entry in the per-user server registry, written to
 /// `<registry_dir>/<pid>.json` by the server it describes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +74,8 @@ pub struct RegistryEntry {
     /// Unix seconds at which the server started.
     pub start_time: u64,
     pub status: ServerStatus,
+    #[serde(default)]
+    pub role: ServerRole,
 }
 
 /// Errors from reading/writing the per-user server registry.
@@ -285,7 +302,7 @@ pub fn entry_is_stale(entry: &RegistryEntry) -> bool {
 /// either side when canonicalization fails (e.g. the path no longer exists),
 /// so a failed canonicalize degrades to the previous raw-equality behavior
 /// rather than making every comparison fail.
-fn paths_match(a: &Path, b: &Path) -> bool {
+pub(crate) fn paths_match(a: &Path, b: &Path) -> bool {
     let canon_a = std::fs::canonicalize(a).unwrap_or_else(|_| a.to_path_buf());
     let canon_b = std::fs::canonicalize(b).unwrap_or_else(|_| b.to_path_buf());
     canon_a == canon_b
@@ -304,7 +321,25 @@ mod tests {
             workspace_root: workspace_root.to_path_buf(),
             start_time: 1_700_000_000,
             status,
+            role: ServerRole::Server,
         }
+    }
+
+    #[test]
+    fn legacy_entry_without_role_key_deserializes_as_server() {
+        let legacy_json = r#"{
+            "pid": 4242,
+            "port": 8080,
+            "scheme": "http",
+            "workspace_root": "/tmp/legacy-workspace",
+            "start_time": 1700000000,
+            "status": "healthy"
+        }"#;
+
+        let entry: RegistryEntry =
+            serde_json::from_str(legacy_json).expect("legacy entry without role must deserialize");
+
+        assert_eq!(entry.role, ServerRole::Server);
     }
 
     #[test]

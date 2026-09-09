@@ -117,6 +117,24 @@ fn run_serve_management(home: &Path, args: &[&str]) -> (i32, String, String) {
     )
 }
 
+/// Run `codanna ls` to completion, with the same `home` registry root as
+/// `start_http_server`/`run_serve_management`, so it observes the same
+/// registered/rogue state.
+fn run_ls(home: &Path) -> (i32, String, String) {
+    let output = Command::new(codanna_binary())
+        .arg("ls")
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home)
+        .output()
+        .expect("run codanna ls");
+
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
+}
+
 /// Registry directory this test's `home` resolves to, mirroring
 /// `serve_registry::registry_dir()`'s own resolution
 /// (`dirs::state_dir().or_else(dirs::data_dir)/codanna/servers`) so the test
@@ -367,4 +385,219 @@ fn reap_prunes_stale_entry_that_list_already_skipped() {
         !registry_file_exists(&home, pid),
         "serve --reap should remove the stale registry entry"
     );
+}
+
+/// A real, running `codanna serve` process whose registry entry lives under
+/// a *different* per-user registry root ("rogue" from the perspective of the
+/// `home` used for the `--stop` invocation below): the pid genuinely
+/// `looks_like_codanna_serve`, but no entry for it exists in the registry
+/// `--stop` is about to consult.
+struct RogueServer {
+    _workspace: TempDir,
+    _home: TempDir,
+    server: Child,
+}
+
+fn start_rogue_server() -> RogueServer {
+    let workspace = prepare_workspace();
+    let home_dir = TempDir::new().expect("create rogue registry home");
+    let server = start_http_server(workspace.path(), home_dir.path());
+    RogueServer {
+        _workspace: workspace,
+        _home: home_dir,
+        server,
+    }
+}
+
+/// Regression guard: `codanna serve --stop <pid>` without `--include-rogue`
+/// must refuse a pid that looks like `codanna serve` but has no entry in the
+/// registry being consulted -- today's registered-only contract, unchanged.
+#[test]
+fn stop_without_include_rogue_refuses_unregistered_codanna_pid() {
+    let home = TempDir::new().expect("create test home");
+
+    let mut rogue = start_rogue_server();
+    let pid = rogue.server.id();
+    let _reaper = Reaper(pid);
+
+    wait_until(
+        || pid_alive(pid),
+        FAST_DEADLINE,
+        "rogue server to be running",
+    );
+    assert!(
+        !registry_file_exists(home.path(), pid),
+        "rogue server's registry entry must not be visible under the --stop registry root"
+    );
+
+    let (code, stdout, stderr) = run_serve_management(home.path(), &["--stop", &pid.to_string()]);
+    assert_eq!(
+        code, 1,
+        "serve --stop without --include-rogue must refuse an unregistered pid\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        pid_alive(pid),
+        "a refused --stop must never signal the target process"
+    );
+
+    let _ = rogue.server.kill();
+    let _ = rogue.server.wait();
+}
+
+/// `codanna serve --stop <pid> --include-rogue` accepts a pid that is not
+/// registered under the consulted registry root, as long as it still
+/// independently looks like a `codanna serve` process.
+#[test]
+fn stop_with_include_rogue_accepts_unregistered_codanna_pid() {
+    let home = TempDir::new().expect("create test home");
+
+    let mut rogue = start_rogue_server();
+    let pid = rogue.server.id();
+    let _reaper = Reaper(pid);
+
+    wait_until(
+        || pid_alive(pid),
+        FAST_DEADLINE,
+        "rogue server to be running",
+    );
+    assert!(
+        !registry_file_exists(home.path(), pid),
+        "rogue server's registry entry must not be visible under the --stop registry root"
+    );
+
+    let (code, stdout, stderr) = run_serve_management(
+        home.path(),
+        &["--stop", &pid.to_string(), "--include-rogue"],
+    );
+    assert_eq!(
+        code, 0,
+        "serve --stop --include-rogue should accept a rogue codanna-serve pid\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    // `rogue.server` is this test's own child handle: the OS keeps a
+    // terminated child as a zombie -- which `pid_alive` deliberately still
+    // treats as "alive" -- until its parent reaps it via `wait`/`try_wait`,
+    // so exit must be observed through the owning `Child`, exactly like
+    // `stop_sends_sigterm_and_server_self_deregisters` above.
+    wait_until(
+        || matches!(rogue.server.try_wait(), Ok(Some(_))),
+        FAST_DEADLINE,
+        "rogue server to exit after --stop --include-rogue",
+    );
+}
+
+/// `--include-rogue` waives only registry membership, never the
+/// `looks_like_codanna_serve` identity check: a pid that is not a codanna
+/// process at all must still be refused even with the flag set.
+#[test]
+fn stop_with_include_rogue_still_refuses_non_codanna_pid() {
+    let home = TempDir::new().expect("create test home");
+
+    let mut non_codanna = Command::new("sleep")
+        .arg("60")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn non-codanna process");
+    let pid = non_codanna.id();
+    let _reaper = Reaper(pid);
+
+    wait_until(
+        || pid_alive(pid),
+        FAST_DEADLINE,
+        "non-codanna process to be running",
+    );
+
+    let (code, stdout, stderr) = run_serve_management(
+        home.path(),
+        &["--stop", &pid.to_string(), "--include-rogue"],
+    );
+    assert_eq!(
+        code, 1,
+        "serve --stop --include-rogue must still refuse a non-codanna pid\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        pid_alive(pid),
+        "a refused --stop must never signal the target process"
+    );
+
+    let _ = non_codanna.kill();
+    let _ = non_codanna.wait();
+}
+
+/// `codanna serve --list` is deprecated in favor of `codanna ls`: it must
+/// print a one-line deprecation notice to stderr, and its stdout must carry
+/// the exact same registered-server row content `codanna ls` produces for an
+/// identical registry state, because it now delegates entirely into `ls.rs`'s
+/// listing logic rather than duplicating a table-building loop of its own.
+#[test]
+fn list_prints_deprecation_notice_and_delegates_to_ls() {
+    let workspace = prepare_workspace();
+    let home = workspace.path().join(".home");
+    std::fs::create_dir_all(&home).expect("create test home");
+
+    let mut server = start_http_server(workspace.path(), &home);
+    let pid = server.id();
+    let _reaper = Reaper(pid);
+
+    wait_until(
+        || registry_file_exists(&home, pid),
+        FAST_DEADLINE,
+        "backing server to publish its registry entry",
+    );
+
+    let (list_code, list_stdout, list_stderr) = run_serve_management(&home, &["--list"]);
+    assert_eq!(
+        list_code, 0,
+        "serve --list should succeed\nstdout:\n{list_stdout}\nstderr:\n{list_stderr}"
+    );
+    assert!(
+        list_stderr.to_lowercase().contains("deprecat")
+            && list_stderr.contains("codanna ls")
+            && list_stderr.contains("serve --list"),
+        "serve --list must print a deprecation notice mentioning both itself and `codanna ls` to stderr:\n{list_stderr}"
+    );
+
+    let (ls_code, ls_stdout, ls_stderr) = run_ls(&home);
+    assert_eq!(
+        ls_code, 0,
+        "codanna ls should succeed\nstdout:\n{ls_stdout}\nstderr:\n{ls_stderr}"
+    );
+
+    // Same registered-server row content: pid, "server" kind, "registered"
+    // source, and "healthy" status must appear identically in both outputs,
+    // proving `serve --list` delegated into the same listing logic rather
+    // than rebuilding its own (now-divergent) table.
+    for needle in [pid.to_string().as_str(), "server", "registered", "healthy"] {
+        assert!(
+            list_stdout.contains(needle),
+            "serve --list output missing {needle:?}:\n{list_stdout}"
+        );
+        assert!(
+            ls_stdout.contains(needle),
+            "codanna ls output missing {needle:?}:\n{ls_stdout}"
+        );
+    }
+    // Compare only the registered rows (source == "registered"), not the
+    // full output: rogue rows come from a live, machine-wide process-table
+    // scan taken independently by each invocation, so on a host with other
+    // rogue `codanna serve` processes running concurrently that set can
+    // legitimately differ between the two separate subprocess calls above.
+    // The registered rows, backed by this test's own isolated registry
+    // root, must match exactly regardless.
+    fn registered_rows(stdout: &str) -> Vec<&str> {
+        stdout
+            .lines()
+            .filter(|line| line.contains("registered"))
+            .collect()
+    }
+    assert_eq!(
+        registered_rows(&list_stdout),
+        registered_rows(&ls_stdout),
+        "serve --list's registered-server rows must match codanna ls's exactly\nserve --list:\n{list_stdout}\ncodanna ls:\n{ls_stdout}"
+    );
+
+    let _ = server.kill();
+    let _ = server.wait();
 }
