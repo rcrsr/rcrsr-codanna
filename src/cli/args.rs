@@ -62,6 +62,7 @@ fn create_custom_help() -> String {
     help.push_str("  list-dirs     List all directories that are being indexed\n");
     help.push_str("  retrieve      Query symbols, relationships, and dependencies\n");
     help.push_str("  serve         Start MCP server\n");
+    help.push_str("  ls            List registered and rogue codanna servers/proxies\n");
     help.push_str("  config        Display active settings\n");
     help.push_str("  mcp-test      Test MCP connection\n");
     help.push_str("  mcp           Execute MCP tools directly\n");
@@ -276,10 +277,14 @@ pub enum Commands {
         bind: String,
 
         /// List servers from the per-user server registry instead of starting one
+        ///
+        /// Deprecated in favor of `codanna ls`, which is now the primary
+        /// listing command; this flag is kept for one release cycle and
+        /// delegates to the same listing logic.
         #[arg(
             long,
             conflicts_with_all = ["http", "https", "proxy", "bind"],
-            help = "List registered codanna servers (pid, port, scheme, workspace, status)"
+            help = "[DEPRECATED: use `codanna ls`] List registered codanna servers (pid, port, scheme, workspace, status)"
         )]
         list: bool,
 
@@ -307,7 +312,28 @@ pub enum Commands {
             help = "With --stop, send SIGKILL instead of the default SIGTERM"
         )]
         force: bool,
+
+        /// Allow --stop to target a pid that looks like codanna serve but is
+        /// not present in the per-user server registry (e.g. started before
+        /// the registry existed, or from another user's session this one
+        /// can still signal). Never permits stopping an arbitrary pid: the
+        /// target must still independently pass the process-identity check.
+        #[arg(
+            long,
+            requires = "stop",
+            help = "With --stop, also allow an unregistered pid that still looks like codanna serve"
+        )]
+        include_rogue: bool,
     },
+
+    /// List every `codanna serve` process visible to the invoking user
+    #[command(
+        about = "List registered and rogue codanna servers/proxies",
+        long_about = "Merge the per-user server registry with a process-table scan into one \
+read-only table: registered servers, registered proxies attributed to their backing server, and \
+any rogue codanna serve process with no live registry entry. Never loads the code index."
+    )]
+    Ls,
 
     /// Test MCP connection
     #[command(name = "mcp-test", about = "Test MCP connection and list tools")]

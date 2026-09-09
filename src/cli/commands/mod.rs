@@ -9,6 +9,7 @@ pub mod documents;
 pub mod dump;
 pub mod index;
 pub mod init;
+pub mod ls;
 pub mod mcp;
 pub mod parse;
 pub mod plugin;

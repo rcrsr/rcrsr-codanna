@@ -495,11 +495,10 @@ proxy or started manually) publishes itself to a per-user server registry,
 separate from the per-workspace `.codanna/serve.json` discovery record
 described above. Where `serve.json` is scoped to one workspace and used for
 discovery, the registry is scoped to the whole user and used for lifecycle
-management: it is how `codanna serve` itself can tell you (and let you stop)
-every codanna server you have running, across every workspace, without
-walking the filesystem for `.codanna` directories. HTTPS backing servers get
-the same disappeared-workspace self-check and idle-shutdown timer as HTTP
-ones.
+management: it is how codanna itself can tell you (and let you stop) every
+codanna server you have running, across every workspace, without walking the
+filesystem for `.codanna` directories. HTTPS backing servers get the same
+disappeared-workspace self-check and idle-shutdown timer as HTTP ones.
 
 The registry lives under your per-user state directory
 (`$XDG_STATE_HOME`, or `~/.local/state` on Linux; falling back to the data
@@ -508,11 +507,21 @@ directory -- `~/Library/Application Support` on macOS,
 at `codanna/servers/`. Each running server owns exactly one file there,
 named after its own pid, so there is nothing to lock or contend over.
 
+`codanna ls` is the primary, top-level command for listing every registered
+and rogue `codanna serve` process visible to the invoking user (registered
+servers, attached proxies, and best-effort-enriched rogue pids merged into
+one table). `codanna serve --list` is **deprecated for one release cycle** in
+favor of `codanna ls`: it prints a deprecation notice to stderr and then
+delegates to the exact same listing logic, so the two commands always agree.
+Prefer `codanna ls` in scripts and habit going forward.
+
 ```bash
-codanna serve --list                    # show every running server this user owns
+codanna ls                              # show every running server this user owns (primary)
+codanna serve --list                    # deprecated: delegates to `codanna ls`, prints a deprecation notice to stderr
 codanna serve --stop <pid>              # SIGTERM a server by pid
 codanna serve --stop <workspace-path>   # ...or by the workspace root it's serving
 codanna serve --stop <pid> --force      # SIGKILL instead (only when SIGTERM isn't enough)
+codanna serve --stop <pid> --include-rogue  # also accept a rogue pid (shown by `codanna ls`) that has no registry entry
 codanna serve --reap                    # prune registry entries for servers that are no longer running
 ```
 

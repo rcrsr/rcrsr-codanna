@@ -9,9 +9,10 @@
 //! tightening does not apply on non-Unix platforms.
 
 use std::fs::OpenOptions;
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -164,9 +165,34 @@ pub enum DiscoveryError {
         workspace_root: PathBuf,
         config_path: PathBuf,
     },
+
+    #[error(
+        "spawned backing 'codanna serve --http' process exited (exit code: {code:?}) before becoming healthy; stderr tail:\n{stderr}"
+    )]
+    SpawnedProcessExited { code: Option<i32>, stderr: String },
 }
 
 pub type DiscoveryResult<T> = Result<T, DiscoveryError>;
+
+/// Captured tail of a spawned backing server's stderr plus its exit status,
+/// populated by `spawn_detached`'s reaper thread once the child process
+/// exits. Lets a caller that only observes "the pid stopped being alive"
+/// (e.g. a `discover_or_spawn` wait loop) also surface *why* -- the last
+/// bytes the child wrote to stderr before dying -- instead of a bare
+/// timeout with no diagnostic content.
+#[derive(Debug, Clone)]
+pub struct CapturedExit {
+    /// The child's exit code, or `None` if it was killed by a signal rather
+    /// than exiting normally (see `std::process::ExitStatus::code`).
+    pub code: Option<i32>,
+    /// A bounded tail of the child's stderr, read after `wait()` returns.
+    pub stderr: String,
+}
+
+/// Shared slot `spawn_detached`'s reaper thread populates with a
+/// [`CapturedExit`] once the spawned child exits. `None` until then (or
+/// forever, for a server that never exits during this process's lifetime).
+pub type SpawnExitSlot = Arc<Mutex<Option<CapturedExit>>>;
 
 /// Resolve the workspace root to key discovery off of: prefer the already
 /// -resolved `Settings::workspace_root`, falling back to walking up from the
@@ -583,11 +609,22 @@ async fn discover_live(codanna_dir: &Path) -> Option<ServeRecord> {
 /// loser (waiting on the winner). The token check is what distinguishes the
 /// server this record actually names from any other process that happens to
 /// answer on that port -- see `check_health`.
+///
+/// `exit_slot` is `Some` only for the lock winner, which owns the `Child`
+/// handle whose reaper thread populates it: if the spawned process has
+/// already exited by the time a poll iteration runs, this returns
+/// `Err(DiscoveryError::SpawnedProcessExited)` immediately instead of
+/// continuing to poll until `timeout` -- surfacing the captured exit code and
+/// stderr tail rather than a bare, less actionable `SpawnTimeout`. The lock
+/// loser passes `None`: it never holds a `Child` handle for someone else's
+/// spawn (see `wait_on_spawning_pid`), so it has no exit slot to check and
+/// simply falls back to polling until `timeout`.
 async fn wait_until_healthy(
     codanna_dir: &Path,
     lock_path: &Path,
     timeout: Duration,
     poll_interval: Duration,
+    exit_slot: Option<&SpawnExitSlot>,
 ) -> DiscoveryResult<ServeRecord> {
     let deadline = Instant::now() + timeout;
     loop {
@@ -598,6 +635,13 @@ async fn wait_until_healthy(
             {
                 return Ok(record);
             }
+        }
+
+        if let Some(captured) = exit_slot.and_then(|slot| slot.lock().ok()?.clone()) {
+            return Err(DiscoveryError::SpawnedProcessExited {
+                code: captured.code,
+                stderr: captured.stderr,
+            });
         }
 
         if Instant::now() >= deadline {
@@ -688,6 +732,32 @@ fn test_spawn_delay_ms() -> Option<u64> {
         .filter(|&ms| ms > 0)
 }
 
+/// Test-only fast-fail hook, read once per `spawn_detached` call: when set to
+/// a valid `i32`, the spawned child never execs the real `codanna serve`
+/// invocation at all -- instead it writes [`TEST_SPAWN_FAIL_MARKER`] to
+/// stderr and exits immediately with this code, so tests can deterministically
+/// exercise `wait_until_healthy`'s early `SpawnedProcessExited` detection (see
+/// its doc comment) against a REAL spawned process, rather than only the
+/// hermetic unit test that populates the exit slot directly. Mirrors
+/// [`test_spawn_delay_ms`]'s env-var-gated, inert-unless-set precedent. Any
+/// unset/unparseable value disables the hook. Unix-only: see
+/// [`build_spawn_command`] for why the hook itself does not apply on other
+/// platforms.
+#[cfg(unix)]
+fn test_spawn_fail_code() -> Option<i32> {
+    std::env::var("CODANNA_TEST_SPAWN_FAIL_CODE")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+}
+
+/// Fixed stderr marker [`test_spawn_fail_code`]'s wrapper script writes
+/// before exiting, so a test asserting on the surfaced
+/// `DiscoveryError::SpawnedProcessExited` message can confirm it captured
+/// THIS process's stderr (not e.g. an empty tail from a race) in addition to
+/// the exit code.
+#[cfg(unix)]
+const TEST_SPAWN_FAIL_MARKER: &str = "codanna-test-spawn-fail-marker";
+
 /// Quote `path` as a single POSIX shell word, for the `sh -c` wrapper script
 /// [`build_spawn_command`] builds under the [`test_spawn_delay_ms`] hook.
 /// Escapes embedded single quotes rather than assuming a path never contains
@@ -701,20 +771,35 @@ fn shell_quote(path: &Path) -> String {
 
 /// Build the `Command` [`spawn_detached`] actually spawns: ordinarily a
 /// direct `<exe> serve --http --watch --bind 127.0.0.1:0 [--config
-/// <config_path>]` invocation, or -- ONLY when [`test_spawn_delay_ms`]
-/// returns `Some` -- that same invocation wrapped in a `sh -c 'sleep ...&&
-/// exec ...'` script. `exec` (not `&&`-then-exit) is load-bearing: it
-/// replaces the shell process image in place, so the eventual `codanna
-/// serve --http` process keeps the SAME pid the wrapping shell was spawned
-/// with -- exactly the pid `spawn_detached`'s caller publishes as `Spawning`
-/// and the started server later republishes as `Healthy` under. Unix-only
+/// <config_path>]` invocation, or -- ONLY when one of two test-only env hooks
+/// is set -- something else entirely. [`test_spawn_fail_code`], checked
+/// first, replaces the invocation with `sh -c 'echo <marker> >&2; exit
+/// <code>'`: it never execs `codanna` at all, so tests can deterministically
+/// drive the "spawned process exits before becoming healthy" path (fast,
+/// with a known stderr marker and exit code) instead of racing a real
+/// startup failure. Otherwise, when [`test_spawn_delay_ms`] returns `Some`,
+/// the plain invocation is wrapped in a `sh -c 'sleep ... && exec ...'`
+/// script. `exec` (not `&&`-then-exit) is load-bearing there: it replaces the
+/// shell process image in place, so the eventual `codanna serve --http`
+/// process keeps the SAME pid the wrapping shell was spawned with -- exactly
+/// the pid `spawn_detached`'s caller publishes as `Spawning` and the started
+/// server later republishes as `Healthy` under. Both hooks are Unix-only
 /// (mirrors this module's other `#[cfg(unix)]`-gated behavior, e.g.
-/// `process_group`); on non-Unix platforms the hook is inert and this always
+/// `process_group`); on non-Unix platforms both are inert and this always
 /// returns the plain invocation, since `cmd.exe` has no equivalent
 /// process-image-replacement primitive and wrapping there would spawn the
 /// real server under a DIFFERENT pid than the wrapper -- silently breaking
 /// this exact invariant instead of merely not testing it.
 fn build_spawn_command(exe: &Path, config_path: Option<&Path>) -> Command {
+    #[cfg(unix)]
+    if let Some(code) = test_spawn_fail_code() {
+        let mut shell = Command::new("sh");
+        shell
+            .arg("-c")
+            .arg(format!("echo {TEST_SPAWN_FAIL_MARKER} >&2; exit {code}"));
+        return shell;
+    }
+
     #[cfg(unix)]
     if let Some(delay_ms) = test_spawn_delay_ms() {
         let mut invocation = format!(
@@ -756,18 +841,63 @@ fn build_spawn_command(exe: &Path, config_path: Option<&Path>) -> Command {
 /// server loads the same configuration file that started the proxy, rather
 /// than falling back to config discovery from `workspace_root`.
 ///
+/// Bound applied to the stderr tail read by the reaper thread below: enough
+/// to carry a panic message or a handful of error-log lines without risking
+/// an unbounded read against a runaway child that wrote gigabytes of noise.
+const SPAWN_STDERR_TAIL_BYTES: u64 = 16 * 1024;
+
+/// Best-effort read of the last [`SPAWN_STDERR_TAIL_BYTES`] of `path`. Never
+/// panics: any failure to open, seek, or read the file yields an empty (or
+/// partial) string, since a missing diagnostic tail is not worth failing the
+/// reaper thread over.
+fn read_stderr_tail(path: &Path) -> String {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if len > SPAWN_STDERR_TAIL_BYTES {
+        let offset = -(SPAWN_STDERR_TAIL_BYTES as i64);
+        let _ = file.seek(std::io::SeekFrom::End(offset));
+    }
+    let mut buf = Vec::new();
+    let _ = file.read_to_end(&mut buf);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
 /// Returns the child's pid so the caller can publish it to the per-user
 /// server registry (`crate::serve_registry`) as a `Spawning` entry -- the
 /// same real pid the spawned server later republishes as `Healthy` once it
-/// finishes starting up (see `discover_or_spawn`'s winner branch).
-fn spawn_detached(workspace_root: &Path, config_path: Option<&Path>) -> DiscoveryResult<u32> {
+/// finishes starting up (see `discover_or_spawn`'s winner branch) -- plus a
+/// [`SpawnExitSlot`] the reaper thread below populates with the child's exit
+/// code and a stderr tail once it exits, so a caller polling for health can
+/// also surface why a spawn attempt died instead of only a bare timeout.
+fn spawn_detached(
+    workspace_root: &Path,
+    config_path: Option<&Path>,
+) -> DiscoveryResult<(u32, SpawnExitSlot)> {
     let exe = std::env::current_exe().map_err(|source| DiscoveryError::CurrentExe { source })?;
+
+    // The child's stderr is redirected to a uniquely-named temp file, NOT a
+    // pipe: a pipe's read end lives in this (spawning) process, and once
+    // this process exits -- which it does, since the whole point of a
+    // detached spawn is that the backing server outlives it -- the read end
+    // closes and the next write the long-lived child makes to a closed pipe
+    // raises SIGPIPE/EPIPE. A plain file has no such reader to lose.
+    let stderr_path = std::env::temp_dir().join(format!(
+        "codanna-spawn-stderr-{}.log",
+        generate_launch_token()
+    ));
+    let stderr_file =
+        std::fs::File::create(&stderr_path).map_err(|source| DiscoveryError::Spawn {
+            workspace_root: workspace_root.to_path_buf(),
+            source,
+        })?;
 
     let mut cmd = build_spawn_command(&exe, config_path);
     cmd.current_dir(workspace_root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::from(stderr_file));
 
     #[cfg(unix)]
     {
@@ -792,20 +922,30 @@ fn spawn_detached(workspace_root: &Path, config_path: Option<&Path>) -> Discover
     // this function is sync and has no ambient async runtime to lean on, so
     // `tokio::task::spawn_blocking` would be the wrong tool here.
     //
-    // Best-effort: `wait()` failing just means we couldn't reap; there's
-    // nothing actionable to do with that error on a detached background
-    // thread, so it's discarded rather than unwrapped.
+    // Best-effort throughout: `wait()` failing, the exit-slot lock being
+    // poisoned, or the temp file failing to remove are all discarded rather
+    // than unwrapped -- there is nothing actionable to do with any of those
+    // errors on a detached background thread.
     let child = cmd.spawn().map_err(|source| DiscoveryError::Spawn {
         workspace_root: workspace_root.to_path_buf(),
         source,
     })?;
     let child_pid = child.id();
+    let exit_slot: SpawnExitSlot = Arc::new(Mutex::new(None));
+    let reaper_slot = exit_slot.clone();
+    let reaper_stderr_path = stderr_path.clone();
     std::thread::spawn(move || {
         let mut child = child;
-        let _ = child.wait();
+        let status = child.wait();
+        let code = status.ok().and_then(|s| s.code());
+        let stderr = read_stderr_tail(&reaper_stderr_path);
+        if let Ok(mut slot) = reaper_slot.lock() {
+            *slot = Some(CapturedExit { code, stderr });
+        }
+        let _ = std::fs::remove_file(&reaper_stderr_path);
     });
 
-    Ok(child_pid)
+    Ok((child_pid, exit_slot))
 }
 
 /// Discover a live HTTP MCP server for `workspace_root`, spawning one if none
@@ -952,7 +1092,7 @@ pub async fn discover_or_spawn(
                 return Ok(record);
             }
 
-            let child_pid = spawn_detached(workspace_root, original_config_path)?;
+            let (child_pid, exit_slot) = spawn_detached(workspace_root, original_config_path)?;
 
             // Publish this attempt to the per-user server registry under the
             // REAL child pid, before waiting on it, so a peer's later
@@ -973,6 +1113,7 @@ pub async fn discover_or_spawn(
                 workspace_root: workspace_root.to_path_buf(),
                 start_time: unix_now_secs(),
                 status: crate::serve_registry::ServerStatus::Spawning,
+                role: crate::serve_registry::ServerRole::Server,
             };
             if let Err(e) = crate::serve_registry::write_entry(&spawning_entry) {
                 tracing::warn!(
@@ -981,7 +1122,14 @@ pub async fn discover_or_spawn(
                 );
             }
 
-            wait_until_healthy(&codanna_dir, &lock_path, timeout, poll_interval).await
+            wait_until_healthy(
+                &codanna_dir,
+                &lock_path,
+                timeout,
+                poll_interval,
+                Some(&exit_slot),
+            )
+            .await
             // `_guard` drops here, releasing the lock once the winner's
             // spawn attempt has succeeded, timed out, or errored. Holding
             // the guard across the `.await` above is fine: it is a file
@@ -1001,7 +1149,7 @@ pub async fn discover_or_spawn(
         Err(PidLockError::Held { lock_path, .. }) => {
             // LOSER. Someone else is spawning (or just finished); wait on
             // their record instead of racing a second spawn.
-            wait_until_healthy(&codanna_dir, &lock_path, timeout, poll_interval).await
+            wait_until_healthy(&codanna_dir, &lock_path, timeout, poll_interval, None).await
         }
         Err(PidLockError::Io(source)) => Err(DiscoveryError::LockIo {
             path: lock_path,
@@ -1241,6 +1389,51 @@ mod tests {
     #[test]
     fn pid_zero_is_never_alive() {
         assert!(!pid_is_alive(0));
+    }
+
+    /// `wait_until_healthy` must check `exit_slot` before it ever consults
+    /// the timeout: if the spawned child has already exited, the caller
+    /// wants `DiscoveryError::SpawnedProcessExited` with the captured code
+    /// and stderr immediately, not a `SpawnTimeout` after waiting out the
+    /// full duration. Hermetic -- no process is spawned; the slot is
+    /// populated directly, exactly as the reaper thread in `spawn_detached`
+    /// would populate it after a real exit.
+    #[tokio::test]
+    async fn wait_until_healthy_returns_captured_exit_without_waiting_out_timeout() {
+        let workspace = TempDir::new().unwrap();
+        let codanna_dir = workspace.path().join(crate::init::local_dir_name());
+        let lock_path = codanna_dir.join("http.lock");
+        let slot: SpawnExitSlot = Arc::new(Mutex::new(Some(CapturedExit {
+            code: Some(3),
+            stderr: "boom".to_string(),
+        })));
+
+        let start = Instant::now();
+        let result = wait_until_healthy(
+            &codanna_dir,
+            &lock_path,
+            Duration::from_secs(5),
+            Duration::from_millis(10),
+            Some(&slot),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        match result {
+            Err(DiscoveryError::SpawnedProcessExited { code, stderr }) => {
+                assert_eq!(code, Some(3));
+                assert!(
+                    stderr.contains("boom"),
+                    "expected stderr to contain 'boom', got: {stderr}"
+                );
+            }
+            other => panic!("expected SpawnedProcessExited, got: {other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "wait_until_healthy should return as soon as the exit slot is populated, \
+             not wait out the 5s timeout; elapsed = {elapsed:?}"
+        );
     }
 
     #[tokio::test]

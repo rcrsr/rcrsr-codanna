@@ -342,6 +342,7 @@ async fn main() {
             | Commands::Plugin { .. }
             | Commands::Documents { .. }
             | Commands::Profile { .. }
+            | Commands::Ls
     ) && !is_proxy_serve(&cli.command, &config)
         && !is_serve_management_op(&cli.command);
 
@@ -872,6 +873,7 @@ async fn main() {
             stop,
             reap,
             force,
+            include_rogue,
         } => {
             use codanna::cli::commands::serve::{ServeArgs, run as run_serve};
             // Proxy mode and registry-management ops (--list/--stop/--reap)
@@ -896,6 +898,7 @@ async fn main() {
                     stop,
                     reap,
                     force,
+                    include_rogue,
                 },
                 config,
                 settings,
@@ -956,6 +959,10 @@ async fn main() {
 
         Commands::ListDirs => {
             codanna::cli::commands::directories::run_list_dirs(&config);
+        }
+
+        Commands::Ls => {
+            codanna::cli::commands::ls::run();
         }
 
         Commands::Retrieve { query } => {
@@ -1158,6 +1165,7 @@ mod is_proxy_serve_tests {
             stop: None,
             reap: false,
             force: false,
+            include_rogue: false,
         }
     }
 

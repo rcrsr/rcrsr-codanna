@@ -103,6 +103,12 @@ contributing/scripts/changelog-section.sh <version>
 - `RCRSR-README.md` § Installing the fork: only if the user-facing install
   instructions or examples changed. The pinned-version examples
   (`v0.12.0+rcrsr.1`) are illustrative and do not need to track the release.
+- **Deprecated-for-one-release-cycle flags:** if a prior `[Unreleased]` entry
+  deprecated a flag "for one release cycle" (e.g. `codanna serve --list` in
+  favor of `codanna ls`), this release is that cycle's boundary. Check
+  whether the deprecation has now spanned a full release; if so, file (or
+  fold into this PR) the follow-up to remove the deprecated flag rather than
+  letting it linger silently past its stated grace period.
 
 ## 5. Branch, commit, and PR conventions
 

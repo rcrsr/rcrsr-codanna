@@ -46,7 +46,7 @@ use std::time::{Duration, Instant};
 
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
-use codanna::serve_registry::{RegistryEntry, ServerStatus};
+use codanna::serve_registry::{RegistryEntry, ServerRole, ServerStatus};
 use tempfile::TempDir;
 
 use crate::support::codanna_binary;
@@ -406,17 +406,26 @@ fn second_proxy_waits_on_spawning_entry_instead_of_duplicating() {
         DEADLINE,
         "the backing server's registry entry to converge to Healthy",
     );
+    // Proxy #2 now also publishes its own best-effort `Proxy`-role registry
+    // entry once its `Dialer::connect` succeeds, so the dedup assertion must
+    // be scoped to `Server`-role entries -- this test is about backing-server
+    // duplication, not the (expected) proxy attribution row.
     let entries_final = registry_entries_for_workspace(&home, workspace.path());
+    let server_entries_final: Vec<&RegistryEntry> = entries_final
+        .iter()
+        .filter(|e| e.role == ServerRole::Server)
+        .collect();
     assert_eq!(
-        entries_final.len(),
+        server_entries_final.len(),
         1,
-        "exactly one registry entry should exist for this workspace after both proxy calls -- \
-         a second entry here means a duplicate backing server was spawned; got: {entries_final:?}"
+        "exactly one Server-role registry entry should exist for this workspace after both \
+         proxy calls -- a second entry here means a duplicate backing server was spawned; \
+         got: {entries_final:?}"
     );
     assert_eq!(
-        entries_final[0].pid, first_pid,
-        "the single registry entry after both proxy calls must still name proxy #1's pid, not a \
-         second spawned server"
+        server_entries_final[0].pid, first_pid,
+        "the single Server-role registry entry after both proxy calls must still name proxy \
+         #1's pid, not a second spawned server"
     );
 
     // The discovery record under <ws>/.codanna/serve.json must also name

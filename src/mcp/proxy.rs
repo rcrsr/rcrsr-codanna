@@ -58,6 +58,7 @@ use tokio::sync::Mutex;
 use crate::config::Settings;
 use crate::mcp::DUMMY_BEARER_TOKEN;
 use crate::serve_discovery::{self, DiscoveryError, ServeScheme};
+use crate::serve_registry;
 use crate::serve_tls;
 
 /// Errors from establishing or running the stdio<->HTTP proxy.
@@ -82,6 +83,20 @@ pub enum ProxyError {
 }
 
 pub type ProxyResult<T> = Result<T, ProxyError>;
+
+/// Current wall-clock time as unix seconds, for the proxy's own
+/// [`serve_registry::RegistryEntry::start_time`]. Falls back to 0 only if
+/// the system clock is set before the epoch, which is not a case worth
+/// failing proxy startup over. Mirrors `serve_discovery::unix_now_secs` and
+/// `mcp::http_server::unix_now_secs` (kept private to each module rather
+/// than shared, since all three are trivial one-liners with no other
+/// coupling).
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 /// Converts an upstream `ServiceError` into the `McpError` shape expected by
 /// `ServerHandler` methods. A `ServiceError::McpError` already carries a
@@ -934,6 +949,11 @@ pub async fn serve_proxy(
     );
 
     let state: Arc<Mutex<DownstreamState>> = Arc::new(Mutex::new(DownstreamState::default()));
+    // Captured before `workspace_root` is moved into `Dialer` below: this is
+    // the proxy's own stable workspace root, known before the backing
+    // server is ever dialed, and must never be confused with anything the
+    // backing server later reports about itself.
+    let proxy_workspace_root = workspace_root.clone();
     let dial = Dialer {
         workspace_root,
         config,
@@ -945,6 +965,29 @@ pub async fn serve_proxy(
     // every later revive (`UpstreamHandle::revive`) both go through it, so
     // there is exactly one HTTPS-pinning branch, not two.
     let upstream = dial.connect().await?;
+
+    // Best-effort registry entry for this proxy process itself, mirroring
+    // the discipline used for the `Spawning` entry write in
+    // `serve_discovery::discover_or_spawn`: this entry exists only so
+    // `codanna serve --list` can attribute this pid to the workspace it
+    // proxies for. A failed write must never block or fail the proxy --
+    // only `ls`'s proxy-attribution display degrades.
+    let proxy_pid = std::process::id();
+    let proxy_entry = serve_registry::RegistryEntry {
+        pid: proxy_pid,
+        port: 0,
+        scheme: ServeScheme::Http,
+        workspace_root: proxy_workspace_root,
+        start_time: unix_now_secs(),
+        status: serve_registry::ServerStatus::Healthy,
+        role: serve_registry::ServerRole::Proxy,
+    };
+    if let Err(e) = serve_registry::write_entry(&proxy_entry) {
+        tracing::warn!(
+            target: "proxy",
+            "failed to write registry entry for proxy pid {proxy_pid}: {e}"
+        );
+    }
 
     let handler = DelegatingProxyHandler {
         upstream: Arc::new(UpstreamHandle {
@@ -969,10 +1012,19 @@ pub async fn serve_proxy(
         .await
         .map_err(|e| ProxyError::Stdio(e.to_string()))?;
 
-    service
+    let wait_result = service
         .waiting()
         .await
-        .map_err(|e| ProxyError::Stdio(e.to_string()))?;
+        .map_err(|e| ProxyError::Stdio(e.to_string()));
+
+    // Graceful shutdown: remove this proxy's own registry entry regardless
+    // of whether `waiting()` returned an error, so a clean exit never leaves
+    // a stale row behind for `ls` to display. A crash/kill instead leaves
+    // this entry in place; the existing `entry_is_stale`/`--reap` machinery
+    // already prunes that case, so no new cleanup path is added here.
+    serve_registry::remove_entry(proxy_pid);
+
+    wait_result?;
 
     Ok(())
 }
