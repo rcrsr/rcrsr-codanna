@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **KEEP — convergence verified false** (a naive "take upstream" would have reintroduced a bug): `storage/tantivy/writer.rs`'s retry stays on the fork's `is_transient_writer_error`, which matches the concrete `LockFailure(LockBusy, _)` / `LockFailure(IoError)` / `IoError` variants. Upstream's own new `create_writer_with_retry` classifies via `source().downcast::<io::Error>()`, which never matches `LockError::LockBusy` on tantivy 0.26 — a lookalike that does not cover the case the fork's retry (#41) exists to survive. Upstream's 0.13.3 segment-merge-wait fix (`wait_merging_threads()` before releasing the writer) was adopted as an additional layer composed with, not replacing, the fork's retry.
   - **EXTEND** (re-verified, already landed): the fork's first-class `#[tool] reindex` (discoverable in `list_tools`, `codanna mcp reindex` CLI, `documents` reindex) stays wired to all three `server.rs` constructors, `KNOWN_TOOLS`, and the CLI match arm, sitting on top of upstream's `handle_force_reindex`/`run_reindex` primitive.
 
+### Fixed
+
+- **Backing-server lifecycle:** Proxy backing servers now have a per-user registry for lifecycle management and spawn-deduplication. Default idle shutdown is 4 hours. ([#77](https://github.com/rcrsr/rcrsr-codanna/pull/77))
+
 ## [0.16.0] - 2026-08-29
 
 Receiver-typed call resolution reaches seven more languages: local and parameter declarations now supply receiver types for PHP, Java, Kotlin, Go, Swift, GDScript, and C#. Index format and emission semantics are unchanged (v3); receiver bindings are resolved in memory and never persisted.

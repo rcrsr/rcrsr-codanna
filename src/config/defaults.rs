@@ -80,8 +80,13 @@ pub(super) fn default_spawn_timeout_ms() -> u64 {
 pub(super) fn default_health_poll_ms() -> u64 {
     100
 }
+/// Idle shutdown timeout for `--http` backing servers, in minutes.
+///
+/// Defaults to 4 hours (240 minutes) so an unattended workspace doesn't
+/// accumulate resident server processes indefinitely. Set to `0` to disable
+/// idle shutdown entirely and keep the previous never-shutdown behavior.
 pub(super) fn default_idle_shutdown_minutes() -> u64 {
-    0
+    240
 }
 pub(super) fn default_test_path_patterns() -> Vec<String> {
     vec![
@@ -250,4 +255,14 @@ pub(super) fn fallback_minimal_languages() -> IndexMap<String, LanguageConfig> {
     );
 
     langs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_idle_shutdown_minutes_is_four_hours() {
+        assert_eq!(default_idle_shutdown_minutes(), 240);
+    }
 }

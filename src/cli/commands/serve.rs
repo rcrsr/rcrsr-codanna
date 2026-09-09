@@ -16,6 +16,14 @@ pub struct ServeArgs {
     pub https: bool,
     pub proxy: bool,
     pub bind: String,
+    /// List servers from the per-user server registry instead of starting one.
+    pub list: bool,
+    /// Stop a registered server (pid or workspace-root path) instead of starting one.
+    pub stop: Option<String>,
+    /// Prune stale registry entries instead of starting one.
+    pub reap: bool,
+    /// With `stop`, send SIGKILL instead of the default SIGTERM.
+    pub force: bool,
 }
 
 /// Resolve which server transport `codanna serve` should start.
@@ -65,7 +73,22 @@ pub async fn run(
         https,
         proxy,
         bind,
+        list,
+        stop,
+        reap,
+        force,
     } = args;
+
+    // Registry lifecycle operations (--list/--stop/--reap) are never
+    // start-a-server operations: handle them here, before any transport mode
+    // is resolved, and return without ever reaching the server-startup match
+    // below. Clap's `conflicts_with_all` on these flags (see
+    // `cli::args::Commands::Serve`) already guarantees `http`/`https`/`proxy`/
+    // `bind` are all still at their defaults whenever one of these is set.
+    if list || stop.is_some() || reap {
+        run_registry_management(list, stop, reap, force).await;
+        return;
+    }
 
     let server_mode = resolve_server_mode(https, http, proxy, &config.server.mode);
 
@@ -111,6 +134,179 @@ pub async fn run(
             )
             .await;
         }
+    }
+}
+
+/// Dispatch `codanna serve --list`/`--stop`/`--reap`. Runs each requested
+/// operation in turn (reap, then stop, then list) so `--stop --list` reflects
+/// the post-stop state and `--reap --list` reflects the post-reap state.
+async fn run_registry_management(list: bool, stop: Option<String>, reap: bool, force: bool) {
+    if reap {
+        reap_stale_entries();
+    }
+    if let Some(selector) = stop {
+        stop_server(&selector, force).await;
+    }
+    if list {
+        print_registry_list();
+    }
+}
+
+/// Remove every registry entry whose process is no longer alive (via the
+/// zombie-safe `pid_is_alive`). This never signals a process -- it only
+/// prunes stale registry files left behind by a server that did not
+/// self-deregister (e.g. it was killed with SIGKILL).
+fn reap_stale_entries() {
+    let mut reaped = 0u32;
+    for entry in crate::serve_registry::list_entries() {
+        if crate::serve_registry::entry_is_stale(&entry) {
+            crate::serve_registry::remove_entry(entry.pid);
+            reaped += 1;
+        }
+    }
+    eprintln!(
+        "Reaped {reaped} stale server registry {}.",
+        if reaped == 1 { "entry" } else { "entries" }
+    );
+}
+
+/// Print a table of every registered server whose process is currently
+/// alive. Stale entries (dead pid, or a pid reused by a process that no
+/// longer looks like `codanna serve` -- see
+/// [`crate::serve_registry::entry_is_stale`]) are skipped from the printed
+/// list, but -- unlike `--reap` -- are NOT deleted here; pruning is
+/// `--reap`'s job alone.
+fn print_registry_list() {
+    let mut entries: Vec<_> = crate::serve_registry::list_entries()
+        .into_iter()
+        .filter(|entry| !crate::serve_registry::entry_is_stale(entry))
+        .collect();
+    entries.sort_by_key(|entry| entry.pid);
+
+    if entries.is_empty() {
+        println!("No running codanna servers registered.");
+        return;
+    }
+
+    println!(
+        "{:<10} {:<7} {:<7} {:<10} {:<12} WORKSPACE",
+        "PID", "PORT", "SCHEME", "STATUS", "STARTED"
+    );
+    for entry in entries {
+        let status = match entry.status {
+            crate::serve_registry::ServerStatus::Spawning => "spawning",
+            crate::serve_registry::ServerStatus::Healthy => "healthy",
+        };
+        println!(
+            "{:<10} {:<7} {:<7} {:<10} {:<12} {}",
+            entry.pid,
+            entry.port,
+            entry.scheme.as_str(),
+            status,
+            entry.start_time,
+            entry.workspace_root.display()
+        );
+    }
+}
+
+/// Resolve a `--stop` selector to a pid: either a literal pid, or a
+/// workspace-root path matched (exactly, or after canonicalization) against
+/// every registered entry's `workspace_root`.
+///
+/// A numeric selector must name a pid that is both registered (present in
+/// the per-user server registry) and still looks like a `codanna serve`
+/// process -- otherwise `codanna serve --stop <pid>` would SIGTERM/SIGKILL
+/// any process the invoking user can signal, not just a registered codanna
+/// server, contradicting the "Stop a registered server..." help text.
+fn resolve_selector_to_pid(selector: &str) -> Option<u32> {
+    if let Ok(pid) = selector.parse::<u32>() {
+        return crate::serve_registry::list_entries()
+            .iter()
+            .any(|entry| entry.pid == pid && crate::serve_registry::looks_like_codanna_serve(pid))
+            .then_some(pid);
+    }
+
+    let path = PathBuf::from(selector);
+    let canonical = std::fs::canonicalize(&path).ok();
+
+    crate::serve_registry::list_entries()
+        .into_iter()
+        .find_map(|entry| {
+            let matches = entry.workspace_root == path
+                || canonical.as_deref() == Some(entry.workspace_root.as_path());
+            matches.then_some(entry.pid)
+        })
+}
+
+/// Stop a registered server: resolve `selector` to a pid, send SIGTERM (or
+/// SIGKILL with `force`), then poll -- bounded, a few seconds -- for the
+/// target to exit. SIGTERM is the default; SIGKILL is only ever sent when
+/// `force` is set explicitly.
+async fn stop_server(selector: &str, force: bool) {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System};
+
+    let Some(pid) = resolve_selector_to_pid(selector) else {
+        if let Ok(pid) = selector.parse::<u32>() {
+            eprintln!("No registered server with pid {pid}.");
+        } else {
+            eprintln!(
+                "No registered server matches '{selector}' (expected a pid or a workspace-root path)."
+            );
+        }
+        std::process::exit(1);
+    };
+
+    let mut sys = System::new();
+    let target = Pid::from_u32(pid);
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[target]),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+
+    let Some(process) = sys.process(target) else {
+        eprintln!(
+            "No running process with pid {pid} (its registry entry may be stale; try --reap)."
+        );
+        std::process::exit(1);
+    };
+
+    let signal = if force { Signal::Kill } else { Signal::Term };
+    match process.kill_with(signal) {
+        Some(true) => {}
+        Some(false) => {
+            let name = if force { "SIGKILL" } else { "SIGTERM" };
+            eprintln!("Failed to send {name} to pid {pid}.");
+            std::process::exit(1);
+        }
+        None => {
+            eprintln!("Sending signals is not supported on this platform (pid {pid}).");
+            std::process::exit(1);
+        }
+    }
+
+    let deadline = std::time::Duration::from_secs(5);
+    let poll_interval = std::time::Duration::from_millis(100);
+    let start = std::time::Instant::now();
+    while start.elapsed() < deadline && crate::serve_registry::pid_is_alive(pid) {
+        tokio::time::sleep(poll_interval).await;
+    }
+
+    if crate::serve_registry::pid_is_alive(pid) {
+        eprintln!(
+            "Server pid {pid} did not exit within {}s of receiving the signal.",
+            deadline.as_secs()
+        );
+        std::process::exit(1);
+    }
+
+    if force {
+        eprintln!(
+            "Killed server pid {pid} (SIGKILL); its registry entry may remain since a killed \
+             process cannot self-deregister -- run `codanna serve --reap` to prune it."
+        );
+    } else {
+        eprintln!("Stopped server pid {pid} (SIGTERM).");
     }
 }
 

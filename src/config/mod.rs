@@ -317,7 +317,8 @@ pub struct ServerConfig {
     #[serde(default = "default_health_poll_ms")]
     pub health_poll_ms: u64,
 
-    /// Idle shutdown timeout for the backing server, in minutes (0 = never)
+    /// Idle shutdown timeout for the backing server, in minutes.
+    /// Defaults to 240 (4 hours); 0 disables idle shutdown.
     #[serde(default = "default_idle_shutdown_minutes")]
     pub idle_shutdown_minutes: u64,
 }
@@ -823,7 +824,10 @@ mode = "stdio"
         assert!(server.auto_spawn);
         assert_eq!(server.spawn_timeout_ms, 8000);
         assert_eq!(server.health_poll_ms, 100);
-        assert_eq!(server.idle_shutdown_minutes, 0);
+        assert_eq!(
+            server.idle_shutdown_minutes,
+            default_idle_shutdown_minutes()
+        );
     }
 
     #[test]

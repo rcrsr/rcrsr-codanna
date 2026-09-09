@@ -274,6 +274,39 @@ pub enum Commands {
             help = "Address to bind HTTP/HTTPS server to"
         )]
         bind: String,
+
+        /// List servers from the per-user server registry instead of starting one
+        #[arg(
+            long,
+            conflicts_with_all = ["http", "https", "proxy", "bind"],
+            help = "List registered codanna servers (pid, port, scheme, workspace, status)"
+        )]
+        list: bool,
+
+        /// Stop a registered server instead of starting one
+        #[arg(
+            long,
+            value_name = "PID_OR_WORKSPACE",
+            conflicts_with_all = ["http", "https", "proxy", "bind"],
+            help = "Stop a registered server, identified by pid or workspace-root path (SIGTERM unless --force)"
+        )]
+        stop: Option<String>,
+
+        /// Prune stale registry entries instead of starting a server
+        #[arg(
+            long,
+            conflicts_with_all = ["http", "https", "proxy", "bind"],
+            help = "Remove registry entries whose process is no longer alive (does not signal anything)"
+        )]
+        reap: bool,
+
+        /// Send SIGKILL instead of SIGTERM when used with --stop
+        #[arg(
+            long,
+            requires = "stop",
+            help = "With --stop, send SIGKILL instead of the default SIGTERM"
+        )]
+        force: bool,
     },
 
     /// Test MCP connection

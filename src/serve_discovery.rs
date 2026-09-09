@@ -56,6 +56,19 @@ impl ServeScheme {
 /// lets a record written before this field existed still deserialize (as
 /// `None`), rather than erroring; `check_health` treats a missing token as an
 /// automatic reject, never as "trust it anyway" (see the rejection site).
+///
+/// `workspace_dev`/`workspace_ino` identify the workspace root's filesystem
+/// device and inode at the moment the record was written, so a running
+/// server can detect that its workspace root was deleted (or replaced by an
+/// unrelated directory reusing the same path) rather than merely renamed --
+/// a rename preserves the inode, a delete-and-recreate does not. Populated on
+/// Unix only (`std::os::unix::fs::MetadataExt`); always `None` on other
+/// platforms, where only the plain path-existence check applies. Deliberately
+/// plain `Option<u64>` (not `#[cfg(unix)]`-gated fields) so the on-disk JSON
+/// shape and this type's `Deserialize` impl are identical on every platform.
+/// `#[serde(default)]` lets a record written before these fields existed
+/// still deserialize (as `None`), following the same compat precedent as
+/// `scheme`/`token` above.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServeRecord {
     pub pid: u32,
@@ -64,6 +77,10 @@ pub struct ServeRecord {
     pub scheme: ServeScheme,
     #[serde(default)]
     pub token: Option<String>,
+    #[serde(default)]
+    pub workspace_dev: Option<u64>,
+    #[serde(default)]
+    pub workspace_ino: Option<u64>,
 }
 
 /// Generate a fresh, unpredictable per-launch token for [`ServeRecord::token`].
@@ -266,11 +283,16 @@ fn decide(record: Option<&ServeRecord>) -> Decision {
     }
 }
 
-/// For `Http` records, verify the recorded PID's command line looks like a
-/// codanna serve process before trusting it. A bare PID-alive check has no
-/// binding between a `serve.json` record and the process that actually wrote
-/// it -- a stale record naming a PID number that the OS has since reused for
-/// an unrelated process would otherwise be blindly trusted.
+/// For both `Http` and `Https` records, verify the recorded PID's command
+/// line looks like a codanna serve process before trusting it. A bare
+/// PID-alive check has no binding between a `serve.json` record and the
+/// process that actually wrote it -- a stale record naming a PID number that
+/// the OS has since reused for an unrelated process would otherwise be
+/// blindly trusted. This liveness/zombie guard is independent of the
+/// pinned-certificate identity check used later in `check_health`/
+/// `discover_live` for `Https` records (which skips the HTTP health probe
+/// because the cert already establishes trust) -- that is a separate concern
+/// from whether the recorded PID is still the process that wrote the record.
 ///
 /// Deliberately does NOT require a literal `--http` token: `codanna serve`
 /// can enter HTTP mode via `server.mode = "http"` in `settings.toml` with no
@@ -278,15 +300,7 @@ fn decide(record: Option<&ServeRecord>) -> Decision {
 /// legitimately-running HTTP server's cmdline may never contain `--http`.
 /// The record's own `scheme` field already carries which mode was recorded;
 /// this check only needs to confirm the PID is *some* codanna serve process.
-///
-/// Not applied to `Https` records: their identity is already established
-/// out-of-band by the pinned certificate (`serve_tls::pinned_client`), so no
-/// additional cmdline check is needed there.
 fn pid_looks_like_codanna_serve(record: &ServeRecord) -> bool {
-    if record.scheme != ServeScheme::Http {
-        return true;
-    }
-
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
     let mut sys = System::new();
     let pid = Pid::from_u32(record.pid);
@@ -599,26 +613,157 @@ async fn wait_until_healthy(
     }
 }
 
-/// Spawn a detached `codanna serve --http --watch --bind 127.0.0.1:0` process
-/// rooted at `workspace_root`. The child's stdio is severed and it is placed
-/// in its own process group (Unix) / detached process group (Windows) so it
-/// outlives the spawning process. The caller does not wait on the child;
-/// readiness is observed exclusively through the discovery record and
-/// `/health`, matching the record+lock discipline this module relies on
-/// instead of a reaper or `ss`/`lsof`/`pgrep` process scan (deliberately
-/// dropped: record+lock alone make duplicate servers unarisable).
+/// Current wall-clock time as unix seconds, for `RegistryEntry::start_time`.
+/// Falls back to 0 only if the system clock is set before the epoch, which is
+/// not a case worth failing a spawn attempt over. Mirrors
+/// `mcp::http_server::unix_now_secs` (kept private to each module rather than
+/// shared, since both are trivial one-liners with no other coupling).
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Wait on `spawning_pid` -- a pid a peer's `discover_or_spawn` call already
+/// published to the per-user server registry as `Spawning` -- instead of
+/// racing a second `spawn_detached` for the same workspace. See Guard 3 in
+/// `discover_or_spawn` for why this check exists.
 ///
-/// `config_path`, when set, is forwarded as `--config <path>` so the spawned
-/// server loads the same configuration file that started the proxy, rather
-/// than falling back to config discovery from `workspace_root`.
-fn spawn_detached(workspace_root: &Path, config_path: Option<&Path>) -> DiscoveryResult<()> {
-    let exe = std::env::current_exe().map_err(|source| DiscoveryError::CurrentExe { source })?;
+/// Returns:
+/// - `Some(Ok(record))` once the workspace's discovery record converges to
+///   healthy within `timeout`.
+/// - `Some(Err(DiscoveryError::SpawnTimeout))` if `spawning_pid` is still
+///   alive but the wait ran out.
+/// - `None` if `spawning_pid` died before becoming healthy -- the caller
+///   falls through to the normal spawn path in that case, since a dead pid
+///   means the previous attempt genuinely failed rather than merely being
+///   slow.
+async fn wait_on_spawning_pid(
+    codanna_dir: &Path,
+    lock_path: &Path,
+    spawning_pid: u32,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Option<DiscoveryResult<ServeRecord>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !pid_is_alive(spawning_pid) {
+            return None;
+        }
+        if let Some(record) = discover_live(codanna_dir).await {
+            return Some(Ok(record));
+        }
+
+        if Instant::now() >= deadline {
+            return Some(Err(DiscoveryError::SpawnTimeout {
+                timeout_ms: timeout.as_millis() as u64,
+                lock_path: lock_path.to_path_buf(),
+                record_path: record_path(codanna_dir),
+            }));
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        tokio::time::sleep(poll_interval.min(remaining).max(Duration::from_millis(1))).await;
+    }
+}
+
+/// Test-only startup-delay hook, read once per `spawn_detached` call: when
+/// set to a positive integer, the spawned child sleeps for this many
+/// milliseconds before it starts running the real `codanna serve`
+/// invocation, so tests can deterministically simulate a legitimately slow
+/// cold start (e.g. a large index load or an embedding-model download)
+/// without needing to actually reproduce one. Mirrors the
+/// `CODANNA_TEST_IDLE_THRESHOLD_MS` precedent in `mcp::http_server` -- a
+/// test-controllable timing hook gated behind an env var, inert in
+/// production unless a test sets it. Any unset/unparseable/non-positive
+/// value disables the hook, matching that precedent's fallback behavior.
+/// Unix-only: see [`build_spawn_command`] for why the hook itself does not
+/// apply on other platforms.
+#[cfg(unix)]
+fn test_spawn_delay_ms() -> Option<u64> {
+    std::env::var("CODANNA_TEST_SPAWN_DELAY_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+}
+
+/// Quote `path` as a single POSIX shell word, for the `sh -c` wrapper script
+/// [`build_spawn_command`] builds under the [`test_spawn_delay_ms`] hook.
+/// Escapes embedded single quotes rather than assuming a path never contains
+/// one, even though every path this module actually passes here (the
+/// current executable, a `--config` file under a temp workspace) is
+/// controlled by this codebase's own tests.
+#[cfg(unix)]
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+}
+
+/// Build the `Command` [`spawn_detached`] actually spawns: ordinarily a
+/// direct `<exe> serve --http --watch --bind 127.0.0.1:0 [--config
+/// <config_path>]` invocation, or -- ONLY when [`test_spawn_delay_ms`]
+/// returns `Some` -- that same invocation wrapped in a `sh -c 'sleep ...&&
+/// exec ...'` script. `exec` (not `&&`-then-exit) is load-bearing: it
+/// replaces the shell process image in place, so the eventual `codanna
+/// serve --http` process keeps the SAME pid the wrapping shell was spawned
+/// with -- exactly the pid `spawn_detached`'s caller publishes as `Spawning`
+/// and the started server later republishes as `Healthy` under. Unix-only
+/// (mirrors this module's other `#[cfg(unix)]`-gated behavior, e.g.
+/// `process_group`); on non-Unix platforms the hook is inert and this always
+/// returns the plain invocation, since `cmd.exe` has no equivalent
+/// process-image-replacement primitive and wrapping there would spawn the
+/// real server under a DIFFERENT pid than the wrapper -- silently breaking
+/// this exact invariant instead of merely not testing it.
+fn build_spawn_command(exe: &Path, config_path: Option<&Path>) -> Command {
+    #[cfg(unix)]
+    if let Some(delay_ms) = test_spawn_delay_ms() {
+        let mut invocation = format!(
+            "{} serve --http --watch --bind 127.0.0.1:0",
+            shell_quote(exe)
+        );
+        if let Some(config_path) = config_path {
+            invocation.push_str(&format!(" --config {}", shell_quote(config_path)));
+        }
+
+        let mut shell = Command::new("sh");
+        shell.arg("-c").arg(format!(
+            "sleep {:.3} && exec {invocation}",
+            delay_ms as f64 / 1000.0
+        ));
+        return shell;
+    }
 
     let mut cmd = Command::new(exe);
     cmd.args(["serve", "--http", "--watch", "--bind", "127.0.0.1:0"]);
     if let Some(config_path) = config_path {
         cmd.arg("--config").arg(config_path);
     }
+    cmd
+}
+
+/// Spawn a detached `codanna serve --http --watch --bind 127.0.0.1:0` process
+/// rooted at `workspace_root`. The child's stdio is severed and it is placed
+/// in its own process group (Unix) / detached process group (Windows) so it
+/// outlives the spawning process. Readiness is observed exclusively through
+/// the discovery record and `/health`, matching the record+lock discipline
+/// this module relies on instead of a `ss`/`lsof`/`pgrep` process scan
+/// (deliberately dropped: record+lock alone make duplicate servers
+/// unarisable). The child handle itself is reaped on a detached background
+/// thread (see below) purely to avoid a `<defunct>` zombie once the detached
+/// server exits -- the spawning process never blocks on it.
+///
+/// `config_path`, when set, is forwarded as `--config <path>` so the spawned
+/// server loads the same configuration file that started the proxy, rather
+/// than falling back to config discovery from `workspace_root`.
+///
+/// Returns the child's pid so the caller can publish it to the per-user
+/// server registry (`crate::serve_registry`) as a `Spawning` entry -- the
+/// same real pid the spawned server later republishes as `Healthy` once it
+/// finishes starting up (see `discover_or_spawn`'s winner branch).
+fn spawn_detached(workspace_root: &Path, config_path: Option<&Path>) -> DiscoveryResult<u32> {
+    let exe = std::env::current_exe().map_err(|source| DiscoveryError::CurrentExe { source })?;
+
+    let mut cmd = build_spawn_command(&exe, config_path);
     cmd.current_dir(workspace_root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -639,14 +784,28 @@ fn spawn_detached(workspace_root: &Path, config_path: Option<&Path>) -> Discover
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     }
 
-    // Intentionally not waited on: a detached server is meant to outlive
-    // this call. The handle is dropped without joining.
-    let _child = cmd.spawn().map_err(|source| DiscoveryError::Spawn {
+    // The detached server is meant to outlive this call, so its exit is not
+    // waited on here inline. But the `Child` handle still must be reaped
+    // eventually or an exited backing server becomes a `<defunct>` zombie
+    // under this (long-lived) spawning process. Reap it on a plain
+    // background thread rather than blocking `spawn_detached` itself --
+    // this function is sync and has no ambient async runtime to lean on, so
+    // `tokio::task::spawn_blocking` would be the wrong tool here.
+    //
+    // Best-effort: `wait()` failing just means we couldn't reap; there's
+    // nothing actionable to do with that error on a detached background
+    // thread, so it's discarded rather than unwrapped.
+    let child = cmd.spawn().map_err(|source| DiscoveryError::Spawn {
         workspace_root: workspace_root.to_path_buf(),
         source,
     })?;
+    let child_pid = child.id();
+    std::thread::spawn(move || {
+        let mut child = child;
+        let _ = child.wait();
+    });
 
-    Ok(())
+    Ok(child_pid)
 }
 
 /// Discover a live HTTP MCP server for `workspace_root`, spawning one if none
@@ -753,6 +912,36 @@ pub async fn discover_or_spawn(
         });
     }
 
+    // Guard 3: an in-flight spawn attempt for this workspace may already
+    // exist even though `http.lock` above is free -- specifically, a PEER's
+    // earlier `discover_or_spawn` call that won the lock, called
+    // `spawn_detached`, then hit `SpawnTimeout` and returned (dropping its
+    // `_guard`, freeing the lock) WITHOUT the spawned child having failed: a
+    // cold index build or embedding-model download can legitimately outlive
+    // `spawn_timeout_ms`. Racing a second `spawn_detached` here would create
+    // the exact duplicate this check exists to prevent, so consult the
+    // per-user server registry (`crate::serve_registry`) BEFORE contending
+    // for the lock: if it names a still-live `Spawning` entry for this
+    // workspace, wait on THAT pid instead. `find_spawning_for` already
+    // filters out a dead pid (a genuine startup failure, not merely slow),
+    // so `None` here means it is safe to proceed with a normal spawn.
+    if let Some(spawning) = crate::serve_registry::find_spawning_for(workspace_root) {
+        if let Some(outcome) = wait_on_spawning_pid(
+            &codanna_dir,
+            &lock_path,
+            spawning.pid,
+            timeout,
+            poll_interval,
+        )
+        .await
+        {
+            return outcome;
+        }
+        // `spawning.pid` died before becoming healthy while we were about to
+        // wait on it -- the previous attempt genuinely failed, not merely
+        // slow. Fall through to the normal spawn path below.
+    }
+
     match PidLockGuard::acquire(&lock_path) {
         Ok(_guard) => {
             // WINNER. Re-check: another process may have finished spawning
@@ -763,12 +952,51 @@ pub async fn discover_or_spawn(
                 return Ok(record);
             }
 
-            spawn_detached(workspace_root, original_config_path)?;
+            let child_pid = spawn_detached(workspace_root, original_config_path)?;
+
+            // Publish this attempt to the per-user server registry under the
+            // REAL child pid, before waiting on it, so a peer's later
+            // `discover_or_spawn` call (Guard 3 above) can find it via
+            // `find_spawning_for` and wait on this same child instead of
+            // racing a second `spawn_detached` if OUR wait below times out.
+            // The spawned server itself overwrites this exact pid's entry
+            // with `status = Healthy` once it finishes starting up
+            // (`http_server.rs`'s startup registry write) -- same process,
+            // same pid, is what makes that overwrite the promotion signal
+            // `find_spawning_for` relies on. Best-effort: a failed write
+            // here does not block spawning; the worst case is a peer falling
+            // back to the (still safe, just slower) lock-contention path.
+            let spawning_entry = crate::serve_registry::RegistryEntry {
+                pid: child_pid,
+                port: 0,
+                scheme: ServeScheme::Http,
+                workspace_root: workspace_root.to_path_buf(),
+                start_time: unix_now_secs(),
+                status: crate::serve_registry::ServerStatus::Spawning,
+            };
+            if let Err(e) = crate::serve_registry::write_entry(&spawning_entry) {
+                tracing::warn!(
+                    target: "discovery",
+                    "failed to write Spawning registry entry for pid {child_pid}: {e}"
+                );
+            }
+
             wait_until_healthy(&codanna_dir, &lock_path, timeout, poll_interval).await
             // `_guard` drops here, releasing the lock once the winner's
             // spawn attempt has succeeded, timed out, or errored. Holding
             // the guard across the `.await` above is fine: it is a file
             // lock, not a mutex guard.
+            //
+            // On `SpawnTimeout`, `child_pid` is deliberately NOT killed and
+            // the `Spawning` registry entry written above is deliberately
+            // left in place -- a legitimately slow cold start is not a
+            // failure to correct by killing, and removing the entry would
+            // reopen the exact duplicate-spawn window Guard 3 above closes
+            // for the next caller. A dead-pid `Spawning` entry left behind by
+            // a genuine startup failure is simply ignored by
+            // `find_spawning_for`'s liveness check and left for `codanna
+            // serve --reap` to clean up later -- no TTL/cleanup is needed
+            // here.
         }
         Err(PidLockError::Held { lock_path, .. }) => {
             // LOSER. Someone else is spawning (or just finished); wait on
@@ -870,6 +1098,69 @@ mod tests {
             .expect("failed to spawn fake codanna serve process for test")
     }
 
+    /// Spawns a short-lived, genuinely live process whose cmdline contains
+    /// neither "codanna" nor "serve". Used to prove `pid_looks_like_codanna_serve`
+    /// rejects a live-but-unrelated PID for `Https` records just as it does
+    /// for `Http` -- the cmdline check must not be bypassed for either scheme.
+    #[cfg(unix)]
+    fn spawn_fake_non_codanna_process() -> std::process::Child {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .spawn()
+            .expect("failed to spawn unrelated live process for test")
+    }
+
+    #[cfg(windows)]
+    fn spawn_fake_non_codanna_process() -> std::process::Child {
+        std::process::Command::new("cmd")
+            .args(["/C", "timeout /T 30"])
+            .spawn()
+            .expect("failed to spawn unrelated live process for test")
+    }
+
+    /// `pid_looks_like_codanna_serve` must apply the same cmdline scrutiny to
+    /// `Https` records as it does to `Http` records: a live PID whose
+    /// cmdline does not look like a codanna serve process must not be
+    /// trusted just because the record's scheme is `Https`. The
+    /// pinned-certificate identity check used later in `check_health` for
+    /// `Https` is a separate, unrelated concern from this liveness guard.
+    #[test]
+    fn https_record_with_live_non_codanna_pid_is_not_trusted() {
+        let mut fake_process = spawn_fake_non_codanna_process();
+        let record = ServeRecord {
+            pid: fake_process.id(),
+            port: 8443,
+            scheme: ServeScheme::Https,
+            token: None,
+            workspace_dev: None,
+            workspace_ino: None,
+        };
+
+        assert!(!pid_looks_like_codanna_serve(&record));
+
+        let _ = fake_process.kill();
+        let _ = fake_process.wait();
+    }
+
+    /// `pid_looks_like_codanna_serve` must not unconditionally trust `Https`
+    /// records: a record naming a dead PID must be rejected the same way an
+    /// `Http` record would be.
+    #[test]
+    fn https_record_with_dead_pid_is_not_trusted() {
+        let record = ServeRecord {
+            pid: 0,
+            port: 8443,
+            scheme: ServeScheme::Https,
+            token: None,
+            workspace_dev: None,
+            workspace_ino: None,
+        };
+        assert!(!pid_is_alive(0), "PID 0 must read as dead for this test");
+
+        assert!(!pid_looks_like_codanna_serve(&record));
+    }
+
     /// Polls `decide(Some(record))` until it reports `Discover`, or a bounded
     /// timeout elapses.
     ///
@@ -901,6 +1192,8 @@ mod tests {
             port: 8080,
             scheme: ServeScheme::Http,
             token: None,
+            workspace_dev: None,
+            workspace_ino: None,
         };
 
         write_record(dir.path(), &record).expect("write_record should succeed");
@@ -921,6 +1214,8 @@ mod tests {
             port: 9090,
             scheme: ServeScheme::Http,
             token: None,
+            workspace_dev: None,
+            workspace_ino: None,
         };
 
         write_record(dir.path(), &record).expect("write_record should succeed");
@@ -967,6 +1262,8 @@ mod tests {
             port,
             scheme: ServeScheme::Http,
             token: Some(token.to_string()),
+            workspace_dev: None,
+            workspace_ino: None,
         };
         write_record(&codanna_dir, &record).expect("write_record should succeed");
         wait_until_decide_ready(&record);
@@ -1014,6 +1311,8 @@ mod tests {
             port: real_port,
             scheme: ServeScheme::Http,
             token: Some("attacker-guessed-wrong".to_string()),
+            workspace_dev: None,
+            workspace_ino: None,
         };
         write_record(&codanna_dir, &record).expect("write_record should succeed");
         wait_until_decide_ready(&record);
@@ -1107,6 +1406,8 @@ mod tests {
             port,
             scheme: ServeScheme::Http,
             token: Some(token.to_string()),
+            workspace_dev: None,
+            workspace_ino: None,
         };
         write_record(&codanna_dir, &record).expect("write_record should succeed");
         wait_until_decide_ready(&record);
@@ -1256,6 +1557,8 @@ mod tests {
             port: 8080,
             scheme: ServeScheme::Http,
             token: None,
+            workspace_dev: None,
+            workspace_ino: None,
         };
         assert!(!pid_is_alive(0), "PID 0 must read as dead for this test");
 
@@ -1271,6 +1574,8 @@ mod tests {
             port: 8080,
             scheme: ServeScheme::Http,
             token: None,
+            workspace_dev: None,
+            workspace_ino: None,
         };
         wait_until_decide_ready(&live);
         assert_eq!(decide(Some(&live)), Decision::Discover);
@@ -1292,6 +1597,8 @@ mod tests {
             port: 8080,
             scheme: ServeScheme::Http,
             token: None,
+            workspace_dev: None,
+            workspace_ino: None,
         };
         wait_until_decide_ready(&live);
         assert_eq!(decide(Some(&live)), Decision::Discover);
@@ -1373,6 +1680,8 @@ mod tests {
             port,
             scheme: ServeScheme::Http,
             token: Some(token.to_string()),
+            workspace_dev: None,
+            workspace_ino: None,
         };
         write_record(&codanna_dir, &record).expect("write_record should succeed");
         wait_until_decide_ready(&record);
@@ -1417,6 +1726,33 @@ mod tests {
         assert_eq!(record.unwrap().scheme, ServeScheme::Http);
     }
 
+    /// Same compat guarantee as `legacy_record_without_scheme_reads_as_http`,
+    /// but for `workspace_dev`/`workspace_ino`: a `serve.json` written before
+    /// these fields existed carries neither key, and must still parse (with
+    /// both defaulting to `None`) rather than failing to deserialize.
+    #[test]
+    fn legacy_record_without_workspace_identity_reads_as_none() {
+        let dir = TempDir::new().unwrap();
+        let pid = std::process::id();
+        std::fs::write(
+            dir.path().join("serve.json"),
+            format!(r#"{{"pid":{pid},"port":8080}}"#),
+        )
+        .unwrap();
+
+        let record = read_record(dir.path());
+        assert!(
+            record.is_some(),
+            "a legacy serve.json without workspace_dev/workspace_ino keys must \
+             still parse; otherwise read_record returns None, decide() resolves \
+             to Spawn, and a duplicate server gets spawned alongside the live \
+             legacy one"
+        );
+        let record = record.unwrap();
+        assert_eq!(record.workspace_dev, None);
+        assert_eq!(record.workspace_ino, None);
+    }
+
     #[test]
     fn https_record_round_trips() {
         let dir = TempDir::new().unwrap();
@@ -1425,6 +1761,8 @@ mod tests {
             port: 8443,
             scheme: ServeScheme::Https,
             token: None,
+            workspace_dev: None,
+            workspace_ino: None,
         };
 
         write_record(dir.path(), &record).expect("write_record should succeed");

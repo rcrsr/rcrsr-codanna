@@ -222,6 +222,24 @@ fn is_proxy_serve(command: &Commands, config: &Settings) -> bool {
     }
 }
 
+/// Resolve whether a `Commands::Serve` invocation is a registry lifecycle
+/// operation (`--list`/`--stop`/`--reap`) rather than a request to start a
+/// server.
+///
+/// These operations only ever read/write the per-user server registry
+/// (`src/serve_registry.rs`); they never load an `IndexFacade`, exactly like
+/// proxy mode (`is_proxy_serve`). Every pre-dispatch resource predicate that
+/// excludes proxy mode must also exclude these, or `serve --list` would
+/// needlessly load a full index before printing a table.
+fn is_serve_management_op(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::Serve { list: true, .. }
+            | Commands::Serve { stop: Some(_), .. }
+            | Commands::Serve { reap: true, .. }
+    )
+}
+
 fn create_facade_or_exit(settings: Arc<Settings>) -> IndexFacade {
     IndexFacade::new(settings).unwrap_or_else(|e| {
         eprintln!("Error: Failed to create index: {e}");
@@ -324,7 +342,8 @@ async fn main() {
             | Commands::Plugin { .. }
             | Commands::Documents { .. }
             | Commands::Profile { .. }
-    ) && !is_proxy_serve(&cli.command, &config);
+    ) && !is_proxy_serve(&cli.command, &config)
+        && !is_serve_management_op(&cli.command);
 
     // Initialize project resolution providers (only if needed)
     // This ensures caches are built before indexing starts
@@ -375,7 +394,8 @@ async fn main() {
             ..
         } | Commands::Index { .. }
             | Commands::Serve { .. }
-    ) && !is_proxy_serve(&cli.command, &config);
+    ) && !is_proxy_serve(&cli.command, &config)
+        && !is_serve_management_op(&cli.command);
 
     // Determine if we need semantic search (ML model loading)
     // Retrieve commands use Tantivy text search only - no ML model needed
@@ -385,6 +405,7 @@ async fn main() {
             ["semantic_search_docs", "semantic_search_with_context"].contains(&tool.as_str())
         }
         Commands::Serve { .. } if is_proxy_serve(&cli.command, &config) => false,
+        Commands::Serve { .. } if is_serve_management_op(&cli.command) => false,
         Commands::Index { .. } | Commands::Serve { .. } => true,
         _ => false,
     };
@@ -794,6 +815,7 @@ async fn main() {
     }
 
     let serve_is_proxy = is_proxy_serve(&cli.command, &config);
+    let serve_is_management = is_serve_management_op(&cli.command);
 
     match cli.command {
         Commands::Init { force } => {
@@ -846,16 +868,21 @@ async fn main() {
             https,
             proxy,
             bind,
+            list,
+            stop,
+            reap,
+            force,
         } => {
             use codanna::cli::commands::serve::{ServeArgs, run as run_serve};
-            // Proxy mode never loads an IndexFacade in-process (§4.5): the
-            // predicates above (needs_indexer/needs_trait_resolver/
-            // needs_semantic_search) already exclude it, so `indexer` is
-            // `None` here and must not be unwrapped.
-            let facade = if serve_is_proxy {
+            // Proxy mode and registry-management ops (--list/--stop/--reap)
+            // never load an IndexFacade in-process (§4.5): the predicates
+            // above (needs_indexer/needs_trait_resolver/needs_semantic_search)
+            // already exclude both, so `indexer` is `None` here and must not
+            // be unwrapped in either case.
+            let facade = if serve_is_proxy || serve_is_management {
                 None
             } else {
-                Some(indexer.expect("non-proxy serve requires indexer"))
+                Some(indexer.expect("non-proxy, non-management serve requires indexer"))
             };
             run_serve(
                 ServeArgs {
@@ -865,6 +892,10 @@ async fn main() {
                     https,
                     proxy,
                     bind,
+                    list,
+                    stop,
+                    reap,
+                    force,
                 },
                 config,
                 settings,
@@ -1123,6 +1154,10 @@ mod is_proxy_serve_tests {
             https,
             proxy,
             bind: "127.0.0.1:8080".to_string(),
+            list: false,
+            stop: None,
+            reap: false,
+            force: false,
         }
     }
 

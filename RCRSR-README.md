@@ -19,6 +19,7 @@ upstream base. For the how, see the commit history.
     - [Idle shutdown](#idle-shutdown)
     - [Configuration](#configuration)
     - [Ports](#ports)
+    - [Server registry (`--list` / `--stop` / `--reap`)](#server-registry---list----stop----reap)
     - [Hot-reload notifications through the proxy](#hot-reload-notifications-through-the-proxy)
   - [Reindexing on demand (`reindex` MCP tool)](#reindexing-on-demand-reindex-mcp-tool)
     - [Arguments](#arguments)
@@ -341,9 +342,9 @@ and the rest attach to it.
 
 The backing server is started as a detached background process and keeps running
 after the clients disconnect, so the next client reattaches to the warm index
-instead of paying startup again. By default it stays up until you stop it (or the
-host reboots); set `idle_shutdown_minutes` (see below) to have it exit on its own
-after a spell of inactivity.
+instead of paying startup again. By default it exits on its own after 4 hours of
+inactivity; set `idle_shutdown_minutes` (see below) to change that window, or to
+`0` to have it stay up until you stop it (or the host reboots).
 
 A `codanna serve --proxy` process that is already running and connected does
 not need to be restarted when its backing server goes away (idle shutdown, a
@@ -363,20 +364,20 @@ servers through the proxy (the common case), they are started with `--http`
 and this section applies as written. If you manually start a backing server
 with `codanna serve --https`, `idle_shutdown_minutes` has no effect on it.
 
-By default a backing server runs indefinitely, so every workspace you touch
-accumulates a resident process. Set `idle_shutdown_minutes` in `[server]` to a
-non-zero value and the (`--http`) server exits cleanly after that many minutes
-with no MCP request activity, removing its `.codanna/serve.json` record exactly
-as a Ctrl+C shutdown does. The next tool call through a proxy connection finds
-no record and auto-spawns a fresh server (paying only startup latency); on an
+By default a backing server exits cleanly after 240 minutes (4 hours) with no
+MCP request activity, removing its `.codanna/serve.json` record exactly as a
+Ctrl+C shutdown does — so an unattended workspace doesn't accumulate a resident
+process forever. The next tool call through a proxy connection finds no record
+and auto-spawns a fresh server (paying only startup latency); on an
 already-connected proxy that is exactly the same [upstream revival](#upstream-revival)
 path any other dead-transport failure goes through, so idle shutdown is
-transparent to clients either way.
+transparent to clients either way. Set `idle_shutdown_minutes` in `[server]` to
+a different non-zero value to change the window, or to `0` to disable idle
+shutdown and run the (`--http`) server indefinitely.
 
 Only real inbound MCP requests count as activity — SSE keep-alive pings do not
 reset the idle clock, so a merely *connected* client does not keep the server
-alive forever. The default is `0` (never shut down), preserving upstream
-behavior.
+alive forever.
 
 ### Upstream revival
 
@@ -456,7 +457,7 @@ auto_spawn = true          # let the proxy start a backing server when none is f
                            # set false to require starting `codanna serve --http --watch` yourself
 spawn_timeout_ms = 8000    # how long to wait for a spawned server to become ready
 health_poll_ms = 100       # how often to poll for readiness while waiting
-idle_shutdown_minutes = 0  # exit the backing server after N idle minutes (0 = never)
+idle_shutdown_minutes = 240 # exit the backing server after N idle minutes (0 = never)
 ```
 
 The defaults shown above apply when the keys are absent, so an initialized
@@ -485,6 +486,49 @@ Use it when more than one tool or editor talks to codanna for the same project
 and you don't want a separate index loaded into memory for each. Both HTTP and
 HTTPS backing servers are supported; with `--https` the connection is verified
 against codanna's own certificate.
+
+### Server registry (`--list` / `--stop` / `--reap`)
+
+Every `codanna serve --http`/`--https` process (whether auto-spawned by a
+proxy or started manually) publishes itself to a per-user server registry,
+separate from the per-workspace `.codanna/serve.json` discovery record
+described above. Where `serve.json` is scoped to one workspace and used for
+discovery, the registry is scoped to the whole user and used for lifecycle
+management: it is how `codanna serve` itself can tell you (and let you stop)
+every codanna server you have running, across every workspace, without
+walking the filesystem for `.codanna` directories. HTTPS backing servers get
+the same disappeared-workspace self-check and idle-shutdown timer as HTTP
+ones.
+
+The registry lives under your per-user state directory
+(`$XDG_STATE_HOME`, or `~/.local/state` on Linux; falling back to the data
+directory -- `~/Library/Application Support` on macOS,
+`%APPDATA%` on Windows -- on platforms with no state-directory concept),
+at `codanna/servers/`. Each running server owns exactly one file there,
+named after its own pid, so there is nothing to lock or contend over.
+
+```bash
+codanna serve --list                    # show every running server this user owns
+codanna serve --stop <pid>              # SIGTERM a server by pid
+codanna serve --stop <workspace-path>   # ...or by the workspace root it's serving
+codanna serve --stop <pid> --force      # SIGKILL instead (only when SIGTERM isn't enough)
+codanna serve --reap                    # prune registry entries for servers that are no longer running
+```
+
+`--list`, `--stop`, and `--reap` are lifecycle operations, not ways to start a
+server: they cannot be combined with `--http`/`--https`/`--proxy`/`--bind`.
+
+`--stop` defaults to `SIGTERM`, giving the target server a chance to run its
+normal shutdown path -- the same one Ctrl+C and idle-shutdown already use,
+which removes both its `.codanna/serve.json` record and its registry entry
+before exiting. `--force` sends `SIGKILL` instead; a killed process gets no
+chance to clean up, so its registry entry can be left behind even though the
+process itself is gone. `--reap` is the way to prune those (and any other
+stale-pid) leftovers: it never signals anything, it only removes registry
+files whose pid is no longer alive. `--list` also skips dead-pid entries when
+printing, but -- unlike `--reap` -- never deletes them; that separation keeps
+"what does the registry currently say" and "clean up what's stale" as two
+distinct, independently-safe operations.
 
 ### Hot-reload notifications through the proxy
 
