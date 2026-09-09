@@ -5,6 +5,7 @@ use rmcp::model::ErrorData as McpError;
 use rmcp::model::*;
 use rmcp::{handler::server::wrapper::Parameters, tool, tool_router};
 
+use crate::documents::SearchConfig;
 use crate::documents::SearchQuery as DocSearchQuery;
 
 use crate::io::envelope::{EntityType, Envelope, ResultCode};
@@ -932,6 +933,7 @@ impl CodeIntelligenceServer {
             collection,
             exclude_collections,
             limit,
+            threshold,
             output_format,
         }): Parameters<SearchDocumentsRequest>,
     ) -> Result<CallToolResult, McpError> {
@@ -958,6 +960,7 @@ impl CodeIntelligenceServer {
             collections,
             exclude_collections,
             limit,
+            threshold,
             output_format,
             None,
         )
@@ -982,6 +985,7 @@ impl CodeIntelligenceServer {
             collections,
             Vec::new(),
             limit,
+            None,
             OutputFormat::Text,
             Some(search_phase_started),
         )
@@ -999,6 +1003,7 @@ impl CodeIntelligenceServer {
         collections: Vec<String>,
         exclude_collections: Vec<String>,
         limit: u32,
+        threshold: Option<f32>,
         output_format: OutputFormat,
         search_phase_started: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Result<CallToolResult, McpError> {
@@ -1035,6 +1040,32 @@ impl CodeIntelligenceServer {
             let indexer = self.facade.read().await;
             std::sync::Arc::clone(indexer.settings())
         };
+
+        // Validate caller-supplied inputs (unknown collection names,
+        // limit:0) before any config-sourced defaults are merged in and
+        // before auto-sync or the search call run. Names added later by
+        // `default_visibility_exclusions` are config-sourced and valid by
+        // construction, so this must run on the pre-merge sets.
+        if let Err(e) = settings.documents.validate_search_inputs(
+            &collections,
+            &exclude_collections,
+            limit as usize,
+        ) {
+            let code = if e.is_invalid_input() {
+                ResultCode::InvalidQuery
+            } else {
+                ResultCode::IndexError
+            };
+            if output_format == OutputFormat::Json {
+                let envelope: Envelope<()> = Envelope::error(code, e.to_string())
+                    .with_entity_type(EntityType::Document)
+                    .with_query(&query);
+                return Ok(json_result(envelope));
+            }
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                e.to_string(),
+            )]));
+        }
 
         // Auto-sync: check for file changes in all collections before
         // searching. This is the only step that needs exclusive access to
@@ -1085,13 +1116,36 @@ impl CodeIntelligenceServer {
                 .default_visibility_exclusions(&collections),
         );
 
+        // JSON output must carry no ANSI escapes or `>>`/`<<` markers in
+        // `content_preview`, since it is consumed programmatically rather
+        // than rendered in a terminal. Suppress highlight marker injection
+        // at the generation layer via `SearchConfig.highlight` for JSON
+        // only; the text path keeps KWIC windowing and highlighting as
+        // configured.
+        let preview_config = if output_format == OutputFormat::Json {
+            SearchConfig {
+                highlight: false,
+                ..settings.documents.search.clone()
+            }
+        } else {
+            settings.documents.search.clone()
+        };
+
+        // Preserved for the response envelope's `meta.collections` /
+        // `meta.excluded_collections` (post-merge, i.e. what was actually
+        // searched/excluded), since `collections`/`exclude_collections` are
+        // moved into `search_query` below.
+        let resolved_collections = collections.clone();
+        let resolved_excludes = exclude_collections.clone();
+
         let search_query = DocSearchQuery {
             text: query.clone(),
             collections,
             exclude_collections,
             document: None,
             limit: limit as usize,
-            preview_config: Some(settings.documents.search.clone()),
+            preview_config: Some(preview_config),
+            threshold,
         };
 
         // `DocumentStore::search` embeds the query text (an ONNX forward
@@ -1133,6 +1187,8 @@ impl CodeIntelligenceServer {
                         ))
                         .with_entity_type(EntityType::Document)
                         .with_query(&query)
+                        .with_collections(resolved_collections)
+                        .with_excluded_collections(resolved_excludes)
                     } else {
                         Envelope::success(results)
                             .with_entity_type(EntityType::Document)
@@ -1142,16 +1198,21 @@ impl CodeIntelligenceServer {
                             .with_hint(
                                 "Use the file paths and byte ranges to read specific sections",
                             )
+                            .with_collections(resolved_collections)
+                            .with_excluded_collections(resolved_excludes)
                     };
                     json_result(envelope)
                 }
                 Err(e) => {
-                    let envelope: Envelope<()> = Envelope::error(
-                        ResultCode::IndexError,
-                        format!("Document search failed: {e}"),
-                    )
-                    .with_entity_type(EntityType::Document)
-                    .with_query(&query);
+                    let code = if e.is_invalid_input() {
+                        ResultCode::InvalidQuery
+                    } else {
+                        ResultCode::IndexError
+                    };
+                    let envelope: Envelope<()> =
+                        Envelope::error(code, format!("Document search failed: {e}"))
+                            .with_entity_type(EntityType::Document)
+                            .with_query(&query);
                     json_result(envelope)
                 }
             });
@@ -1576,8 +1637,218 @@ mod search_documents_concurrency_tests {
             collection: None,
             exclude_collections: None,
             limit: limit as u32,
+            threshold: None,
             output_format: OutputFormat::Text,
         })
+    }
+
+    /// JSON output must be safe for programmatic consumption: no ANSI
+    /// escapes and no `>>`/`<<` highlight markers in `content_preview`.
+    /// Regression guard for the `SearchConfig.highlight = false` gate
+    /// threaded into `preview_config` on the JSON branch of
+    /// `search_documents_inner`.
+    #[tokio::test]
+    async fn search_documents_json_preview_has_no_highlight_markers() {
+        let (settings, _temp) = fixture_settings(1, 1);
+        let server = build_server(settings);
+
+        let result = server
+            .search_documents(Parameters(SearchDocumentsRequest {
+                query: "lorem".to_string(),
+                collection: None,
+                exclude_collections: None,
+                limit: 10,
+                threshold: None,
+                output_format: OutputFormat::Json,
+            }))
+            .await
+            .expect("json search_documents call must succeed");
+
+        let raw = text_of(&result);
+        let envelope: Envelope<serde_json::Value> =
+            serde_json::from_str(&raw).expect("json envelope must deserialize");
+        let results = envelope
+            .data
+            .expect("successful json search must carry data");
+        let results = results.as_array().expect("data must be a json array");
+        assert!(!results.is_empty(), "fixture query must match a result");
+
+        for result in results {
+            let content_preview = result["content_preview"]
+                .as_str()
+                .expect("result must carry a content_preview string");
+            assert!(
+                !content_preview.contains('\x1b'),
+                "JSON content_preview must carry no ANSI escapes, got: {content_preview:?}"
+            );
+            assert!(
+                !content_preview.contains(">>"),
+                "JSON content_preview must carry no '>>' highlight markers, got: {content_preview:?}"
+            );
+        }
+    }
+
+    /// An unknown collection name must be rejected with `INVALID_QUERY`
+    /// (not `INDEX_ERROR`), naming the offending value.
+    #[tokio::test]
+    async fn search_documents_unknown_collection_is_invalid_query() {
+        let (settings, _temp) = fixture_settings(1, 1);
+        let server = build_server(settings);
+
+        let result = server
+            .search_documents(Parameters(SearchDocumentsRequest {
+                query: "lorem".to_string(),
+                collection: Some(crate::mcp::requests::OneOrMany::One("bogus".to_string())),
+                exclude_collections: None,
+                limit: 10,
+                threshold: None,
+                output_format: OutputFormat::Json,
+            }))
+            .await
+            .expect("search_documents call must succeed at the transport level");
+
+        let raw = text_of(&result);
+        let envelope: Envelope<serde_json::Value> =
+            serde_json::from_str(&raw).expect("json envelope must deserialize");
+        assert_eq!(envelope.code, ResultCode::InvalidQuery);
+        assert!(
+            envelope.message.contains("bogus"),
+            "error message must name the bad collection, got: {}",
+            envelope.message
+        );
+    }
+
+    /// `limit: 0` must be rejected with `INVALID_QUERY`.
+    #[tokio::test]
+    async fn search_documents_zero_limit_is_invalid_query() {
+        let (settings, _temp) = fixture_settings(1, 1);
+        let server = build_server(settings);
+
+        let result = server
+            .search_documents(Parameters(SearchDocumentsRequest {
+                query: "lorem".to_string(),
+                collection: None,
+                exclude_collections: None,
+                limit: 0,
+                threshold: None,
+                output_format: OutputFormat::Json,
+            }))
+            .await
+            .expect("search_documents call must succeed at the transport level");
+
+        let raw = text_of(&result);
+        let envelope: Envelope<serde_json::Value> =
+            serde_json::from_str(&raw).expect("json envelope must deserialize");
+        assert_eq!(envelope.code, ResultCode::InvalidQuery);
+    }
+
+    /// Regression guard: a known collection that legitimately has zero
+    /// indexed chunks must still surface as `NOT_FOUND`, not
+    /// `INVALID_QUERY`, and both the success and not_found envelopes must
+    /// carry a non-null `meta.collections`. Without an embedding generator
+    /// configured, `DocumentStore::search`'s non-vector path
+    /// (`enrich_results`) ignores query text entirely and returns every
+    /// candidate chunk in the filtered collection set, so the only way to
+    /// force a genuinely empty result here is a collection with no
+    /// indexed chunks at all (not merely a query that fails to match).
+    #[tokio::test]
+    async fn search_documents_known_collection_empty_result_is_not_found() {
+        let temp = tempfile::tempdir().expect("create temp root");
+        let docs_dir = temp.path().join("docs");
+        let empty_dir = temp.path().join("empty");
+        std::fs::create_dir_all(&docs_dir).expect("create docs dir");
+        std::fs::create_dir_all(&empty_dir).expect("create empty dir");
+        std::fs::write(docs_dir.join("doc.md"), "lorem ipsum ".repeat(60))
+            .expect("write docs fixture");
+        // `empty_dir` intentionally contains no matching files, so the
+        // "empty" collection indexes zero chunks.
+
+        let index_dir = temp.path().join("index");
+        let mut settings = Settings {
+            index_path: index_dir,
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.documents.collections.insert(
+            "docs".to_string(),
+            CollectionConfig {
+                paths: vec![docs_dir],
+                patterns: vec!["**/*.md".to_string()],
+                ..Default::default()
+            },
+        );
+        settings.documents.collections.insert(
+            "empty".to_string(),
+            CollectionConfig {
+                paths: vec![empty_dir],
+                patterns: vec!["**/*.md".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let server = build_server_multi(settings);
+
+        let result = server
+            .search_documents(Parameters(SearchDocumentsRequest {
+                query: "lorem".to_string(),
+                collection: Some(crate::mcp::requests::OneOrMany::One("empty".to_string())),
+                exclude_collections: None,
+                limit: 10,
+                threshold: None,
+                output_format: OutputFormat::Json,
+            }))
+            .await
+            .expect("search_documents call must succeed at the transport level");
+
+        let raw = text_of(&result);
+        let envelope: Envelope<serde_json::Value> =
+            serde_json::from_str(&raw).expect("json envelope must deserialize");
+        assert_eq!(envelope.code, ResultCode::NotFound);
+        assert!(
+            envelope.meta.collections.is_some(),
+            "not_found envelope must carry non-null meta.collections"
+        );
+
+        let json_success = server
+            .search_documents(Parameters(SearchDocumentsRequest {
+                query: "lorem".to_string(),
+                collection: Some(crate::mcp::requests::OneOrMany::One("docs".to_string())),
+                exclude_collections: None,
+                limit: 10,
+                threshold: None,
+                output_format: OutputFormat::Json,
+            }))
+            .await
+            .expect("json search_documents call must succeed");
+        let raw = text_of(&json_success);
+        let envelope: Envelope<serde_json::Value> =
+            serde_json::from_str(&raw).expect("json envelope must deserialize");
+        assert_eq!(envelope.code, ResultCode::Ok);
+        assert!(
+            envelope.meta.collections.is_some(),
+            "success envelope must carry non-null meta.collections"
+        );
+    }
+
+    /// Sibling of [`search_documents_json_preview_has_no_highlight_markers`]:
+    /// the text path is unaffected by the JSON-only highlight gate, so its
+    /// `content_preview` (rendered into the "Preview:" line) still carries
+    /// the `>>`/`<<` highlight markers for the same query.
+    #[tokio::test]
+    async fn search_documents_text_preview_has_highlight_markers() {
+        let (settings, _temp) = fixture_settings(1, 1);
+        let server = build_server(settings);
+
+        let result = server
+            .search_documents(search_request(10))
+            .await
+            .expect("text search_documents call must succeed");
+
+        let output = text_of(&result);
+        assert!(
+            output.contains(">>"),
+            "text path preview must retain '>>' highlight markers, got: {output}"
+        );
     }
 
     /// Terminal-state / provenance regression for `search_documents`'s
@@ -1858,6 +2129,21 @@ mod search_documents_concurrency_tests {
         use crate::config::{GuidanceRange, GuidanceTemplate};
 
         let (mut settings, _temp) = fixture_settings(3, 1);
+        // A second, deliberately empty collection: unknown collection names
+        // are now rejected up front by `DocumentsConfig::validate_search_inputs`,
+        // so forcing the empty-result branch requires a *configured*
+        // collection with zero indexed chunks rather than a nonexistent
+        // name.
+        let empty_dir = _temp.path().join("empty");
+        std::fs::create_dir_all(&empty_dir).expect("create empty dir");
+        settings.documents.collections.insert(
+            "empty".to_string(),
+            CollectionConfig {
+                paths: vec![empty_dir],
+                patterns: vec!["**/*.md".to_string()],
+                ..Default::default()
+            },
+        );
         settings.guidance.enabled = true;
         settings.guidance.templates.insert(
             "search_documents".to_string(),
@@ -1873,21 +2159,19 @@ mod search_documents_concurrency_tests {
             },
         );
 
-        let server = build_server(settings);
+        let server = build_server_multi(settings);
 
-        // Empty-result branch: `DocumentStore::search` filters by exact
-        // collection match (query text only ranks/relevance-scores when an
-        // embedding generator is configured, which this fixture
-        // deliberately omits), so a nonexistent collection is the reliable
-        // way to force zero candidates here.
+        // Empty-result branch: the "empty" collection has zero indexed
+        // chunks, so `DocumentStore::search` returns zero candidates
+        // (query text only ranks/relevance-scores when an embedding
+        // generator is configured, which this fixture deliberately omits).
         let empty_result = server
             .search_documents(Parameters(SearchDocumentsRequest {
                 query: "lorem".to_string(),
-                collection: Some(crate::mcp::requests::OneOrMany::One(
-                    "no-such-collection".to_string(),
-                )),
+                collection: Some(crate::mcp::requests::OneOrMany::One("empty".to_string())),
                 exclude_collections: None,
                 limit: 10,
+                threshold: None,
                 output_format: OutputFormat::Text,
             }))
             .await
@@ -2147,6 +2431,7 @@ mod search_documents_concurrency_tests {
                 collection: Some(OneOrMany::Many(vec!["".to_string(), "  ".to_string()])),
                 exclude_collections: None,
                 limit: 100,
+                threshold: None,
                 output_format: OutputFormat::Text,
             }))
             .await

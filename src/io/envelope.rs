@@ -169,6 +169,14 @@ pub struct Meta {
     /// Traversal depth for tree/graph results
     #[serde(skip_serializing_if = "Option::is_none")]
     pub depth: Option<u32>,
+
+    /// Resolved (post-merge) collection allowlist actually searched
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collections: Option<Vec<String>>,
+
+    /// Resolved (post-merge) collection denylist actually excluded
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub excluded_collections: Option<Vec<String>>,
 }
 
 impl Default for Meta {
@@ -182,6 +190,8 @@ impl Default for Meta {
             duration_ms: None,
             truncated: None,
             depth: None,
+            collections: None,
+            excluded_collections: None,
         }
     }
 }
@@ -334,6 +344,18 @@ impl<T> Envelope<T> {
     /// Set traversal depth.
     pub fn with_depth(mut self, depth: u32) -> Self {
         self.meta.depth = Some(depth);
+        self
+    }
+
+    /// Set the resolved (post-merge) collection allowlist in metadata.
+    pub fn with_collections(mut self, collections: Vec<String>) -> Self {
+        self.meta.collections = Some(collections);
+        self
+    }
+
+    /// Set the resolved (post-merge) collection denylist in metadata.
+    pub fn with_excluded_collections(mut self, excluded_collections: Vec<String>) -> Self {
+        self.meta.excluded_collections = Some(excluded_collections);
         self
     }
 

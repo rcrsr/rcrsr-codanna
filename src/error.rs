@@ -297,8 +297,13 @@ pub enum DocumentStoreError {
     #[error("Vector storage error: {0}")]
     VectorStorage(#[from] VectorStorageError),
 
-    #[error("Collection not found: {0}")]
-    CollectionNotFound(String),
+    #[error("Unknown collection '{name}'. Configured collections: {valid}")]
+    CollectionNotFound { name: String, valid: String },
+
+    /// A search limit of 0 would otherwise silently return zero results
+    /// with no indication why.
+    #[error("limit must be >= 1 (got {0})")]
+    InvalidLimit(usize),
 
     #[error("Index error: {0}")]
     Index(String),
@@ -323,6 +328,22 @@ pub enum DocumentStoreError {
     /// surface's flag spelling.
     #[error("Collection '{0}' cannot be both included and excluded in the same search")]
     ConflictingCollectionFilter(String),
+}
+
+impl DocumentStoreError {
+    /// True for variants caused by invalid caller input (unknown
+    /// collection name, conflicting filter, non-positive limit), which
+    /// envelope-building code maps to `ResultCode::InvalidQuery` instead of
+    /// `ResultCode::IndexError`. Machine-readable so callers never need to
+    /// string-match `to_string()` output to classify these cases.
+    pub fn is_invalid_input(&self) -> bool {
+        matches!(
+            self,
+            Self::CollectionNotFound { .. }
+                | Self::ConflictingCollectionFilter(_)
+                | Self::InvalidLimit(_)
+        )
+    }
 }
 
 /// Result type alias for index operations

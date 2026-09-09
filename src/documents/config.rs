@@ -1,5 +1,6 @@
 //! Configuration types for document chunking and collections.
 
+use crate::error::DocumentStoreError;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -46,6 +47,52 @@ impl DocumentsConfig {
             .filter(|(_, cfg)| !cfg.default)
             .map(|(name, _)| name.clone())
             .collect()
+    }
+
+    /// Validate the caller-supplied inputs to a document search before any
+    /// config-sourced defaults (e.g. `default_visibility_exclusions`) are
+    /// merged in. Config owns the valid collection-name set, so this check
+    /// lives here rather than in `DocumentStore::search`
+    /// (`src/documents/store.rs`), which stays a pure filter with no
+    /// `Settings` access.
+    ///
+    /// Checks, in order:
+    /// - `limit == 0` -> `DocumentStoreError::InvalidLimit(0)`
+    /// - every name in `collections` and `exclude_collections` must be a
+    ///   configured collection, else
+    ///   `DocumentStoreError::CollectionNotFound { name, valid }` naming the
+    ///   offending value and the sorted, comma-joined set of configured
+    ///   collection names.
+    ///
+    /// Does not check for a name present in both `collections` and
+    /// `exclude_collections` — that is `DocumentStoreError::ConflictingCollectionFilter`,
+    /// the store's own invariant guard (`store.rs`), and stays there.
+    pub fn validate_search_inputs(
+        &self,
+        collections: &[String],
+        exclude_collections: &[String],
+        limit: usize,
+    ) -> Result<(), DocumentStoreError> {
+        if limit == 0 {
+            return Err(DocumentStoreError::InvalidLimit(0));
+        }
+
+        let valid_names = || {
+            let mut names: Vec<&str> = self.collections.keys().map(String::as_str).collect();
+            names.sort_unstable();
+            names.join(", ")
+        };
+
+        for name in collections.iter().chain(exclude_collections.iter()) {
+            if !self.collections.contains_key(name) {
+                return Err(DocumentStoreError::CollectionNotFound {
+                    name: name.clone(),
+                    valid: valid_names(),
+                });
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -353,6 +400,79 @@ mod tests {
         assert!(
             excluded.is_empty(),
             "explicitly naming a non-default collection must not exclude it"
+        );
+    }
+
+    fn config_with_collections(names: &[&str]) -> DocumentsConfig {
+        let mut collections = HashMap::new();
+        for name in names {
+            collections.insert(name.to_string(), CollectionConfig::default());
+        }
+        DocumentsConfig {
+            collections,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_validate_search_inputs_unknown_collection_name() {
+        let config = config_with_collections(&["docs"]);
+        let err = config
+            .validate_search_inputs(&["bogus".to_string()], &[], 5)
+            .expect_err("unknown collection name must be rejected");
+        match err {
+            crate::error::DocumentStoreError::CollectionNotFound { name, valid } => {
+                assert_eq!(name, "bogus");
+                assert_eq!(valid, "docs");
+            }
+            other => panic!("expected CollectionNotFound, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_validate_search_inputs_unknown_exclude_collection_name() {
+        let config = config_with_collections(&["docs"]);
+        let err = config
+            .validate_search_inputs(&[], &["bogus".to_string()], 5)
+            .expect_err("unknown exclude_collections name must be rejected");
+        match err {
+            crate::error::DocumentStoreError::CollectionNotFound { name, valid } => {
+                assert_eq!(name, "bogus");
+                assert_eq!(valid, "docs");
+            }
+            other => panic!("expected CollectionNotFound, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_validate_search_inputs_all_valid_names_ok() {
+        let config = config_with_collections(&["docs", "guides"]);
+        assert!(
+            config
+                .validate_search_inputs(&["docs".to_string()], &["guides".to_string()], 5)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_validate_search_inputs_zero_limit_rejected() {
+        let config = config_with_collections(&["docs"]);
+        let err = config
+            .validate_search_inputs(&[], &[], 0)
+            .expect_err("limit 0 must be rejected");
+        assert!(matches!(
+            err,
+            crate::error::DocumentStoreError::InvalidLimit(0)
+        ));
+    }
+
+    #[test]
+    fn test_validate_search_inputs_limit_one_with_valid_names_ok() {
+        let config = config_with_collections(&["docs"]);
+        assert!(
+            config
+                .validate_search_inputs(&["docs".to_string()], &[], 1)
+                .is_ok()
         );
     }
 }

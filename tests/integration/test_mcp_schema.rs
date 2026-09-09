@@ -496,6 +496,31 @@ fn test_search_documents_request_collection_accepts_string_or_array() {
     );
 }
 
+#[test]
+fn test_search_documents_request_threshold_round_trips() {
+    let with_threshold: SearchDocumentsRequest = serde_json::from_value(serde_json::json!({
+        "query": "x",
+        "threshold": 0.5,
+    }))
+    .expect("threshold must deserialize");
+    assert_eq!(with_threshold.threshold, Some(0.5));
+
+    let without_threshold: SearchDocumentsRequest =
+        serde_json::from_value(serde_json::json!({"query": "x"}))
+            .expect("omitted threshold must deserialize");
+    assert_eq!(without_threshold.threshold, None);
+
+    let schema = rmcp::schemars::schema_for!(SearchDocumentsRequest);
+    let json = serde_json::to_string_pretty(&schema).unwrap();
+    let root: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert!(
+        root["properties"].get("threshold").is_some(),
+        "SearchDocumentsRequest schema must expose a threshold property\nGot:\n{json}"
+    );
+
+    println!("[OK] SearchDocumentsRequest.threshold round-trips and is exposed in the schema.");
+}
+
 /// Extract and parse the single JSON text content block out of a
 /// `CallToolResult` produced by `output_format: Json` tool calls.
 fn call_tool_result_json(result: &rmcp::model::CallToolResult) -> serde_json::Value {

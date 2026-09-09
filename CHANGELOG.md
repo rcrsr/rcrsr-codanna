@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`search_documents` relevance threshold:** the MCP tool (and `codanna mcp search_documents threshold:<score>`) now accepts an optional `threshold`, a minimum cosine similarity score (range [-1, 1], same metric `semantic_search_docs` uses). Scored results below it are dropped before `limit` applies, and an empty result after the cut returns `status: not_found`, so a caller can tell "nothing relevant" from "best of a bad lot". Omitting `threshold` reproduces the previous behavior exactly. The no-embedding fallback path (which scores every hit at 0.0) is unaffected. ([#65](https://github.com/rcrsr/rcrsr-codanna/issues/65)) ([#81](https://github.com/rcrsr/rcrsr-codanna/pull/81))
+- **`search_documents` echoes its resolved collection filter:** JSON envelopes from the MCP tool and the CLI wrapper now carry `meta.collections` and `meta.excluded_collections` on both `success` and `not_found`, reflecting the post-merge sets actually searched and excluded (including collections dropped by `default = false`), so a caller can see which collections a result came from. Both fields are additive and omitted when unset. ([#66](https://github.com/rcrsr/rcrsr-codanna/issues/66)) ([#81](https://github.com/rcrsr/rcrsr-codanna/pull/81))
+
+### Changed
+
+- **`search_documents` rejects bad input instead of returning a plausible empty result:** an unknown name in `collection` or `exclude_collections` now returns `code: INVALID_QUERY` with a message naming the bad value and listing the configured collection names, instead of an ordinary `NOT_FOUND` indistinguishable from a genuine miss; `limit: 0` is likewise rejected with `INVALID_QUERY` rather than silently returning zero results (`get_file_outline`'s `max_results: 0` = unlimited is unchanged). The pre-existing `ConflictingCollectionFilter` error (a name in both `collection` and `exclude_collections`) is reclassified from `INDEX_ERROR` to `INVALID_QUERY` for consistency, via a new `DocumentStoreError::is_invalid_input` classifier. Validation runs once, in `DocumentsConfig::validate_search_inputs`, before auto-sync and before any config-sourced defaults are merged in, and is shared by the MCP tool and the CLI JSON path. `codanna mcp search_documents` now also accepts `exclude_collections:` and `threshold:` as argument keys (the former was carried by the request struct but rejected by the CLI's key vocabulary). ([#66](https://github.com/rcrsr/rcrsr-codanna/issues/66), [#67](https://github.com/rcrsr/rcrsr-codanna/issues/67)) ([#81](https://github.com/rcrsr/rcrsr-codanna/pull/81))
+
+### Fixed
+
+- **`search_documents` JSON output no longer embeds terminal escapes:** with `output_format: json`, `content_preview` is now plain text — no ANSI color sequences (`\x1b[1;36m` / `\x1b[0m`) and no `>>`/`<<` highlight markers — while KWIC windowing is preserved. The text-format render keeps its highlighting unchanged. Implemented by turning off the existing `[documents.search] highlight` knob for JSON callers at preview-generation time, so no post-hoc stripping is needed. The sibling `codanna documents search --json` command shares the root cause and is deliberately left for a follow-up; word-boundary KWIC matching (the secondary note in the issue) is likewise out of scope here. ([#68](https://github.com/rcrsr/rcrsr-codanna/issues/68)) ([#81](https://github.com/rcrsr/rcrsr-codanna/pull/81))
+
 ## [0.16.0+rcrsr.4] - 2026-09-08
 
 ### Added
