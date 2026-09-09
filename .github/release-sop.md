@@ -34,7 +34,7 @@ The version lives in **three places that must agree**, all in the repo root:
 |----------|-------------|
 | `Cargo.toml` → `[package] version` | `<version>` (raw, with `+`) |
 | `Cargo.toml` → `[package.metadata.binstall.overrides.*]` — four `pkg-url` filename segments and four `bin-dir` values | the **sanitized** version, `+` → `-` (e.g. `0.16.0-rcrsr.4`). The `download/v{ version }/` path segment keeps the raw `{ version }` template and must not be hand-edited. |
-| `Cargo.lock` → the `codanna` package entry | regenerated, never hand-edited: run `cargo update -p codanna --offline` (or any `cargo check`) after editing `Cargo.toml` |
+| `Cargo.lock` → the `codanna` package entry | regenerated, never hand-edited: run `cargo check` (or `cargo build`, optionally with `--offline`) after editing `Cargo.toml` — avoid `cargo update`, which is a dependency-upgrade command and can pull in newer transitive dependency versions beyond the version edit |
 
 `tests/binstall_metadata_tests.rs` guards the binstall literals against drift
 from `Cargo.toml`'s version. Run it after any bump:
@@ -111,9 +111,9 @@ contributing/scripts/changelog-section.sh <version>
 - **Commit:** `chore(release): prepare <version>`. Stage only the files this
   procedure edits (`CHANGELOG.md`, `CLAUDE.md`, and — on a bump —
   `Cargo.toml`, `Cargo.lock`). Never `git add .`.
-- **PR title:** `chore(release): prepare <version>`. No `[area]` prefix —
-  `label.yml` applies `area:docs` / `area:dx` automatically from the touched
-  paths.
+- **PR title:** `chore(release): prepare <version>`. No `[area]` prefix — the
+  `Label` workflow (`.github/workflows/label.yml`) applies `area:docs` /
+  `area:dx` automatically per `.github/labeler.yml`'s path mappings.
 - **PR body:** lead with a prose narrative of the release, then a
   `## What ships` summary and a `## Release note` reminding that tagging is a
   separate step after merge. Point at the stamped CHANGELOG section for full
