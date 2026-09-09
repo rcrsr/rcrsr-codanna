@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0+rcrsr.4] - 2026-09-08
+
 ### Added
 
 - **Release SOP:** Documented this fork's release version/tag scheme, changelog stamping rules, and pre-tag verification steps. ([#78](https://github.com/rcrsr/rcrsr-codanna/pull/78))
