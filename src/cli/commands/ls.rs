@@ -33,9 +33,13 @@ use crate::serve_registry::{RegistryEntry, ServerRole, ServerStatus, paths_match
 /// registry existed, or their registry entry was pruned/removed out from
 /// under a still-running process.
 ///
-/// Best-effort resolve a rogue pid's workspace root, port, and scheme.
+/// Best-effort resolve a rogue pid's workspace root, port, scheme, and
+/// server/proxy kind, in a single `sysinfo` refresh -- rather than the two
+/// separate per-pid scans `resolve_rogue`/`guess_rogue_kind` used to perform
+/// independently (each constructing its own `System::new()` and refreshing
+/// the same pid a second time).
 ///
-/// Resolution order:
+/// Resolution order for workspace/port/scheme:
 /// 1. Read the process's current working directory (best-effort guess at
 ///    its workspace root).
 /// 2. If `<cwd>/.codanna/serve.json` exists and its recorded pid matches
@@ -45,11 +49,16 @@ use crate::serve_registry::{RegistryEntry, ServerRole, ServerStatus, paths_match
 ///    `--bind=HOST:PORT`) argument out of the process's argv for a port
 ///    guess. No scheme can be inferred this way, so `scheme` stays `None`.
 ///
+/// `kind` is a best-effort guess at whether the pid is a stdio-facing proxy
+/// or a backing server, by checking its argv for a literal `--proxy` token
+/// (see [`kind_from_cmd`]); it defaults to [`RowKind::Server`] when the
+/// process cannot be inspected.
+///
 /// Any field that cannot be discovered -- because the process has already
 /// exited, its cwd/argv are unreadable (e.g. permission-restricted
 /// `/proc/<pid>` on Linux), or no `--bind` argument is present -- renders as
 /// `None`. This function never returns an error.
-pub fn resolve_rogue(pid: u32) -> (Option<String>, Option<u16>, Option<ServeScheme>) {
+fn resolve_rogue(pid: u32) -> (Option<String>, Option<u16>, Option<ServeScheme>, RowKind) {
     let target = Pid::from_u32(pid);
     let mut sys = System::new();
     sys.refresh_processes_specifics(
@@ -60,20 +69,21 @@ pub fn resolve_rogue(pid: u32) -> (Option<String>, Option<u16>, Option<ServeSche
             .with_cmd(UpdateKind::Always),
     );
     let Some(process) = sys.process(target) else {
-        return (None, None, None);
+        return (None, None, None, RowKind::Server);
     };
+    let kind = kind_from_cmd(process.cmd());
 
     let Some(cwd) = process.cwd().map(Path::to_path_buf) else {
-        return (None, None, None);
+        return (None, None, None, kind);
     };
     let workspace = cwd.to_string_lossy().into_owned();
 
     if let Some((port, scheme)) = read_record_if_pid_matches(&cwd, pid) {
-        return (Some(workspace), Some(port), Some(scheme));
+        return (Some(workspace), Some(port), Some(scheme), kind);
     }
 
     let port = parse_bind_port(process.cmd()).filter(|port| *port != 0);
-    (Some(workspace), port, None)
+    (Some(workspace), port, None, kind)
 }
 
 /// Read `<cwd>/.codanna/serve.json` (via the existing
@@ -168,26 +178,15 @@ struct Row {
     workspace: Option<String>,
 }
 
-/// Best-effort guess at whether a rogue pid is a stdio-facing proxy or a
+/// Best-effort guess at whether a rogue process is a stdio-facing proxy or a
 /// backing server, by checking its argv for a literal `--proxy` token.
-/// Defaults to `Server` when the process cannot be inspected or the token is
-/// absent, since a backing server is the common case and every field of a
-/// rogue row is already best-effort display data (see [`resolve_rogue`]).
-fn guess_rogue_kind(pid: u32) -> RowKind {
-    let target = Pid::from_u32(pid);
-    let mut sys = System::new();
-    sys.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[target]),
-        true,
-        ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
-    );
-    let Some(process) = sys.process(target) else {
-        return RowKind::Server;
-    };
-    let is_proxy = process
-        .cmd()
-        .iter()
-        .any(|arg| arg.to_string_lossy() == "--proxy");
+/// Defaults to `Server` when the token is absent, since a backing server is
+/// the common case and every field of a rogue row is already best-effort
+/// display data (see [`resolve_rogue`]). Pure function over an already-
+/// fetched argv so [`resolve_rogue`] can derive kind from the single scan it
+/// already performs, instead of a second per-pid `sysinfo` refresh.
+fn kind_from_cmd(cmd: &[std::ffi::OsString]) -> RowKind {
+    let is_proxy = cmd.iter().any(|arg| arg.to_string_lossy() == "--proxy");
     if is_proxy {
         RowKind::Proxy
     } else {
@@ -231,7 +230,7 @@ fn registered_row(entry: &RegistryEntry, kind: RowKind) -> Row {
 ///    workspace, e.g. the backing server is itself rogue or stale).
 /// 4. Rogue pids from a full-process-table scan, minus any pid already
 ///    covered by step 1/2/3's live registry entries, enriched best-effort
-///    via [`resolve_rogue`] and [`guess_rogue_kind`].
+///    via a single per-pid [`resolve_rogue`] call.
 fn build_rows() -> Vec<Row> {
     let live_entries: Vec<RegistryEntry> = crate::serve_registry::list_entries()
         .into_iter()
@@ -280,10 +279,10 @@ fn build_rows() -> Vec<Row> {
     rogue_pids.dedup();
 
     for pid in rogue_pids {
-        let (workspace, port, scheme) = resolve_rogue(pid);
+        let (workspace, port, scheme, kind) = resolve_rogue(pid);
         rows.push(Row {
             pid,
-            kind: guess_rogue_kind(pid),
+            kind,
             source: RowSource::Rogue,
             port,
             scheme,

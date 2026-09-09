@@ -850,6 +850,12 @@ const SPAWN_STDERR_TAIL_BYTES: u64 = 16 * 1024;
 /// panics: any failure to open, seek, or read the file yields an empty (or
 /// partial) string, since a missing diagnostic tail is not worth failing the
 /// reaper thread over.
+///
+/// The read itself is bounded via [`Read::take`] regardless of the seek
+/// outcome: if the end-seek fails, or the file is concurrently extended
+/// after `metadata().len()` is sampled, an unbounded `read_to_end` would
+/// still slurp the whole (possibly much larger) file, defeating
+/// [`SPAWN_STDERR_TAIL_BYTES`].
 fn read_stderr_tail(path: &Path) -> String {
     let Ok(mut file) = std::fs::File::open(path) else {
         return String::new();
@@ -860,8 +866,43 @@ fn read_stderr_tail(path: &Path) -> String {
         let _ = file.seek(std::io::SeekFrom::End(offset));
     }
     let mut buf = Vec::new();
-    let _ = file.read_to_end(&mut buf);
+    let _ = file.take(SPAWN_STDERR_TAIL_BYTES).read_to_end(&mut buf);
     String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Create the uniquely-named temp file the spawned child's stderr is
+/// redirected to, opened with `create_new(true)` so a pre-existing path (a
+/// regular file or a symlink planted by another user in a world-writable
+/// temp dir) is never followed or truncated. Retries once with a fresh
+/// random filename on `AlreadyExists` before giving up.
+fn create_unique_stderr_file(workspace_root: &Path) -> DiscoveryResult<(PathBuf, std::fs::File)> {
+    for _ in 0..2 {
+        let stderr_path = std::env::temp_dir().join(format!(
+            "codanna-spawn-stderr-{}.log",
+            generate_launch_token()
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&stderr_path)
+        {
+            Ok(file) => return Ok((stderr_path, file)),
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(source) => {
+                return Err(DiscoveryError::Spawn {
+                    workspace_root: workspace_root.to_path_buf(),
+                    source,
+                });
+            }
+        }
+    }
+    Err(DiscoveryError::Spawn {
+        workspace_root: workspace_root.to_path_buf(),
+        source: io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "failed to create a unique spawn-stderr temp file after retry",
+        ),
+    })
 }
 
 /// Returns the child's pid so the caller can publish it to the per-user
@@ -883,15 +924,16 @@ fn spawn_detached(
     // detached spawn is that the backing server outlives it -- the read end
     // closes and the next write the long-lived child makes to a closed pipe
     // raises SIGPIPE/EPIPE. A plain file has no such reader to lose.
-    let stderr_path = std::env::temp_dir().join(format!(
-        "codanna-spawn-stderr-{}.log",
-        generate_launch_token()
-    ));
-    let stderr_file =
-        std::fs::File::create(&stderr_path).map_err(|source| DiscoveryError::Spawn {
-            workspace_root: workspace_root.to_path_buf(),
-            source,
-        })?;
+    //
+    // Opened with `create_new(true)` rather than `File::create` (which
+    // follows symlinks and truncates any pre-existing file at the path): in
+    // a world-writable temp directory an attacker could pre-create the path
+    // -- as a regular file or a symlink to one of ours -- and have
+    // `File::create` clobber it. `create_new` instead fails with
+    // `AlreadyExists` if anything is already there; retry once with a fresh
+    // random filename (the same 128-bit token source used for the path
+    // itself) rather than falling back to the unsafe `File::create`.
+    let (stderr_path, stderr_file) = create_unique_stderr_file(workspace_root)?;
 
     let mut cmd = build_spawn_command(&exe, config_path);
     cmd.current_dir(workspace_root)
@@ -926,9 +968,15 @@ fn spawn_detached(
     // poisoned, or the temp file failing to remove are all discarded rather
     // than unwrapped -- there is nothing actionable to do with any of those
     // errors on a detached background thread.
-    let child = cmd.spawn().map_err(|source| DiscoveryError::Spawn {
-        workspace_root: workspace_root.to_path_buf(),
-        source,
+    let child = cmd.spawn().map_err(|source| {
+        // No reaper thread starts on this path, so nothing else ever removes
+        // the stderr temp file just created above -- clean it up here rather
+        // than leaking it.
+        let _ = std::fs::remove_file(&stderr_path);
+        DiscoveryError::Spawn {
+            workspace_root: workspace_root.to_path_buf(),
+            source,
+        }
     })?;
     let child_pid = child.id();
     let exit_slot: SpawnExitSlot = Arc::new(Mutex::new(None));

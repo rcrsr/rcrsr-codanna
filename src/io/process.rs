@@ -102,19 +102,33 @@ pub fn looks_like_codanna_serve(pid: u32) -> bool {
 /// re-checking a single already-trusted pid.
 ///
 /// Read-only: performs no signal, kill, or write side effects.
+///
+/// Restricted to processes owned by the invoking user's own uid. Without
+/// this, a full-system scan would surface other users' `codanna serve`
+/// processes (pid, port, workspace, cwd) to `codanna ls`'s rogue-row
+/// enrichment, breaking the per-user isolation the server registry
+/// (0700/0600 permissions) otherwise guarantees.
 pub fn scan_codanna_serve_pids() -> Vec<u32> {
-    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
     let mut sys = System::new();
     sys.refresh_processes_specifics(
         ProcessesToUpdate::All,
         true,
         ProcessRefreshKind::nothing()
             .with_cmd(UpdateKind::Always)
-            .with_exe(UpdateKind::Always),
+            .with_exe(UpdateKind::Always)
+            .with_user(UpdateKind::Always),
     );
+    // The own-pid lookup reuses this same scan (it already refreshed every
+    // process, including this one) rather than a second, separate scan.
+    let own_uid = sys
+        .process(Pid::from_u32(std::process::id()))
+        .and_then(|process| process.user_id())
+        .cloned();
     sys.processes()
         .iter()
         .filter(|(_, process)| process_is_codanna_serve(process))
+        .filter(|(_, process)| own_uid.is_some() && process.user_id() == own_uid.as_ref())
         .map(|(pid, _)| pid.as_u32())
         .collect()
 }

@@ -332,6 +332,14 @@ struct Dialer {
     /// [`NotificationRelay`] forwards to the same downstream peer -- see the
     /// "HIGHEST-RISK SILENT FAILURE" note on [`Dialer::connect`].
     state: Arc<Mutex<DownstreamState>>,
+    /// The scheme (`http`/`https`) [`Dialer::connect`] most recently
+    /// connected the backing server with, updated on every dial (initial
+    /// connect and every later revive alike). `serve_proxy` reads this after
+    /// the initial `connect()` to record the proxy's OWN registry entry with
+    /// the scheme actually in use, rather than a hard-coded default -- since
+    /// `connect()` can dial either an HTTP or an HTTPS backing server
+    /// depending on what `discover_or_spawn` returns.
+    connected_scheme: std::sync::Mutex<ServeScheme>,
 }
 
 impl Dialer {
@@ -384,6 +392,11 @@ impl Dialer {
             record.port
         ))
         .auth_header(DUMMY_BEARER_TOKEN);
+
+        *self
+            .connected_scheme
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = record.scheme;
 
         let relay = self.relay();
 
@@ -959,12 +972,17 @@ pub async fn serve_proxy(
         config,
         config_path,
         state: state.clone(),
+        connected_scheme: std::sync::Mutex::new(ServeScheme::default()),
     };
 
     // `Dialer::connect` is the single dial site: this initial connection and
     // every later revive (`UpstreamHandle::revive`) both go through it, so
     // there is exactly one HTTPS-pinning branch, not two.
     let upstream = dial.connect().await?;
+    let connected_scheme = *dial
+        .connected_scheme
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     // Best-effort registry entry for this proxy process itself, mirroring
     // the discipline used for the `Spawning` entry write in
@@ -976,7 +994,7 @@ pub async fn serve_proxy(
     let proxy_entry = serve_registry::RegistryEntry {
         pid: proxy_pid,
         port: 0,
-        scheme: ServeScheme::Http,
+        scheme: connected_scheme,
         workspace_root: proxy_workspace_root,
         start_time: unix_now_secs(),
         status: serve_registry::ServerStatus::Healthy,
@@ -1389,6 +1407,7 @@ mod tests {
             config: Settings::default(),
             config_path: None,
             state: state.clone(),
+            connected_scheme: std::sync::Mutex::new(ServeScheme::default()),
         };
 
         // Build the relay exactly as the initial dial does, then again as a

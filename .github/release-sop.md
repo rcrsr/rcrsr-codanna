@@ -108,7 +108,11 @@ contributing/scripts/changelog-section.sh <version>
   favor of `codanna ls`), this release is that cycle's boundary. Check
   whether the deprecation has now spanned a full release; if so, file (or
   fold into this PR) the follow-up to remove the deprecated flag rather than
-  letting it linger silently past its stated grace period.
+  letting it linger silently past its stated grace period. Each such
+  deprecation carries a machine-checkable `// TODO(remove-after: vX.Y.Z)`
+  comment next to the flag's definition (e.g. `list: bool` in
+  `src/cli/args.rs`); grep for `TODO(remove-after:` and compare the version
+  against the one being cut here instead of relying on memory alone.
 
 ## 5. Branch, commit, and PR conventions
 

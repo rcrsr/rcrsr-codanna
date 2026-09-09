@@ -209,16 +209,34 @@ fn print_registry_list() {
 /// text. By default it must additionally be registered (present in the
 /// per-user server registry); `allow_rogue` is an explicit, non-default
 /// opt-in (`--include-rogue`) that waives the registry-membership check but
-/// never the `looks_like_codanna_serve` identity check, so this can never
-/// become a generic kill-any-pid primitive.
+/// never an identity check, so this can never become a generic kill-any-pid
+/// primitive.
+///
+/// The identity check itself is stricter for an unregistered pid than a
+/// registered one. A registered pid is already vouched for by the registry
+/// (this process itself wrote that entry), so the lenient
+/// `looks_like_codanna_serve` (`cmd` contains "codanna" as a substring
+/// anywhere) suffices to confirm the same process is still there. An
+/// unregistered pid reached only via `--include-rogue` has no such
+/// vouching, so it is checked against the stricter, basename-anchored
+/// `scan_codanna_serve_pids` predicate instead, to minimize the chance of
+/// signaling an unrelated process that merely mentions "codanna" on its
+/// command line.
 fn resolve_selector_to_pid(selector: &str, allow_rogue: bool) -> Option<u32> {
     if let Ok(pid) = selector.parse::<u32>() {
-        if !crate::serve_registry::looks_like_codanna_serve(pid) {
-            return None;
-        }
         let is_registered = crate::serve_registry::list_entries()
             .iter()
             .any(|entry| entry.pid == pid);
+
+        let looks_like_codanna_serve = if is_registered {
+            crate::serve_registry::looks_like_codanna_serve(pid)
+        } else {
+            crate::io::process::scan_codanna_serve_pids().contains(&pid)
+        };
+        if !looks_like_codanna_serve {
+            return None;
+        }
+
         return (allow_rogue || is_registered).then_some(pid);
     }
 
@@ -243,7 +261,17 @@ async fn stop_server(selector: &str, force: bool, include_rogue: bool) {
 
     let Some(pid) = resolve_selector_to_pid(selector, include_rogue) else {
         if let Ok(pid) = selector.parse::<u32>() {
-            eprintln!("No registered server with pid {pid}.");
+            // With `--include-rogue`, registry membership is already waived
+            // by `resolve_selector_to_pid`, so reaching here means the pid
+            // failed the identity check instead -- report that distinctly
+            // rather than the registry-membership wording below, which
+            // would be misleading given `--include-rogue` explicitly waived
+            // that requirement.
+            if include_rogue {
+                eprintln!("pid {pid} does not look like a codanna serve process.");
+            } else {
+                eprintln!("No registered server with pid {pid}.");
+            }
         } else {
             eprintln!(
                 "No registered server matches '{selector}' (expected a pid or a workspace-root path)."

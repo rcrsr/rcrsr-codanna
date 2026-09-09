@@ -281,10 +281,13 @@ pub enum Commands {
         /// Deprecated in favor of `codanna ls`, which is now the primary
         /// listing command; this flag is kept for one release cycle and
         /// delegates to the same listing logic.
+        // TODO(remove-after: v0.17.0): drop this flag once the deprecation
+        // has spanned one full release cycle -- see .github/release-sop.md
+        // "Deprecated-for-one-release-cycle flags".
         #[arg(
             long,
             conflicts_with_all = ["http", "https", "proxy", "bind"],
-            help = "[DEPRECATED: use `codanna ls`] List registered codanna servers (pid, port, scheme, workspace, status)"
+            help = "[DEPRECATED: use `codanna ls`] List codanna serve processes, registered and rogue (pid, port, scheme, workspace, status)"
         )]
         list: bool,
 
