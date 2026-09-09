@@ -159,7 +159,7 @@ async fn run_registry_management(list: bool, stop: Option<String>, reap: bool, f
 fn reap_stale_entries() {
     let mut reaped = 0u32;
     for entry in crate::serve_registry::list_entries() {
-        if !crate::serve_registry::pid_is_alive(entry.pid) {
+        if crate::serve_registry::entry_is_stale(&entry) {
             crate::serve_registry::remove_entry(entry.pid);
             reaped += 1;
         }
@@ -171,12 +171,15 @@ fn reap_stale_entries() {
 }
 
 /// Print a table of every registered server whose process is currently
-/// alive. Dead-pid entries are skipped from the printed list, but -- unlike
-/// `--reap` -- are NOT deleted here; pruning is `--reap`'s job alone.
+/// alive. Stale entries (dead pid, or a pid reused by a process that no
+/// longer looks like `codanna serve` -- see
+/// [`crate::serve_registry::entry_is_stale`]) are skipped from the printed
+/// list, but -- unlike `--reap` -- are NOT deleted here; pruning is
+/// `--reap`'s job alone.
 fn print_registry_list() {
     let mut entries: Vec<_> = crate::serve_registry::list_entries()
         .into_iter()
-        .filter(|entry| crate::serve_registry::pid_is_alive(entry.pid))
+        .filter(|entry| !crate::serve_registry::entry_is_stale(entry))
         .collect();
     entries.sort_by_key(|entry| entry.pid);
 
@@ -209,9 +212,18 @@ fn print_registry_list() {
 /// Resolve a `--stop` selector to a pid: either a literal pid, or a
 /// workspace-root path matched (exactly, or after canonicalization) against
 /// every registered entry's `workspace_root`.
+///
+/// A numeric selector must name a pid that is both registered (present in
+/// the per-user server registry) and still looks like a `codanna serve`
+/// process -- otherwise `codanna serve --stop <pid>` would SIGTERM/SIGKILL
+/// any process the invoking user can signal, not just a registered codanna
+/// server, contradicting the "Stop a registered server..." help text.
 fn resolve_selector_to_pid(selector: &str) -> Option<u32> {
     if let Ok(pid) = selector.parse::<u32>() {
-        return Some(pid);
+        return crate::serve_registry::list_entries()
+            .iter()
+            .any(|entry| entry.pid == pid && crate::serve_registry::looks_like_codanna_serve(pid))
+            .then_some(pid);
     }
 
     let path = PathBuf::from(selector);
@@ -234,9 +246,13 @@ async fn stop_server(selector: &str, force: bool) {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System};
 
     let Some(pid) = resolve_selector_to_pid(selector) else {
-        eprintln!(
-            "No registered server matches '{selector}' (expected a pid or a workspace-root path)."
-        );
+        if let Ok(pid) = selector.parse::<u32>() {
+            eprintln!("No registered server with pid {pid}.");
+        } else {
+            eprintln!(
+                "No registered server matches '{selector}' (expected a pid or a workspace-root path)."
+            );
+        }
         std::process::exit(1);
     };
 

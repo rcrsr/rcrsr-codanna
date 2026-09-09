@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub use crate::io::process::pid_is_alive;
+pub use crate::io::process::{looks_like_codanna_serve, pid_is_alive};
 pub use crate::serve_discovery::ServeScheme;
 
 /// Whether a registered server has finished starting up.
@@ -129,6 +129,23 @@ fn write_entry_in(dir: &Path, entry: &RegistryEntry) -> RegistryResult<()> {
         source,
     })?;
 
+    // Harden the registry directory itself to owner-only, mirroring the
+    // 0600 hardening applied to each entry file below: on a misconfigured or
+    // non-default `$XDG_STATE_HOME` (e.g. pointed at a shared/world-readable
+    // location), an unhardened directory could otherwise leak pids via
+    // `<pid>.json` filenames to other local users even though the file
+    // contents themselves are protected.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(|source| {
+            RegistryError::Permissions {
+                path: dir.to_path_buf(),
+                source,
+            }
+        })?;
+    }
+
     let final_path = entry_path(dir, entry.pid);
     let tmp_path = dir.join(format!("{}.json.tmp.{}", entry.pid, std::process::id()));
 
@@ -209,21 +226,69 @@ fn list_entries_in(dir: &Path) -> Vec<RegistryEntry> {
 /// zombie-safe `pid_is_alive`) AND its status is still `Spawning` -- a dead
 /// pid or one that has already transitioned to `Healthy` does not match.
 pub fn find_spawning_for(workspace_root: &Path) -> Option<RegistryEntry> {
-    find_spawning_for_in(&list_entries(), workspace_root)
+    find_spawning_for_in(&list_entries(), workspace_root, is_live_codanna_serve)
 }
 
 /// Search-only half of [`find_spawning_for`], split out so unit tests can
 /// supply a fixed `Vec<RegistryEntry>` (including dead-pid or
 /// already-`Healthy` entries) without depending on `registry_dir()`.
-fn find_spawning_for_in(entries: &[RegistryEntry], workspace_root: &Path) -> Option<RegistryEntry> {
+///
+/// An entry only counts as an in-flight spawn if, beyond the `Spawning`
+/// status and workspace match, `is_live_serve(entry.pid)` holds. In
+/// production that means both pid-alive AND cmdline-still-looks-like-codanna
+/// (see [`is_live_codanna_serve`]): a stale entry whose pid has been reused
+/// by an unrelated live process must not be mistaken for a genuine in-flight
+/// spawn, or the caller would wait unnecessarily (or time out) for a spawn
+/// that will never report healthy. Taking the check as a parameter (rather
+/// than calling `is_live_codanna_serve` directly) lets unit tests simulate
+/// "alive and looks like codanna" / "dead or reused" without spawning a real
+/// process.
+fn find_spawning_for_in(
+    entries: &[RegistryEntry],
+    workspace_root: &Path,
+    is_live_serve: impl Fn(u32) -> bool,
+) -> Option<RegistryEntry> {
     entries
         .iter()
         .find(|entry| {
             entry.status == ServerStatus::Spawning
-                && entry.workspace_root == workspace_root
-                && pid_is_alive(entry.pid)
+                && paths_match(&entry.workspace_root, workspace_root)
+                && is_live_serve(entry.pid)
         })
         .cloned()
+}
+
+/// Whether `pid` is both alive and still looks like a `codanna serve`
+/// process (see [`looks_like_codanna_serve`]). The production liveness
+/// check used by [`find_spawning_for`] and [`entry_is_stale`]: combining
+/// both conditions here means a registry entry whose pid has been reused by
+/// an unrelated live process is treated the same as a dead pid everywhere
+/// staleness matters.
+fn is_live_codanna_serve(pid: u32) -> bool {
+    pid_is_alive(pid) && looks_like_codanna_serve(pid)
+}
+
+/// Whether `entry` is stale: its pid is dead, OR the pid is alive but no
+/// longer looks like a `codanna serve` process (i.e. it was reused by an
+/// unrelated live process after the original server exited uncleanly).
+/// `codanna serve --reap`/`--list` use this instead of a bare
+/// `!pid_is_alive(entry.pid)` check so a reused pid does not leave an
+/// unprunable stale entry behind.
+pub fn entry_is_stale(entry: &RegistryEntry) -> bool {
+    !is_live_codanna_serve(entry.pid)
+}
+
+/// Whether `a` and `b` name the same workspace root, tolerating a
+/// symlink-vs-real-path spelling difference between two proxy invocations
+/// that otherwise agree on the workspace: both sides are canonicalized
+/// before comparing, falling back to the original (uncanonicalized) path on
+/// either side when canonicalization fails (e.g. the path no longer exists),
+/// so a failed canonicalize degrades to the previous raw-equality behavior
+/// rather than making every comparison fail.
+fn paths_match(a: &Path, b: &Path) -> bool {
+    let canon_a = std::fs::canonicalize(a).unwrap_or_else(|_| a.to_path_buf());
+    let canon_b = std::fs::canonicalize(b).unwrap_or_else(|_| b.to_path_buf());
+    canon_a == canon_b
 }
 
 #[cfg(test)]
@@ -281,6 +346,24 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn registry_directory_has_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let entry = sample_entry(
+            std::process::id(),
+            Path::new("/tmp/some-workspace"),
+            ServerStatus::Healthy,
+        );
+
+        write_entry_in(dir.path(), &entry).expect("write_entry_in should succeed");
+
+        let mode = fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "registry directory must be mode 0700");
+    }
+
+    #[test]
     fn list_entries_skips_corrupt_files_without_panicking() {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("1234.json"), b"not valid json{{{").unwrap();
@@ -313,7 +396,7 @@ mod tests {
             ServerStatus::Spawning,
         )];
 
-        let found = find_spawning_for_in(&entries, workspace);
+        let found = find_spawning_for_in(&entries, workspace, |_| true);
         assert!(found.is_some());
         assert_eq!(found.unwrap().pid, std::process::id());
     }
@@ -327,7 +410,7 @@ mod tests {
             ServerStatus::Healthy,
         )];
 
-        assert!(find_spawning_for_in(&entries, workspace).is_none());
+        assert!(find_spawning_for_in(&entries, workspace, |_| true).is_none());
     }
 
     #[test]
@@ -336,7 +419,7 @@ mod tests {
         // pid 0 reads as dead via pid_is_alive.
         let entries = vec![sample_entry(0, workspace, ServerStatus::Spawning)];
 
-        assert!(find_spawning_for_in(&entries, workspace).is_none());
+        assert!(find_spawning_for_in(&entries, workspace, |_| false).is_none());
     }
 
     #[test]
@@ -347,7 +430,44 @@ mod tests {
             ServerStatus::Spawning,
         )];
 
-        assert!(find_spawning_for_in(&entries, Path::new("/tmp/workspace-b")).is_none());
+        assert!(find_spawning_for_in(&entries, Path::new("/tmp/workspace-b"), |_| true).is_none());
+    }
+
+    #[test]
+    fn find_spawning_for_ignores_pid_reused_by_non_codanna_process() {
+        // Simulates a stale `Spawning` entry whose pid is alive but has been
+        // reused by an unrelated process (the process is alive, but
+        // `is_live_serve` reports it does not look like codanna serve).
+        let workspace = Path::new("/tmp/reused-pid-workspace");
+        let entries = vec![sample_entry(
+            std::process::id(),
+            workspace,
+            ServerStatus::Spawning,
+        )];
+
+        assert!(find_spawning_for_in(&entries, workspace, |_| false).is_none());
+    }
+
+    #[test]
+    fn find_spawning_for_matches_across_symlinked_workspace_path() {
+        // Simulates two proxy invocations reaching the same workspace via
+        // different path spellings (symlink vs. real path): the registry
+        // entry's path and the lookup path canonicalize to the same real
+        // path even though they are spelled differently.
+        let real_dir = TempDir::new().unwrap();
+        let entries = vec![sample_entry(
+            std::process::id(),
+            real_dir.path(),
+            ServerStatus::Spawning,
+        )];
+
+        let symlink_dir = TempDir::new().unwrap();
+        let symlink_path = symlink_dir.path().join("workspace-link");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(real_dir.path(), &symlink_path).unwrap();
+            assert!(find_spawning_for_in(&entries, &symlink_path, |_| true).is_some());
+        }
     }
 
     #[test]

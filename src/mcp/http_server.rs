@@ -20,7 +20,7 @@ fn is_authorized(auth_header: Option<&str>) -> bool {
 /// back to 0 only if the system clock is set before the epoch, which is not
 /// a case worth failing startup over.
 #[cfg(feature = "http-server")]
-fn unix_now_secs() -> u64 {
+pub(crate) fn unix_now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -33,13 +33,13 @@ fn unix_now_secs() -> u64 {
 /// platforms there is no portable device/inode equivalent, so this returns
 /// `None` and the periodic self-check falls back to a plain existence check.
 #[cfg(all(feature = "http-server", unix))]
-fn workspace_identity(root: &std::path::Path) -> Option<(u64, u64)> {
+pub(crate) fn workspace_identity(root: &std::path::Path) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
     std::fs::metadata(root).ok().map(|m| (m.dev(), m.ino()))
 }
 
 #[cfg(all(feature = "http-server", not(unix)))]
-fn workspace_identity(_root: &std::path::Path) -> Option<(u64, u64)> {
+pub(crate) fn workspace_identity(_root: &std::path::Path) -> Option<(u64, u64)> {
     None
 }
 
@@ -50,7 +50,7 @@ fn workspace_identity(_root: &std::path::Path) -> Option<(u64, u64)> {
 /// Extracted as a pure function so `stamp_activity`'s method-scoping can be
 /// unit-tested without spinning up an axum app.
 #[cfg(feature = "http-server")]
-fn should_stamp_activity(method: &axum::http::Method) -> bool {
+pub(crate) fn should_stamp_activity(method: &axum::http::Method) -> bool {
     *method == axum::http::Method::POST
 }
 
@@ -72,7 +72,7 @@ fn idle_timeout_exceeded(
 /// Which of the two independent periodic self-checks fired.
 #[cfg(feature = "http-server")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ShutdownTrigger {
+pub(crate) enum ShutdownTrigger {
     /// The workspace root no longer exists, or (Unix only) still exists at
     /// that path but is no longer the same filesystem object (deleted and
     /// recreated, or replaced) that was there at startup.
@@ -94,8 +94,16 @@ enum ShutdownTrigger {
 /// directory to a new name preserves its device/inode, so the identity
 /// comparison here still matches and no shutdown is triggered by a rename
 /// alone (only by moving/replacing what lives at the original path).
+///
+/// Uses `tokio::fs::metadata` (not `std::fs::metadata`) because this is
+/// called on every tick of `wait_for_workspace_or_idle`'s poll loop, which
+/// runs for the life of every `--http`/`--https` backing server; a
+/// synchronous `stat()` there would block the tokio worker thread driving
+/// this server's `select!` loop for as long as the idle-shutdown timer is
+/// active (up to the configured `idle_shutdown_minutes`, or indefinitely
+/// with `idle_shutdown_minutes = 0`).
 #[cfg(feature = "http-server")]
-fn workspace_is_gone(
+pub(crate) async fn workspace_is_gone(
     workspace_root: &std::path::Path,
     workspace_dev: Option<u64>,
     workspace_ino: Option<u64>,
@@ -104,7 +112,7 @@ fn workspace_is_gone(
     // unconditionally here (both are `Copy`, so this is not a move) so the
     // non-Unix build does not warn about unused parameters.
     let _ = (workspace_dev, workspace_ino);
-    match std::fs::metadata(workspace_root) {
+    match tokio::fs::metadata(workspace_root).await {
         Err(_) => true,
         #[cfg(unix)]
         Ok(meta) => {
@@ -124,7 +132,7 @@ fn workspace_is_gone(
 /// disables the idle timer) the workspace-disappeared check must still fire;
 /// piggybacking it on the idle gate would silently disable both together.
 #[cfg(feature = "http-server")]
-async fn wait_for_workspace_or_idle(
+pub(crate) async fn wait_for_workspace_or_idle(
     workspace_root: Option<&std::path::Path>,
     workspace_dev: Option<u64>,
     workspace_ino: Option<u64>,
@@ -138,7 +146,7 @@ async fn wait_for_workspace_or_idle(
         ticker.tick().await;
 
         if let Some(root) = workspace_root
-            && workspace_is_gone(root, workspace_dev, workspace_ino)
+            && workspace_is_gone(root, workspace_dev, workspace_ino).await
         {
             return ShutdownTrigger::WorkspaceGone;
         }
@@ -165,7 +173,7 @@ async fn wait_for_workspace_or_idle(
 /// env-var override never compiles into a release build and can't silently
 /// override an operator's `idle_shutdown_minutes`.
 #[cfg(all(feature = "http-server", debug_assertions))]
-fn idle_threshold_override() -> Option<std::time::Duration> {
+pub(crate) fn idle_threshold_override() -> Option<std::time::Duration> {
     std::env::var("CODANNA_TEST_IDLE_THRESHOLD_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -175,7 +183,7 @@ fn idle_threshold_override() -> Option<std::time::Duration> {
 /// Release-build stand-in for [`idle_threshold_override`]: the env-var
 /// override is compiled out entirely, so this always returns `None`.
 #[cfg(all(feature = "http-server", not(debug_assertions)))]
-fn idle_threshold_override() -> Option<std::time::Duration> {
+pub(crate) fn idle_threshold_override() -> Option<std::time::Duration> {
     None
 }
 
@@ -185,7 +193,7 @@ fn idle_threshold_override() -> Option<std::time::Duration> {
 /// observed shutdown time relative to the (also shrunk) threshold. Gated on
 /// `debug_assertions` for the same reason as `idle_threshold_override`.
 #[cfg(all(feature = "http-server", debug_assertions))]
-fn idle_poll_interval_override() -> Option<std::time::Duration> {
+pub(crate) fn idle_poll_interval_override() -> Option<std::time::Duration> {
     std::env::var("CODANNA_TEST_IDLE_POLL_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -195,7 +203,7 @@ fn idle_poll_interval_override() -> Option<std::time::Duration> {
 /// Release-build stand-in for [`idle_poll_interval_override`]: the env-var
 /// override is compiled out entirely, so this always returns `None`.
 #[cfg(all(feature = "http-server", not(debug_assertions)))]
-fn idle_poll_interval_override() -> Option<std::time::Duration> {
+pub(crate) fn idle_poll_interval_override() -> Option<std::time::Duration> {
     None
 }
 

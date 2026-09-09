@@ -55,6 +55,14 @@ pub async fn serve_https(config: crate::Settings, watch: bool, bind: String) -> 
     // Create cancellation token for graceful shutdown
     let ct = CancellationToken::new();
 
+    // Idle-shutdown activity tracking (unix seconds), mirroring
+    // `http_server::serve_http`'s `last_activity`: stamped to `now` by the
+    // `stamp_activity` middleware on every inbound POST /mcp request, read by
+    // the idle-timer `select!` arm further down.
+    let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(
+        crate::mcp::http_server::unix_now_secs(),
+    ));
+
     // Load document store once (shared between MCP server and watcher)
     let document_store_arc = crate::documents::load_from_settings(&config);
     if document_store_arc.is_some() {
@@ -265,9 +273,28 @@ pub async fn serve_https(config: crate::Settings, watch: bool, bind: String) -> 
         Ok(next.run(req).await)
     }
 
+    // Idle-timer activity stamp middleware, mirroring `http_server::serve_http`'s
+    // `stamp_activity`: only inbound POST /mcp (JSON-RPC calls) count as
+    // activity, matching `should_stamp_activity`'s GET/DELETE exclusion.
+    let last_activity_for_middleware = last_activity.clone();
+    let stamp_activity = move |req: axum::http::Request<axum::body::Body>,
+                               next: axum::middleware::Next| {
+        let last_activity = last_activity_for_middleware.clone();
+        async move {
+            if crate::mcp::http_server::should_stamp_activity(req.method()) {
+                last_activity.store(
+                    crate::mcp::http_server::unix_now_secs(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            next.run(req).await
+        }
+    };
+
     // Create MCP router with logging middleware
     let mcp_router_with_logging = Router::new()
         .nest_service("/mcp", mcp_service)
+        .layer(axum::middleware::from_fn(stamp_activity))
         .layer(axum::middleware::from_fn(log_requests));
 
     // Fresh per-launch token this process's `/health` endpoint echoes back,
@@ -326,8 +353,19 @@ pub async fn serve_https(config: crate::Settings, watch: bool, bind: String) -> 
     // `index_path` may be absolute or resolved relative to a `--config`
     // file's parent (`init::resolve_index_path`), so it can diverge from
     // `.codanna` in exactly the cases `discover_or_spawn` relies on.
-    let codanna_dir = crate::serve_discovery::resolve_workspace_root(&config)
-        .map(|root| crate::serve_discovery::discovery_dir(&root));
+    //
+    // Resolved once, up front, so both the `ServeRecord` written below and
+    // the periodic workspace-disappeared self-check further down agree on
+    // the exact same workspace root and captured identity -- mirroring
+    // `http_server::serve_http`.
+    let workspace_root = crate::serve_discovery::resolve_workspace_root(&config);
+    let (workspace_dev, workspace_ino): (Option<u64>, Option<u64>) = workspace_root
+        .as_ref()
+        .and_then(|root| crate::mcp::http_server::workspace_identity(root))
+        .unzip();
+    let codanna_dir = workspace_root
+        .as_ref()
+        .map(|root| crate::serve_discovery::discovery_dir(root));
 
     // Convert to std listener for axum_server's Rustls acceptor. `into_std`
     // preserves the non-blocking mode tokio's listener already has, which
@@ -351,10 +389,8 @@ pub async fn serve_https(config: crate::Settings, watch: bool, bind: String) -> 
                 port: actual_port,
                 scheme: crate::serve_discovery::ServeScheme::Https,
                 token: Some(launch_token.clone()),
-                // Workspace-identity capture (dev/ino) for the disappeared-workspace
-                // self-check is implemented for `serve --http` only; out of scope here.
-                workspace_dev: None,
-                workspace_ino: None,
+                workspace_dev,
+                workspace_ino,
             };
             if let Err(e) = crate::serve_discovery::write_record(codanna_dir, &serve_record) {
                 tracing::warn!(target: "mcp", "failed to write serve discovery record: {e}");
@@ -373,12 +409,43 @@ pub async fn serve_https(config: crate::Settings, watch: bool, bind: String) -> 
         }
     }
 
-    // Handle graceful shutdown
+    // Publish this server to the per-user server registry
+    // (`crate::serve_registry`), independent of whether a per-workspace
+    // `.codanna` discovery record could be written above -- mirroring
+    // `http_server::serve_http` so `codanna serve --list/--stop/--reap` can
+    // see and manage HTTPS backing servers too.
+    let registry_workspace_root = workspace_root
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let registry_entry = crate::serve_registry::RegistryEntry {
+        pid: std::process::id(),
+        port: actual_port,
+        scheme: crate::serve_discovery::ServeScheme::Https,
+        workspace_root: registry_workspace_root,
+        start_time: crate::mcp::http_server::unix_now_secs(),
+        status: crate::serve_registry::ServerStatus::Healthy,
+    };
+    if let Err(e) = crate::serve_registry::write_entry(&registry_entry) {
+        tracing::warn!(target: "mcp", "failed to write server registry entry: {e}");
+    }
+
+    // Idle-shutdown configuration, mirroring `http_server::serve_http`: 0
+    // disables the timer entirely (the `select!` arm below is guarded on
+    // `idle_minutes > 0 || workspace_root.is_some()` and is never polled in
+    // that case).
+    let idle_minutes = config.server.idle_shutdown_minutes;
+    let idle_threshold = crate::mcp::http_server::idle_threshold_override()
+        .unwrap_or_else(|| Duration::from_secs(idle_minutes.saturating_mul(60)));
+    let idle_poll_interval =
+        crate::mcp::http_server::idle_poll_interval_override().unwrap_or(Duration::from_secs(5));
+
+    // Handle graceful shutdown with tokio::select!
     tokio::select! {
         result = server => {
             if let Some(codanna_dir) = &codanna_dir {
                 crate::serve_discovery::remove_record(codanna_dir);
             }
+            crate::serve_registry::remove_entry(std::process::id());
             result?;
         }
         _ = shutdown_signal() => {
@@ -387,6 +454,34 @@ pub async fn serve_https(config: crate::Settings, watch: bool, bind: String) -> 
             if let Some(codanna_dir) = &codanna_dir {
                 crate::serve_discovery::remove_record(codanna_dir);
             }
+            crate::serve_registry::remove_entry(std::process::id());
+        }
+        // See `http_server::serve_http`'s matching arm: gated on
+        // `idle_minutes > 0 OR a workspace root was resolved` so the
+        // workspace-disappeared check still runs when idle-shutdown is
+        // disabled (`idle_shutdown_minutes = 0`).
+        trigger = crate::mcp::http_server::wait_for_workspace_or_idle(
+            workspace_root.as_deref(),
+            workspace_dev,
+            workspace_ino,
+            &last_activity,
+            idle_threshold,
+            idle_minutes,
+            idle_poll_interval,
+        ), if idle_minutes > 0 || workspace_root.is_some() => {
+            match trigger {
+                crate::mcp::http_server::ShutdownTrigger::WorkspaceGone => {
+                    eprintln!("Shutting down HTTPS server: workspace root no longer exists...");
+                }
+                crate::mcp::http_server::ShutdownTrigger::Idle => {
+                    eprintln!("Shutting down HTTPS server after {idle_minutes} minute(s) of inactivity...");
+                }
+            }
+            ct.cancel();
+            if let Some(codanna_dir) = &codanna_dir {
+                crate::serve_discovery::remove_record(codanna_dir);
+            }
+            crate::serve_registry::remove_entry(std::process::id());
         }
     }
 
@@ -560,13 +655,36 @@ async fn oauth_authorize(
     axum::response::Html(html)
 }
 
-/// Helper function for shutdown signal
-#[cfg(feature = "https-server")]
+/// Helper function for shutdown signal with cancellation token.
+/// Also listens for SIGTERM on Unix (in addition to Ctrl+C/SIGINT) so
+/// `codanna serve --stop <pid>` -- which sends SIGTERM by default, only
+/// escalating to SIGKILL with `--force` -- reaches this SAME graceful
+/// shutdown arm, and therefore the SAME `remove_record`/
+/// `serve_registry::remove_entry` cleanup Ctrl+C already triggers. Without
+/// this, the default (unhandled) disposition of SIGTERM is immediate
+/// termination, which would skip this `select!` entirely and leave both the
+/// discovery record and the registry entry behind. Mirrors
+/// `http_server::serve_http`'s `shutdown_signal`.
+#[cfg(all(feature = "https-server", unix))]
+async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            eprintln!("Received shutdown signal (Ctrl+C)");
+        }
+        _ = sigterm.recv() => {
+            eprintln!("Received shutdown signal (SIGTERM)");
+        }
+    }
+}
+
+#[cfg(all(feature = "https-server", not(unix)))]
 async fn shutdown_signal() {
     tokio::signal::ctrl_c()
         .await
         .expect("failed to listen for ctrl+c");
-    eprintln!("Received shutdown signal");
+    eprintln!("Received shutdown signal (Ctrl+C)");
 }
 
 /// Get or create self-signed certificate for HTTPS

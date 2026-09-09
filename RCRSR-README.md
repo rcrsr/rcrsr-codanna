@@ -489,14 +489,16 @@ against codanna's own certificate.
 
 ### Server registry (`--list` / `--stop` / `--reap`)
 
-Every `codanna serve --http` process (whether auto-spawned by a proxy or
-started manually) publishes itself to a per-user server registry, separate
-from the per-workspace `.codanna/serve.json` discovery record described
-above. Where `serve.json` is scoped to one workspace and used for discovery,
-the registry is scoped to the whole user and used for lifecycle management:
-it is how `codanna serve` itself can tell you (and let you stop) every
-codanna server you have running, across every workspace, without walking the
-filesystem for `.codanna` directories.
+Every `codanna serve --http`/`--https` process (whether auto-spawned by a
+proxy or started manually) publishes itself to a per-user server registry,
+separate from the per-workspace `.codanna/serve.json` discovery record
+described above. Where `serve.json` is scoped to one workspace and used for
+discovery, the registry is scoped to the whole user and used for lifecycle
+management: it is how `codanna serve` itself can tell you (and let you stop)
+every codanna server you have running, across every workspace, without
+walking the filesystem for `.codanna` directories. HTTPS backing servers get
+the same disappeared-workspace self-check and idle-shutdown timer as HTTP
+ones.
 
 The registry lives under your per-user state directory
 (`$XDG_STATE_HOME`, or `~/.local/state` on Linux; falling back to the data
