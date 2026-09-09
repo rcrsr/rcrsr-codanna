@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Release SOP:** Documented this fork's release version/tag scheme, changelog stamping rules, and pre-tag verification steps. ([#78](https://github.com/rcrsr/rcrsr-codanna/pull/78))
+
 ### Changed
 
 - **Upstream base v0.16.0:** advanced the fork's upstream base from v0.13.1 to v0.16.0 (through 0.13.2, 0.13.3, 0.14.0, and 0.15.0; see the version sections below for upstream's changes) and bumped dependencies (rmcp 3.1.4, tree-sitter 0.26.13, thiserror 2.0.20, clap 4.6.6, ignore 0.4.33, rcgen 0.14.9, async-trait 0.1.92). The crate version is now `0.16.0+rcrsr.4` (base advanced from v0.13.1, and the monotonic `+rcrsr` counter incremented from `.3` to `.4` for the fork-private reconciliation in this release). Index format stays v3; no data migration or forced rebuild. Fork-private capabilities reconciled against the new base ([#76](https://github.com/rcrsr/rcrsr-codanna/pull/76)):
