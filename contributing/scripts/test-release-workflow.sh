@@ -359,7 +359,9 @@ if [[ ! -x "$install_dir/codanna" ]]; then
 fi
 
 installed_version_line=$("$install_dir/codanna" --version)
-assert_eq "$installed_version_line" "codanna $version" "P3 installed binary reports the raw (+-bearing) version"
+# build.rs appends " (<short-sha>)" when built from a git checkout; strip it.
+installed_version="${installed_version_line% (*)}"
+assert_eq "$installed_version" "codanna $version" "P3 installed binary reports the raw (+-bearing) version"
 
 # ---------------------------------------------------------------------------
 # Rosetta detection logic (extracted verbatim from scripts/install.sh's

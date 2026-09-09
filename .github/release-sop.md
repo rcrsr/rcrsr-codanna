@@ -96,10 +96,6 @@ contributing/scripts/changelog-section.sh <version>
 
 ## 4. Other files to touch in the release PR
 
-- `CLAUDE.md` § Fork discipline, first bullet: update the sentence
-  "The last released fork tag is `v…`; the current in-flight version is
-  `…`" so the released tag is the one being cut and the in-flight version is
-  the next expected one (usually the same base with `N+1`, or "none yet").
 - `RCRSR-README.md` § Installing the fork: only if the user-facing install
   instructions or examples changed. The pinned-version examples
   (`v0.12.0+rcrsr.1`) are illustrative and do not need to track the release.
@@ -119,8 +115,8 @@ contributing/scripts/changelog-section.sh <version>
 - **Branch:** `release/<version>` (e.g. `release/0.16.0+rcrsr.4`). Git accepts
   `+` in ref names.
 - **Commit:** `chore(release): prepare <version>`. Stage only the files this
-  procedure edits (`CHANGELOG.md`, `CLAUDE.md`, and — on a bump —
-  `Cargo.toml`, `Cargo.lock`). Never `git add .`.
+  procedure edits (`CHANGELOG.md` and — on a bump — `Cargo.toml`,
+  `Cargo.lock`). Never `git add .`.
 - **PR title:** `chore(release): prepare <version>`. No `[area]` prefix — the
   `Label` workflow (`.github/workflows/label.yml`) applies `area:docs` /
   `area:dx` automatically per `.github/labeler.yml`'s path mappings.
@@ -191,9 +187,7 @@ codanna --version                         # prints <version> with +rcrsr.N
 cargo binstall --git https://github.com/rcrsr/rcrsr-codanna codanna --dry-run
 ```
 
-Then open a follow-up (or fold into the next feature PR) to keep the
-in-flight version pointer in `CLAUDE.md` current, and start the next
-`[Unreleased]` section as work lands.
+Then start the next `[Unreleased]` section as work lands.
 
 ## 9. Mapping to `/conduct:cut-release` phases
 
@@ -204,7 +198,7 @@ in-flight version pointer in `CLAUDE.md` current, and start the next
 | 3 Branch | `release/<version>` |
 | 4 Bump | usually a no-op (already bumped upstream of the release); otherwise `Cargo.toml` (version + 8 binstall literals) and regenerate `Cargo.lock`; run `cargo test --test binstall_metadata_tests` |
 | 5 Changelog | `CHANGELOG.md` only; full version in the heading; fork-ordering rule; no bottom link-ref; verify with `changelog-section.sh` |
-| 6 PR | also edit `CLAUDE.md`'s released/in-flight pointer; commit and title `chore(release): prepare <version>` |
+| 6 PR | commit and title `chore(release): prepare <version>` |
 | 7 Wait | standard merge-readiness (CLEAN, 0 threads, no pending checks) |
 | 8.1 Merge | squash, subject `chore(release): prepare <version> (#<pr>)` |
 | 8.2 Tag | `v<version>` with `+`, annotated |
