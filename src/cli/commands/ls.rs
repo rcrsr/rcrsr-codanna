@@ -7,7 +7,7 @@
 //!    `Server`/`Proxy` rows.
 //! 2. "Rogue" `codanna serve` pids -- discovered via a full-process-table
 //!    scan (`crate::io::process::scan_codanna_serve_pids`) -- that have no
-//!    live registry entry, enriched best-effort via [`resolve_rogue`].
+//!    live registry entry, enriched best-effort via `resolve_rogue`.
 //! 3. Each registered `Proxy` entry, attributed to the registered `Server`
 //!    entry sharing its `workspace_root` (via `serve_registry::paths_match`),
 //!    displayed as an attached proxy row under its backing server.
