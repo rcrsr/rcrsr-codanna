@@ -84,6 +84,29 @@ fn exit_index_error(entity: EntityType, query: &str, error: impl std::fmt::Displ
     emit_envelope_and_exit(envelope);
 }
 
+/// Print a `DocumentStoreError`-classified envelope and exit: `INVALID_QUERY`
+/// for caller-input errors (unknown collection, conflicting filter,
+/// non-positive limit, per `DocumentStoreError::is_invalid_input`),
+/// `INDEX_ERROR` otherwise. Mirrors the equivalent classification in
+/// `mcp/tools/search.rs`'s `search_documents_inner` so the CLI and MCP
+/// surfaces agree on which document-search failures are the caller's fault.
+fn exit_document_search_error(
+    entity: EntityType,
+    query: &str,
+    error: crate::error::DocumentStoreError,
+) -> ! {
+    use crate::io::envelope::{Envelope, ResultCode};
+    let code = if error.is_invalid_input() {
+        ResultCode::InvalidQuery
+    } else {
+        ResultCode::IndexError
+    };
+    let envelope: Envelope<()> = Envelope::error(code, error.to_string())
+        .with_entity_type(entity)
+        .with_query(query);
+    emit_envelope_and_exit(envelope);
+}
+
 /// Reject an invalid argument set: INVALID_QUERY envelope (JSON) or stderr
 /// message (text), exit 2 in both modes. One emitter for missing required
 /// params and unknown keys alike — the two failure directions of the same
@@ -793,6 +816,11 @@ pub async fn run(
                 .and_then(|m| m.get("limit"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(5) as usize;
+            let threshold = arguments
+                .as_ref()
+                .and_then(|m| m.get("threshold"))
+                .and_then(|v| v.as_f64())
+                .map(|t| t as f32);
 
             // Both the auto-sync loop and the search below read collection
             // definitions from this single `Arc<Settings>` (rather than the
@@ -800,6 +828,20 @@ pub async fn run(
             // never observe different collection definitions even if
             // `facade` and `config` diverge in the future.
             let settings = std::sync::Arc::clone(facade.settings());
+
+            // Validate caller-supplied inputs (unknown collection names,
+            // limit:0) before any config-sourced defaults are merged in
+            // and before auto-sync or the search call run (mirrors the MCP
+            // tool call site in mcp/tools/search.rs). Names added later by
+            // `default_visibility_exclusions` are config-sourced and valid
+            // by construction, so this must run on the pre-merge sets.
+            if let Err(e) =
+                settings
+                    .documents
+                    .validate_search_inputs(&collections, &exclude_collections, limit)
+            {
+                exit_document_search_error(EntityType::Document, &query, e);
+            }
 
             // When the caller named no collections, merge in every collection
             // whose `default` flag opts it out of unscoped search (mirrors
@@ -852,6 +894,14 @@ pub async fn run(
             // same `Arc<Settings>` used by the auto-sync loop above, so
             // search always observes the collection definitions it just
             // synced against.
+            // Preserved for the response envelope's `meta.collections` /
+            // `meta.excluded_collections` (post-merge, i.e. what was
+            // actually searched/excluded), since `collections`/
+            // `exclude_collections` are moved into the `spawn_blocking`
+            // closure below.
+            let resolved_collections = collections.clone();
+            let resolved_excludes = exclude_collections.clone();
+
             let owned_guard = std::sync::Arc::clone(store_arc).read_owned().await;
             let settings = std::sync::Arc::clone(&settings);
             let query_owned = query.clone();
@@ -864,13 +914,14 @@ pub async fn run(
                     collections,
                     exclude_collections,
                     limit,
+                    threshold,
                 )
             })
             .await;
 
             match join_result {
-                Ok(Ok(results)) => Some((query, results)),
-                Ok(Err(e)) => exit_index_error(EntityType::Document, &query, e),
+                Ok(Ok(results)) => Some((query, results, resolved_collections, resolved_excludes)),
+                Ok(Err(e)) => exit_document_search_error(EntityType::Document, &query, e),
                 Err(e) => exit_index_error(
                     EntityType::Document,
                     &query,
@@ -1290,12 +1341,18 @@ pub async fn run(
                     .and_then(|m| m.get("limit"))
                     .and_then(|v| v.as_u64())
                     .unwrap_or(5) as u32;
+                let threshold = arguments
+                    .as_ref()
+                    .and_then(|m| m.get("threshold"))
+                    .and_then(|v| v.as_f64())
+                    .map(|v| v as f32);
                 server
                     .search_documents(Parameters(SearchDocumentsRequest {
                         query,
                         collection,
                         exclude_collections,
                         limit,
+                        threshold,
                         output_format: crate::mcp::requests::OutputFormat::Text,
                     }))
                     .await
@@ -1718,7 +1775,9 @@ pub async fn run(
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
 
-                if let Some((query_text, results)) = search_documents_data {
+                if let Some((query_text, results, resolved_collections, resolved_excludes)) =
+                    search_documents_data
+                {
                     let count = results.len();
 
                     // Convert to serializable format
@@ -1743,6 +1802,8 @@ pub async fn run(
                         ))
                         .with_entity_type(EntityType::Document)
                         .with_query(&query_text)
+                        .with_collections(resolved_collections)
+                        .with_excluded_collections(resolved_excludes)
                     } else {
                         Envelope::success(data)
                             .with_entity_type(EntityType::Document)
@@ -1752,6 +1813,8 @@ pub async fn run(
                             .with_hint(
                                 "Use the file paths and byte ranges to read specific sections",
                             )
+                            .with_collections(resolved_collections)
+                            .with_excluded_collections(resolved_excludes)
                     };
 
                     let output = render_envelope_json(&envelope, fields.as_ref());

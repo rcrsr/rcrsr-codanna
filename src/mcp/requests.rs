@@ -307,9 +307,13 @@ pub struct SearchDocumentsRequest {
     /// Exclude these collection name(s) from results (optional).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exclude_collections: Option<Vec<String>>,
-    /// Maximum number of results (default: 5)
+    /// Maximum number of results (default: 5). Must be >= 1; `0` is
+    /// rejected with `INVALID_QUERY` rather than treated as unlimited.
     #[serde(default = "default_context_limit")]
     pub limit: u32,
+    /// Minimum similarity score (0-1)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<f32>,
     /// Output rendering: "text" (default) or "json"
     #[serde(default)]
     pub output_format: OutputFormat,

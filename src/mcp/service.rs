@@ -168,7 +168,16 @@ pub fn tool_param_spec(tool: &str) -> (&'static [&'static str], &'static [&'stat
         "semantic_search_docs" | "semantic_search_with_context" => {
             (&["query", "limit", "threshold", "lang"], &["query"])
         }
-        "search_documents" => (&["query", "collection", "limit"], &["query"]),
+        "search_documents" => (
+            &[
+                "query",
+                "collection",
+                "exclude_collections",
+                "limit",
+                "threshold",
+            ],
+            &["query"],
+        ),
         _ => (&[], &[]),
     }
 }
@@ -848,14 +857,21 @@ pub fn search_documents_data(
     collections: Vec<String>,
     exclude_collections: Vec<String>,
     limit: usize,
+    threshold: Option<f32>,
 ) -> crate::documents::store::StoreResult<Vec<crate::documents::SearchResult>> {
+    // This function only feeds the JSON precompute path, so the preview
+    // must carry no ANSI escapes or `>>`/`<<` markers in `content_preview`.
+    let mut preview_config = settings.documents.search.clone();
+    preview_config.highlight = false;
+
     let search_query = crate::documents::SearchQuery {
         text: query.to_string(),
         collections,
         exclude_collections,
         document: None,
         limit,
-        preview_config: Some(settings.documents.search.clone()),
+        preview_config: Some(preview_config),
+        threshold,
     };
 
     store.search(search_query)

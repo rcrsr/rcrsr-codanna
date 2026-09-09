@@ -32,6 +32,7 @@ upstream base. For the how, see the commit history.
     - [Per-collection default visibility (`default` / `--no-default`)](#per-collection-default-visibility-default----no-default)
     - [Negated glob patterns in collection `patterns`](#negated-glob-patterns-in-collection-patterns)
     - [Multi-select `--collection` / `--exclude-collection`](#multi-select---collection----exclude-collection)
+    - [Input validation, `threshold`, and plain JSON previews](#input-validation-threshold-and-plain-json-previews)
     - [Clarified tool descriptions: `semantic_search_docs` vs `search_documents`](#clarified-tool-descriptions-semantic_search_docs-vs-search_documents)
   - [MCP tool enhancements for agent workflows](#mcp-tool-enhancements-for-agent-workflows)
     - [Structured JSON output (`output_format`)](#structured-json-output-output_format)
@@ -931,6 +932,47 @@ multi-select; a new `exclude_collections` argument (array of strings) is the
 MCP equivalent of `--exclude-collection`. `codanna mcp search_documents` on the
 CLI accepts the same `collection:`/`exclude_collections:` forms, including a
 JSON array value.
+
+### Input validation, `threshold`, and plain JSON previews
+
+`search_documents` (over MCP and via `codanna mcp search_documents`) has a
+stricter, more informative contract for agent callers:
+
+- **Unknown collection names are an input error, not an empty result.** A
+  `collection` or `exclude_collections` entry that names no configured
+  collection returns `code: INVALID_QUERY` with a message naming the bad
+  value and listing the configured collection names. Previously this came
+  back as an ordinary `NOT_FOUND`, indistinguishable from a real miss, so a
+  typo read as "this collection has nothing on that topic". A genuine miss
+  on a known collection is still `NOT_FOUND`.
+- **`limit: 0` is rejected** with `INVALID_QUERY` rather than silently
+  returning zero results. (This is deliberately *not* the `0 = unlimited`
+  convention `get_file_outline`'s `max_results` uses; rejecting the
+  degenerate value fails loudly instead of returning a plausible wrong
+  answer.)
+- **`threshold` (optional, 0-1)** is a minimum similarity score with the same
+  meaning as `semantic_search_docs`'s parameter. Scored hits below it are
+  dropped before `limit` applies; if nothing clears it the result is
+  `status: not_found`. Omit it for the previous behavior. It has no effect on
+  the no-embedding fallback path, which scores every hit at 0.0.
+- **`meta.collections` / `meta.excluded_collections`** on every JSON `success`
+  and `not_found` envelope echo the *resolved* filter — what was actually
+  searched and excluded after `default = false` collections were merged into
+  the exclusions — so a caller can always tell which collections a result
+  (or an empty result) came from.
+- **JSON `content_preview` is plain text.** With `output_format: json`, the
+  KWIC preview carries no ANSI color escapes and no `>>`/`<<` highlight
+  markers; the text-format render keeps them for terminal display. The
+  `[documents.search] highlight` setting still governs the text path.
+
+Validation runs once, before the collection auto-sync and before any
+config-sourced defaults are merged in, and is shared by the MCP tool and the
+CLI JSON path (`DocumentsConfig::validate_search_inputs`). The CLI wrapper's
+argument vocabulary now also accepts `exclude_collections:` and `threshold:`.
+
+Known follow-ups: `codanna documents search --json` (the separate CLI
+subcommand) still emits highlighted previews in its JSON output, and KWIC
+highlighting matches substrings rather than whole words.
 
 ### Clarified tool descriptions: `semantic_search_docs` vs `search_documents`
 

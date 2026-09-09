@@ -76,6 +76,10 @@ pub struct SearchQuery {
     pub limit: usize,
     /// Preview configuration (KWIC, highlighting, etc.).
     pub preview_config: Option<super::config::SearchConfig>,
+    /// Minimum similarity score (0-1). Applies only to the vector-scored
+    /// search branch; the no-embedding fallback (which scores results at
+    /// 0.0) is intentionally unaffected by this filter.
+    pub threshold: Option<f32>,
 }
 
 impl Default for SearchQuery {
@@ -87,6 +91,7 @@ impl Default for SearchQuery {
             document: None,
             limit: 10,
             preview_config: None,
+            threshold: None,
         }
     }
 }
@@ -735,6 +740,9 @@ impl DocumentStore {
         // Sort by similarity (highest first) and limit
         scored_candidates
             .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        if let Some(t) = query.threshold {
+            scored_candidates.retain(|(_, sim)| *sim >= t);
+        }
         scored_candidates.truncate(query.limit);
 
         // Enrich with full metadata and KWIC preview
@@ -1738,6 +1746,86 @@ mod tests {
         }
 
         (store_dir, alpha_dir, beta_dir, gamma_dir, store)
+    }
+
+    /// Builds a store like [`build_three_collection_store`], but with a
+    /// [`crate::vector::MockEmbeddingGenerator`] configured before indexing,
+    /// so `DocumentStore::search` runs the vector-scored branch (rather than
+    /// the no-embedding `enrich_results` fallback) and `SearchQuery::threshold`
+    /// filtering applies.
+    fn build_three_collection_store_with_embeddings()
+    -> (TempDir, TempDir, TempDir, TempDir, DocumentStore) {
+        use crate::documents::config::{ChunkingConfig, CollectionConfig};
+        use crate::vector::MockEmbeddingGenerator;
+
+        let store_dir = TempDir::new().unwrap();
+        let alpha_dir = TempDir::new().unwrap();
+        let beta_dir = TempDir::new().unwrap();
+        let gamma_dir = TempDir::new().unwrap();
+
+        let body = "# Heading\n\n".to_string()
+            + &"This document discusses lorem ipsum content padded above the minimum chunk size threshold. "
+                .repeat(8);
+        std::fs::write(alpha_dir.path().join("a1.md"), &body).unwrap();
+        std::fs::write(beta_dir.path().join("b1.md"), &body).unwrap();
+        std::fs::write(gamma_dir.path().join("g1.md"), &body).unwrap();
+
+        let chunking = ChunkingConfig::default();
+        let mut store = DocumentStore::new(store_dir.path(), test_dimension())
+            .unwrap()
+            .with_embeddings(Box::new(MockEmbeddingGenerator::with_dimension(
+                test_dimension(),
+            )))
+            .unwrap();
+
+        for (name, dir) in [
+            ("alpha", &alpha_dir),
+            ("beta", &beta_dir),
+            ("gamma", &gamma_dir),
+        ] {
+            let cfg = CollectionConfig {
+                paths: vec![dir.path().to_path_buf()],
+                patterns: vec!["**/*.md".to_string()],
+                ..Default::default()
+            };
+            store.index_collection(name, &cfg, &chunking).unwrap();
+        }
+
+        (store_dir, alpha_dir, beta_dir, gamma_dir, store)
+    }
+
+    #[test]
+    fn test_search_threshold_filters_low_similarity_results() {
+        let (_store_dir, _alpha_dir, _beta_dir, _gamma_dir, store) =
+            build_three_collection_store_with_embeddings();
+
+        // A threshold above the maximum possible cosine similarity (1.0)
+        // must drop every candidate, regardless of match quality.
+        let high_threshold_query = SearchQuery {
+            text: "lorem".to_string(),
+            limit: 100,
+            threshold: Some(1.5),
+            ..Default::default()
+        };
+        let results = store.search(high_threshold_query).unwrap();
+        assert!(
+            results.is_empty(),
+            "threshold above 1.0 must drop all results, got: {results:?}"
+        );
+
+        // A threshold below the minimum possible cosine similarity (-1.0)
+        // must keep every candidate that would otherwise be returned.
+        let low_threshold_query = SearchQuery {
+            text: "lorem".to_string(),
+            limit: 100,
+            threshold: Some(-1.5),
+            ..Default::default()
+        };
+        let results = store.search(low_threshold_query).unwrap();
+        assert!(
+            !results.is_empty(),
+            "threshold below -1.0 must not drop any results"
+        );
     }
 
     #[test]

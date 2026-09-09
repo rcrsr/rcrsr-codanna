@@ -165,6 +165,7 @@ pub fn run(action: DocumentAction, config: &Settings, cli_config: Option<&PathBu
                 document: None,
                 limit: final_limit,
                 preview_config: Some(config.documents.search.clone()),
+                threshold: None,
             };
 
             let start = Instant::now();
