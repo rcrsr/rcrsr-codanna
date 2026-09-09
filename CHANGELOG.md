@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0+rcrsr.5] - 2026-09-09
+
 ### Added
 
 - **`search_documents` relevance threshold:** the MCP tool (and `codanna mcp search_documents threshold:<score>`) now accepts an optional `threshold`, a minimum cosine similarity score (range [-1, 1], same metric `semantic_search_docs` uses). Scored results below it are dropped before `limit` applies, and an empty result after the cut returns `status: not_found`, so a caller can tell "nothing relevant" from "best of a bad lot". Omitting `threshold` reproduces the previous behavior exactly. The no-embedding fallback path (which scores every hit at 0.0) is unaffected. ([#65](https://github.com/rcrsr/rcrsr-codanna/issues/65)) ([#81](https://github.com/rcrsr/rcrsr-codanna/pull/81))
