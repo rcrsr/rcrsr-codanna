@@ -351,6 +351,10 @@ pub async fn serve_https(config: crate::Settings, watch: bool, bind: String) -> 
                 port: actual_port,
                 scheme: crate::serve_discovery::ServeScheme::Https,
                 token: Some(launch_token.clone()),
+                // Workspace-identity capture (dev/ino) for the disappeared-workspace
+                // self-check is implemented for `serve --http` only; out of scope here.
+                workspace_dev: None,
+                workspace_ino: None,
             };
             if let Err(e) = crate::serve_discovery::write_record(codanna_dir, &serve_record) {
                 tracing::warn!(target: "mcp", "failed to write serve discovery record: {e}");

@@ -18,6 +18,18 @@ mod test_serve_proxy_discovery;
 #[path = "cli/test_idle_shutdown.rs"]
 mod test_idle_shutdown;
 
+#[path = "cli/test_serve_registry.rs"]
+mod test_serve_registry;
+
+#[path = "cli/test_spawn_timeout_dedup.rs"]
+mod test_spawn_timeout_dedup;
+
+#[path = "cli/test_workspace_disappears.rs"]
+mod test_workspace_disappears;
+
+#[path = "cli/test_backing_reap.rs"]
+mod test_backing_reap;
+
 #[path = "cli/test_mcp_exit_code_matrix.rs"]
 mod test_mcp_exit_code_matrix;
 

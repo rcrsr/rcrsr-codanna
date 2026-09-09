@@ -27,6 +27,22 @@ fn unix_now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Captures the workspace root's filesystem device + inode, so a later poll
+/// can tell "deleted and recreated" (new inode) apart from "renamed" (same
+/// inode, different path -- must NOT trigger a shutdown). Unix only: on other
+/// platforms there is no portable device/inode equivalent, so this returns
+/// `None` and the periodic self-check falls back to a plain existence check.
+#[cfg(all(feature = "http-server", unix))]
+fn workspace_identity(root: &std::path::Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(root).ok().map(|m| (m.dev(), m.ino()))
+}
+
+#[cfg(all(feature = "http-server", not(unix)))]
+fn workspace_identity(_root: &std::path::Path) -> Option<(u64, u64)> {
+    None
+}
+
 /// Whether an inbound request to the protected `/mcp` router should reset
 /// the idle-activity clock. Only JSON-RPC calls (POST) count; GET
 /// (SSE stream open/reconnect) and DELETE (session teardown) reach the same
@@ -53,25 +69,86 @@ fn idle_timeout_exceeded(
     std::time::Duration::from_secs(now_secs.saturating_sub(last_activity_secs)) >= idle_threshold
 }
 
-/// Polls `last_activity` every `poll_interval` until `idle_threshold` has
-/// elapsed since the last recorded activity, then returns. Kept private and
-/// parameterized on both `Duration`s (rather than hardcoding real-world
-/// `idle_shutdown_minutes`-scale values) so unit tests can inject
-/// millisecond-scale thresholds/intervals instead of waiting minutes for a
-/// real idle timeout to fire.
+/// Which of the two independent periodic self-checks fired.
 #[cfg(feature = "http-server")]
-async fn wait_for_idle(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShutdownTrigger {
+    /// The workspace root no longer exists, or (Unix only) still exists at
+    /// that path but is no longer the same filesystem object (deleted and
+    /// recreated, or replaced) that was there at startup.
+    WorkspaceGone,
+    /// `idle_shutdown_minutes` was configured (> 0) and that many minutes
+    /// have elapsed since the last recorded `/mcp` activity.
+    Idle,
+}
+
+/// Whether the workspace root the server was launched against is gone, per
+/// the same identity `wait_for_workspace_or_idle` was seeded with at
+/// startup. A plain "does the path still exist" failure counts, and (Unix
+/// only) so does "the path exists but names a different filesystem object
+/// now" -- which catches delete-then-recreate at the same path, a case a
+/// bare `Path::exists()` check would miss. Deliberately does NOT compare a
+/// renamed directory as gone: a rename changes the path a *different* root
+/// would be checked at, but this function is always called with the single
+/// path the server was launched against, and renaming that specific
+/// directory to a new name preserves its device/inode, so the identity
+/// comparison here still matches and no shutdown is triggered by a rename
+/// alone (only by moving/replacing what lives at the original path).
+#[cfg(feature = "http-server")]
+fn workspace_is_gone(
+    workspace_root: &std::path::Path,
+    workspace_dev: Option<u64>,
+    workspace_ino: Option<u64>,
+) -> bool {
+    // Referenced only inside the `#[cfg(unix)]` arm below; touched
+    // unconditionally here (both are `Copy`, so this is not a move) so the
+    // non-Unix build does not warn about unused parameters.
+    let _ = (workspace_dev, workspace_ino);
+    match std::fs::metadata(workspace_root) {
+        Err(_) => true,
+        #[cfg(unix)]
+        Ok(meta) => {
+            use std::os::unix::fs::MetadataExt;
+            workspace_dev.is_some_and(|dev| dev != meta.dev())
+                || workspace_ino.is_some_and(|ino| ino != meta.ino())
+        }
+        #[cfg(not(unix))]
+        Ok(_meta) => false,
+    }
+}
+
+/// Polls, on one shared cadence, for either of two independent shutdown
+/// triggers: the workspace root disappearing, or (only when `idle_minutes >
+/// 0`) the idle threshold being exceeded. Deliberately independent checks --
+/// with `idle_shutdown_minutes = 0` (a valid, supported setting that
+/// disables the idle timer) the workspace-disappeared check must still fire;
+/// piggybacking it on the idle gate would silently disable both together.
+#[cfg(feature = "http-server")]
+async fn wait_for_workspace_or_idle(
+    workspace_root: Option<&std::path::Path>,
+    workspace_dev: Option<u64>,
+    workspace_ino: Option<u64>,
     last_activity: &std::sync::atomic::AtomicU64,
     idle_threshold: std::time::Duration,
+    idle_minutes: u64,
     poll_interval: std::time::Duration,
-) {
+) -> ShutdownTrigger {
     let mut ticker = tokio::time::interval(poll_interval);
     loop {
         ticker.tick().await;
-        let now = unix_now_secs();
-        let last = last_activity.load(std::sync::atomic::Ordering::Relaxed);
-        if idle_timeout_exceeded(now, last, idle_threshold) {
-            return;
+
+        if let Some(root) = workspace_root
+            && workspace_is_gone(root, workspace_dev, workspace_ino)
+        {
+            return ShutdownTrigger::WorkspaceGone;
+        }
+
+        if idle_minutes > 0 {
+            let now = unix_now_secs();
+            let last = last_activity.load(std::sync::atomic::Ordering::Relaxed);
+            if idle_timeout_exceeded(now, last, idle_threshold) {
+                return ShutdownTrigger::Idle;
+            }
         }
     }
 }
@@ -534,11 +611,35 @@ pub async fn serve_http(config: crate::Settings, watch: bool, bind: String) -> a
     }
 
     // Helper function for shutdown signal with cancellation token
+    // Also listens for SIGTERM on Unix (in addition to Ctrl+C/SIGINT) so
+    // `codanna serve --stop <pid>` -- which sends SIGTERM by default, only
+    // escalating to SIGKILL with `--force` -- reaches this SAME graceful
+    // shutdown arm, and therefore the SAME `remove_record`/
+    // `serve_registry::remove_entry` cleanup Ctrl+C already triggers.
+    // Without this, the default (unhandled) disposition of SIGTERM is
+    // immediate termination, which would skip this `select!` entirely and
+    // leave both the discovery record and the registry entry behind.
+    #[cfg(unix)]
+    async fn shutdown_signal() {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("Received shutdown signal (Ctrl+C)");
+            }
+            _ = sigterm.recv() => {
+                eprintln!("Received shutdown signal (SIGTERM)");
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
     async fn shutdown_signal() {
         tokio::signal::ctrl_c()
             .await
             .expect("failed to listen for ctrl+c");
-        eprintln!("Received shutdown signal");
+        eprintln!("Received shutdown signal (Ctrl+C)");
     }
 
     // Bearer token validation middleware - only for MCP endpoints
@@ -602,11 +703,38 @@ pub async fn serve_http(config: crate::Settings, watch: bool, bind: String) -> a
     // here, not derived from the pid/port/anything else an observer could
     // predict -- see `serve_discovery::generate_launch_token`'s doc comment.
     let launch_token = crate::serve_discovery::generate_launch_token();
+
+    // Resolved once, up front, so both the `/health` response headers and the
+    // `ServeRecord` written below (and the periodic workspace-disappeared
+    // self-check further down) agree on the exact same workspace root and
+    // captured identity.
+    let workspace_root = crate::serve_discovery::resolve_workspace_root(&config);
+    let (workspace_dev, workspace_ino): (Option<u64>, Option<u64>) = workspace_root
+        .as_ref()
+        .and_then(|root| workspace_identity(root))
+        .unzip();
+
+    // The `/health` body MUST remain the bare launch token -- `check_health`
+    // asserts `body.trim() == expected_token` verbatim. Workspace identity is
+    // exposed via response headers instead, never folded into the body.
     let health_check = {
         let launch_token = launch_token.clone();
         move || {
             let launch_token = launch_token.clone();
-            async move { launch_token }
+            async move {
+                let mut headers = axum::http::HeaderMap::new();
+                if let Some(dev) = workspace_dev {
+                    if let Ok(value) = axum::http::HeaderValue::from_str(&dev.to_string()) {
+                        headers.insert("x-codanna-workspace-dev", value);
+                    }
+                }
+                if let Some(ino) = workspace_ino {
+                    if let Ok(value) = axum::http::HeaderValue::from_str(&ino.to_string()) {
+                        headers.insert("x-codanna-workspace-ino", value);
+                    }
+                }
+                (headers, launch_token)
+            }
         }
     };
 
@@ -642,8 +770,14 @@ pub async fn serve_http(config: crate::Settings, watch: bool, bind: String) -> a
     // `index_path` may be absolute or resolved relative to a `--config`
     // file's parent (`init::resolve_index_path`), so it can diverge from
     // `.codanna` in exactly the cases `discover_or_spawn` relies on.
-    let codanna_dir = crate::serve_discovery::resolve_workspace_root(&config)
-        .map(|root| crate::serve_discovery::discovery_dir(&root));
+    //
+    // `workspace_root`/`workspace_dev`/`workspace_ino` were already resolved
+    // above (before `health_check` was built); reused here so the record
+    // written to disk and the runtime self-check below agree with what
+    // `/health` reports.
+    let codanna_dir = workspace_root
+        .as_ref()
+        .map(|root| crate::serve_discovery::discovery_dir(root));
 
     match &codanna_dir {
         Some(codanna_dir) => {
@@ -652,6 +786,8 @@ pub async fn serve_http(config: crate::Settings, watch: bool, bind: String) -> a
                 port: actual_port,
                 scheme: crate::serve_discovery::ServeScheme::Http,
                 token: Some(launch_token.clone()),
+                workspace_dev,
+                workspace_ino,
             };
             if let Err(e) = crate::serve_discovery::write_record(codanna_dir, &serve_record) {
                 tracing::warn!(target: "mcp", "failed to write serve discovery record: {e}");
@@ -668,6 +804,26 @@ pub async fn serve_http(config: crate::Settings, watch: bool, bind: String) -> a
                  `codanna serve --proxy` cannot discover this server. Run `codanna init` in the project root."
             );
         }
+    }
+
+    // Publish this server to the per-user server registry
+    // (`crate::serve_registry`), independent of whether a per-workspace
+    // `.codanna` discovery record could be written above: `codanna serve
+    // --list/--stop/--reap` must be able to see and manage this server even
+    // for a workspace with no `.codanna` directory.
+    let registry_workspace_root = workspace_root
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let registry_entry = crate::serve_registry::RegistryEntry {
+        pid: std::process::id(),
+        port: actual_port,
+        scheme: crate::serve_discovery::ServeScheme::Http,
+        workspace_root: registry_workspace_root,
+        start_time: unix_now_secs(),
+        status: crate::serve_registry::ServerStatus::Healthy,
+    };
+    if let Err(e) = crate::serve_registry::write_entry(&registry_entry) {
+        tracing::warn!(target: "mcp", "failed to write server registry entry: {e}");
     }
 
     // Create server future
@@ -697,6 +853,7 @@ pub async fn serve_http(config: crate::Settings, watch: bool, bind: String) -> a
             if let Some(codanna_dir) = &codanna_dir {
                 crate::serve_discovery::remove_record(codanna_dir);
             }
+            crate::serve_registry::remove_entry(std::process::id());
             result?;
         }
         _ = shutdown_signal() => {
@@ -705,17 +862,42 @@ pub async fn serve_http(config: crate::Settings, watch: bool, bind: String) -> a
             if let Some(codanna_dir) = &codanna_dir {
                 crate::serve_discovery::remove_record(codanna_dir);
             }
+            crate::serve_registry::remove_entry(std::process::id());
         }
-        // Respawn after idle exit is already handled by discover_or_spawn
-        // once serve.json is gone: removing the record here (before
-        // exiting) makes this backing server undiscoverable, so the next
-        // `discover_or_spawn` call for this workspace spawns a fresh one.
-        _ = wait_for_idle(&last_activity, idle_threshold, idle_poll_interval), if idle_minutes > 0 => {
-            eprintln!("Shutting down HTTP server after {idle_minutes} minute(s) of inactivity...");
+        // Respawn after either self-exit is already handled by
+        // discover_or_spawn once serve.json is gone: removing the record
+        // here (before exiting) makes this backing server undiscoverable,
+        // so the next `discover_or_spawn` call for this workspace spawns a
+        // fresh one.
+        //
+        // Gated on `idle_minutes > 0 OR a workspace root was resolved` --
+        // deliberately NOT solely on `idle_minutes > 0` -- so the
+        // workspace-disappeared check still runs when idle-shutdown is
+        // disabled (`idle_shutdown_minutes = 0`, a valid setting). The two
+        // triggers inside `wait_for_workspace_or_idle` remain independent:
+        // idle-shutdown being off never suppresses the workspace check.
+        trigger = wait_for_workspace_or_idle(
+            workspace_root.as_deref(),
+            workspace_dev,
+            workspace_ino,
+            &last_activity,
+            idle_threshold,
+            idle_minutes,
+            idle_poll_interval,
+        ), if idle_minutes > 0 || workspace_root.is_some() => {
+            match trigger {
+                ShutdownTrigger::WorkspaceGone => {
+                    eprintln!("Shutting down HTTP server: workspace root no longer exists...");
+                }
+                ShutdownTrigger::Idle => {
+                    eprintln!("Shutting down HTTP server after {idle_minutes} minute(s) of inactivity...");
+                }
+            }
             ct.cancel();
             if let Some(codanna_dir) = &codanna_dir {
                 crate::serve_discovery::remove_record(codanna_dir);
             }
+            crate::serve_registry::remove_entry(std::process::id());
         }
     }
 
@@ -737,7 +919,10 @@ pub async fn serve_http(
 #[cfg(all(test, feature = "http-server"))]
 mod tests {
     use super::is_authorized;
-    use super::{idle_timeout_exceeded, should_stamp_activity, unix_now_secs, wait_for_idle};
+    use super::{
+        ShutdownTrigger, idle_timeout_exceeded, should_stamp_activity, unix_now_secs,
+        wait_for_workspace_or_idle,
+    };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::Duration;
@@ -811,35 +996,43 @@ mod tests {
         assert!(!idle_timeout_exceeded(5, 100, Duration::from_secs(10)));
     }
 
-    /// Exercises the private `wait_for_idle` seam directly with
+    /// Exercises the private `wait_for_workspace_or_idle` seam directly with
     /// millisecond-scale injected `Duration`s -- proving the loop actually
     /// resolves once the threshold is exceeded, without waiting on a real
-    /// `idle_shutdown_minutes`-scale (whole-minute) timeout.
+    /// `idle_shutdown_minutes`-scale (whole-minute) timeout. `workspace_root`
+    /// is `None` so only the idle trigger is exercised here.
     #[tokio::test]
     async fn wait_for_idle_resolves_once_threshold_elapses() {
         // Recorded activity far enough in the past that even the very first
         // poll tick observes the threshold as exceeded.
         let last_activity = AtomicU64::new(0);
 
-        tokio::time::timeout(
+        let trigger = tokio::time::timeout(
             Duration::from_millis(500),
-            wait_for_idle(
+            wait_for_workspace_or_idle(
+                None,
+                None,
+                None,
                 &last_activity,
                 Duration::from_millis(1),
+                1,
                 Duration::from_millis(10),
             ),
         )
         .await
         .expect(
-            "wait_for_idle should resolve well within the timeout once the threshold is exceeded",
+            "wait_for_workspace_or_idle should resolve well within the timeout once the \
+             threshold is exceeded",
         );
+        assert_eq!(trigger, ShutdownTrigger::Idle);
     }
 
     /// Complement of the resolves-once-idle test: proves ongoing activity
     /// actually holds the idle timer off. A concurrent stamper refreshes
     /// `last_activity` to "now" on a tight cadence -- exactly what the
     /// `stamp_activity` middleware does on each inbound POST /mcp -- and
-    /// `wait_for_idle` must NOT resolve while that traffic continues. A timer
+    /// `wait_for_workspace_or_idle` must NOT resolve while that traffic
+    /// continues. A timer
     /// that ignored `last_activity` would fire at the threshold regardless and
     /// fail this test; a correct one, re-reading the refreshed timestamp on
     /// every poll, keeps waiting for the full window.
@@ -867,11 +1060,16 @@ mod tests {
 
         // Poll for 2.2s -- past the 2s threshold, so a timer ignoring
         // `last_activity` would resolve -- and require that it does not.
+        // `workspace_root` is `None` so only the idle trigger is exercised.
         let result = tokio::time::timeout(
             Duration::from_millis(2200),
-            wait_for_idle(
+            wait_for_workspace_or_idle(
+                None,
+                None,
+                None,
                 &last_activity,
                 Duration::from_secs(2),
+                1,
                 Duration::from_millis(25),
             ),
         )
@@ -882,7 +1080,7 @@ mod tests {
 
         assert!(
             result.is_err(),
-            "wait_for_idle must not resolve while activity is continuously refreshed"
+            "wait_for_workspace_or_idle must not resolve while activity is continuously refreshed"
         );
     }
 }

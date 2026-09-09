@@ -24,6 +24,7 @@ pub mod relationship;
 pub mod retrieve;
 pub mod semantic;
 pub mod serve_discovery;
+pub mod serve_registry;
 pub mod serve_tls;
 pub mod storage;
 pub mod symbol;
