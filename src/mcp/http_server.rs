@@ -830,6 +830,7 @@ pub async fn serve_http(config: crate::Settings, watch: bool, bind: String) -> a
         start_time: unix_now_secs(),
         status: crate::serve_registry::ServerStatus::Healthy,
         role: crate::serve_registry::ServerRole::Server,
+        version: env!("CARGO_PKG_VERSION").to_string(),
     };
     if let Err(e) = crate::serve_registry::write_entry(&registry_entry) {
         tracing::warn!(target: "mcp", "failed to write server registry entry: {e}");

@@ -296,6 +296,7 @@ pub enum Commands {
             long,
             value_name = "PID_OR_WORKSPACE",
             conflicts_with_all = ["http", "https", "proxy", "bind"],
+            group = "stop_or_kill_all",
             help = "Stop a registered server, identified by pid or workspace-root path (SIGTERM unless --force)"
         )]
         stop: Option<String>,
@@ -308,11 +309,38 @@ pub enum Commands {
         )]
         reap: bool,
 
-        /// Send SIGKILL instead of SIGTERM when used with --stop
+        /// Stop every registered server instead of starting one
         #[arg(
             long,
-            requires = "stop",
-            help = "With --stop, send SIGKILL instead of the default SIGTERM"
+            conflicts_with_all = ["http", "https", "proxy", "bind"],
+            conflicts_with = "stop",
+            group = "stop_or_kill_all",
+            help = "Stop every registered server (SIGTERM unless --force); pass --include-proxies to also stop registered proxies"
+        )]
+        kill_all: bool,
+
+        /// With --kill-all, also stop registered proxies (not just backing servers)
+        #[arg(
+            long,
+            requires = "kill_all",
+            // Belt-and-suspenders: `kill_all` itself has `conflicts_with =
+            // "stop"`, and when `--stop` is present clap treats `kill_all`
+            // as blocked and silently skips validating `requires` against
+            // it -- so without this explicit conflict, `--stop
+            // --include-proxies` would parse successfully with
+            // `include_proxies == true` but `kill_all == false`, making
+            // `--include-proxies` a silent no-op under `--stop` instead of
+            // a rejected combination.
+            conflicts_with = "stop",
+            help = "With --kill-all, also stop registered proxies, not just backing servers"
+        )]
+        include_proxies: bool,
+
+        /// Send SIGKILL instead of SIGTERM when used with --stop or --kill-all
+        #[arg(
+            long,
+            requires = "stop_or_kill_all",
+            help = "With --stop or --kill-all, send SIGKILL instead of the default SIGTERM"
         )]
         force: bool,
 

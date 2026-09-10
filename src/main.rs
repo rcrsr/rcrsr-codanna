@@ -237,6 +237,7 @@ fn is_serve_management_op(command: &Commands) -> bool {
         Commands::Serve { list: true, .. }
             | Commands::Serve { stop: Some(_), .. }
             | Commands::Serve { reap: true, .. }
+            | Commands::Serve { kill_all: true, .. }
     )
 }
 
@@ -327,7 +328,7 @@ async fn main() {
     let needs_providers = !matches!(
         &cli.command,
         Commands::Parse { .. } | Commands::McpTest { .. } | Commands::Benchmark { .. }
-    );
+    ) && !is_serve_management_op(&cli.command);
 
     let needs_indexer = !matches!(
         &cli.command,
@@ -872,6 +873,8 @@ async fn main() {
             list,
             stop,
             reap,
+            kill_all,
+            include_proxies,
             force,
             include_rogue,
         } => {
@@ -897,6 +900,8 @@ async fn main() {
                     list,
                     stop,
                     reap,
+                    kill_all,
+                    include_proxies,
                     force,
                     include_rogue,
                 },
@@ -1164,6 +1169,8 @@ mod is_proxy_serve_tests {
             list: false,
             stop: None,
             reap: false,
+            kill_all: false,
+            include_proxies: false,
             force: false,
             include_rogue: false,
         }

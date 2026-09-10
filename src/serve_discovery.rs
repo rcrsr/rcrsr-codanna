@@ -1162,6 +1162,11 @@ pub async fn discover_or_spawn(
                 start_time: unix_now_secs(),
                 status: crate::serve_registry::ServerStatus::Spawning,
                 role: crate::serve_registry::ServerRole::Server,
+                // Transient value: this Spawning entry is overwritten by the
+                // child's own Healthy entry (see the comment above) once it
+                // finishes starting up, so a version mismatch here is not
+                // itself a signal of anything.
+                version: env!("CARGO_PKG_VERSION").to_string(),
             };
             if let Err(e) = crate::serve_registry::write_entry(&spawning_entry) {
                 tracing::warn!(
