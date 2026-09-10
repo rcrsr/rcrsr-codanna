@@ -194,6 +194,10 @@ fn kill_pid_externally(pid: u32) {
 /// `entry_is_stale`. `SIGKILL` (used by `Reaper`'s teardown) still terminates
 /// a stopped process immediately, since `SIGKILL` cannot be blocked or
 /// ignored even while stopped.
+///
+/// `SIGSTOP` is Unix-specific, so this helper (and the test that relies on
+/// it to force a genuine in-loop timeout) is gated to Unix targets.
+#[cfg(unix)]
 fn stop_pid_externally(pid: u32) {
     let target = Pid::from_u32(pid);
     let mut sys = System::new();
@@ -878,6 +882,7 @@ fn kill_all_continues_past_a_dead_target() {
 /// second target that does stop cleanly. `--kill-all` must still attempt and
 /// report on the second target rather than aborting the sweep on the first
 /// target's failure.
+#[cfg(unix)]
 #[test]
 fn kill_all_continues_past_an_unresponsive_live_target() {
     let workspace = prepare_workspace();

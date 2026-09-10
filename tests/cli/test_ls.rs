@@ -243,8 +243,14 @@ fn empty_registry_never_reports_a_registered_row() {
         code, 0,
         "codanna ls should succeed against an empty registry\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
+    // The empty-registry summary sentence itself contains the word
+    // "registered" ("No running codanna servers registered."), so it must be
+    // stripped before checking for an actual registered *row* (a table row
+    // whose SOURCE column reads "registered") -- otherwise this assertion
+    // would fail even on the correct, expected empty output.
+    let stdout_without_summary = stdout.replace("No running codanna servers registered.", "");
     assert!(
-        !stdout.to_lowercase().contains("registered"),
+        !stdout_without_summary.to_lowercase().contains("registered"),
         "codanna ls must not report any registered row when this test's own isolated registry \
          root is empty, got:\n{stdout}"
     );

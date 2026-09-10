@@ -223,8 +223,8 @@ fn is_proxy_serve(command: &Commands, config: &Settings) -> bool {
 }
 
 /// Resolve whether a `Commands::Serve` invocation is a registry lifecycle
-/// operation (`--list`/`--stop`/`--reap`) rather than a request to start a
-/// server.
+/// operation (`--list`/`--stop`/`--reap`/`--kill-all`) rather than a request
+/// to start a server.
 ///
 /// These operations only ever read/write the per-user server registry
 /// (`src/serve_registry.rs`); they never load an `IndexFacade`, exactly like

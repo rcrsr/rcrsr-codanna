@@ -219,6 +219,10 @@ fn kind_from_cmd(cmd: &[std::ffi::OsString]) -> RowKind {
 /// - `"-"` -- `current_exe` itself could not be resolved, so no comparison
 ///   is possible.
 ///
+/// `current_exe` must already be canonicalized by the caller: `build_rows`
+/// resolves it once (alongside `std::env::current_exe()`) rather than
+/// re-canonicalizing it on every rogue row this function is called for.
+///
 /// Split out as a pure function (mirrors `render`/`process_is_codanna_serve`)
 /// so every outcome can be exercised directly against synthetic paths in
 /// tests, without depending on a live process scan.
@@ -232,14 +236,13 @@ fn classify_rogue_version(rogue_exe: Option<&Path>, current_exe: Option<&Path>) 
     let Some(current_exe) = current_exe else {
         return "-";
     };
-    match (rogue_exe.canonicalize(), current_exe.canonicalize()) {
-        (Ok(rogue), Ok(current)) if rogue == current => "same",
-        (Ok(_), Ok(_)) => "other",
+    match rogue_exe.canonicalize() {
+        Ok(rogue) if rogue == current_exe => "same",
+        Ok(_) => "other",
         // The rogue path no longer resolves on disk: the binary was removed
         // out from under the running process (same situation as the
         // `(deleted)` marker, just without the marker).
-        (Err(_), _) => "deleted",
-        (Ok(_), Err(_)) => "-",
+        Err(_) => "deleted",
     }
 }
 
@@ -328,7 +331,9 @@ fn build_rows() -> Vec<Row> {
     rogue_pids.sort_unstable();
     rogue_pids.dedup();
 
-    let current_exe = std::env::current_exe().ok();
+    let current_exe = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.canonicalize().ok());
 
     for pid in rogue_pids {
         let (workspace, port, scheme, kind, rogue_exe) = resolve_rogue(pid);
@@ -515,13 +520,19 @@ mod tests {
 
     #[test]
     fn classify_rogue_version_equal_canonical_paths_are_same() {
-        let exe = std::env::current_exe().expect("test binary must have a resolvable exe path");
+        let exe = std::env::current_exe()
+            .and_then(|exe| exe.canonicalize())
+            .expect("test binary must have a resolvable, canonicalizable exe path");
         assert_eq!(classify_rogue_version(Some(&exe), Some(&exe)), "same");
     }
 
     #[test]
     fn classify_rogue_version_differing_resolvable_paths_are_other() {
-        let current = std::env::current_exe().expect("test binary must have a resolvable exe path");
+        // `current_exe` is expected pre-canonicalized by the caller; mirror
+        // that here rather than relying on `classify_rogue_version` to do it.
+        let current = std::env::current_exe()
+            .and_then(|exe| exe.canonicalize())
+            .expect("test binary must have a resolvable, canonicalizable exe path");
         // /bin/sh and /bin exist on essentially every Linux/macOS test host,
         // and neither canonicalizes to the test binary's own exe path.
         assert_eq!(

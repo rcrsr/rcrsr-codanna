@@ -165,6 +165,11 @@ pub async fn run(
 /// requested operation in turn (reap, then stop, then kill-all, then list) so
 /// `--stop --list` reflects the post-stop state, `--reap --list` reflects the
 /// post-reap state, and `--kill-all --list` reflects the post-kill-all state.
+///
+/// `kill_all_servers` reports its outcome instead of exiting the process
+/// directly, so `--list` still runs (and reflects the post-sweep state) even
+/// when a `--kill-all` target failed to stop; the failure is only turned
+/// into a nonzero exit code after every requested step has run.
 async fn run_registry_management(
     list: bool,
     stop: Option<String>,
@@ -180,11 +185,16 @@ async fn run_registry_management(
     if let Some(selector) = stop {
         stop_server(&selector, force, include_rogue).await;
     }
-    if kill_all {
-        kill_all_servers(force, include_proxies).await;
-    }
+    let kill_all_succeeded = if kill_all {
+        Some(kill_all_servers(force, include_proxies).await)
+    } else {
+        None
+    };
     if list {
         print_registry_list();
+    }
+    if kill_all_succeeded == Some(false) {
+        std::process::exit(1);
     }
 }
 
@@ -415,9 +425,18 @@ async fn stop_server(selector: &str, force: bool, include_rogue: bool) {
 /// targeted; `include_proxies` additionally targets `ServerRole::Proxy`
 /// entries. Every target is attempted even if an earlier one fails or times
 /// out (§BASIC.12.1: bounded fail-fast -- report every failure, but never
-/// abort the sweep on the first one); the aggregate exit code is 0 only if
-/// every target stopped, 1 if any did not.
-async fn kill_all_servers(force: bool, include_proxies: bool) {
+/// abort the sweep on the first one).
+///
+/// Every target is signaled first (re-validating its identity immediately
+/// before its own signal, since an earlier target's signal may have taken
+/// time), then every signaled target is polled for exit *concurrently*, so
+/// one unresponsive target cannot push the sweep's wall-clock time past a
+/// single `wait_for_exit` deadline.
+///
+/// Returns whether every target stopped (`true`) or at least one did not
+/// (`false`), so the caller can run any remaining requested steps (e.g.
+/// `--list`) before turning a failure into a nonzero exit code.
+async fn kill_all_servers(force: bool, include_proxies: bool) -> bool {
     let targets: Vec<u32> = crate::serve_registry::list_entries()
         .into_iter()
         .filter(|entry| !crate::serve_registry::entry_is_stale(entry))
@@ -426,37 +445,59 @@ async fn kill_all_servers(force: bool, include_proxies: bool) {
         .collect();
 
     if targets.is_empty() {
-        eprintln!("No registered servers to stop.");
-        return;
+        let hint = if include_proxies {
+            "run `codanna serve --reap` to prune stale entries"
+        } else {
+            "run `codanna serve --reap` to prune stale entries, or pass --include-proxies to \
+             also target registered proxies"
+        };
+        eprintln!("No live registered servers to stop ({hint}).");
+        return true;
     }
 
     let mut any_failed = false;
+    let mut signaled = Vec::with_capacity(targets.len());
     for pid in targets {
-        if !kill_one_registered_target(pid, force).await {
+        if kill_one_registered_target(pid, force) {
+            signaled.push(pid);
+        } else {
             any_failed = true;
         }
     }
 
-    if any_failed {
-        std::process::exit(1);
+    let mut waits = tokio::task::JoinSet::new();
+    for pid in signaled {
+        waits.spawn(wait_for_registered_target(pid, force));
     }
+    while let Some(result) = waits.join_next().await {
+        match result {
+            Ok(exited) => any_failed |= !exited,
+            Err(_) => any_failed = true,
+        }
+    }
+
+    !any_failed
 }
 
-/// Signal one already-resolved registered pid (SIGTERM, or SIGKILL with
-/// `force`), then poll for it to exit -- the same signal-then-wait sequence
-/// `stop_server` uses -- and report the outcome in the same message shape,
-/// returning whether this target ended up stopped rather than exiting the
-/// process, so `kill_all_servers` can attempt every target regardless of any
-/// one target's outcome.
-async fn kill_one_registered_target(pid: u32, force: bool) -> bool {
-    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System};
+/// Re-validate one already-selected registered pid's identity, then signal
+/// it (SIGTERM, or SIGKILL with `force`) -- the same signal step
+/// `stop_server` uses -- sharing a single process-table refresh across the
+/// identity check and the signal send rather than scanning twice.
+///
+/// The identity re-check happens immediately before signaling (mirroring
+/// `stop_server`'s tight check-then-use adjacency) because, in
+/// `kill_all_servers`'s sequential signal pass, a pid selected by the
+/// up-front filter may no longer be a live codanna server by the time its
+/// turn comes.
+fn kill_one_registered_target(pid: u32, force: bool) -> bool {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System, UpdateKind};
 
     let mut sys = System::new();
     let target = Pid::from_u32(pid);
     sys.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[target]),
         true,
-        ProcessRefreshKind::nothing(),
+        ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
     );
 
     let Some(process) = sys.process(target) else {
@@ -466,20 +507,34 @@ async fn kill_one_registered_target(pid: u32, force: bool) -> bool {
         return false;
     };
 
+    if !crate::io::process::process_looks_like_codanna_serve(process) {
+        eprintln!(
+            "pid {pid} no longer looks like a codanna serve process; skipping (its registry \
+             entry may be stale; try --reap)."
+        );
+        return false;
+    }
+
     let signal = if force { Signal::Kill } else { Signal::Term };
     match send_signal(process, signal) {
-        SignalOutcome::Sent => {}
+        SignalOutcome::Sent => true,
         SignalOutcome::SendFailed => {
             let name = if force { "SIGKILL" } else { "SIGTERM" };
             eprintln!("Failed to send {name} to pid {pid}.");
-            return false;
+            false
         }
         SignalOutcome::UnsupportedPlatform => {
             eprintln!("Sending signals is not supported on this platform (pid {pid}).");
-            return false;
+            false
         }
     }
+}
 
+/// Poll one already-signaled registered pid for exit and report the outcome
+/// in the same message shape `stop_server` uses, returning whether this
+/// target ended up stopped -- so `kill_all_servers` can poll every signaled
+/// target concurrently and still learn each one's individual outcome.
+async fn wait_for_registered_target(pid: u32, force: bool) -> bool {
     let deadline = std::time::Duration::from_secs(5);
     let poll_interval = std::time::Duration::from_millis(100);
     let exited = wait_for_exit(
