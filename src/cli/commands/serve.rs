@@ -22,7 +22,13 @@ pub struct ServeArgs {
     pub stop: Option<String>,
     /// Prune stale registry entries instead of starting one.
     pub reap: bool,
-    /// With `stop`, send SIGKILL instead of the default SIGTERM.
+    /// Stop every registered server instead of starting one.
+    pub kill_all: bool,
+    /// With `kill_all`, also stop registered proxies (not just backing
+    /// servers).
+    pub include_proxies: bool,
+    /// With `stop` or `kill_all`, send SIGKILL instead of the default
+    /// SIGTERM.
     pub force: bool,
     /// With `stop`, also allow a numeric pid selector that is not present in
     /// the per-user server registry, as long as it still independently
@@ -81,18 +87,30 @@ pub async fn run(
         list,
         stop,
         reap,
+        kill_all,
+        include_proxies,
         force,
         include_rogue,
     } = args;
 
-    // Registry lifecycle operations (--list/--stop/--reap) are never
-    // start-a-server operations: handle them here, before any transport mode
-    // is resolved, and return without ever reaching the server-startup match
-    // below. Clap's `conflicts_with_all` on these flags (see
-    // `cli::args::Commands::Serve`) already guarantees `http`/`https`/`proxy`/
-    // `bind` are all still at their defaults whenever one of these is set.
-    if list || stop.is_some() || reap {
-        run_registry_management(list, stop, reap, force, include_rogue).await;
+    // Registry lifecycle operations (--list/--stop/--reap/--kill-all) are
+    // never start-a-server operations: handle them here, before any
+    // transport mode is resolved, and return without ever reaching the
+    // server-startup match below. Clap's `conflicts_with_all` on these flags
+    // (see `cli::args::Commands::Serve`) already guarantees `http`/`https`/
+    // `proxy`/`bind` are all still at their defaults whenever one of these is
+    // set.
+    if list || stop.is_some() || reap || kill_all {
+        run_registry_management(
+            list,
+            stop,
+            reap,
+            kill_all,
+            include_proxies,
+            force,
+            include_rogue,
+        )
+        .await;
         return;
     }
 
@@ -143,13 +161,21 @@ pub async fn run(
     }
 }
 
-/// Dispatch `codanna serve --list`/`--stop`/`--reap`. Runs each requested
-/// operation in turn (reap, then stop, then list) so `--stop --list` reflects
-/// the post-stop state and `--reap --list` reflects the post-reap state.
+/// Dispatch `codanna serve --list`/`--stop`/`--reap`/`--kill-all`. Runs each
+/// requested operation in turn (reap, then stop, then kill-all, then list) so
+/// `--stop --list` reflects the post-stop state, `--reap --list` reflects the
+/// post-reap state, and `--kill-all --list` reflects the post-kill-all state.
+///
+/// `kill_all_servers` reports its outcome instead of exiting the process
+/// directly, so `--list` still runs (and reflects the post-sweep state) even
+/// when a `--kill-all` target failed to stop; the failure is only turned
+/// into a nonzero exit code after every requested step has run.
 async fn run_registry_management(
     list: bool,
     stop: Option<String>,
     reap: bool,
+    kill_all: bool,
+    include_proxies: bool,
     force: bool,
     include_rogue: bool,
 ) {
@@ -159,8 +185,16 @@ async fn run_registry_management(
     if let Some(selector) = stop {
         stop_server(&selector, force, include_rogue).await;
     }
+    let kill_all_succeeded = if kill_all {
+        Some(kill_all_servers(force, include_proxies).await)
+    } else {
+        None
+    };
     if list {
         print_registry_list();
+    }
+    if kill_all_succeeded == Some(false) {
+        std::process::exit(1);
     }
 }
 
@@ -252,6 +286,50 @@ fn resolve_selector_to_pid(selector: &str, allow_rogue: bool) -> Option<u32> {
         })
 }
 
+/// Outcome of attempting to deliver a signal to a process, as classified by
+/// `sysinfo::Process::kill_with`'s `Option<bool>` result.
+enum SignalOutcome {
+    /// The signal was delivered successfully.
+    Sent,
+    /// The OS rejected or failed to deliver the signal.
+    SendFailed,
+    /// Sending signals is not supported on this platform.
+    UnsupportedPlatform,
+}
+
+/// Send `signal` to an already-resolved `process`, classifying the result.
+///
+/// Shared by `stop_server` and any future kill-all path so both agree on how
+/// `sysinfo`'s `Option<bool>` outcome maps to a typed result (§BASIC.2 DRY).
+fn send_signal(process: &sysinfo::Process, signal: sysinfo::Signal) -> SignalOutcome {
+    match process.kill_with(signal) {
+        Some(true) => SignalOutcome::Sent,
+        Some(false) => SignalOutcome::SendFailed,
+        None => SignalOutcome::UnsupportedPlatform,
+    }
+}
+
+/// Poll `is_alive(pid)` every `poll_interval` until either `pid` is no
+/// longer alive or `deadline` elapses, returning whether the pid exited
+/// within the deadline.
+///
+/// `is_alive` is an injectable predicate (rather than a hardcoded call to
+/// `crate::serve_registry::pid_is_alive`) so this can be unit-tested without
+/// a real process, mirroring the split-for-testability pattern used
+/// elsewhere (e.g. `serve_registry::find_spawning_for_in`, `ls::render`).
+async fn wait_for_exit(
+    pid: u32,
+    deadline: std::time::Duration,
+    poll_interval: std::time::Duration,
+    is_alive: impl Fn(u32) -> bool,
+) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed() < deadline && is_alive(pid) {
+        tokio::time::sleep(poll_interval).await;
+    }
+    !is_alive(pid)
+}
+
 /// Stop a registered server: resolve `selector` to a pid, send SIGTERM (or
 /// SIGKILL with `force`), then poll -- bounded, a few seconds -- for the
 /// target to exit. SIGTERM is the default; SIGKILL is only ever sent when
@@ -296,14 +374,14 @@ async fn stop_server(selector: &str, force: bool, include_rogue: bool) {
     };
 
     let signal = if force { Signal::Kill } else { Signal::Term };
-    match process.kill_with(signal) {
-        Some(true) => {}
-        Some(false) => {
+    match send_signal(process, signal) {
+        SignalOutcome::Sent => {}
+        SignalOutcome::SendFailed => {
             let name = if force { "SIGKILL" } else { "SIGTERM" };
             eprintln!("Failed to send {name} to pid {pid}.");
             std::process::exit(1);
         }
-        None => {
+        SignalOutcome::UnsupportedPlatform => {
             eprintln!("Sending signals is not supported on this platform (pid {pid}).");
             std::process::exit(1);
         }
@@ -311,12 +389,15 @@ async fn stop_server(selector: &str, force: bool, include_rogue: bool) {
 
     let deadline = std::time::Duration::from_secs(5);
     let poll_interval = std::time::Duration::from_millis(100);
-    let start = std::time::Instant::now();
-    while start.elapsed() < deadline && crate::serve_registry::pid_is_alive(pid) {
-        tokio::time::sleep(poll_interval).await;
-    }
+    let exited = wait_for_exit(
+        pid,
+        deadline,
+        poll_interval,
+        crate::serve_registry::pid_is_alive,
+    )
+    .await;
 
-    if crate::serve_registry::pid_is_alive(pid) {
+    if !exited {
         eprintln!(
             "Server pid {pid} did not exit within {}s of receiving the signal.",
             deadline.as_secs()
@@ -332,6 +413,156 @@ async fn stop_server(selector: &str, force: bool, include_rogue: bool) {
     } else {
         eprintln!("Stopped server pid {pid} (SIGTERM).");
     }
+}
+
+/// Stop every registered server (and, with `include_proxies`, every
+/// registered proxy too) instead of starting one.
+///
+/// Targets come from `serve_registry::list_entries()` -- the same source
+/// `codanna ls`/`codanna serve --list` read -- filtered to entries that are
+/// not already stale (`entry_is_stale`, mirroring `--reap`'s definition of
+/// "still alive"). By default only `ServerRole::Server` entries are
+/// targeted; `include_proxies` additionally targets `ServerRole::Proxy`
+/// entries. Every target is attempted even if an earlier one fails or times
+/// out (§BASIC.12.1: bounded fail-fast -- report every failure, but never
+/// abort the sweep on the first one).
+///
+/// Every target is signaled first (re-validating its identity immediately
+/// before its own signal, since an earlier target's signal may have taken
+/// time), then every signaled target is polled for exit *concurrently*, so
+/// one unresponsive target cannot push the sweep's wall-clock time past a
+/// single `wait_for_exit` deadline.
+///
+/// Returns whether every target stopped (`true`) or at least one did not
+/// (`false`), so the caller can run any remaining requested steps (e.g.
+/// `--list`) before turning a failure into a nonzero exit code.
+async fn kill_all_servers(force: bool, include_proxies: bool) -> bool {
+    let targets: Vec<u32> = crate::serve_registry::list_entries()
+        .into_iter()
+        .filter(|entry| !crate::serve_registry::entry_is_stale(entry))
+        .filter(|entry| include_proxies || entry.role == crate::serve_registry::ServerRole::Server)
+        .map(|entry| entry.pid)
+        .collect();
+
+    if targets.is_empty() {
+        let hint = if include_proxies {
+            "run `codanna serve --reap` to prune stale entries"
+        } else {
+            "run `codanna serve --reap` to prune stale entries, or pass --include-proxies to \
+             also target registered proxies"
+        };
+        eprintln!("No live registered servers to stop ({hint}).");
+        return true;
+    }
+
+    let mut any_failed = false;
+    let mut signaled = Vec::with_capacity(targets.len());
+    for pid in targets {
+        if kill_one_registered_target(pid, force) {
+            signaled.push(pid);
+        } else {
+            any_failed = true;
+        }
+    }
+
+    let mut waits = tokio::task::JoinSet::new();
+    for pid in signaled {
+        waits.spawn(wait_for_registered_target(pid, force));
+    }
+    while let Some(result) = waits.join_next().await {
+        match result {
+            Ok(exited) => any_failed |= !exited,
+            Err(_) => any_failed = true,
+        }
+    }
+
+    !any_failed
+}
+
+/// Re-validate one already-selected registered pid's identity, then signal
+/// it (SIGTERM, or SIGKILL with `force`) -- the same signal step
+/// `stop_server` uses -- sharing a single process-table refresh across the
+/// identity check and the signal send rather than scanning twice.
+///
+/// The identity re-check happens immediately before signaling (mirroring
+/// `stop_server`'s tight check-then-use adjacency) because, in
+/// `kill_all_servers`'s sequential signal pass, a pid selected by the
+/// up-front filter may no longer be a live codanna server by the time its
+/// turn comes.
+fn kill_one_registered_target(pid: u32, force: bool) -> bool {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System, UpdateKind};
+
+    let mut sys = System::new();
+    let target = Pid::from_u32(pid);
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[target]),
+        true,
+        ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
+    );
+
+    let Some(process) = sys.process(target) else {
+        eprintln!(
+            "No running process with pid {pid} (its registry entry may be stale; try --reap)."
+        );
+        return false;
+    };
+
+    if !crate::io::process::process_looks_like_codanna_serve(process) {
+        eprintln!(
+            "pid {pid} no longer looks like a codanna serve process; skipping (its registry \
+             entry may be stale; try --reap)."
+        );
+        return false;
+    }
+
+    let signal = if force { Signal::Kill } else { Signal::Term };
+    match send_signal(process, signal) {
+        SignalOutcome::Sent => true,
+        SignalOutcome::SendFailed => {
+            let name = if force { "SIGKILL" } else { "SIGTERM" };
+            eprintln!("Failed to send {name} to pid {pid}.");
+            false
+        }
+        SignalOutcome::UnsupportedPlatform => {
+            eprintln!("Sending signals is not supported on this platform (pid {pid}).");
+            false
+        }
+    }
+}
+
+/// Poll one already-signaled registered pid for exit and report the outcome
+/// in the same message shape `stop_server` uses, returning whether this
+/// target ended up stopped -- so `kill_all_servers` can poll every signaled
+/// target concurrently and still learn each one's individual outcome.
+async fn wait_for_registered_target(pid: u32, force: bool) -> bool {
+    let deadline = std::time::Duration::from_secs(5);
+    let poll_interval = std::time::Duration::from_millis(100);
+    let exited = wait_for_exit(
+        pid,
+        deadline,
+        poll_interval,
+        crate::serve_registry::pid_is_alive,
+    )
+    .await;
+
+    if !exited {
+        eprintln!(
+            "Server pid {pid} did not exit within {}s of receiving the signal -- run `codanna \
+             serve --reap` to prune it if it has in fact died.",
+            deadline.as_secs()
+        );
+        return false;
+    }
+
+    if force {
+        eprintln!(
+            "Killed server pid {pid} (SIGKILL); its registry entry may remain since a killed \
+             process cannot self-deregister -- run `codanna serve --reap` to prune it."
+        );
+    } else {
+        eprintln!("Stopped server pid {pid} (SIGTERM).");
+    }
+    true
 }
 
 async fn run_https_server(config: &Settings, watch: bool, bind_address: String) {
@@ -606,6 +837,28 @@ pub async fn run_stale_stdio(stored: Option<u32>, current: u32) {
         Err(e) => {
             eprintln!("Failed to start degraded MCP server: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod wait_for_exit_tests {
+    use super::wait_for_exit;
+
+    // `wait_for_exit` takes `is_alive` as an injectable predicate specifically
+    // so the "still alive after deadline" branch (stop_server's "did not exit
+    // within Ns" path) can be exercised hermetically -- no real stuck process,
+    // no wall-clock dependency beyond the short deadline injected here.
+    #[tokio::test]
+    async fn wait_for_exit_reports_still_alive_after_deadline() {
+        let deadline = std::time::Duration::from_millis(200);
+        let poll_interval = std::time::Duration::from_millis(20);
+
+        let exited = wait_for_exit(1, deadline, poll_interval, |_pid| true).await;
+
+        assert!(
+            !exited,
+            "expected wait_for_exit to report the pid still alive once the deadline elapsed"
+        );
     }
 }
 

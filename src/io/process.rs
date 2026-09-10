@@ -57,6 +57,15 @@ pub fn looks_like_codanna_serve(pid: u32) -> bool {
     let Some(process) = sys.process(target) else {
         return false;
     };
+    process_looks_like_codanna_serve(process)
+}
+
+/// The lenient `codanna serve` identity predicate used by
+/// [`looks_like_codanna_serve`], factored out so a caller that already holds
+/// a fresh `sysinfo::Process` handle (e.g. one it is about to signal) can
+/// re-run the same identity check against it without a second, separate
+/// process-table scan.
+pub(crate) fn process_looks_like_codanna_serve(process: &sysinfo::Process) -> bool {
     let joined_cmd = process
         .cmd()
         .iter()

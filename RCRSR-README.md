@@ -19,7 +19,7 @@ upstream base. For the how, see the commit history.
     - [Idle shutdown](#idle-shutdown)
     - [Configuration](#configuration)
     - [Ports](#ports)
-    - [Server registry (`--list` / `--stop` / `--reap`)](#server-registry---list----stop----reap)
+    - [Server registry (`--list` / `--stop` / `--reap` / `--kill-all`)](#server-registry---list----stop----reap----kill-all)
     - [Hot-reload notifications through the proxy](#hot-reload-notifications-through-the-proxy)
   - [Reindexing on demand (`reindex` MCP tool)](#reindexing-on-demand-reindex-mcp-tool)
     - [Arguments](#arguments)
@@ -488,7 +488,7 @@ and you don't want a separate index loaded into memory for each. Both HTTP and
 HTTPS backing servers are supported; with `--https` the connection is verified
 against codanna's own certificate.
 
-### Server registry (`--list` / `--stop` / `--reap`)
+### Server registry (`--list` / `--stop` / `--reap` / `--kill-all`)
 
 Every `codanna serve --http`/`--https` process (whether auto-spawned by a
 proxy or started manually) publishes itself to a per-user server registry,
@@ -507,6 +507,13 @@ directory -- `~/Library/Application Support` on macOS,
 at `codanna/servers/`. Each running server owns exactly one file there,
 named after its own pid, so there is nothing to lock or contend over.
 
+Each registry entry carries a `version` field -- the `codanna` version string
+(`env!("CARGO_PKG_VERSION")`) of the binary that wrote it -- which is what
+`codanna ls`'s VERSION column reads back for registered rows (see below).
+It defaults to an empty string via `#[serde(default)]`, so registry entries
+written by a pre-`version` build still deserialize without error; `codanna ls`
+renders an empty `version` as `-`.
+
 `codanna ls` is the primary, top-level command for listing every registered
 and rogue `codanna serve` process visible to the invoking user (registered
 servers, attached proxies, and best-effort-enriched rogue pids merged into
@@ -514,6 +521,28 @@ one table). `codanna serve --list` is **deprecated for one release cycle** in
 favor of `codanna ls`: it prints a deprecation notice to stderr and then
 delegates to the exact same listing logic, so the two commands always agree.
 Prefer `codanna ls` in scripts and habit going forward.
+
+`codanna ls`'s table has a VERSION column, populated differently depending on
+where a row came from:
+
+- **Registered rows** (from the registry, whether server or proxy) print the
+  `codanna` version string the server itself recorded when it started --
+  `env!("CARGO_PKG_VERSION")` at the time it wrote its registry entry.
+- **Rogue rows** (a `codanna serve` process found by process-table scan, with
+  no live registry entry) have no self-reported version to read, so the
+  column instead shows how the rogue binary on disk compares to the
+  `codanna ls` process's own binary, by canonicalizing and comparing the two
+  executable paths -- never by exec'ing or `--version`-probing the rogue
+  process:
+  - `same` -- the rogue process is running the identical binary on disk as
+    the `codanna ls` invocation (safe to assume it's the same build).
+  - `other` -- the rogue process is running a different binary path (a
+    different version, or a different install location).
+  - `deleted` -- the rogue process's backing binary is gone from disk (the
+    common Linux in-place-upgrade signature, a `/proc/<pid>/exe` path ending
+    in `(deleted)`) or otherwise unreadable, so no comparison was possible.
+  - `-` -- the `codanna ls` process's own executable path couldn't be
+    resolved, so there was nothing to compare the rogue binary against.
 
 ```bash
 codanna ls                              # show every running server this user owns (primary)
@@ -523,10 +552,26 @@ codanna serve --stop <workspace-path>   # ...or by the workspace root it's servi
 codanna serve --stop <pid> --force      # SIGKILL instead (only when SIGTERM isn't enough)
 codanna serve --stop <pid> --include-rogue  # also accept a rogue pid (shown by `codanna ls`) that has no registry entry
 codanna serve --reap                    # prune registry entries for servers that are no longer running
+codanna serve --kill-all                # stop every registered backing server (SIGTERM unless --force)
+codanna serve --kill-all --include-proxies  # ...and also stop every registered proxy, not just backing servers
+codanna serve --kill-all --force        # SIGKILL every target instead of SIGTERM
 ```
 
-`--list`, `--stop`, and `--reap` are lifecycle operations, not ways to start a
-server: they cannot be combined with `--http`/`--https`/`--proxy`/`--bind`.
+`--list`, `--stop`, `--reap`, and `--kill-all` are lifecycle operations, not
+ways to start a server: they cannot be combined with
+`--http`/`--https`/`--proxy`/`--bind`.
+
+`--kill-all` sweeps every live (non-stale) registry entry and stops it the
+same way `--stop` does -- SIGTERM by default, SIGKILL with `--force` -- but
+in one command instead of one `--stop` per pid. By default it only targets
+`ServerRole::Server` entries (backing servers), leaving proxies running;
+`--include-proxies` (which requires `--kill-all` and cannot be combined with
+`--stop`) widens the sweep to registered proxies as well. Every target is
+attempted even if an earlier one fails or times out, so one unresponsive
+server never blocks the rest of the sweep; the command's exit code is `0`
+only if every target stopped, `1` if any did not. Like `--stop`, a killed
+(`--force`) process cannot self-deregister, so its registry entry can be
+left behind -- `--reap` is still the way to prune those afterward.
 
 `--stop` defaults to `SIGTERM`, giving the target server a chance to run its
 normal shutdown path -- the same one Ctrl+C and idle-shutdown already use,

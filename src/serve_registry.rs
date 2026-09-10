@@ -76,6 +76,16 @@ pub struct RegistryEntry {
     pub status: ServerStatus,
     #[serde(default)]
     pub role: ServerRole,
+    /// The `codanna` version that wrote this entry, from
+    /// `env!("CARGO_PKG_VERSION")`.
+    ///
+    /// Defaults to an empty string so that legacy registry entries written
+    /// before this field existed (no `version` key at all) deserialize
+    /// successfully via `#[serde(default)]` on `RegistryEntry::version`,
+    /// rather than failing to parse -- mirroring the `role` back-compat
+    /// precedent above.
+    #[serde(default)]
+    pub version: String,
 }
 
 /// Errors from reading/writing the per-user server registry.
@@ -322,6 +332,7 @@ mod tests {
             start_time: 1_700_000_000,
             status,
             role: ServerRole::Server,
+            version: "0.0.0-test".to_string(),
         }
     }
 
@@ -343,6 +354,23 @@ mod tests {
     }
 
     #[test]
+    fn legacy_entry_without_version_key_deserializes_as_empty() {
+        let legacy_json = r#"{
+            "pid": 4242,
+            "port": 8080,
+            "scheme": "http",
+            "workspace_root": "/tmp/legacy-workspace",
+            "start_time": 1700000000,
+            "status": "healthy"
+        }"#;
+
+        let entry: RegistryEntry = serde_json::from_str(legacy_json)
+            .expect("legacy entry without role/version must deserialize");
+
+        assert!(entry.version.is_empty());
+    }
+
+    #[test]
     fn write_then_list_round_trips() {
         let dir = TempDir::new().unwrap();
         let entry = sample_entry(
@@ -359,6 +387,7 @@ mod tests {
         assert_eq!(entries[0].port, entry.port);
         assert_eq!(entries[0].workspace_root, entry.workspace_root);
         assert_eq!(entries[0].status, ServerStatus::Healthy);
+        assert_eq!(entries[0].version, entry.version);
     }
 
     #[test]

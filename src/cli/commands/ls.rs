@@ -58,7 +58,15 @@ use crate::serve_registry::{RegistryEntry, ServerRole, ServerStatus, paths_match
 /// exited, its cwd/argv are unreadable (e.g. permission-restricted
 /// `/proc/<pid>` on Linux), or no `--bind` argument is present -- renders as
 /// `None`. This function never returns an error.
-fn resolve_rogue(pid: u32) -> (Option<String>, Option<u16>, Option<ServeScheme>, RowKind) {
+fn resolve_rogue(
+    pid: u32,
+) -> (
+    Option<String>,
+    Option<u16>,
+    Option<ServeScheme>,
+    RowKind,
+    Option<std::path::PathBuf>,
+) {
     let target = Pid::from_u32(pid);
     let mut sys = System::new();
     sys.refresh_processes_specifics(
@@ -66,24 +74,26 @@ fn resolve_rogue(pid: u32) -> (Option<String>, Option<u16>, Option<ServeScheme>,
         true,
         ProcessRefreshKind::nothing()
             .with_cwd(UpdateKind::Always)
-            .with_cmd(UpdateKind::Always),
+            .with_cmd(UpdateKind::Always)
+            .with_exe(UpdateKind::Always),
     );
     let Some(process) = sys.process(target) else {
-        return (None, None, None, RowKind::Server);
+        return (None, None, None, RowKind::Server, None);
     };
     let kind = kind_from_cmd(process.cmd());
+    let rogue_exe = process.exe().map(Path::to_path_buf);
 
     let Some(cwd) = process.cwd().map(Path::to_path_buf) else {
-        return (None, None, None, kind);
+        return (None, None, None, kind, rogue_exe);
     };
     let workspace = cwd.to_string_lossy().into_owned();
 
     if let Some((port, scheme)) = read_record_if_pid_matches(&cwd, pid) {
-        return (Some(workspace), Some(port), Some(scheme), kind);
+        return (Some(workspace), Some(port), Some(scheme), kind, rogue_exe);
     }
 
     let port = parse_bind_port(process.cmd()).filter(|port| *port != 0);
-    (Some(workspace), port, None, kind)
+    (Some(workspace), port, None, kind, rogue_exe)
 }
 
 /// Read `<cwd>/.codanna/serve.json` (via the existing
@@ -176,6 +186,7 @@ struct Row {
     scheme: Option<ServeScheme>,
     status: String,
     workspace: Option<String>,
+    version: String,
 }
 
 /// Best-effort guess at whether a rogue process is a stdio-facing proxy or a
@@ -191,6 +202,47 @@ fn kind_from_cmd(cmd: &[std::ffi::OsString]) -> RowKind {
         RowKind::Proxy
     } else {
         RowKind::Server
+    }
+}
+
+/// Classify a rogue row's binary against the invoking `codanna ls` process's
+/// own executable, without ever exec'ing or spawning the rogue binary --
+/// this is a pure path comparison, not a `--version` probe.
+///
+/// - `"deleted"` -- `rogue_exe` is `None` (unreadable, e.g. the process
+///   already exited or `/proc/<pid>/exe` is permission-restricted), or its
+///   path renders with a trailing `" (deleted)"` marker, the Linux
+///   in-place-upgrade signature for a still-running process whose backing
+///   binary on disk was replaced or removed out from under it.
+/// - `"same"` -- both paths resolve and canonicalize to the identical path.
+/// - `"other"` -- both paths resolve but canonicalize to different paths.
+/// - `"-"` -- `current_exe` itself could not be resolved, so no comparison
+///   is possible.
+///
+/// `current_exe` must already be canonicalized by the caller: `build_rows`
+/// resolves it once (alongside `std::env::current_exe()`) rather than
+/// re-canonicalizing it on every rogue row this function is called for.
+///
+/// Split out as a pure function (mirrors `render`/`process_is_codanna_serve`)
+/// so every outcome can be exercised directly against synthetic paths in
+/// tests, without depending on a live process scan.
+fn classify_rogue_version(rogue_exe: Option<&Path>, current_exe: Option<&Path>) -> &'static str {
+    let Some(rogue_exe) = rogue_exe else {
+        return "deleted";
+    };
+    if rogue_exe.to_string_lossy().ends_with("(deleted)") {
+        return "deleted";
+    }
+    let Some(current_exe) = current_exe else {
+        return "-";
+    };
+    match rogue_exe.canonicalize() {
+        Ok(rogue) if rogue == current_exe => "same",
+        Ok(_) => "other",
+        // The rogue path no longer resolves on disk: the binary was removed
+        // out from under the running process (same situation as the
+        // `(deleted)` marker, just without the marker).
+        Err(_) => "deleted",
     }
 }
 
@@ -210,6 +262,7 @@ fn registered_row(entry: &RegistryEntry, kind: RowKind) -> Row {
         scheme: Some(entry.scheme),
         status: registry_status_str(entry.status).to_string(),
         workspace: Some(entry.workspace_root.display().to_string()),
+        version: entry.version.clone(),
     }
 }
 
@@ -278,8 +331,13 @@ fn build_rows() -> Vec<Row> {
     rogue_pids.sort_unstable();
     rogue_pids.dedup();
 
+    let current_exe = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.canonicalize().ok());
+
     for pid in rogue_pids {
-        let (workspace, port, scheme, kind) = resolve_rogue(pid);
+        let (workspace, port, scheme, kind, rogue_exe) = resolve_rogue(pid);
+        let version = classify_rogue_version(rogue_exe.as_deref(), current_exe.as_deref());
         rows.push(Row {
             pid,
             kind,
@@ -288,6 +346,7 @@ fn build_rows() -> Vec<Row> {
             scheme,
             status: "running".to_string(),
             workspace,
+            version: version.to_string(),
         });
     }
 
@@ -308,8 +367,8 @@ fn render(rows: &[Row]) -> String {
     }
 
     let mut out = format!(
-        "{:<10} {:<7} {:<11} {:<7} {:<7} {:<10} WORKSPACE\n",
-        "PID", "KIND", "SOURCE", "PORT", "SCHEME", "STATUS"
+        "{:<10} {:<7} {:<11} {:<7} {:<7} {:<10} {:<15} WORKSPACE\n",
+        "PID", "KIND", "SOURCE", "PORT", "SCHEME", "STATUS", "VERSION"
     );
     for row in rows {
         let port = row
@@ -321,14 +380,20 @@ fn render(rows: &[Row]) -> String {
             .map(|s| s.as_str().to_string())
             .unwrap_or_else(|| "-".to_string());
         let workspace = row.workspace.as_deref().unwrap_or("-");
+        let version = if row.version.is_empty() {
+            "-"
+        } else {
+            row.version.as_str()
+        };
         out.push_str(&format!(
-            "{:<10} {:<7} {:<11} {:<7} {:<7} {:<10} {}\n",
+            "{:<10} {:<7} {:<11} {:<7} {:<7} {:<10} {:<15} {}\n",
             row.pid,
             row.kind.as_str(),
             row.source.as_str(),
             port,
             scheme,
             row.status,
+            version,
             workspace
         ));
     }
@@ -391,6 +456,7 @@ mod tests {
                 scheme: Some(ServeScheme::Http),
                 status: "healthy".to_string(),
                 workspace: Some("/tmp/ws".to_string()),
+                version: "0.16.0+rcrsr.5".to_string(),
             },
             Row {
                 pid: 222,
@@ -400,6 +466,7 @@ mod tests {
                 scheme: Some(ServeScheme::Http),
                 status: "healthy".to_string(),
                 workspace: Some("/tmp/ws".to_string()),
+                version: "0.16.0+rcrsr.5".to_string(),
             },
             Row {
                 pid: 333,
@@ -409,6 +476,7 @@ mod tests {
                 scheme: None,
                 status: "running".to_string(),
                 workspace: None,
+                version: "same".to_string(),
             },
         ];
 
@@ -417,8 +485,67 @@ mod tests {
             text.starts_with("PID"),
             "output should start with a header row: {text}"
         );
+        assert!(
+            text.contains("VERSION"),
+            "header should include a VERSION column: {text}"
+        );
         assert!(text.contains("111") && text.contains("server") && text.contains("registered"));
+        assert!(
+            text.contains("0.16.0+rcrsr.5"),
+            "registered row should print its version string: {text}"
+        );
         assert!(text.contains("222") && text.contains("proxy") && text.contains("registered"));
         assert!(text.contains("333") && text.contains("rogue") && text.contains('-'));
+        assert!(text.contains("same"));
+    }
+
+    #[test]
+    fn classify_rogue_version_none_rogue_exe_is_deleted() {
+        assert_eq!(
+            classify_rogue_version(None, Some(Path::new("/usr/bin/codanna"))),
+            "deleted"
+        );
+    }
+
+    #[test]
+    fn classify_rogue_version_deleted_marker_is_deleted() {
+        assert_eq!(
+            classify_rogue_version(
+                Some(Path::new("/usr/bin/codanna (deleted)")),
+                Some(Path::new("/usr/bin/codanna")),
+            ),
+            "deleted"
+        );
+    }
+
+    #[test]
+    fn classify_rogue_version_equal_canonical_paths_are_same() {
+        let exe = std::env::current_exe()
+            .and_then(|exe| exe.canonicalize())
+            .expect("test binary must have a resolvable, canonicalizable exe path");
+        assert_eq!(classify_rogue_version(Some(&exe), Some(&exe)), "same");
+    }
+
+    #[test]
+    fn classify_rogue_version_differing_resolvable_paths_are_other() {
+        // `current_exe` is expected pre-canonicalized by the caller; mirror
+        // that here rather than relying on `classify_rogue_version` to do it.
+        let current = std::env::current_exe()
+            .and_then(|exe| exe.canonicalize())
+            .expect("test binary must have a resolvable, canonicalizable exe path");
+        // /bin/sh and /bin exist on essentially every Linux/macOS test host,
+        // and neither canonicalizes to the test binary's own exe path.
+        assert_eq!(
+            classify_rogue_version(Some(Path::new("/bin")), Some(&current)),
+            "other"
+        );
+    }
+
+    #[test]
+    fn classify_rogue_version_unresolvable_current_exe_is_dash() {
+        assert_eq!(
+            classify_rogue_version(Some(Path::new("/usr/bin/codanna")), None),
+            "-"
+        );
     }
 }

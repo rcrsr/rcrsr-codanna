@@ -999,6 +999,7 @@ pub async fn serve_proxy(
         start_time: unix_now_secs(),
         status: serve_registry::ServerStatus::Healthy,
         role: serve_registry::ServerRole::Proxy,
+        version: env!("CARGO_PKG_VERSION").to_string(),
     };
     if let Err(e) = serve_registry::write_entry(&proxy_entry) {
         tracing::warn!(
