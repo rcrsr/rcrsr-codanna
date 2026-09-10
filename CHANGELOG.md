@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0+rcrsr.6] - 2026-09-09
+
 ### Added
 
 - **`codanna serve --kill-all` / `--include-proxies`:** stop every registered server in one command instead of one `--stop <pid>` at a time. Sweeps every live (non-stale) registry entry, signaling each the same way `--stop` does (SIGTERM by default, SIGKILL with `--force`); by default only backing-server entries are targeted, and `--include-proxies` (requires `--kill-all`, mutually exclusive with `--stop`) widens the sweep to registered proxies too. Every target is attempted regardless of an earlier target's failure, and the command exits `0` only if all of them stopped. ([#89](https://github.com/rcrsr/rcrsr-codanna/pull/89))
