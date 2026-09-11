@@ -488,7 +488,8 @@ pub async fn serve_https(config: crate::Settings, watch: bool, bind: String) -> 
     }
 
     eprintln!("HTTPS server shut down gracefully");
-    Ok(())
+    // Mirrors http_server::serve_http's tail -- see that comment for why.
+    std::process::exit(0);
 }
 
 /// OAuth register endpoint - accepts any registration

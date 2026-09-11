@@ -912,7 +912,10 @@ pub async fn serve_http(config: crate::Settings, watch: bool, bind: String) -> a
     }
 
     eprintln!("HTTP server shut down gracefully");
-    Ok(())
+    // Cleanup above already ran; a detached watcher's spawn_blocking work can
+    // still be stuck, and the default runtime's Drop would block main()'s
+    // exit forever waiting for it. Exit directly instead.
+    std::process::exit(0);
 }
 
 #[cfg(not(feature = "http-server"))]

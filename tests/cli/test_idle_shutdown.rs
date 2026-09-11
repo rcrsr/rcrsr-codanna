@@ -109,15 +109,17 @@ idle_shutdown_minutes = 1
     workspace
 }
 
-/// Start `codanna serve --http --bind 127.0.0.1:0` rooted at `ws` directly
-/// (not via `discover_or_spawn`), so this test observes the backing server's
-/// own idle-timer exit rather than a proxy's.
+/// Start `codanna serve --http --bind 127.0.0.1:0 --watch` rooted at `ws`
+/// directly (not via `discover_or_spawn`), so this test observes the backing
+/// server's own idle-timer exit rather than a proxy's. `--watch` is included
+/// so the file-watcher teardown path is exercised, not just the bare HTTP
+/// server's.
 fn start_http_server(ws: &Path) -> Child {
     let test_home = ws.join(".home");
     std::fs::create_dir_all(&test_home).expect("create test home");
 
     Command::new(codanna_binary())
-        .args(["serve", "--http", "--bind", "127.0.0.1:0"])
+        .args(["serve", "--http", "--bind", "127.0.0.1:0", "--watch"])
         .current_dir(ws)
         .env("HOME", &test_home)
         .env("XDG_CONFIG_HOME", &test_home)
