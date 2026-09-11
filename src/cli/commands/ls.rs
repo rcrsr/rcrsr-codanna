@@ -206,16 +206,22 @@ fn kind_from_cmd(cmd: &[std::ffi::OsString]) -> RowKind {
 }
 
 /// Classify a rogue row's binary against the invoking `codanna ls` process's
-/// own executable, without ever exec'ing or spawning the rogue binary --
-/// this is a pure path comparison, not a `--version` probe.
+/// own executable. This never exec's or spawns the rogue binary -- it only
+/// compares paths and, when those differ, reads the rogue binary's bytes
+/// (never runs it) -- so it is never a `--version` probe.
 ///
 /// - `"deleted"` -- `rogue_exe` is `None` (unreadable, e.g. the process
 ///   already exited or `/proc/<pid>/exe` is permission-restricted), or its
 ///   path renders with a trailing `" (deleted)"` marker, the Linux
 ///   in-place-upgrade signature for a still-running process whose backing
 ///   binary on disk was replaced or removed out from under it.
-/// - `"same"` -- both paths resolve and canonicalize to the identical path.
-/// - `"other"` -- both paths resolve but canonicalize to different paths.
+/// - `"same"` -- both paths resolve and canonicalize to the identical path,
+///   OR the canonicalized paths differ but the two files are byte-identical
+///   (e.g. the same binary installed at two different locations, such as a
+///   mise install dir vs `~/.local/bin`).
+/// - `"other"` -- both paths resolve but canonicalize to different paths,
+///   and the two files' sizes or contents differ (or could not be compared,
+///   e.g. a permission error or a file vanishing mid-check).
 /// - `"-"` -- `current_exe` itself could not be resolved, so no comparison
 ///   is possible.
 ///
@@ -238,11 +244,42 @@ fn classify_rogue_version(rogue_exe: Option<&Path>, current_exe: Option<&Path>) 
     };
     match rogue_exe.canonicalize() {
         Ok(rogue) if rogue == current_exe => "same",
-        Ok(_) => "other",
+        // Canonicalized paths differ -- before concluding "other", fall back
+        // to a content comparison, since two different install locations can
+        // hold the byte-identical binary (e.g. mise vs `~/.local/bin`).
+        Ok(_) => {
+            if binaries_are_byte_identical(rogue_exe, current_exe) {
+                "same"
+            } else {
+                "other"
+            }
+        }
         // The rogue path no longer resolves on disk: the binary was removed
         // out from under the running process (same situation as the
         // `(deleted)` marker, just without the marker).
         Err(_) => "deleted",
+    }
+}
+
+/// Best-effort byte-content comparison of two binaries, used only as a
+/// fallback when their canonicalized paths differ (see
+/// `classify_rogue_version`). Never exec's or spawns either binary -- it only
+/// reads file metadata/bytes. Compares file sizes first as a cheap
+/// short-circuit (a size mismatch is definitely "different", no need to read
+/// either file), then falls back to a full byte comparison. Any I/O error
+/// along the way (permission denied, file vanished mid-check, etc.) is
+/// treated as inconclusive and returns `false`, matching this function's
+/// best-effort, infallible-to-the-caller style.
+fn binaries_are_byte_identical(a: &Path, b: &Path) -> bool {
+    let (Ok(meta_a), Ok(meta_b)) = (std::fs::metadata(a), std::fs::metadata(b)) else {
+        return false;
+    };
+    if meta_a.len() != meta_b.len() {
+        return false;
+    }
+    match (std::fs::read(a), std::fs::read(b)) {
+        (Ok(bytes_a), Ok(bytes_b)) => bytes_a == bytes_b,
+        _ => false,
     }
 }
 
@@ -254,13 +291,30 @@ fn registry_status_str(status: ServerStatus) -> &'static str {
 }
 
 fn registered_row(entry: &RegistryEntry, kind: RowKind) -> Row {
+    registered_row_with_status_override(entry, kind, None)
+}
+
+/// Like `registered_row`, but optionally overrides the displayed status
+/// instead of trusting `entry.status` verbatim. Used for unattached proxy
+/// rows: `entry.status` is stale write-once data recorded by
+/// `src/mcp/proxy.rs` at spawn time and never rewritten, so an unattached
+/// proxy (its backing server is gone, dead, or itself rogue/stale) would
+/// otherwise keep displaying "healthy" long after it stopped being true.
+fn registered_row_with_status_override(
+    entry: &RegistryEntry,
+    kind: RowKind,
+    status_override: Option<&str>,
+) -> Row {
+    let status = status_override
+        .map(str::to_string)
+        .unwrap_or_else(|| registry_status_str(entry.status).to_string());
     Row {
         pid: entry.pid,
         kind,
         source: RowSource::Registered,
         port: (entry.port != 0).then_some(entry.port),
         scheme: Some(entry.scheme),
-        status: registry_status_str(entry.status).to_string(),
+        status,
         workspace: Some(entry.workspace_root.display().to_string()),
         version: entry.version.clone(),
     }
@@ -316,9 +370,17 @@ fn build_rows() -> Vec<Row> {
         }
     }
 
+    // An unattached proxy's `entry.status` is stale write-once data from
+    // spawn time (`src/mcp/proxy.rs` never rewrites it), so displaying it
+    // verbatim as "healthy" would be misleading once its backing server is
+    // gone -- override the displayed status to "orphaned" instead.
     for proxy in &proxies {
         if !attached.contains(&proxy.pid) {
-            rows.push(registered_row(proxy, RowKind::Proxy));
+            rows.push(registered_row_with_status_override(
+                proxy,
+                RowKind::Proxy,
+                Some("orphaned"),
+            ));
         }
     }
 
@@ -547,5 +609,84 @@ mod tests {
             classify_rogue_version(Some(Path::new("/usr/bin/codanna")), None),
             "-"
         );
+    }
+
+    #[test]
+    fn classify_rogue_version_differing_paths_same_bytes_are_same() {
+        let dir = std::env::temp_dir();
+        let a = dir.join(format!(
+            "codanna-ls-test-identical-a-{}",
+            std::process::id()
+        ));
+        let b = dir.join(format!(
+            "codanna-ls-test-identical-b-{}",
+            std::process::id()
+        ));
+        std::fs::write(&a, b"identical content").expect("write temp file a");
+        std::fs::write(&b, b"identical content").expect("write temp file b");
+
+        let current = a.canonicalize().expect("canonicalize temp file a");
+        // `b`'s canonicalized path differs from `current` (different file
+        // name/location), but its bytes are identical -- must classify "same".
+        let result = classify_rogue_version(Some(&b), Some(&current));
+
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+
+        assert_eq!(result, "same");
+    }
+
+    #[test]
+    fn classify_rogue_version_differing_paths_differing_bytes_are_other() {
+        let dir = std::env::temp_dir();
+        let a = dir.join(format!(
+            "codanna-ls-test-differing-a-{}",
+            std::process::id()
+        ));
+        let b = dir.join(format!(
+            "codanna-ls-test-differing-b-{}",
+            std::process::id()
+        ));
+        std::fs::write(&a, b"content one").expect("write temp file a");
+        std::fs::write(&b, b"a totally different length of content").expect("write temp file b");
+
+        let current = a.canonicalize().expect("canonicalize temp file a");
+        let result = classify_rogue_version(Some(&b), Some(&current));
+
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+
+        assert_eq!(result, "other");
+    }
+
+    fn synthetic_registry_entry(pid: u32, role: ServerRole, status: ServerStatus) -> RegistryEntry {
+        RegistryEntry {
+            pid,
+            port: 8080,
+            scheme: ServeScheme::Http,
+            workspace_root: std::path::PathBuf::from("/tmp/ws"),
+            start_time: 0,
+            status,
+            role,
+            version: "0.16.0+rcrsr.6".to_string(),
+        }
+    }
+
+    #[test]
+    fn registered_row_uses_entry_status_when_no_override() {
+        let entry = synthetic_registry_entry(1, ServerRole::Server, ServerStatus::Healthy);
+        let row = registered_row(&entry, RowKind::Server);
+        assert_eq!(row.status, "healthy");
+    }
+
+    #[test]
+    fn unattached_proxy_status_is_overridden_to_orphaned() {
+        // Mirrors the `build_rows` unattached-proxy loop: `entry.status` is
+        // stale write-once "healthy" data from spawn time, but since no live
+        // server shares its workspace, the displayed status must not repeat
+        // that stale claim.
+        let entry = synthetic_registry_entry(2, ServerRole::Proxy, ServerStatus::Healthy);
+        let row = registered_row_with_status_override(&entry, RowKind::Proxy, Some("orphaned"));
+        assert_eq!(row.status, "orphaned");
     }
 }
