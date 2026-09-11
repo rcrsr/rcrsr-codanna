@@ -584,6 +584,11 @@ async fn run_https_server(config: &Settings, watch: bool, bind_address: String) 
             eprintln!("HTTPS server error: {e}");
             std::process::exit(1);
         }
+        // `serve_https` has already joined any watcher tasks; exit directly
+        // here (CLI-only call site, before the Tokio runtime is dropped)
+        // rather than letting a detached watcher's leftover state block
+        // `main()`'s exit.
+        std::process::exit(0);
     }
 
     #[cfg(not(feature = "https-server"))]
@@ -623,6 +628,10 @@ async fn run_http_server(config: Settings, watch: bool, bind_address: String) {
         eprintln!("HTTP server error: {e}");
         std::process::exit(1);
     }
+    // `serve_http` has already joined any watcher tasks; exit directly here
+    // (CLI-only call site, before the Tokio runtime is dropped) rather than
+    // letting a detached watcher's leftover state block `main()`'s exit.
+    std::process::exit(0);
 }
 
 async fn run_stdio_server(

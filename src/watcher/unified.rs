@@ -9,6 +9,7 @@ use notify::{Event, EventKind, RecursiveMode, Watcher};
 use tokio::sync::{RwLock, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 use crate::documents::DocumentStore;
 use crate::documents::config::ChunkingConfig;
@@ -124,6 +125,27 @@ pub struct UnifiedWatcher {
     /// satisfy).
     #[cfg(test)]
     walk_count: Arc<std::sync::atomic::AtomicUsize>,
+    /// Cooperative shutdown signal, polled only in the same `select!` as the
+    /// event/tick/broadcast sources inside `watch()`'s own loop -- i.e.
+    /// strictly *between* iterations, never while a `spawn_blocking` call
+    /// spawned by the previous iteration's handler (e.g.
+    /// `process_removal_wave`, `execute_action`) is still being awaited.
+    /// Those handler calls run to completion sequentially, outside the
+    /// `select!`, before control returns to the top of the loop where this
+    /// token is polled again. This is what lets a caller `.await` the
+    /// `JoinHandle` for `watch()` and be sure no facade write guard held
+    /// inside `spawn_blocking` is still in flight once it resolves -- unlike
+    /// wrapping the whole `watch()` future in an *external* `select!` against
+    /// cancellation, which can drop `watch()` (and abandon a nested
+    /// `spawn_blocking` mid-write on its own OS thread) at an arbitrary await
+    /// point deep inside a handler.
+    ///
+    /// Defaults to a fresh, unlinked token (see [`UnifiedWatcherBuilder`])
+    /// when the caller does not wire one in, so `watch()` simply never
+    /// observes a cancellation and runs until an internal error -- unchanged
+    /// behavior for existing callers (including tests) that predate this
+    /// field.
+    cancellation_token: CancellationToken,
 }
 
 impl UnifiedWatcher {
@@ -199,6 +221,20 @@ impl UnifiedWatcher {
 
         loop {
             tokio::select! {
+                // Cooperative shutdown: polled only here, at the top of each
+                // loop iteration, alongside the other event sources -- never
+                // while a previous iteration's handler call is still awaiting
+                // a `spawn_blocking` closure that may hold the facade's write
+                // guard (those calls run to completion, sequentially, in the
+                // arm bodies below, outside this `select!`). This is what
+                // lets a caller `.await` the `watch()` task's `JoinHandle`
+                // after cancelling the token and be sure no such closure is
+                // still running.
+                _ = self.cancellation_token.cancelled() => {
+                    crate::log_event!("watcher", "stopped", "cancellation requested");
+                    return Ok(());
+                }
+
                 // Handle incoming file events
                 Some(res) = self.event_rx.recv() => {
                     match res {
@@ -1508,6 +1544,7 @@ pub struct UnifiedWatcherBuilder {
     debounce_ms: u64,
     refresh_on_overflow: bool,
     startup_catch_up: bool,
+    cancellation_token: CancellationToken,
 }
 
 impl UnifiedWatcherBuilder {
@@ -1532,6 +1569,10 @@ impl UnifiedWatcherBuilder {
             // `.startup_catch_up(...)` call behaves the same as one built
             // from default config: startup catch-up is opt-in.
             startup_catch_up: false,
+            // Unlinked by default: nothing holds a clone to cancel it, so
+            // `watch()` never observes cancellation unless the caller wires
+            // one in via `.cancellation_token(...)`.
+            cancellation_token: CancellationToken::new(),
         }
     }
 
@@ -1598,6 +1639,15 @@ impl UnifiedWatcherBuilder {
         self
     }
 
+    /// Wire in a cooperative shutdown token: `watch()` returns cleanly (never
+    /// mid-handler) once this token is cancelled. See the field doc on
+    /// [`UnifiedWatcher::cancellation_token`] for why this replaces wrapping
+    /// `watch()` in an external `select!` against cancellation.
+    pub fn cancellation_token(mut self, token: CancellationToken) -> Self {
+        self.cancellation_token = token;
+        self
+    }
+
     /// Build the UnifiedWatcher.
     pub fn build(self) -> Result<UnifiedWatcher, WatchError> {
         let broadcaster = self.broadcaster.ok_or_else(|| WatchError::InitFailed {
@@ -1653,6 +1703,7 @@ impl UnifiedWatcherBuilder {
             batch_sync_roots: Vec::new(),
             #[cfg(test)]
             walk_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            cancellation_token: self.cancellation_token,
         })
     }
 }

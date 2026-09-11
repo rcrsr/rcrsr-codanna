@@ -112,8 +112,10 @@ idle_shutdown_minutes = 1
 /// Start `codanna serve --http --bind 127.0.0.1:0 --watch` rooted at `ws`
 /// directly (not via `discover_or_spawn`), so this test observes the backing
 /// server's own idle-timer exit rather than a proxy's. `--watch` is included
-/// so the file-watcher teardown path is exercised, not just the bare HTTP
-/// server's.
+/// so the file-watcher's startup/shutdown wiring is exercised, not just the
+/// bare HTTP server's -- no file is written after the server starts, so this
+/// does not exercise the watcher mid-commit (`spawn_blocking` holding the
+/// facade's write guard).
 fn start_http_server(ws: &Path) -> Child {
     let test_home = ws.join(".home");
     std::fs::create_dir_all(&test_home).expect("create test home");
@@ -295,10 +297,22 @@ fn idle_backing_server_self_exits_and_is_respawned_with_a_new_pid() {
     // `pid_is_alive`'s `/proc` scan (via `sysinfo`) still reports as
     // present, which would make this loop spin for the full
     // `IDLE_EXIT_DEADLINE` even though the process already self-exited.
+    let exit_status = std::cell::Cell::new(None);
     wait_until(
-        || matches!(server.try_wait(), Ok(Some(_))),
+        || match server.try_wait() {
+            Ok(Some(status)) => {
+                exit_status.set(Some(status));
+                true
+            }
+            _ => false,
+        },
         IDLE_EXIT_DEADLINE,
         "idle backing server to self-exit after the configured idle_shutdown_minutes elapses",
+    );
+    assert!(
+        exit_status.get().is_some_and(|status| status.success()),
+        "idle backing server should exit 0 on self-exit, got {:?}",
+        exit_status.get()
     );
     // (2): serve.json is removed as part of that same self-exit -- the SAME
     // cleanup path the Ctrl+C arm uses.

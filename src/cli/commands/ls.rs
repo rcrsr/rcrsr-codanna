@@ -261,6 +261,18 @@ fn classify_rogue_version(rogue_exe: Option<&Path>, current_exe: Option<&Path>) 
     }
 }
 
+thread_local! {
+    /// Cache of the most recently read `b` path/bytes pair from
+    /// `binaries_are_byte_identical`. `build_rows` calls this function once
+    /// per rogue pid with `b` fixed to `current_exe`, so reusing the cached
+    /// bytes when `b` matches the cached path avoids re-reading the same
+    /// (typically large) binary from disk on every rogue row. Keyed by path
+    /// equality (not just "populated") so unrelated callers/tests using a
+    /// different `b` path still get a correct, freshly-read comparison.
+    static BINARY_BYTES_CACHE: std::cell::RefCell<Option<(std::path::PathBuf, std::rc::Rc<Vec<u8>>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Best-effort byte-content comparison of two binaries, used only as a
 /// fallback when their canonicalized paths differ (see
 /// `classify_rogue_version`). Never exec's or spawns either binary -- it only
@@ -270,6 +282,10 @@ fn classify_rogue_version(rogue_exe: Option<&Path>, current_exe: Option<&Path>) 
 /// along the way (permission denied, file vanished mid-check, etc.) is
 /// treated as inconclusive and returns `false`, matching this function's
 /// best-effort, infallible-to-the-caller style.
+///
+/// `b`'s bytes are cached (see `BINARY_BYTES_CACHE`) across calls with the
+/// same `b` path, since the real caller (`build_rows`) calls this once per
+/// rogue pid with `b` fixed to `current_exe`.
 fn binaries_are_byte_identical(a: &Path, b: &Path) -> bool {
     let (Ok(meta_a), Ok(meta_b)) = (std::fs::metadata(a), std::fs::metadata(b)) else {
         return false;
@@ -277,9 +293,24 @@ fn binaries_are_byte_identical(a: &Path, b: &Path) -> bool {
     if meta_a.len() != meta_b.len() {
         return false;
     }
-    match (std::fs::read(a), std::fs::read(b)) {
-        (Ok(bytes_a), Ok(bytes_b)) => bytes_a == bytes_b,
-        _ => false,
+    let Ok(bytes_a) = std::fs::read(a) else {
+        return false;
+    };
+    let bytes_b = BINARY_BYTES_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some((cached_path, cached_bytes)) = cache.as_ref() {
+            if cached_path == b {
+                return Some(cached_bytes.clone());
+            }
+        }
+        let bytes = std::fs::read(b).ok()?;
+        let bytes = std::rc::Rc::new(bytes);
+        *cache = Some((b.to_path_buf(), bytes.clone()));
+        Some(bytes)
+    });
+    match bytes_b {
+        Some(bytes_b) => bytes_a == *bytes_b,
+        None => false,
     }
 }
 
