@@ -509,11 +509,13 @@ pub async fn serve_https(config: crate::Settings, watch: bool, bind: String) -> 
     // future's own natural completion). Awaiting these handles here -- not
     // just relying on `ct.cancel()` -- is what lets the unified watcher's
     // `watch()` task finish any `spawn_blocking` closure holding the
-    // facade's write guard before this function returns: `watch()` only
-    // observes `ct` between its own loop iterations (see
-    // `UnifiedWatcher::cancellation_token`), so by the time its `JoinHandle`
-    // resolves, no such closure is still running, and it is safe for the
-    // caller to tear the process down right after this function returns.
+    // facade's write guard, and join any in-flight catch-up reindex task,
+    // before this function returns: `watch()` only observes `ct` between
+    // its own loop iterations (see `UnifiedWatcher::cancellation_token`),
+    // and its cancellation arm blocks on the catch-up task's completion
+    // rather than dropping it, so by the time its `JoinHandle` resolves, no
+    // such closure or task is still running, and it is safe for the caller
+    // to tear the process down right after this function returns.
     if let Some(handle) = hot_reload_handle {
         let _ = handle.await;
     }
