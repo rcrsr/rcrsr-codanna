@@ -70,6 +70,7 @@ pub async fn serve_https(config: crate::Settings, watch: bool, bind: String) -> 
     }
 
     // Start unified file watcher if enabled
+    let mut unified_watcher_handle: Option<tokio::task::JoinHandle<()>> = None;
     if watch || config.file_watch.enabled {
         use crate::watcher::UnifiedWatcher;
         use crate::watcher::handlers::{CodeFileHandler, ConfigFileHandler, DocumentFileHandler};
@@ -90,7 +91,8 @@ pub async fn serve_https(config: crate::Settings, watch: bool, bind: String) -> 
             .workspace_root(workspace_root.clone())
             .debounce_ms(debounce_ms)
             .refresh_on_overflow(config.file_watch.refresh_on_overflow)
-            .startup_catch_up(config.file_watch.startup_catch_up);
+            .startup_catch_up(config.file_watch.startup_catch_up)
+            .cancellation_token(ct.clone());
 
         // Add code file handler
         builder = builder.handler(CodeFileHandler::new(
@@ -120,22 +122,24 @@ pub async fn serve_https(config: crate::Settings, watch: bool, bind: String) -> 
                 ));
         }
 
-        // Build and start the unified watcher
+        // Build and start the unified watcher. The `JoinHandle` is kept so the
+        // caller can `.await` it after cancelling `ct`. Cancellation is wired
+        // into `watch()` itself (via `.cancellation_token(ct.clone())` above)
+        // rather than raced against `watch()` in an external `select!` here:
+        // `watch()` only observes the token between its own loop iterations,
+        // never while a handler-spawned `spawn_blocking` closure (e.g. inside
+        // `process_removal_wave`/`execute_action`) that may hold the facade's
+        // write guard is still being awaited. That guarantees `watch()`
+        // returns only once any such closure has finished, so awaiting this
+        // handle after cancelling `ct` truly waits for that work to finish.
         match builder.build() {
             Ok(unified_watcher) => {
-                let watcher_ct = ct.clone();
-                tokio::spawn(async move {
-                    tokio::select! {
-                        result = unified_watcher.watch() => {
-                            if let Err(e) = result {
-                                tracing::error!("[watcher] error: {e}");
-                            }
-                        }
-                        _ = watcher_ct.cancelled() => {
-                            crate::log_event!("watcher", "stopped");
-                        }
+                unified_watcher_handle = Some(tokio::spawn(async move {
+                    if let Err(e) = unified_watcher.watch().await {
+                        tracing::error!("[watcher] error: {e}");
                     }
-                });
+                    crate::log_event!("watcher", "stopped");
+                }));
                 crate::log_event!(
                     "watcher",
                     "started",
@@ -150,7 +154,19 @@ pub async fn serve_https(config: crate::Settings, watch: bool, bind: String) -> 
         }
     }
 
-    // Start index watcher if watch mode is enabled
+    // Start index watcher if watch mode is enabled.
+    //
+    // The `JoinHandle` is kept (not discarded) so the caller can `.await` it
+    // after cancelling `ct`. Unlike the unified watcher above,
+    // `HotReloadWatcher::watch()` never uses `spawn_blocking` -- its facade
+    // swap takes the async `RwLock::write().await`, and dropping that await
+    // (e.g. because the outer `select!` below picked the cancellation arm)
+    // simply abandons the pending lock acquisition rather than leaving a
+    // detached OS thread holding the write guard. Awaiting the handle here
+    // is still worth doing so a reload-in-progress settles (rather than the
+    // task being silently dropped) before the process exits, but it is not
+    // closing the same race the unified watcher's threading does.
+    let mut hot_reload_handle: Option<tokio::task::JoinHandle<()>> = None;
     if watch {
         let hot_reload_indexer = indexer.clone();
         let hot_reload_settings = Arc::new(config.clone());
@@ -167,7 +183,7 @@ pub async fn serve_https(config: crate::Settings, watch: bool, bind: String) -> 
         )
         .with_broadcaster(hot_reload_broadcaster);
 
-        tokio::spawn(async move {
+        hot_reload_handle = Some(tokio::spawn(async move {
             tokio::select! {
                 _ = hot_reload_watcher.watch() => {
                     crate::log_event!("hot-reload", "ended");
@@ -176,7 +192,7 @@ pub async fn serve_https(config: crate::Settings, watch: bool, bind: String) -> 
                     crate::log_event!("hot-reload", "stopped");
                 }
             }
-        });
+        }));
 
         crate::log_event!("hot-reload", "started", "polling every {watch_interval}s");
     }
@@ -442,13 +458,15 @@ pub async fn serve_https(config: crate::Settings, watch: bool, bind: String) -> 
         crate::mcp::http_server::idle_poll_interval_override().unwrap_or(Duration::from_secs(5));
 
     // Handle graceful shutdown with tokio::select!
+    let mut server_result: Option<std::io::Result<()>> = None;
     tokio::select! {
         result = server => {
+            ct.cancel();
             if let Some(codanna_dir) = &codanna_dir {
                 crate::serve_discovery::remove_record(codanna_dir);
             }
             crate::serve_registry::remove_entry(std::process::id());
-            result?;
+            server_result = Some(result);
         }
         _ = shutdown_signal() => {
             eprintln!("Shutting down HTTPS server...");
@@ -485,6 +503,28 @@ pub async fn serve_https(config: crate::Settings, watch: bool, bind: String) -> 
             }
             crate::serve_registry::remove_entry(std::process::id());
         }
+    }
+
+    // `ct` is cancelled on every branch above (including the `server`
+    // future's own natural completion). Awaiting these handles here -- not
+    // just relying on `ct.cancel()` -- is what lets the unified watcher's
+    // `watch()` task finish any `spawn_blocking` closure holding the
+    // facade's write guard, and join any in-flight catch-up reindex task,
+    // before this function returns: `watch()` only observes `ct` between
+    // its own loop iterations (see `UnifiedWatcher::cancellation_token`),
+    // and its cancellation arm blocks on the catch-up task's completion
+    // rather than dropping it, so by the time its `JoinHandle` resolves, no
+    // such closure or task is still running, and it is safe for the caller
+    // to tear the process down right after this function returns.
+    if let Some(handle) = hot_reload_handle {
+        let _ = handle.await;
+    }
+    if let Some(handle) = unified_watcher_handle {
+        let _ = handle.await;
+    }
+
+    if let Some(result) = server_result {
+        result?;
     }
 
     eprintln!("HTTPS server shut down gracefully");

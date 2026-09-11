@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`codanna serve` idle-shutdown exit and `codanna ls` display fixes:** idle-shutdown on `--http` and `--https` modes now exits cleanly instead of hanging when background `--watch` tasks ignore SIGTERM. `codanna ls` also corrects misreported binary versions at different paths and no longer shows orphaned proxies as healthy. ([#92](https://github.com/rcrsr/rcrsr-codanna/pull/92))
+
 ## [0.16.0+rcrsr.6] - 2026-09-09
 
 ### Added

@@ -1,10 +1,11 @@
 # rcrsr-codanna — Fork Changes
 
-This is a fork of [`bartolli/codanna`](https://github.com/bartolli/codanna). This
-file lists what the fork adds or changes for you as a user, on top of its
-upstream base. For the how, see the commit history.
+This is a fork of [`bartolli/codanna`](https://github.com/bartolli/codanna).
+This file lists what the fork adds or changes for you as a user, on top of its
+upstream base. Everything not listed here behaves as it does upstream; for the
+how, see the commit history.
 
-- **Upstream base:** the latest `codanna` release the fork is built on
+- **Upstream base:** v0.16.0 — the `codanna` release the fork is built on
 - **Fork build:** the upstream version with a `+rcrsr.N` suffix (see [Identifying the fork](#identifying-the-fork))
 
 ## Contents
@@ -14,12 +15,16 @@ upstream base. For the how, see the commit history.
   - [Updating](#updating)
   - [Alternatives](#alternatives)
   - [PATH and shadowing](#path-and-shadowing)
+  - [Cutting a release (maintainers)](#cutting-a-release-maintainers)
+- [Upstream base](#upstream-base)
 - [Improvements](#improvements)
   - [Proxy mode: one backing server per workspace](#proxy-mode-one-backing-server-per-workspace)
     - [Idle shutdown](#idle-shutdown)
+    - [Upstream revival](#upstream-revival)
+    - [Discovery record identity](#discovery-record-identity)
     - [Configuration](#configuration)
     - [Ports](#ports)
-    - [Server registry (`--list` / `--stop` / `--reap` / `--kill-all`)](#server-registry---list----stop----reap----kill-all)
+    - [Server registry and `codanna ls`](#server-registry-and-codanna-ls)
     - [Hot-reload notifications through the proxy](#hot-reload-notifications-through-the-proxy)
   - [Reindexing on demand (`reindex` MCP tool)](#reindexing-on-demand-reindex-mcp-tool)
     - [Arguments](#arguments)
@@ -28,52 +33,21 @@ upstream base. For the how, see the commit history.
     - [Startup catch-up (opt-in)](#startup-catch-up-opt-in)
     - [Configuration](#configuration-1)
   - [`ignore_patterns` now excludes files during indexing](#ignore_patterns-now-excludes-files-during-indexing)
+  - [Indexing no longer depends on the working directory](#indexing-no-longer-depends-on-the-working-directory)
   - [Document collection controls (`search_documents`)](#document-collection-controls-search_documents)
-    - [Per-collection default visibility (`default` / `--no-default`)](#per-collection-default-visibility-default----no-default)
-    - [Negated glob patterns in collection `patterns`](#negated-glob-patterns-in-collection-patterns)
-    - [Multi-select `--collection` / `--exclude-collection`](#multi-select---collection----exclude-collection)
-    - [Input validation, `threshold`, and plain JSON previews](#input-validation-threshold-and-plain-json-previews)
-    - [Clarified tool descriptions: `semantic_search_docs` vs `search_documents`](#clarified-tool-descriptions-semantic_search_docs-vs-search_documents)
   - [MCP tool enhancements for agent workflows](#mcp-tool-enhancements-for-agent-workflows)
-    - [Structured JSON output (`output_format`)](#structured-json-output-output_format)
-    - [Batch symbol lookup (`find_symbols`)](#batch-symbol-lookup-find_symbols)
-    - [Canonical `name` parameter across symbol tools](#canonical-name-parameter-across-symbol-tools)
-    - [Test/production classification on `find_callers`](#testproduction-classification-on-find_callers)
-    - [Symbol-scoped reads (`get_file_outline`, `read_symbol`)](#symbol-scoped-reads-get_file_outline-read_symbol)
-    - [Slimmer `analyze_impact`](#slimmer-analyze_impact)
 - [Identifying the fork](#identifying-the-fork)
 
 ## Installing the fork
 
 The fork is distributed through its own [GitHub Releases](https://github.com/rcrsr/rcrsr-codanna/releases),
-not crates.io or Homebrew. Each release is cut by pushing a `v<version>` tag; CI
-builds Linux, macOS (x64 + arm64), and Windows binaries and attaches them.
-
-**Before tagging, prepare `CHANGELOG.md`:** rename `## [Unreleased]` to
-`## [<version>] - <date>`, where `<version>` is the *full* `Cargo.toml`
-version **including the `+rcrsr.N` suffix and its literal `+`** — e.g.
-`## [0.12.0+rcrsr.1] - 2026-07-28`. The release body is extracted from the
-section whose heading matches that version exactly, and the match is a literal
-string compare, so a bare upstream heading (`## [0.12.0]`) will not be found.
-Every heading currently in the file predates the fork's release pipeline and is
-a bare upstream version, so the file's visible convention is the wrong one to
-copy here. A tag push with no matching, non-empty section fails in CI before
-anything is built.
-
-To validate the whole pipeline locally before tagging — version derivation,
-the release build, packaging and checksums, manifest generation, and an
-offline end-to-end run of `scripts/install.sh` — run
-`contributing/scripts/test-release-workflow.sh` from the repository root. It
-mirrors `.github/workflows/release.yml` and asserts against the shipping
-workflow, so it also catches drift between the two. Running the release
-workflow via `workflow_dispatch` exercises the same pipeline on CI as a dry
-run: it builds and uploads artifacts for inspection but never publishes a
-release, even when dispatched against a tag.
+not crates.io or Homebrew. CI builds Linux, macOS (x64 + arm64), and Windows
+binaries for every `v<version>` tag.
 
 ### Quick install (recommended)
 
-The installer script downloads the right archive for your platform from the
-latest (or a pinned) GitHub release, verifies its checksum, and puts the
+The installer downloads the right archive for your platform, verifies its
+`sha256` against the release manifest (aborting on mismatch), and puts the
 `codanna` binary on your `PATH`.
 
 macOS / Linux:
@@ -82,1109 +56,582 @@ macOS / Linux:
 curl -fsSL https://raw.githubusercontent.com/rcrsr/rcrsr-codanna/main/scripts/install.sh | sh
 ```
 
-Windows (PowerShell):
+Windows (PowerShell) — stop any running `codanna serve` first, since the
+installer cannot overwrite a locked `codanna.exe`:
 
 ```powershell
 irm https://raw.githubusercontent.com/rcrsr/rcrsr-codanna/main/scripts/install.ps1 | iex
 ```
 
-Before running the Windows installer, stop any running `codanna serve`
-process first — the installer copies the new binary over the old one
-(`Copy-Item -Force`), which cannot overwrite a `codanna.exe` that a running
-process still has locked.
+Optional environment variables:
 
-The script pulls its content from the `main` branch, not a tagged commit, so
-the *installer logic* can change between the time you run it and any future
-run — only the *binary it downloads* is checksum-verified per release. If you
-want the installer script itself pinned to an immutable ref (e.g. for CI or a
-provisioning pipeline), replace `main` in the URL above with a specific tag,
-such as `v0.12.0+rcrsr.1`:
+- `CODANNA_INSTALL_DIR` — install location (default `~/.local/bin`, or
+  `%USERPROFILE%\.local\bin` on Windows).
+- `CODANNA_VERSION` — install a specific release by tag (e.g.
+  `v0.12.0+rcrsr.1`) instead of the latest.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/rcrsr/rcrsr-codanna/v0.12.0+rcrsr.1/scripts/install.sh | sh
-```
+The script is fetched from `main`, so the *installer logic* can change between
+runs; only the binary it downloads is checksum-verified per release. To pin the
+script itself, replace `main` in the URL with a release tag.
 
-Two environment variables configure the installer; both are optional:
-
-- `CODANNA_INSTALL_DIR` — where to install the binary (default: `~/.local/bin`,
-  or `%USERPROFILE%\.local\bin` on Windows).
-- `CODANNA_VERSION` — install a specific fork version (e.g. `v0.12.0+rcrsr.1`,
-  matching the release's `tag_name`) instead of the latest release.
-
-The installer downloads a per-platform archive named
-`codanna-<sanitized-version>-<platform>.tar.xz` (`.zip` on Windows). The
-archive filename never contains a literal `+` — in the filename only, the
-`+` is replaced with `-`, so `0.12.0+rcrsr.1` becomes `0.12.0-rcrsr.1`. The
-build metadata itself is preserved; only the separator changes, since a
-literal `+` is not portable across every download/extraction tool and
-GitHub rewrites release-asset filenames containing it. (The version
-still appears with `+rcrsr.N` intact in the release tag itself, e.g.
-`v0.12.0+rcrsr.1`, and in `codanna --version` output — only the asset
-filename is sanitized.) The installer then verifies the downloaded archive's
-`sha256` checksum against the release manifest before extracting it. If
-verification fails, the install aborts instead of installing an unverified
-binary.
+Release archives are named `codanna-<version>-<platform>.tar.xz` (`.zip` on
+Windows) with the `+` in the version replaced by `-` (`0.12.0-rcrsr.1`) — a
+literal `+` is not portable across download tools and GitHub rewrites asset
+names containing it. The tag and `codanna --version` keep the `+` intact.
 
 ### Updating
 
-Re-run the same install command to upgrade to the latest release — there is
-no separate `codanna update` or `codanna upgrade` subcommand. This matches the
-model used by installers like rustup, uv, and deno: the one-liner is
-idempotent, so running it again simply replaces your existing install with
-the current latest (or, with `CODANNA_VERSION` set, a specific pinned)
-release.
+Re-run the same install command — there is no `codanna update` subcommand.
+The one-liner is idempotent and replaces your existing install with the latest
+(or `CODANNA_VERSION`-pinned) release, the same model rustup, uv, and deno use.
 
 ### Alternatives
 
-Prebuilt binary via [`cargo binstall`](https://github.com/cargo-bins/cargo-binstall)
-(reads this repo's binstall metadata, so it must be pointed at the fork with `--git`):
-
 ```bash
+# prebuilt binary via cargo-binstall (must be pointed at the fork with --git;
+# plain `cargo binstall codanna` resolves the upstream crate from crates.io)
 cargo binstall --git https://github.com/rcrsr/rcrsr-codanna codanna
-```
 
-Plain `cargo binstall codanna` resolves the **upstream** crate from crates.io — use
-the `--git` form above to get the fork.
-
-From source:
-
-```bash
+# from source
 cargo install --git https://github.com/rcrsr/rcrsr-codanna --all-features codanna
 ```
 
-Or download a platform archive directly from the [releases page](https://github.com/rcrsr/rcrsr-codanna/releases)
-and put the `codanna` binary on your `PATH` yourself; this is what the
-installer script above automates, including the checksum check.
+Or download an archive from the [releases page](https://github.com/rcrsr/rcrsr-codanna/releases)
+and put the binary on your `PATH` yourself.
 
 ### PATH and shadowing
 
-The binary is named `codanna` (same as upstream), so it will shadow an
-upstream install on the same `PATH`. This also applies to the installer's own
-target directory: if `CODANNA_INSTALL_DIR` (or its per-platform default, such
-as `~/.local/bin`) comes earlier on your `PATH` than wherever an existing
-`codanna` lives (e.g. a Homebrew or crates.io install in `/usr/local/bin` or
-`~/.cargo/bin`), the fork build will take precedence — and vice versa if it
-comes later. Run `which codanna` (or `where.exe codanna` on Windows) after
-installing to confirm which binary resolves first, and `codanna --version`
-to confirm you're running the fork build (see
-[Identifying the fork](#identifying-the-fork)).
+The binary is named `codanna`, same as upstream, so whichever install comes
+first on your `PATH` wins — the fork's `~/.local/bin` vs a Homebrew or
+crates.io install in `/usr/local/bin` or `~/.cargo/bin`. After installing, run
+`which codanna` (`where.exe codanna` on Windows) to see which resolves, and
+`codanna --version` to confirm the `+rcrsr.N` suffix.
+
+### Cutting a release (maintainers)
+
+Before pushing a `v<version>` tag, rename `## [Unreleased]` in `CHANGELOG.md`
+to `## [<version>] - <date>` using the *full* `Cargo.toml` version including
+the literal `+rcrsr.N` (e.g. `## [0.12.0+rcrsr.1] - 2026-07-28`). The release
+body is extracted by exact heading match, so a bare upstream heading is not
+found and the tag push fails in CI before anything is built.
+
+`contributing/scripts/test-release-workflow.sh` validates the whole pipeline
+locally (version derivation, build, packaging, checksums, manifest, and an
+offline run of `install.sh`) and asserts against `.github/workflows/release.yml`
+so drift between the two is caught. Running the release workflow via
+`workflow_dispatch` is a CI dry run: it builds and uploads artifacts but never
+publishes a release, even against a tag.
 
 ## Upstream base
 
-The fork now tracks upstream **v0.16.0** (merged from the prior v0.13.1 base).
-Moving the upstream base does not touch the fork build counter, which only ever
-counts up (see [Identifying the fork](#identifying-the-fork)).
+The fork tracks upstream **v0.16.0**. Moving the base never touches the
+`+rcrsr.N` counter (see [Identifying the fork](#identifying-the-fork)).
 
-**v0.13.1 → v0.16.0 reconciliation.** Two fork-private capabilities now sit
-alongside upstream's own, newer equivalents rather than being retired:
+Two fork-private capabilities are kept alongside upstream's newer equivalents
+rather than retired, because upstream's version does not cover the case the
+fork's exists for:
 
-- **Writer transient-error retry** (`storage/tantivy/writer.rs`). Upstream
-  shipped its own `create_writer_with_retry` in this range, but it classifies
-  transient errors via `source().downcast::<io::Error>()`, which never matches
-  `LockError::LockBusy` on tantivy 0.26 — the exact case the fork's retry
-  exists to survive. The fork's `is_transient_writer_error` (matching the
-  concrete `LockFailure(LockBusy, _)` / `LockFailure(IoError)` / `IoError`
-  variants, with capped backoff) stays the live retry path; upstream's
-  0.13.3 segment-merge-wait fix (`wait_merging_threads()` before releasing the
-  writer) was adopted as an additional layer on top, not a replacement.
-- **JSON envelope** (`io/envelope.rs`). Upstream added `begin`/`summary`
-  dump-streaming markers in 0.14.0; the fork's pre-existing `ambiguous(message,
-  data)` constructor (and its `ResultCode` handling) is kept alongside them.
+- **Writer transient-error retry.** Upstream's `create_writer_with_retry`
+  classifies transient errors by downcasting to `io::Error`, which never
+  matches tantivy's `LockError::LockBusy` — the exact case the fork's retry
+  survives. The fork's retry stays the live path; upstream's segment-merge
+  wait before releasing the writer was adopted on top.
+- **JSON envelope `ambiguous` status.** Upstream added `begin`/`summary`
+  dump-streaming markers; the fork's `ambiguous` constructor is kept beside
+  them.
 
-The fork's inline 1-indexed JSON range convention in `search.rs`/`symbols.rs`
-was retired in this pass — upstream converged on the same 1-indexed boundary,
-so the fork's duplicate logic was removed in favor of upstream's.
+Upstream changes between the previous and current base that are user-visible,
+with the fork's caveats:
 
-One upstream v0.10.0 change is user-visible for existing MCP clients:
-**unknown `key:value` arguments on an MCP tool call now reject** instead of
-being silently ignored — this applies on every surface (positional CLI args,
-`--args`, and serve-mode `tools/call`, where the rejection surfaces as
-`isError: true`); tool schemas also now advertise `additionalProperties:
-false`. A misspelled or stale argument key that previously passed through
-unnoticed now fails the call. If you have automation or scripts calling
-codanna's MCP tools, check argument names against the current tool schemas
-after upgrading.
+- **Unknown `key:value` arguments on MCP tool calls are rejected** (v0.10.0)
+  instead of silently ignored, on every surface (positional CLI args, `--args`,
+  and serve-mode `tools/call`, where it surfaces as `isError: true`). Check
+  argument names in any automation after upgrading.
+- **A stale index no longer fails `codanna serve` at startup** (v0.10.1). Over
+  stdio the server completes the MCP handshake and advertises **zero tools**,
+  with instructions beginning `INDEX STALE - ALL TOOLS DISABLED` naming
+  `codanna index` as the fix; it still exits with code 7 after the session, and
+  a terminal still prints `index emission semantics changed`. **Fork note:**
+  proxy mode is exempt because a proxy holds no index. If a proxy has to spawn
+  a *fresh* backing server against a stale index you get a readiness timeout
+  (`backing 'codanna serve --http' did not become healthy within …ms`) rather
+  than the stale-index explanation; run `codanna index` to heal it.
+- **`--fields` rejects unknown field names** (v0.11.1) with a JSON error
+  envelope, `code: INVALID_QUERY`, exit code 2, and a hint listing the fields
+  the tool actually returns (they differ per tool). Dotted paths are now
+  accepted. **Fork note:** applies identically to the fork-only `find_symbols`
+  and `reindex` tools; an ambiguous symbol name still exits 3 with
+  `code: AMBIGUOUS` regardless of `--fields`.
+- **v0.12.0 forces a one-time re-index of every existing index.** Symbol
+  relationships are emitted differently (emission-semantics version 1 → 3),
+  and the gate is absolute: an index from an older binary is refused (exit 7,
+  or the zero-tool handshake over stdio). Run `codanna index` once per
+  workspace and restart any MCP server. Cross-file resolution now **fails
+  closed** — unresolvable calls are left unresolved instead of guessed — so
+  expect relationship counts to *drop* on re-index (upstream measured −7.6% to
+  −48%, mostly lost wrong answers). Re-baseline any tooling that asserts on
+  caller or impact counts. `index.meta` and `get_index_info --json` also gain a
+  descriptive `builder_commit` field.
+- **v0.13.0 migrates every transport to the MCP 2026-07-28 spec** (rmcp
+  3.1.0), serving the new stateless generation alongside the legacy one through
+  its deprecation window. `server/discover` is answered; stateless HTTP requests
+  require the `MCP-Protocol-Version` header (and `Mcp-Name` on name-bearing
+  methods); `subscriptions/listen` lets stateless clients opt into
+  resource-change notifications; tool/prompt lists carry a cache contract.
+  `codanna mcp-test` connects Discover-only and diagnoses a server that dies on
+  the probe. No rebuild. **Fork note:** upstream removed its custom
+  `notifications/codanna/*` wire in favor of standard MCP notifications, and the
+  fork followed — see [Hot-reload notifications](#hot-reload-notifications-through-the-proxy).
+- **v0.13.1 converges incremental indexing with a fresh index** across renames,
+  edits, and deletions (files referencing a moved target are re-analyzed in the
+  same run; already-lost relationships restore on the next edit or with
+  `codanna index --force`). Watched file creation and deletion emit
+  `notifications/resources/list_changed`; modification emits a URI-filtered
+  `notifications/resources/updated`. `serve --watch` no longer livelocks on
+  Linux. Known limitation carried forward: Windows path handling under-reports
+  some relationships.
 
-Upstream v0.10.1 changes what a **stale index** looks like to an MCP client.
-When the index was built by a binary with different emission semantics,
-`codanna serve` (stdio) no longer fails to start — it completes the MCP
-handshake and advertises **zero tools**, with instructions beginning `INDEX
-STALE - ALL TOOLS DISABLED` that name `codanna index` as the fix and remind you
-to restart the MCP server afterwards. Clients that launch codanna themselves
-usually discard its error output, so the old behavior showed up as an opaque
-connection failure with no hint of the cause; now the reason arrives over the
-protocol. Nothing becomes readable — the refusal is still absolute, the process
-still exits with code 7 once the session ends, and running in a terminal still
-prints `index emission semantics changed`.
+## Improvements
 
-**Fork note — this does not cover proxy mode.** `codanna serve --proxy` (and a
-bare `codanna serve` when `mode = "proxy"` is set in `settings.toml`) is exempt
-from the staleness check by design, because a proxy holds no index of its own.
-It delegates to a backing server started as `codanna serve --http`, which
-upstream's degraded-handshake path deliberately excludes, and the fork starts
-that backing process with its error output detached. So if a proxy has to start
-a *fresh* backing server against a stale index, you get a readiness timeout —
-`backing 'codanna serve --http' did not become healthy within …ms` — rather
-than the stale-index explanation. An already-running backing server is
-unaffected. Run `codanna index` in the workspace to heal it.
-
-Upstream v0.11.1 changes what happens when you ask for output fields that
-don't exist. `--fields` now **rejects** unknown field names instead of
-silently returning stripped-empty items, and it does so on every surface that
-accepts the flag — `codanna mcp <tool> --json --fields`, `codanna retrieve
-<query> --json --fields`, and `codanna documents search --json --fields`, all
-of which share one rejection path. A rejection is a JSON error envelope on stdout with
-`code: INVALID_QUERY` and exit code 2, carrying a hint that lists the
-available top-level fields. `--fields` also now understands dotted paths, so
-you can project into a nested field instead of only picking top-level keys.
-If you have scripts that pass `--fields`, check the field names you're
-asking for after upgrading — a misspelling that used to come back as an
-empty object now fails the command outright. Note that the accepted names
-are derived from the records a tool actually returns, so they differ between
-tools: `role` is a valid field on `find_callers`, for instance, but not on
-`analyze_impact`. The hint in the rejection always lists what the tool you
-called will accept.
-
-**Fork note.** The new rejection applies to the fork-only tools too —
-`find_symbols` and `reindex` reject an unknown `--fields` name exactly the
-same way. An ambiguous symbol name still exits **3** with `code: AMBIGUOUS`
-regardless of what you passed to `--fields`, because the fork decides
-ambiguity before it renders anything, so the new exit-2 rejection never
-swallows the fork's ambiguity handling.
-
-**Upstream v0.12.0 forces a one-time re-index of every existing index.**
-Upstream changed how symbol relationships are emitted, and bumped the
-emission-semantics version from 1 to 3 to say so. The gate that guards this is
-absolute, not advisory: any index written by an older binary is refused. In a
-terminal you get `index emission semantics changed (index: v1, binary: v3)` and
-exit code **7**; over stdio MCP you get the degraded zero-tool handshake
-described above, with `INDEX STALE - ALL TOOLS DISABLED` in the instructions.
-Run `codanna index` once per workspace to heal it, and restart any MCP server
-afterwards. This is upstream's intended behavior, not a fork decision — but it
-lands on upgrade with no warning beforehand, so re-index before you rely on a
-workspace. The proxy-mode caveat in the fork note above applies here too: a
-proxy forced to spawn a fresh backing server against a stale index reports a
-readiness timeout rather than the stale-index reason.
-
-The reason for the bump is worth knowing, because it changes result counts.
-Upstream made cross-file resolution **fail closed**: a call that cannot be tied
-to a definition by actual evidence is now left unresolved instead of being
-guessed from the first plausible candidate. Import bindings resolve only on an
-exact module match or an exactly-one survivor, and a symbol with no module
-identity no longer matches everything by accident. Expect relationship counts
-to *drop* on re-index — upstream measured -7.6% on one corpus and -48% on
-another — with the lost recall being mostly wrong answers. If you have tooling
-that asserts on caller or impact counts, re-baseline it against a freshly built
-index rather than assuming a regression.
-
-Upstream v0.12.0 also adds `builder_commit` to `index.meta` and to
-`get_index_info --json`: the commit the building binary came from, suffixed
-`-dirty` when built from a modified tree. It is descriptive only — nothing
-reads it back — and it is absent for tarball builds and for indexes written
-before the stamp existed. **Fork note:** upstream declares this field on its
-own `IndexInfo` in `cli/commands/mcp.rs`; the fork long ago relocated that
-struct to `mcp/service.rs`, so the field is carried there instead. The emitted
-JSON is the same either way.
-
-**Upstream v0.13.0 migrates every transport to the MCP 2026-07-28 spec
-revision (rmcp 3.1.0).** All transports (stdio, HTTP, HTTPS) now serve the new
-stateless generation — the revision that removes protocol-level sessions and
-the `initialize` handshake — alongside the legacy generation through its
-deprecation window: dispatch is per-session on stdio, per-request on
-HTTP/HTTPS. New surface for 2026-07-28 clients: `server/discover` is answered
-as the required RPC and as the stdio back-compat probe; HTTP requests carrying
-2026-07-28 `_meta` are served per-request without minting a session (the
-`MCP-Protocol-Version` header is required, and `Mcp-Name` is required on
-name-bearing methods); `subscriptions/listen` lets a stateless client opt into
-resource-change notifications with per-category and per-URI filters; and tool
-and prompt list results carry a cache contract (`ttlMs` 3600000, `cacheScope`
-"private"). `codanna mcp-test` now connects Discover-only — against a server
-that dies on the probe (every release up to 0.12.0) it fails with a diagnostic
-naming the probe death instead of a raw connection error. Index format,
-emission semantics, and settings are unchanged; no rebuild. **Fork note:**
-upstream also *removed* its custom `notifications/codanna/*` wire notifications
-(file-reindexed, file-created, file-deleted, index-reloaded), moving the watch
-lane onto standard MCP notifications — and the fork followed. The proxy
-hot-reload section below now describes the standard `notifications/resources/*`
-signals the watch lane actually emits; the old custom-notification names no
-longer appear on the wire.
-
-**Upstream v0.13.1 is an incremental-refactor and watcher-notification patch.**
-Renames, renames combined with edits, and deletions now converge the
-incremental index to the same relationship set as a fresh index: a file that
-references a moved or deleted target is re-analyzed in the same run, so each
-relationship follows the current source evidence — across batch indexing,
-`serve --watch`, and `mcp <tool> --watch`. If an earlier version processed a
-rename or deletion, relationships already lost from that index restore on the
-next edit of the referencing files, or all at once with `codanna index
---force`. On the notification side, watched file *creation* emits
-`notifications/resources/list_changed`, *modification* of a known file remains
-a URI-filtered `notifications/resources/updated`, and *deletion* emits one
-list-change notification. `serve --watch` also no longer livelocks on Linux
-(inotify access-class events are ignored, and the debounced drain runs on a
-fixed cadence sustained event streams cannot defer). Index format, emission
-semantics, and settings are unchanged; no automatic rebuild. One upstream
-known limitation carries forward: on Windows, path handling degrades symbol
-resolution — some relationships that resolve on Linux and macOS are
-under-reported — so Windows runs in the test pipeline as a non-blocking
-witness, with fixes tracked for a later release.
-
-# Improvements
-
-The sections below are the fork's additions over upstream codanna — new
-capabilities and behavior changes you get on top of the upstream base.
+The sections below are the fork's additions over upstream — new capabilities
+and behavior changes you get on top of the base.
 
 ## Proxy mode: one backing server per workspace
 
-`codanna serve --proxy` lets several MCP clients share a single backing server
-for a workspace instead of each starting its own. Point every client at the
-proxy: the first one starts (or discovers) a backing server for the workspace,
-and the rest attach to it.
-
-The backing server is started as a detached background process and keeps running
-after the clients disconnect, so the next client reattaches to the warm index
-instead of paying startup again. By default it exits on its own after 4 hours of
-inactivity; set `idle_shutdown_minutes` (see below) to change that window, or to
-`0` to have it stay up until you stop it (or the host reboots).
-
-A `codanna serve --proxy` process that is already running and connected does
-not need to be restarted when its backing server goes away (idle shutdown, a
-crash, a manual kill): the NEXT tool call over that same connection notices the
-upstream connection is dead and transparently revives it (rediscovering or
-respawning a backing server, then retrying the call once) before the client
-sees any error. See [Upstream revival](#upstream-revival) below for exactly
-what that does and does not cover.
-
-### Idle shutdown
-
-**Scope: `--http` backing servers only.** The idle timer (activity tracking,
-the poll loop, and the shutdown trigger) is implemented in `serve_http`; a
-backing server started with `--https` has none of this plumbing, so
-`idle_shutdown_minutes` is silently inert for it. If you auto-spawn backing
-servers through the proxy (the common case), they are started with `--http`
-and this section applies as written. If you manually start a backing server
-with `codanna serve --https`, `idle_shutdown_minutes` has no effect on it.
-
-By default a backing server exits cleanly after 240 minutes (4 hours) with no
-MCP request activity, removing its `.codanna/serve.json` record exactly as a
-Ctrl+C shutdown does — so an unattended workspace doesn't accumulate a resident
-process forever. The next tool call through a proxy connection finds no record
-and auto-spawns a fresh server (paying only startup latency); on an
-already-connected proxy that is exactly the same [upstream revival](#upstream-revival)
-path any other dead-transport failure goes through, so idle shutdown is
-transparent to clients either way. Set `idle_shutdown_minutes` in `[server]` to
-a different non-zero value to change the window, or to `0` to disable idle
-shutdown and run the (`--http`) server indefinitely.
-
-Only real inbound MCP requests count as activity — SSE keep-alive pings do not
-reset the idle clock, so a merely *connected* client does not keep the server
-alive forever.
-
-### Upstream revival
-
-A live `codanna serve --proxy` process holds one connection to its backing
-server for as long as it runs. If that connection dies (the backing server was
-idle-shut-down, crashed, or was killed) it is not detected until the NEXT tool
-call is delegated to it — the proxy does not poll or health-check its upstream
-in the background. That next call observes the dead connection, transparently
-re-runs the same discover-or-spawn logic used at proxy startup (reusing an
-already-live backing server if one now exists, or spawning a fresh one), and
-retries the call exactly once against the revived connection before returning
-a result to the client.
-
-This has real limits, worth knowing before you rely on it:
-
-- **Exactly one retry.** If the revived connection also fails, the error is
-  returned to the client as-is — there is no loop and no backoff. A second
-  failure back-to-back means the backing server is not coming up, not that it
-  needs another attempt.
-- **Single-flight per proxy process, including on failure.** If several
-  requests hit the dead connection concurrently, only one of them actually
-  dials a new backing server; the rest wait for that dial and reuse its
-  result rather than each spawning their own. This holds whether the dial
-  succeeds or fails — a failed dial is cached for the round too, so the
-  waiters get the same error back instead of each re-dialing (and, with
-  `auto_spawn` on, each paying a full spawn-and-health-check timeout back to
-  back).
-- **Revival is never attempted on a timeout.** A backing server that is simply
-  slow to respond (a large reindex, for example) is not treated as dead and is
-  not replaced — only a genuinely closed/broken transport triggers a revive.
-  Spawning a second server underneath a merely-slow one would be strictly
-  worse than waiting.
-- **`auto_spawn = false` fails closed, not silently.** If no live backing
-  server can be discovered and the proxy is not allowed to spawn one, the
-  delegated call fails with an actionable error naming the workspace and
-  pointing at `codanna serve --http --watch` / `auto_spawn = true` — the same
-  message `discover_or_spawn` already gives a proxy at cold start, not a
-  generic "delegation failed".
-- **No background health checks.** The proxy never polls its upstream on its
-  own; revival only ever happens as a side effect of a real client request
-  hitting a dead connection.
-
-### Discovery record identity
-
-`discover_or_spawn` no longer trusts a `.codanna/serve.json` record naming an
-`--http` backing server just because its PID is alive and looks like a
-`codanna serve` process. Each `--http` server now writes a fresh, random
-per-launch token into the record and echoes it back from `/health`; discovery
-re-verifies that token on every read, not just once at proxy startup — the
-fast path and the spawn-wait loop both check it, so it also applies on every
-revive. A record whose token does not match, or that has no token at all
-(written by a codanna binary older than this change), is treated the same as
-"no live server": discovery falls through to spawning a fresh one on a new
-port. This hardens `serve --proxy` against a same-user local process that
-races a plausible-looking record into place pointing at its own loopback
-listener. `--https` records are not probed this way — their identity already
-rests on the pinned certificate checked at the real connection site, and
-probing them here would fall through to spawning `--http` on a rejection,
-silently downgrading a rejected TLS connection to plaintext.
-
-One practical consequence: a backing server started by an older codanna
-binary (no token support) is no longer discovered by a proxy running this
-version — the proxy ignores that record and spawns its own server on a new
-port instead of attaching to the old one. This is self-healing and requires
-no manual migration, but it does mean an extra resident process until the
-stale one is stopped or idles out (see [Idle shutdown](#idle-shutdown)).
-
-### Configuration
-
-The workspace must be initialized (`codanna init` writes `.codanna/settings.toml`);
-the proxy refuses to auto-spawn a backing server for a tree that has no config.
-Proxy behavior is controlled by the `[server]` section of that file:
-
-```toml
-[server]
-auto_spawn = true          # let the proxy start a backing server when none is found;
-                           # set false to require starting `codanna serve --http --watch` yourself
-spawn_timeout_ms = 8000    # how long to wait for a spawned server to become ready
-health_poll_ms = 100       # how often to poll for readiness while waiting
-idle_shutdown_minutes = 240 # exit the backing server after N idle minutes (0 = never)
-```
-
-The defaults shown above apply when the keys are absent, so an initialized
-workspace works with no `[server]` block at all.
-
-### Ports
-
-When the proxy auto-spawns a backing server, it binds a random free port on
-`127.0.0.1` (the OS assigns it). You never choose or need that port: the server
-records it, and the proxy reads the record to connect. Your MCP clients only ever
-talk to the proxy over stdio, so nothing on your side depends on the number.
-
-If you start a backing server yourself instead (`codanna serve --http` /
-`--https`), it uses the normal bind address — `--bind`, or `[server] bind` in
-`settings.toml`, defaulting to `127.0.0.1:8080` for HTTP and `127.0.0.1:8443` for
-HTTPS. All backing servers listen on loopback only; nothing is exposed off-host.
-Note that `idle_shutdown_minutes` (above) only applies to `--http` backing
-servers — a manually-started `--https` server runs indefinitely regardless of
-that setting.
+`codanna serve --proxy` lets several MCP clients share one backing server per
+workspace instead of each loading its own index. Point every client at the
+proxy: the first starts (or discovers) a backing server, the rest attach to it.
+Use it when more than one tool or editor talks to codanna for the same project.
 
 ```bash
 codanna serve --proxy
 ```
 
-Use it when more than one tool or editor talks to codanna for the same project
-and you don't want a separate index loaded into memory for each. Both HTTP and
-HTTPS backing servers are supported; with `--https` the connection is verified
-against codanna's own certificate.
+The backing server is a detached background process that outlives its clients,
+so the next client reattaches to a warm index. It exits on its own after 4
+hours idle by default (see [Idle shutdown](#idle-shutdown)). Both `--http` and
+`--https` backing servers are supported; with `--https` the connection is
+verified against codanna's own certificate.
 
-### Server registry (`--list` / `--stop` / `--reap` / `--kill-all`)
+### Idle shutdown
 
-Every `codanna serve --http`/`--https` process (whether auto-spawned by a
-proxy or started manually) publishes itself to a per-user server registry,
-separate from the per-workspace `.codanna/serve.json` discovery record
-described above. Where `serve.json` is scoped to one workspace and used for
-discovery, the registry is scoped to the whole user and used for lifecycle
-management: it is how codanna itself can tell you (and let you stop) every
-codanna server you have running, across every workspace, without walking the
-filesystem for `.codanna` directories. HTTPS backing servers get the same
-disappeared-workspace self-check and idle-shutdown timer as HTTP ones.
+A backing server (`--http` or `--https`) exits cleanly after
+`idle_shutdown_minutes` (default 240) with no MCP request activity, removing
+its `.codanna/serve.json` record and registry entry exactly as Ctrl+C does. Set
+the key to `0` to disable idle shutdown. Only real inbound MCP requests count as
+activity — SSE keep-alive pings do not reset the clock, so a merely *connected*
+client does not keep the server alive forever.
 
-The registry lives under your per-user state directory
-(`$XDG_STATE_HOME`, or `~/.local/state` on Linux; falling back to the data
-directory -- `~/Library/Application Support` on macOS,
-`%APPDATA%` on Windows -- on platforms with no state-directory concept),
-at `codanna/servers/`. Each running server owns exactly one file there,
-named after its own pid, so there is nothing to lock or contend over.
+Idle shutdown is transparent to clients: the next tool call through a proxy
+finds no live server and auto-spawns a fresh one, paying only startup latency
+(see [Upstream revival](#upstream-revival)).
 
-Each registry entry carries a `version` field -- the `codanna` version string
-(`env!("CARGO_PKG_VERSION")`) of the binary that wrote it -- which is what
-`codanna ls`'s VERSION column reads back for registered rows (see below).
-It defaults to an empty string via `#[serde(default)]`, so registry entries
-written by a pre-`version` build still deserialize without error; `codanna ls`
-renders an empty `version` as `-`.
+### Upstream revival
 
-`codanna ls` is the primary, top-level command for listing every registered
-and rogue `codanna serve` process visible to the invoking user (registered
-servers, attached proxies, and best-effort-enriched rogue pids merged into
-one table). `codanna serve --list` is **deprecated for one release cycle** in
-favor of `codanna ls`: it prints a deprecation notice to stderr and then
-delegates to the exact same listing logic, so the two commands always agree.
-Prefer `codanna ls` in scripts and habit going forward.
+A connected `codanna serve --proxy` does not need restarting when its backing
+server goes away (idle shutdown, crash, manual kill). The proxy holds one
+connection to its upstream and never polls it; the *next* delegated tool call
+notices the dead connection, re-runs the same discover-or-spawn logic used at
+startup (reusing a live backing server if one exists, else spawning one), and
+retries the call exactly once before returning anything to the client.
 
-`codanna ls`'s table has a VERSION column, populated differently depending on
-where a row came from:
+Limits worth knowing before you rely on it:
 
-- **Registered rows** (from the registry, whether server or proxy) print the
-  `codanna` version string the server itself recorded when it started --
-  `env!("CARGO_PKG_VERSION")` at the time it wrote its registry entry.
-- **Rogue rows** (a `codanna serve` process found by process-table scan, with
-  no live registry entry) have no self-reported version to read, so the
-  column instead shows how the rogue binary on disk compares to the
-  `codanna ls` process's own binary, by canonicalizing and comparing the two
-  executable paths -- never by exec'ing or `--version`-probing the rogue
-  process:
-  - `same` -- the rogue process is running the identical binary on disk as
-    the `codanna ls` invocation (safe to assume it's the same build).
-  - `other` -- the rogue process is running a different binary path (a
-    different version, or a different install location).
-  - `deleted` -- the rogue process's backing binary is gone from disk (the
-    common Linux in-place-upgrade signature, a `/proc/<pid>/exe` path ending
-    in `(deleted)`) or otherwise unreadable, so no comparison was possible.
-  - `-` -- the `codanna ls` process's own executable path couldn't be
-    resolved, so there was nothing to compare the rogue binary against.
+- **Exactly one retry.** If the revived connection also fails, the error is
+  returned as-is — no loop, no backoff. Two back-to-back failures mean the
+  backing server is not coming up.
+- **Single-flight per proxy, including on failure.** Concurrent requests
+  hitting the dead connection share one dial; a failed dial is cached for the
+  round so waiters get the same error instead of each re-spawning (and each
+  paying a full spawn-and-health-check timeout).
+- **Never on a timeout.** A backing server that is merely slow (a large
+  reindex, say) is not treated as dead and is not replaced; only a genuinely
+  closed transport triggers revival.
+- **`auto_spawn = false` fails closed, not silently.** With no live backing
+  server and spawning disallowed, the call fails with an actionable error
+  naming the workspace and pointing at `codanna serve --http --watch` /
+  `auto_spawn = true`.
 
-```bash
-codanna ls                              # show every running server this user owns (primary)
-codanna serve --list                    # deprecated: delegates to `codanna ls`, prints a deprecation notice to stderr
-codanna serve --stop <pid>              # SIGTERM a server by pid
-codanna serve --stop <workspace-path>   # ...or by the workspace root it's serving
-codanna serve --stop <pid> --force      # SIGKILL instead (only when SIGTERM isn't enough)
-codanna serve --stop <pid> --include-rogue  # also accept a rogue pid (shown by `codanna ls`) that has no registry entry
-codanna serve --reap                    # prune registry entries for servers that are no longer running
-codanna serve --kill-all                # stop every registered backing server (SIGTERM unless --force)
-codanna serve --kill-all --include-proxies  # ...and also stop every registered proxy, not just backing servers
-codanna serve --kill-all --force        # SIGKILL every target instead of SIGTERM
-```
+### Discovery record identity
 
-`--list`, `--stop`, `--reap`, and `--kill-all` are lifecycle operations, not
-ways to start a server: they cannot be combined with
-`--http`/`--https`/`--proxy`/`--bind`.
+The proxy does not trust a `.codanna/serve.json` record naming an `--http`
+backing server just because its PID is alive and looks like `codanna serve`.
+Each `--http` server writes a fresh random per-launch token into the record and
+echoes it from `/health`; discovery re-verifies it on every read, including on
+every revive. A record whose token is missing or does not match is treated as
+"no live server" and discovery spawns a fresh one on a new port. This hardens
+`serve --proxy` against a same-user process racing a plausible record into
+place. `--https` records are not probed this way — their identity already rests
+on the pinned certificate at the real connection, and a probe rejection would
+otherwise fall through to spawning plaintext `--http`.
 
-`--kill-all` sweeps every live (non-stale) registry entry and stops it the
-same way `--stop` does -- SIGTERM by default, SIGKILL with `--force` -- but
-in one command instead of one `--stop` per pid. By default it only targets
-`ServerRole::Server` entries (backing servers), leaving proxies running;
-`--include-proxies` (which requires `--kill-all` and cannot be combined with
-`--stop`) widens the sweep to registered proxies as well. Every target is
-attempted even if an earlier one fails or times out, so one unresponsive
-server never blocks the rest of the sweep; the command's exit code is `0`
-only if every target stopped, `1` if any did not. Like `--stop`, a killed
-(`--force`) process cannot self-deregister, so its registry entry can be
-left behind -- `--reap` is still the way to prune those afterward.
-
-`--stop` defaults to `SIGTERM`, giving the target server a chance to run its
-normal shutdown path -- the same one Ctrl+C and idle-shutdown already use,
-which removes both its `.codanna/serve.json` record and its registry entry
-before exiting. `--force` sends `SIGKILL` instead; a killed process gets no
-chance to clean up, so its registry entry can be left behind even though the
-process itself is gone. `--reap` is the way to prune those (and any other
-stale-pid) leftovers: it never signals anything, it only removes registry
-files whose pid is no longer alive. `--list` also skips dead-pid entries when
-printing, but -- unlike `--reap` -- never deletes them; that separation keeps
-"what does the registry currently say" and "clean up what's stale" as two
-distinct, independently-safe operations.
-
-### Hot-reload notifications through the proxy
-
-Since the v0.13.1 base, the watch lane rides **standard MCP notifications**
-rather than the fork's old custom `notifications/codanna/*` wire (which upstream
-retired — see the upstream-base note above). A watched file that is *modified*
-emits a URI-filtered `notifications/resources/updated`; a file *created* or
-*deleted* emits `notifications/resources/list_changed`. The proxy forwards these
-server-initiated notifications — along with tool/prompt list-changed, progress,
-and logging notifications — verbatim from the backing server to each stdio
-client, so a client behind the proxy stays as hot-reload-aware as one connected
-directly. A bounded, drop-oldest buffer still guards the narrow
-pre-`initialize` window on the legacy custom-notification forwarding path
-(retained for backward compatibility), flushing once the downstream client is
-ready.
-
-If you only ever run a single client, you don't need this — plain `codanna serve`
-is unchanged.
-
-## Reindexing on demand (`reindex` MCP tool)
-
-The fork exposes reindexing as a first-class MCP tool named `reindex`,
-discoverable through `list_tools` in every serve mode — stdio, HTTP, HTTPS, and
-proxy. Upstream reindexing is a CLI-only operation, so an MCP client (an editor
-or agent) could not trigger it over the protocol; with the fork it can, without
-restarting the server or reloading the index.
-
-A client calls it like any other tool:
-
-```jsonc
-// reindex everything configured (incremental — unchanged files are skipped)
-{ "name": "reindex", "arguments": {} }
-
-// reindex specific files and/or directories
-{ "name": "reindex", "arguments": { "paths": ["src/foo.rs", "src/bar/"] } }
-
-// force a full clear-and-rebuild
-{ "name": "reindex", "arguments": { "force": true } }
-
-// also refresh every configured document collection (discovers new markdown files)
-{ "name": "reindex", "arguments": { "documents": true } }
-```
-
-It is also reachable from the CLI as `codanna mcp reindex`.
-
-### Arguments
-
-- `paths` (optional array of strings) — files or directories to reindex. Omit to
-  reindex all configured `indexed_paths`. Explicit paths must resolve **inside
-  the workspace root**; anything outside is rejected. At most 1024 paths per call.
-- `force` (optional bool, default `false`) — for a **full** reindex (no `paths`),
-  clears the entire index before rebuilding it. For **scoped** `paths`, re-indexes
-  just those paths without a global clear: files are re-parsed even when their
-  content hash is unchanged, and directories bypass the incremental hash-skip.
-- `documents` (optional bool, default `false`) — in addition to the code index,
-  reindex every configured document collection, discovering markdown files added
-  since the last run (upstream reindexing and the watcher only refresh files
-  already in a collection). The code index is always reindexed; this flag adds the
-  document pass on top. Returned totals report the two separately, and a failing
-  collection surfaces as an error naming it rather than being silently skipped.
-
-The call returns a short summary — files reindexed, symbols, and elapsed
-milliseconds (plus per-collection document totals when `documents: true`). Like
-every other tool, `reindex` accepts `output_format: "json"` for a structured
-`Envelope` response instead of the default text summary.
-
-Reindexing does not block reads: the walk-and-parse work runs without holding the
-index write lock, so concurrent read-only tools (`find_symbol`, `search_symbols`,
-`semantic_search_docs`, and the rest) keep serving while a reindex is in flight.
-
-### Concurrency contract
-
-Read-only MCP tools — including `search_documents` — are safe to call in
-parallel from multiple clients, in every `serve` mode (stdio, `--http`,
-`--https`, `--proxy`). Only two operations briefly take an exclusive write
-guard, and both scope it as narrowly as possible:
-
-- **`search_documents`'s collection auto-sync.** Every call first checks
-  configured document collections for file changes under a brief write
-  guard, scoped to just that scan, then drops it before searching.
-  `DocumentStore::search` itself only needs read access, so the search step
-  runs under a read guard and concurrent `search_documents` calls make
-  progress against each other at the `DocumentStore` level instead of
-  serializing there. This holds through the vector storage layer underneath
-  too: `ConcurrentVectorStorage::read_vector` takes its inner lock shared in
-  the common (already-mapped) case, so concurrent similarity scoring no
-  longer serializes on an exclusive vector-storage lock, and the embedding
-  call ahead of it runs inside `spawn_blocking` rather than directly on the
-  async task, so it no longer blocks the runtime worker thread while it
-  runs. Concurrent embedding generation itself still serializes — one
-  `FastEmbedGenerator` holds a single `TextEmbedding` behind one `Mutex`
-  (`src/vector/embedding.rs`), so only one caller can run inference at a
-  time — but callers now queue on a blocking-pool thread instead of stalling
-  the async runtime.
-- **A force reindex's brief write-lock phases** (see above): phase 1 and
-  phase 3 each hold the index write lock briefly; the walk in between runs
-  off-lock. While the walk is in flight, readers may transiently observe a
-  repopulating index (some symbols reindexed, others not yet) until phase 3
-  completes.
-
-**Concurrent code reindexes are serialized, not queued.** Only one
-`reindex` run (any call that reaches the three-phase orchestration above —
-scoped `paths`, a full `force: true` rebuild, or the watcher's own catch-up
-reindex on queue overflow) may be in flight against an index at a time. A
-second call that arrives while one is still running is rejected immediately
-rather than being queued or allowed to race the first: it gets a
-`REINDEX_IN_PROGRESS` error —
-"Another full reindex is already in progress; retry shortly. Wait for the
-current reindex to finish, then retry. Avoid triggering concurrent full
-reindexes on the same index." — which is a client-visible, retryable
-condition, not an internal fault. Simply retry the call once the earlier
-reindex has finished ([issue #44](https://github.com/rcrsr/rcrsr-codanna/issues/44)).
-This also protects a `reindex(force: true)` call from racing the watcher's
-catch-up reindex below: whichever one starts second is rejected rather than
-one clearing the index out from under the other's in-flight work.
-
-**Known limitation — `reindex documents:true` holds a write guard per
-collection.** The `reindex` tool's document pass takes the same exclusive
-write guard as the auto-sync above, scoped per collection (acquired and
-dropped once per collection rather than once for the whole reindex). Each
-collection's own work — reading files from disk, committing to Tantivy, and
-generating embeddings — runs inside `spawn_blocking`, so it no longer blocks
-an async runtime worker thread; unrelated async work continues to make
-progress while a reindex is in flight. The write guard itself, however, is
-still held for that collection's full duration (`index_collection` needs
-`&mut DocumentStore`), so document searches against *that* collection wait
-until it finishes. This is bounded to one collection at a time rather than
-the entire reindex, but is not "brief" in the same sense as the two
-operations above.
-
-## Catch-up reindex on watch-queue overflow and after downtime
-
-The unified file watcher starts whenever `watch || config.file_watch.enabled`
-is true (`src/cli/commands/serve.rs`) — and `[file_watch].enabled` defaults to
-`true`, so a bare `codanna serve` with no `--watch` flag runs it too, in any
-serve mode. Once it is running, the OS file-watch backend has a bounded
-event queue. A bulk operation — `git rebase`,
-`git checkout` across many files, a branch switch, a large `git pull` — can change
-more files at once than the queue holds, and the backend drops events (an inotify
-`IN_Q_OVERFLOW`, or the equivalent on macOS/Windows). Upstream codanna silently
-misses those changes: the index stays out of sync with disk until you reindex by
-hand.
-
-The fork detects the overflow signal and, once file activity settles, fires a
-single catch-up reindex automatically so the index re-converges with disk without
-any manual step. Behavior details:
-
-- It waits for a quiet window after the overflow before reindexing, and coalesces
-  a burst of overflow signals (a rebase with hook pauses, say) into one catch-up
-  rather than firing mid-operation.
-- The catch-up runs off the watcher's event loop, so incoming file events keep
-  draining while it works — a long reindex can't cause a second overflow.
-- If a catch-up fails (transient lock/IO error), staleness is kept and retried on
-  the next quiet window (bounded) instead of being silently dropped.
-- Successive catch-ups are throttled by a short cooldown, so sustained bursty git
-  activity can't thrash repeated full rebuilds.
-- If a catch-up loses the race to an in-flight `reindex` MCP call (see
-  [Concurrency contract](#concurrency-contract) above), that rejection does
-  not count against the bounded retry budget and does not clear the stale
-  marker — it is not treated as a failure, since the index is already being
-  brought up to date by the other reindex. The catch-up simply re-fires after
-  the cooldown and finds the index current.
-- If that rejection repeats for many consecutive cooldowns (roughly a minute),
-  a `WARN`-level log is emitted noting that another reindex appears wedged and
-  a restart may be needed — normal handoffs resolve within a cooldown or two,
-  so a sustained streak is a signal worth surfacing above debug logging. That
-  `WARN` is not a single, one-time event: once it first fires, re-emission is
-  rate-limited on a widening interval rather than repeating on every
-  contention rejection — 10 minutes, then 20, then 40, then capped at hourly
-  and staying hourly indefinitely, mirroring the phase-2 watchdog cadence
-  described below. It widens and caps, but it never stops recurring while the
-  contention persists.
-- That `WARN` only fires when the watcher is the one being rejected. A reindex
-  that wedges with no watcher running (or with no file activity to trigger a
-  catch-up) is covered separately by a watchdog on the reindex walk itself: if
-  the walk runs longer than ten minutes, an `ERROR` is logged naming the elapsed
-  time, noting that every further reindex is being rejected with
-  `REINDEX_IN_PROGRESS` meanwhile, and that a process restart is currently the
-  only recovery. The watchdog re-logs on a widening interval while the walk
-  stays stuck — 10 minutes, then 20, then 40, then capped at hourly and
-  staying hourly indefinitely, so a multi-day wedge stays visible without
-  re-paging on a flat ten-minute cadence forever. It is observability only — it
-  does **not** cancel the walk or release the serialization gate. The walk runs
-  on a blocking thread that cannot be
-  interrupted, and releasing the gate while that thread is still writing would
-  re-open the very race the gate exists to prevent, so holding it is correct.
-  Recovering a genuinely wedged reindex still requires a restart.
-
-### Startup catch-up (opt-in)
-
-The same catch-up machinery can also be armed once, at the moment the
-watcher's event loop starts, so files changed while no watcher was running (a
-process restart, a machine sleep, a deploy) get re-converged without waiting
-for a later overflow signal. Unlike overflow catch-up, this is **off by
-default**: it is gated by its own `[file_watch]` key, `startup_catch_up`
-(default `false`), which is independent of `refresh_on_overflow` — the two
-keys name two distinct triggers ("watcher just started" vs. "backend reported
-overflow/rescan") for the same underlying machinery, not one trigger gated by
-both flags conjunctively. Setting `refresh_on_overflow = false` does not
-disable startup catch-up, and setting `startup_catch_up = true` does not
-require `refresh_on_overflow` to be enabled. It shares the same quiet window,
-cooldown, and bounded-retry behavior described above. As with overflow
-catch-up, this is a full clear-and-rebuild reindex, so expect degraded/empty
-MCP query results until it completes on a large index — this is why the
-feature defaults to off.
-
-The clear and the rebuild are not atomic: the reindex commits an emptied
-Tantivy index before the rebuild walk repopulates it, with no recovery point
-in between. If the process is killed in that window (OOM-kill, `kill -9`, a
-host crash, a container reschedule) the on-disk index under `.codanna/` is
-left empty permanently, with no automatic recovery and no signal on the next
-start. That window exists independent of this feature, but `startup_catch_up`
-makes it routine — it opens on every process start, and on every proxy-mode
-auto-respawn. Run `codanna index <path>` to rebuild if a start is ever
-interrupted mid-rebuild.
-
-If you enable `startup_catch_up` with no `indexing.indexed_paths` registered,
-each catch-up episode has nothing to rebuild from and takes the bounded
-give-up path: five `ERROR`-level log lines (one per attempt, per the
-`MAX_CATCH_UP_ATTEMPTS` bound above) before the watcher gives up on that
-episode. That is expected under this configuration, not a sign of a stuck or
-wedged watcher — register at least one indexed path (`codanna index <path>`)
-to avoid it.
-
-If you do enable `startup_catch_up`, it interacts with proxy mode's
-`server.idle_shutdown_minutes` (see [Idle shutdown](#idle-shutdown)): that
-setting is **`0` (never) by default, so it's opt-in**, but if you've set it to
-a positive value on a large workspace, every auto-respawn of the backing
-server — `discover_or_spawn` (`src/serve_discovery.rs`) launching a new
-process to answer a request after the previous one idled out — now also pays
-for a full startup catch-up rebuild. A short idle timeout on a large index
-combined with `startup_catch_up = true` can therefore turn into
-respawn-triggers-rebuild churn rather than a clean, cheap restart; size the
-timeout with that cost in mind, or leave `startup_catch_up` at its default of
-`false`.
+One consequence: a backing server started by a codanna binary older than this
+change (no token) is not discovered by a current proxy, which spawns its own
+instead. That self-heals with no migration, but leaves the stale server
+resident until it is stopped or idles out.
 
 ### Configuration
 
-Overflow catch-up (`refresh_on_overflow`) is **on by default**. Startup
-catch-up (`startup_catch_up`) is **off by default** — opt in explicitly if you
-want it. Both are controlled by the `[file_watch]` section of
-`.codanna/settings.toml`:
+The workspace must be initialized (`codanna init`); the proxy refuses to
+auto-spawn for a tree with no `.codanna/settings.toml`. All keys below are
+optional and shown at their defaults:
+
+```toml
+[server]
+auto_spawn = true           # let the proxy start a backing server when none is found;
+                            # false = you start `codanna serve --http --watch` yourself
+spawn_timeout_ms = 8000     # how long to wait for a spawned server to become ready
+health_poll_ms = 100        # readiness poll interval while waiting
+idle_shutdown_minutes = 240 # exit the backing server after N idle minutes (0 = never)
+```
+
+### Ports
+
+An auto-spawned backing server binds a random free port on `127.0.0.1`; the
+server records it and the proxy reads it back, so nothing on your side depends
+on the number — clients only ever talk to the proxy over stdio. A backing
+server you start yourself uses `--bind` or `[server] bind`, defaulting to
+`127.0.0.1:8080` (HTTP) / `127.0.0.1:8443` (HTTPS). All backing servers listen
+on loopback only.
+
+### Server registry and `codanna ls`
+
+Every `codanna serve --http`/`--https` process — auto-spawned or manual —
+publishes itself to a per-user registry, separate from the per-workspace
+`serve.json` discovery record: `serve.json` is for discovery within one
+workspace, the registry is for lifecycle management across all of them. It
+lives at `codanna/servers/` under your state directory (`$XDG_STATE_HOME` or
+`~/.local/state` on Linux; `~/Library/Application Support` on macOS;
+`%APPDATA%` on Windows), one file per running server named by pid, so nothing
+contends. Proxies write a lightweight `role: proxy` entry on connect and remove
+it on graceful exit. Each entry records the `codanna` version that wrote it.
+
+`codanna ls` is the top-level command for listing every codanna server process
+visible to you, merging three sources into one table (PID / KIND / SOURCE /
+PORT / SCHEME / STATUS / WORKSPACE / VERSION): registered backing servers,
+registered proxies attributed to the backing server sharing their workspace
+root, and *rogue* `codanna serve` processes found by a process-table scan with
+no live registry entry (best-effort enriched from the process cwd,
+`serve.json`, or a `--bind` argument). `ls` never reaps, signals, or rewrites
+anything. `codanna serve --list` is **deprecated for one release cycle**: it
+prints a notice to stderr and delegates to `ls`.
+
+```bash
+codanna ls                                  # list every codanna server process you own
+codanna serve --stop <pid|workspace-path>   # SIGTERM a registered server
+codanna serve --stop <pid> --force          # SIGKILL instead
+codanna serve --stop <pid> --include-rogue  # allow a rogue pid (still must look like `codanna serve`)
+codanna serve --reap                        # prune registry entries whose pid is dead
+codanna serve --kill-all                    # SIGTERM every registered backing server
+codanna serve --kill-all --include-proxies  # ...and every registered proxy too
+codanna serve --kill-all --force            # SIGKILL every target
+```
+
+These are lifecycle operations and cannot be combined with
+`--http`/`--https`/`--proxy`/`--bind`.
+
+- `--stop` sends SIGTERM by default, so the server runs the same shutdown path
+  as Ctrl+C and idle shutdown, removing its `serve.json` and registry entry.
+  A `--force`d (SIGKILL) process cannot clean up, so its registry entry can be
+  left behind; `--reap` prunes those. `ls` skips dead-pid entries but never
+  deletes them, keeping "what does the registry say" and "clean up" separate.
+- `--kill-all` sweeps every live registry entry. Every target is attempted even
+  if an earlier one fails; exit code is `0` only if all stopped.
+
+**VERSION column.** Registered rows show the version the server recorded at
+startup (`-` for entries written by a pre-`version` build). Rogue rows have no
+self-reported version, so the column instead compares the rogue binary on disk
+to the `codanna ls` binary — by canonical path first, then by size and bytes if
+the paths differ, so the same build installed at two locations (a mise dir vs
+`~/.local/bin`) still reads as `same`. The rogue process is never exec'd or
+`--version`-probed.
+
+- `same` — identical binary, at the same path or a byte-identical copy.
+- `other` — different path and different size/contents (or unreadable for
+  comparison).
+- `deleted` — the rogue's binary is gone from disk (the Linux in-place-upgrade
+  signature: `/proc/<pid>/exe` ending in `(deleted)`) or unreadable.
+- `-` — the `codanna ls` binary's own path could not be resolved.
+
+**STATUS column.** Registered servers show their self-reported `spawning` or
+`healthy`; rogue rows show `running`. A proxy whose backing server is gone,
+dead, or itself rogue shows `orphaned` instead of the `healthy` it recorded at
+connect time (a proxy's entry is written once and never updated, so it would
+otherwise stay `healthy` forever). An orphaned proxy is still live and will
+revive a backing server on its next delegated call; stop it with
+`--kill-all --include-proxies` if you don't want that.
+
+### Hot-reload notifications through the proxy
+
+The watch lane rides standard MCP notifications: a modified watched file emits
+a URI-filtered `notifications/resources/updated`; a created or deleted file
+emits `notifications/resources/list_changed`. The proxy forwards these — along
+with tool/prompt list-changed, progress, and logging notifications — verbatim
+to each stdio client, so a client behind the proxy is as hot-reload-aware as one
+connected directly. If you only run a single client, plain `codanna serve` is
+unchanged.
+
+## Reindexing on demand (`reindex` MCP tool)
+
+Upstream reindexing is CLI-only. The fork exposes it as a `reindex` MCP tool,
+discoverable via `list_tools` in every serve mode (stdio, HTTP, HTTPS, proxy),
+so an editor or agent can trigger it over the protocol without restarting the
+server. It is also reachable as `codanna mcp reindex`.
+
+```jsonc
+{ "name": "reindex", "arguments": {} }                                 // incremental; unchanged files skipped
+{ "name": "reindex", "arguments": { "paths": ["src/foo.rs", "src/bar/"] } }
+{ "name": "reindex", "arguments": { "force": true } }                  // full clear-and-rebuild
+{ "name": "reindex", "arguments": { "documents": true } }              // also refresh document collections
+```
+
+### Arguments
+
+- `paths` — files or directories to reindex (default: all configured
+  `indexed_paths`). Must resolve inside the workspace root; at most 1024.
+- `force` (default `false`) — for a full reindex, clears the index before
+  rebuilding. For scoped `paths`, re-parses those files even when their content
+  hash is unchanged, without a global clear.
+- `documents` (default `false`) — additionally reindex every configured
+  document collection, discovering markdown files added since the last run
+  (which upstream reindexing and the watcher never do). Totals are reported
+  separately, and a failing collection is an error naming it, not a silent skip.
+
+The call returns files reindexed, symbols, and elapsed milliseconds (plus
+per-collection totals with `documents: true`); `output_format: "json"` gives a
+structured envelope.
+
+### Concurrency contract
+
+Read-only MCP tools, including `search_documents`, are safe to call in parallel
+from multiple clients in every serve mode. Reindexing does not block reads: the
+walk-and-parse work runs off the index write lock, which is held only briefly
+before and after it. While the walk is in flight, readers may transiently see a
+repopulating index.
+
+`search_documents` takes a brief write guard per call to auto-sync collections
+against disk, then searches under a read guard, so concurrent calls make
+progress against each other. Embedding inference itself serializes on a single
+model instance, but callers queue on a blocking-pool thread rather than
+stalling the async runtime.
+
+**Concurrent code reindexes are serialized, not queued.** Only one `reindex`
+run — scoped, `force`, or the watcher's own catch-up — may be in flight at a
+time. A second is rejected immediately with a retryable `REINDEX_IN_PROGRESS`
+error ("Another full reindex is already in progress; retry shortly…") rather
+than queued or allowed to race the first
+([#44](https://github.com/rcrsr/rcrsr-codanna/issues/44)).
+
+**Known limitation:** `reindex documents:true` holds the exclusive write guard
+for each collection's full duration (one collection at a time). The work runs
+on a blocking thread so unrelated async work continues, but document searches
+against *that* collection wait until it finishes.
+
+## Catch-up reindex on watch-queue overflow and after downtime
+
+The unified file watcher runs whenever `--watch` is passed *or*
+`[file_watch].enabled` is true — and it defaults to `true`, so a bare
+`codanna serve` runs it too. The OS watch backend has a bounded event queue; a
+bulk operation (`git rebase`, a branch switch, a large `git pull`) can overflow
+it and drop events. Upstream silently misses those changes until you reindex
+by hand.
+
+The fork detects the overflow signal and, once file activity settles, fires one
+catch-up reindex automatically:
+
+- It waits for a quiet window and coalesces a burst of overflow signals into
+  one catch-up rather than firing mid-operation.
+- It runs off the watcher's event loop, so events keep draining while it works.
+- A failed catch-up (transient lock/IO error) is retried on the next quiet
+  window, bounded to five attempts per episode; successive catch-ups are
+  throttled by a short cooldown.
+- If it loses the race to an in-flight `reindex` MCP call, that rejection is
+  not counted as a failure — the index is already being brought current — and
+  it simply re-fires after the cooldown. If that rejection persists for roughly
+  a minute, a `WARN` log notes that the other reindex appears wedged, re-emitted
+  on a widening interval (10 → 20 → 40 min, then hourly).
+- Separately, a watchdog on the reindex walk itself logs an `ERROR` if the walk
+  runs longer than ten minutes (re-logged on the same widening cadence). It is
+  observability only — it does not cancel the walk or release the serialization
+  gate, because the walk runs on a blocking thread that cannot be interrupted
+  and releasing the gate mid-write would re-open the race the gate prevents.
+  Recovering a genuinely wedged reindex requires a restart.
+
+### Startup catch-up (opt-in)
+
+The same machinery can be armed once when the watcher starts, so files changed
+while nothing was watching (a restart, a machine sleep, a deploy) re-converge
+without waiting for an overflow. It is **off by default** (`startup_catch_up`)
+and independent of `refresh_on_overflow` — the two keys are two triggers for
+the same machinery, not one gated by both.
+
+Know what you're opting into: this is a full clear-and-rebuild, so expect
+degraded or empty query results until it completes on a large index. The clear
+and rebuild are not atomic — if the process is killed between them (OOM,
+`kill -9`, host crash) the on-disk index is left empty with no signal on next
+start; run `codanna index <path>` to rebuild. That window exists regardless,
+but `startup_catch_up` opens it on every start and every proxy auto-respawn.
+Combined with a short `idle_shutdown_minutes` on a large workspace, every
+respawn pays a full rebuild — size the timeout with that in mind. With no
+`indexed_paths` registered, each episode logs five `ERROR` lines and gives up;
+that is expected, not a wedge.
+
+### Configuration
 
 ```toml
 [file_watch]
-refresh_on_overflow = true  # catch-up reindex on watch-queue overflow (default: true)
-                            # set false to restore upstream behavior (missed changes stay missed)
-startup_catch_up = false   # opt-in: arm one catch-up reindex at watcher startup
-                            # (default: false); independent of refresh_on_overflow
+refresh_on_overflow = true  # catch-up on watch-queue overflow (false = upstream behavior)
+startup_catch_up = false    # arm one catch-up at watcher startup
 ```
 
-The `churn_threshold` key is parsed and accepted but **reserved** — it is not yet
-consumed by the watcher and has no effect (setting it to a non-zero value logs a
-one-time startup warning).
-
-The unified watcher (and with it, both catch-up triggers) runs whenever
-`watch || config.file_watch.enabled` is true, and `[file_watch].enabled`
-defaults to `true` — so this is not inert on a bare `codanna serve` with no
-`--watch` flag. The `reindex` tool above is still the way to re-sync on
-demand regardless.
+`churn_threshold` is parsed but **reserved** — it has no effect, and a non-zero
+value logs a one-time startup warning.
 
 ## `ignore_patterns` now excludes files during indexing
 
-`indexing.ignore_patterns` in `.codanna/settings.toml` previously deserialized
-but was never consulted by any walk — upstream, setting it had no effect on
-what got indexed ([issue #22](https://github.com/rcrsr/rcrsr-codanna/issues/22)).
-The fork wires it into every walk (`codanna index`, `--dry-run`, incremental
-reindex, and watch-triggered reindex). That now includes upstream v0.12.0's
-created-directory handling: when `serve --watch` sees a new directory appear
-under a watched root, the subtree it registers watches for and the files it
-catches up are decided by the same walk, so `ignore_patterns` prunes them
-exactly as it prunes a batch index. A directory you have excluded never gets
-watched.
+`[indexing] ignore_patterns` in `settings.toml` used to deserialize but was
+never consulted ([#22](https://github.com/rcrsr/rcrsr-codanna/issues/22)). The
+fork wires it into every walk — `codanna index`, `--dry-run`, incremental and
+watch-triggered reindex, and the subtree registration when `serve --watch` sees
+a new directory, so an excluded directory never gets watched.
 
-`ignore_patterns` uses the **same gitignore dialect as `.codannaignore`**:
-`!` negation, trailing `/` for directory-only matches, `**`, and the usual
-anchoring rules all apply. Patterns are additive to `.gitignore`/`.codannaignore`
-and are applied after them, so a leading `!` in `ignore_patterns` can only
-re-include a file excluded by an *earlier* `ignore_patterns` entry — it cannot
-re-include a file already excluded by `.gitignore` or `.codannaignore`. If you
-need to re-include something a gitignore file excludes, do it in that
-gitignore file (a custom `.codannaignore` outranks `.gitignore` there).
+It uses the **same gitignore dialect as `.codannaignore`** (`!` negation,
+trailing `/`, `**`). Patterns are applied *after* `.gitignore`/`.codannaignore`,
+so a `!` here can only re-include something excluded by an earlier
+`ignore_patterns` entry, never something a gitignore file excluded — do that in
+the gitignore file instead.
 
 ```toml
 [indexing]
 ignore_patterns = ["fixtures/**", "!fixtures/keep.rs"]
 ```
 
-The four patterns codanna used to hard-code as the default (`target/**`,
-`node_modules/**`, `.git/**`, `*.generated.*`) are no longer part of the
-`Default` for `IndexingConfig` — new `settings.toml` files ship
-`ignore_patterns = []`. This is a no-op in practice: those four patterns are
-already excluded by the default `.codannaignore` that `codanna init` writes.
-Existing `settings.toml` files are left untouched; any patterns already on
-disk in `ignore_patterns` now take effect.
+The four patterns codanna used to hard-code (`target/**`, `node_modules/**`,
+`.git/**`, `*.generated.*`) are no longer in the default — the default
+`.codannaignore` from `codanna init` already excludes them. Existing
+`settings.toml` files are untouched; any patterns already there now take effect.
 
-**As of upstream v0.12.0 this setting is fork-only.** Upstream resolved the
-same issue #22 in the opposite direction — it deleted `ignore_patterns`
-outright, on the grounds that nothing consumed it and the settings surface
-was promising an exclusion that never happened. That reasoning does not hold
-here, because the fork had already made it real. The fork keeps the setting
-and its behavior. The practical consequence: a `settings.toml` written for
-this fork is not portable to upstream codanna — upstream will load the file
-without complaint and silently ignore the key, so anything you exclude only
-via `ignore_patterns` would get indexed there. Move those patterns to
-`.codannaignore` if you need a config that behaves identically on both.
+**This setting is fork-only.** Upstream resolved #22 by deleting the key. A
+`settings.toml` written for the fork loads on upstream without complaint but
+silently ignores `ignore_patterns`; move those patterns to `.codannaignore` if
+you need identical behavior on both.
 
 ## Indexing no longer depends on the working directory
 
-Two read paths opened workspace-relative paths as-is, which resolves them
-against the process working directory rather than `workspace_root`. The batch
-READ stage gets relative paths from the discovery stage, which has to normalize
-them to compare against the index's stored rows; single-file re-index gets them
-from the watch handler. Both now resolve against `workspace_root` before
-opening.
-
-Running `codanna` from the command line was never affected, because the CLI and
-the server are launched from the workspace root, where the two agree. It bit
-anything that did not do that:
-
-- **Embedding `IndexFacade` in another process.** With `workspace_root` set and
-  a different CWD, every file read failed and the run still reported success —
-  `index_directory` returned `Ok` with `files_indexed` counted and
-  `symbols_found` zero, producing a silently empty index with no error to
-  catch.
-- **`serve --watch` started from elsewhere.** Every re-index failed with
-  `No such file or directory` against a path that plainly existed.
-
-Both are covered by regression tests that fail on the pre-fix behavior: one
-asserting a non-empty index when CWD differs from `workspace_root`, and an
-end-to-end watcher test that creates a directory under a watched root and
-requires the file inside it to become retrievable through the real watch loop.
+Two read paths (batch READ and single-file watch reindex) opened
+workspace-relative paths against the process cwd instead of `workspace_root`.
+Running from the workspace root was never affected, but embedding `IndexFacade`
+from another cwd produced a silently empty index that still reported success,
+and `serve --watch` started from elsewhere failed every reindex with
+`No such file or directory`. Both now resolve against `workspace_root` and are
+covered by regression tests.
 
 ## Document collection controls (`search_documents`)
 
-The fork adds per-collection default-visibility, negated glob patterns for
-collection file selection, and multi-select filtering to `search_documents`
-and `codanna documents search`.
+Additions to `search_documents` and `codanna documents search`:
 
-### Per-collection default visibility (`default` / `--no-default`)
-
-Each collection in `[documents.collections.<name>]` (`.codanna/settings.toml`)
-now takes an optional `default` key:
-
-```toml
-[documents.collections.internal-notes]
-paths = ["docs/internal"]
-patterns = ["**/*.md"]
-default = false   # opt this collection out of unscoped searches
-```
-
-`default` defaults to `true`, so existing collections (and any `settings.toml`
-written before this key existed) keep the prior always-searched behavior with
-no changes required. When it is set to `false`, the collection is skipped by a
-`search_documents` call that names no `collection` at all — but it is still
-searched if you name it explicitly. This lets you keep, say, an internal-only
-or scratch collection out of an agent's general-purpose queries while still
-letting a caller reach it on demand.
-
-Set it from the CLI when creating a collection with `codanna documents
-add-collection --no-default`; the human-readable `codanna documents list`
-output annotates non-default collections with `(non-default)`. The `list
---json` output is a plain array of collection names and does not currently
-carry default/non-default information.
-
-### Negated glob patterns in collection `patterns`
-
-`patterns` entries for a collection now support gitignore-style `!`-prefixed
-negation, resolved with the same `ignore` crate machinery (`ignore::overrides`)
-used elsewhere in codanna, instead of a plain `glob::glob` union:
-
-```toml
-[documents.collections.docs]
-paths = ["docs"]
-patterns = ["**/*.md", "!docs/internal/**", "!**/DRAFT-*.md"]
-```
-
-A later `!`-prefixed pattern actually excludes files matched by an earlier
-pattern (not merely flags them) — the same negation semantics as
-`.codannaignore`/`ignore_patterns`. Non-negated pattern sets behave exactly as
-before: every file under the collection's `paths` matching any pattern is
-indexed.
-
-### Multi-select `--collection` / `--exclude-collection`
-
-`search_documents` and `codanna documents search` accept more than one
-collection at once:
-
-- `codanna documents search --collection docs --collection api-notes "query"`
-  searches the union of the named collections (allowlist).
-- `codanna documents search --exclude-collection scratch "query"` searches
-  every collection except the named one(s) (denylist), on top of whatever the
-  allowlist and default-visibility resolve to.
-- Both flags are repeatable. Naming a collection explicitly with `--collection`
-  always searches it, even if its `default` key is `false`.
-
-Over MCP, `search_documents`'s `collection` argument now accepts either a bare
-string (unchanged, for existing clients) or a JSON array of strings for
-multi-select; a new `exclude_collections` argument (array of strings) is the
-MCP equivalent of `--exclude-collection`. `codanna mcp search_documents` on the
-CLI accepts the same `collection:`/`exclude_collections:` forms, including a
-JSON array value.
-
-### Input validation, `threshold`, and plain JSON previews
-
-`search_documents` (over MCP and via `codanna mcp search_documents`) has a
-stricter, more informative contract for agent callers:
-
-- **Unknown collection names are an input error, not an empty result.** A
-  `collection` or `exclude_collections` entry that names no configured
-  collection returns `code: INVALID_QUERY` with a message naming the bad
-  value and listing the configured collection names. Previously this came
-  back as an ordinary `NOT_FOUND`, indistinguishable from a real miss, so a
-  typo read as "this collection has nothing on that topic". A genuine miss
-  on a known collection is still `NOT_FOUND`.
-- **`limit: 0` is rejected** with `INVALID_QUERY` rather than silently
-  returning zero results. (This is deliberately *not* the `0 = unlimited`
-  convention `get_file_outline`'s `max_results` uses; rejecting the
-  degenerate value fails loudly instead of returning a plausible wrong
-  answer.)
-- **`threshold` (optional, cosine similarity, range [-1, 1])** is a minimum
-  similarity score with the same meaning as `semantic_search_docs`'s
-  parameter. Scored hits below it are dropped before `limit` applies; if
-  nothing clears it the result is
-  `status: not_found`. Omit it for the previous behavior. It has no effect on
-  the no-embedding fallback path, which scores every hit at 0.0.
+- **Per-collection default visibility.** `default = false` on a
+  `[documents.collections.<name>]` opts it out of searches that name no
+  `collection`; naming it explicitly still searches it. Set it at creation with
+  `codanna documents add-collection --no-default`; `documents list` annotates
+  such collections `(non-default)` (the `--json` form does not carry this yet).
+- **Negated glob patterns.** `patterns` accepts gitignore-style `!` entries
+  (`["**/*.md", "!docs/internal/**"]`), resolved with the same `ignore` crate
+  machinery as `.codannaignore`, so a later `!` actually excludes.
+- **Multi-select.** `--collection` and `--exclude-collection` are repeatable
+  (allowlist union / denylist on top of the resolved defaults). Over MCP,
+  `collection` accepts a string or array and `exclude_collections` an array;
+  `codanna mcp search_documents` accepts the same `collection:` /
+  `exclude_collections:` / `threshold:` keys.
+- **Input validation.** An unknown collection name in `collection` or
+  `exclude_collections` is `code: INVALID_QUERY` naming the bad value and
+  listing configured names — not a `NOT_FOUND` indistinguishable from a real
+  miss. `limit: 0` is likewise rejected (deliberately *not* the `0 = unlimited`
+  convention `get_file_outline` uses).
+- **`threshold`** (cosine similarity, `[-1, 1]`, same meaning as
+  `semantic_search_docs`) drops scored hits below it before `limit`; an empty
+  result after the cut is `status: not_found`. No effect on the no-embedding
+  fallback path, which scores every hit 0.0.
 - **`meta.collections` / `meta.excluded_collections`** on every JSON `success`
-  and `not_found` envelope echo the *resolved* filter — what was actually
-  searched and excluded after `default = false` collections were merged into
-  the exclusions — so a caller can always tell which collections a result
-  (or an empty result) came from.
-- **JSON `content_preview` is plain text.** With `output_format: json`, the
-  KWIC preview carries no ANSI color escapes and no `>>`/`<<` highlight
-  markers; the text-format render keeps them for terminal display. The
-  `[documents.search] highlight` setting still governs the text path.
+  and `not_found` envelope echo the *resolved* filter actually searched.
+- **JSON `content_preview` is plain text** — no ANSI escapes or `>>`/`<<`
+  markers; the text format keeps them.
+- **Clearer tool descriptions.** `semantic_search_docs` (doc comments extracted
+  from code symbols) and `search_documents` (indexed markdown collections) now
+  each say which corpus they search and point at the other, so an agent picks
+  the right one from `list_tools` alone.
 
-Validation runs once, before the collection auto-sync and before any
-config-sourced defaults are merged in, and is shared by the MCP tool and the
-CLI JSON path (`DocumentsConfig::validate_search_inputs`). The CLI wrapper's
-argument vocabulary now also accepts `exclude_collections:` and `threshold:`.
-
-Known follow-ups: `codanna documents search --json` (the separate CLI
-subcommand) still emits highlighted previews in its JSON output, and KWIC
-highlighting matches substrings rather than whole words.
-
-### Clarified tool descriptions: `semantic_search_docs` vs `search_documents`
-
-The two tools search different corpora and were easy to confuse from their
-descriptions alone:
-
-- `semantic_search_docs` searches **doc comments extracted from code
-  symbols** (the same corpus as upstream) — its description now says so
-  explicitly and points to `search_documents` for markdown files.
-- `search_documents` searches **indexed markdown document collections**
-  (`[documents.collections.*]`) — its description now says so explicitly and
-  points back to `semantic_search_docs` for doc comments.
-
-This is a documentation-only change (tool names, arguments, and behavior are
-unchanged); it exists so an agent choosing between the two tools from
-`list_tools` output alone picks the right one on the first try.
+Known follow-ups: `codanna documents search --json` still emits highlighted
+previews, and KWIC highlighting matches substrings rather than whole words.
 
 ## MCP tool enhancements for agent workflows
 
-The fork extends the MCP tool surface so agents can machine-parse results, batch
-lookups, and read symbol bodies without pulling whole files. Every change is
-additive — omit the new parameters and behavior is identical to upstream.
+Every change is additive — omit the new parameters and behavior is identical to
+upstream.
 
-### Structured JSON output (`output_format`)
-
-Every MCP tool accepts `output_format: "text" | "json"` (default `"text"`, so the
-compact prose output is unchanged). With `"json"`, the tool emits a structured
-envelope carrying `status`, `code`, `exit_code`, `message`, `data`, and `meta`
-(with a `schema_version`). The status taxonomy distinguishes `success`,
-`not_found`, `ambiguous`, and `error` — so a consumer can tell "no such symbol"
-apart from "the query failed" instead of parsing prose. This is the same envelope
-the CLI `--json` path already emitted; the two paths now share one builder per
-tool.
-
-### Batch symbol lookup (`find_symbols`)
-
-A new `find_symbols` tool takes `names: [ ... ]` and returns a per-name map —
-each entry is `found` (with location, kind, signature, line range), `not_found`,
-or `ambiguous` (with candidates). One round-trip instead of one per name. Batches
-are capped at 1024 names, matching `reindex`.
-
-### Canonical `name` parameter across symbol tools
-
-`find_symbol`, `get_calls`, `find_callers`, and `analyze_impact` now all accept a
-single canonical `name` parameter. The old parameter names (`function_name` on
-`get_calls`/`find_callers`, `symbol_name` on `analyze_impact`) still work as
-serde aliases, so no existing client breaks. `find_symbol` also gains a typed
-`symbol_id` parameter (previously only the `symbol_id:NNN` string prefix worked).
+- **Structured JSON output.** Every tool accepts `output_format: "text" |
+  "json"` (default `"text"`). JSON is an envelope with `status`, `code`,
+  `exit_code`, `message`, `data`, and `meta.schema_version`; `status`
+  distinguishes `success`, `not_found`, `ambiguous`, and `error`. It is the same
+  envelope the CLI `--json` path emits.
+- **Batch symbol lookup.** `find_symbols` takes `names: [...]` (up to 1024) and
+  returns a per-name map of `found` / `not_found` / `ambiguous` (with
+  candidates) in one round-trip.
+- **Canonical `name` parameter.** `find_symbol`, `get_calls`, `find_callers`,
+  and `analyze_impact` all accept `name`; the old `function_name` /
+  `symbol_name` still work as aliases. `find_symbol` also takes a typed
+  `symbol_id`.
+- **Symbol-scoped reads.** `get_file_outline(path)` lists every symbol in a
+  file with kind, signature, visibility, and line range; `read_symbol(name |
+  symbol_id)` returns one symbol's exact source span, refusing with a staleness
+  report if the file's hash no longer matches the index.
+- **Slimmer `analyze_impact`.** `count_only` (symbol and file counts only),
+  `max_results` (truncates and flags `truncated` in `meta`), and `group_by:
+  kind | file`.
 
 ### Test/production classification on `find_callers`
 
-`find_callers` tags each caller with a `role` of `production` or `test`, and
-accepts `filter: all | production | test` (default `all`) plus `count_only: bool`
-(returns totals with a per-role breakdown). "Is this safe to delete" becomes
-"zero *production* callers" without a manual second grep over test directories.
-Classification starts from a path heuristic; the patterns are configurable:
+`find_callers` tags each caller `production` or `test`, accepts `filter: all |
+production | test` and `count_only`, so "is this safe to delete" becomes "zero
+*production* callers". Classification starts from configurable path patterns:
 
 ```toml
 [caller_classification]
 test_path_patterns = ["tests/", "/test/", "*_test.*", "test_*.py", "*.spec.*", "__tests__/"]
 ```
 
-**Rust `#[cfg(test)]` modules are detected.** Every pattern above is
-path-shaped, which cannot see Rust's idiomatic inline
-`#[cfg(test)] mod tests { ... }` — that module lives *inside* the production
-file, so a unit test calling `foo()` from `src/thing.rs` matched no pattern and
-was reported `production`. On a Rust codebase this inverted the feature's main
-use case: a symbol called only by its own unit tests looked load-bearing, and
-`filter: production` was actively misleading rather than merely incomplete.
+**Rust `#[cfg(test)]` modules are detected.** Path patterns cannot see an
+inline `#[cfg(test)] mod tests` inside a production file, which on a Rust
+codebase inverted the feature: a symbol called only by its own unit tests looked
+load-bearing. For Rust callers where the path heuristic says `production`,
+codanna parses the caller's current source with tree-sitter and re-classifies callers
+inside a `#[cfg(test)]` span as `test`. Details:
 
-For Rust callers, codanna now takes a second pass whenever the path heuristic
-says `production`: it parses the caller's current source with tree-sitter,
-collects the line spans covered by `#[cfg(test)]`-annotated items, and
-re-classifies any caller falling inside one as `test`. So the six unit tests
-calling a helper from an inline `mod tests` now report `6 test, 0 production`
-instead of the reverse.
-
-Details worth knowing:
-
-- **No reindex needed.** This is computed at query time from the source on
-  disk, so it fixes existing indexes immediately — nothing is persisted and the
-  emission-semantics version is untouched.
-- **Rust only.** Callers in every other language take the path heuristic
-  unchanged. Nothing about non-Rust results changes.
-- **Staleness-guarded.** The file on disk must still hash to what was indexed
-  (the same guard `read_symbol` uses). If the file changed, is unreadable, or
-  fails to parse, classification silently falls back to the path heuristic —
-  the pre-existing answer. It never errors, and every failure path degrades
-  toward reporting `production`, so a stale file can't turn "unsafe to delete"
-  into "safe".
-- **`#[cfg(feature = "test")]` is correctly not a test span** — the attribute
-  argument is a string literal there, not the `test` identifier.
-- **`#[cfg(any(test, feature = "x"))]` is correctly not a test span**, even
-  though it contains the `test` identifier. `any(...)` is a disjunction: this
-  attribute compiles in a normal (non-test) build whenever the sibling
-  feature is enabled, so treating it as test-only would misclassify a
-  production-reachable caller as `test` — the unsafe direction for a "safe to
-  delete" answer. `#[cfg(not(test))]` is disqualified the same way.
-  `#[cfg(all(test, not(windows)))]` **is** still treated as a test span:
-  `all(...)` is a conjunction, so `test` inside it still means "test builds
-  only" — only a disqualifying `any(...)`/`not(...)` around the `test`
-  identifier itself flips the answer.
-- **No configuration.** There is no toggle; `test_path_patterns` remains the
-  only knob, and it still governs the path heuristic for every language.
-
-The cost is one file read plus one parse attempt per *distinct* Rust caller
-file per call — never more than once per file, even when that attempt fails
-(stale hash, unreadable file, parse error): failure isn't retried per caller,
-it degrades every caller in that file to the path heuristic in one pass. A
-cheap substring check for `cfg` skips the parse entirely for files that
-cannot contain a `#[cfg(...)]` attribute. That check deliberately
-over-matches rather than looking for the exact `#[cfg(` byte sequence, so
-valid-but-unusual formatting (`#[cfg (test)]`, or a line break before the
-token tree) still gets parsed: a spurious parse costs little, whereas
-skipping one would silently misclassify a caller. The read and parse never
-run under the facade's async read
-lock or directly on a tokio worker thread: classification is prepared (path
-heuristics, file de-duplication) while the lock is briefly held, then the
-lock is released and the actual file I/O + parsing runs inside
-`tokio::task::spawn_blocking` (or inline for the synchronous CLI path, which
-has no async runtime to starve).
-
-### Symbol-scoped reads (`get_file_outline`, `read_symbol`)
-
-Two new tools let an agent judge and read a symbol without loading its whole file:
-
-- `get_file_outline(path)` — every symbol in a file with kind, signature,
-  visibility, and start/end lines.
-- `read_symbol(name | symbol_id)` — the exact source span of one symbol plus its
-  metadata. It guards against a stale index: if the file's current hash differs
-  from what was indexed, it reports that instead of returning a possibly-shifted
-  span.
-
-### Slimmer `analyze_impact`
-
-`analyze_impact` gains three parameters: `count_only: bool` (just the symbol count
-and distinct-file count, no listing — for scope gates), `max_results` (truncates
-the listing and flags `truncated` in the envelope meta), and
-`group_by: kind | file` (default `kind`, the current behavior).
+- Computed at query time from the source on disk — no reindex, nothing
+  persisted. Rust only.
+- Staleness-guarded: if the file's hash no longer matches the index, or it is
+  unreadable or fails to parse, classification falls back to the path heuristic
+  for every caller in that file. Every failure path degrades toward
+  `production`, so a stale file cannot turn "unsafe to delete" into "safe".
+- `#[cfg(feature = "test")]`, `#[cfg(any(test, …))]`, and `#[cfg(not(test))]`
+  are correctly *not* test spans (they can compile in a non-test build);
+  `#[cfg(all(test, …))]` is.
+- Cost is one read and one parse per distinct Rust caller file per call, run
+  on a blocking thread outside the index lock; files with no `cfg` substring
+  skip the parse.
 
 ## Identifying the fork
 
-Fork builds carry a `+rcrsr.N` suffix on the upstream version, so you can tell a
-fork build from an upstream one:
+Fork builds carry a `+rcrsr.N` suffix on the upstream version:
 
 ```bash
 codanna --version        # e.g. codanna <upstream-version>+rcrsr.N
 ```
 
-MCP clients see the same string in the `initialize` handshake, so a connected
-client can confirm which build it is talking to. The `+rcrsr.N` suffix is build
-metadata — it does not change how the version compares, so a fork build counts as
-the same release as the upstream version it is built on. `N` is a running count
-of fork additions over the whole life of the fork, not per upstream base: it only
-ever counts up, and moving to a newer upstream base does not reset it. So a
-higher `N` always means more fork work, and an unchanged `N` always means none
-was added — but `N` still says nothing about which upstream release you are on.
-Read the base version for that.
-
-Everything not listed here behaves as it does in upstream codanna.
+MCP clients see the same string in the `initialize` handshake. The suffix is
+semver build metadata — it does not change how the version compares, so a fork
+build counts as the same release as its upstream base. `N` is a running count
+of fork additions over the whole life of the fork: it only ever counts up, and
+moving to a newer upstream base does not reset it. A higher `N` always means
+more fork work, but says nothing about which upstream release you are on — read
+the base version for that.
