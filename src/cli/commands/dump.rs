@@ -6,11 +6,11 @@ use crate::config::Settings;
 use crate::dump::{DumpError, DumpFilter, DumpStamp, write_dump};
 use crate::indexing::facade::IndexFacade;
 use crate::io::ExitCode;
-use crate::storage::IndexMetadata;
+use crate::storage::IndexPersistence;
 
 pub fn run(indexer: &IndexFacade, config: &Settings, filter: &DumpFilter) -> ExitCode {
-    let stamp = IndexMetadata::load(&config.index_path)
-        .ok()
+    let stamp = IndexPersistence::new(config.index_path.clone())
+        .current_metadata()
         .map(|meta| DumpStamp {
             emission_version: meta.emission_version,
             builder_commit: meta.builder_commit,

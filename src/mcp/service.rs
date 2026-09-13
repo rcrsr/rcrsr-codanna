@@ -935,7 +935,7 @@ pub struct IndexInfo {
 /// metadata predates this field or the fingerprint cannot be recomputed --
 /// see [`IndexInfo::ignore_rules_changed`].
 pub(crate) fn ignore_rules_changed(facade: &IndexFacade) -> Option<bool> {
-    let metadata = crate::storage::IndexMetadata::load(facade.index_base()).ok()?;
+    let metadata = crate::storage::IndexMetadata::load(&facade.generation_dir()).ok()?;
     let stored_fingerprint = metadata.ignore_fingerprint?;
 
     let settings = facade.settings();
@@ -990,7 +990,7 @@ pub fn index_info_data(facade: &IndexFacade) -> IndexInfo {
         symbol_count,
         file_count: file_count as usize,
         relationship_count,
-        builder_commit: crate::storage::IndexMetadata::load(facade.index_base())
+        builder_commit: crate::storage::IndexMetadata::load(&facade.generation_dir())
             .ok()
             .and_then(|m| m.builder_commit),
         symbol_kinds: SymbolKindBreakdown {

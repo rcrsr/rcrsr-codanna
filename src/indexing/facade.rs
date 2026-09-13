@@ -24,12 +24,15 @@
 //! ```
 
 use crate::config::Settings;
-use crate::indexing::pipeline::Pipeline;
+use crate::indexing::pipeline::{Pipeline, PipelineConfig};
 use crate::semantic::remote::run_async;
 use crate::semantic::{
     EmbeddingBackend, EmbeddingPool, RemoteEmbedder, SemanticSearchError, SimpleSemanticSearch,
 };
-use crate::storage::{DocumentIndex, SearchResult};
+use crate::storage::generation::layout::unix_millis_now;
+use crate::storage::generation::{Complete, migrate_flat_layout, resolve_current};
+use crate::storage::{DocumentIndex, EMISSION_SEMANTICS_VERSION, GenerationId, IndexLayout};
+use crate::storage::{IndexMetadata, SearchResult};
 use crate::symbol::context::{ContextIncludes, SymbolContext, SymbolRelationships};
 use crate::{FileId, IndexError, RelationKind, Relationship, Symbol, SymbolId, SymbolKind};
 use std::collections::{HashMap, HashSet};
@@ -112,8 +115,11 @@ pub struct IndexFacade {
     /// Tracked indexed directories (canonicalized paths)
     indexed_paths: HashSet<PathBuf>,
 
-    /// Base path for index storage
-    index_base: PathBuf,
+    /// Filesystem layout for the index generations this facade's root owns.
+    layout: IndexLayout,
+
+    /// The generation this facade currently reads/writes.
+    generation: GenerationId,
 
     /// Set to true when load_semantic_search fails with DimensionMismatch so
     /// hot-reload and other callers do not retry on every reload cycle.
@@ -138,23 +144,61 @@ pub struct IndexFacade {
 }
 
 impl IndexFacade {
-    /// Create a new IndexFacade with the given settings.
-    ///
-    /// Creates or opens the DocumentIndex and initializes the Pipeline.
-    pub fn new(settings: Arc<Settings>) -> FacadeResult<Self> {
-        // Construct the full index path
+    /// Derive the [`IndexLayout`] root from `settings`: `workspace_root`
+    /// joined with `index_path` when a workspace root is configured, else
+    /// `index_path` as-is. Shared by [`Self::new`] and
+    /// [`Self::from_components`]'s callers so this derivation lives in
+    /// exactly one place.
+    fn resolve_layout(settings: &Settings) -> IndexLayout {
         let index_base = if let Some(ref workspace_root) = settings.workspace_root {
             workspace_root.join(&settings.index_path)
         } else {
             settings.index_path.clone()
         };
+        IndexLayout::new(index_base)
+    }
 
-        // Tantivy data goes under index_path/tantivy
-        let tantivy_path = index_base.join("tantivy");
+    /// Build the pipeline for generation `id`, pointing its semantic store
+    /// at `layout.semantic_dir(id)` rather than at a path derived from
+    /// `settings.index_path`.
+    fn pipeline_for(settings: &Arc<Settings>, layout: &IndexLayout, id: &GenerationId) -> Pipeline {
+        Pipeline::with_semantic_dir(
+            settings.clone(),
+            PipelineConfig::from_settings(settings),
+            layout.semantic_dir(id),
+        )
+    }
 
+    /// Create a new IndexFacade with the given settings.
+    ///
+    /// Resolves the index layout from `settings`, migrates a legacy flat
+    /// (pre-generations) layout if one is found, then either opens the
+    /// resolved `current` generation or -- when the root is brand new and no
+    /// generation resolves -- bootstraps a fresh empty one.
+    pub fn new(settings: Arc<Settings>) -> FacadeResult<Self> {
+        let layout = Self::resolve_layout(&settings);
+        migrate_flat_layout(&layout)?;
+
+        match resolve_current(&layout)? {
+            Some(id) => Self::open(settings, layout, id),
+            None => Self::bootstrap_empty_generation(settings, layout),
+        }
+    }
+
+    /// Open an existing generation `id` under `layout`.
+    ///
+    /// Opens `DocumentIndex` at `layout.tantivy_dir(&id)`. The caller is
+    /// responsible for having already resolved `id` (e.g. via
+    /// [`crate::storage::generation::resolve_current`]) -- this does not
+    /// itself validate that `id` is `current`, damaged, or in progress.
+    pub fn open(
+        settings: Arc<Settings>,
+        layout: IndexLayout,
+        id: GenerationId,
+    ) -> FacadeResult<Self> {
+        let tantivy_path = layout.tantivy_dir(&id);
         let document_index = Arc::new(DocumentIndex::new(&tantivy_path, &settings)?);
-
-        let pipeline = Pipeline::with_settings(settings.clone());
+        let pipeline = Self::pipeline_for(&settings, &layout, &id);
 
         Ok(Self {
             document_index,
@@ -163,7 +207,67 @@ impl IndexFacade {
             embedding_pool: None,
             settings,
             indexed_paths: HashSet::new(),
-            index_base,
+            layout,
+            generation: id,
+            semantic_incompatible: false,
+            semantic_metadata_snapshot: None,
+            reindex_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        })
+    }
+
+    /// Bootstrap a brand-new, empty generation under `layout` when
+    /// [`Self::new`] finds nothing to open (a fresh index root).
+    ///
+    /// Allocates a fresh [`GenerationId`], opens `DocumentIndex` at its
+    /// `tantivy/` path (which creates the on-disk Tantivy skeleton),
+    /// writes an empty `index.meta` and `COMPLETE` manifest for it, then
+    /// publishes it via [`IndexLayout::write_current`].
+    ///
+    /// Deliberately minimal: no `BUILDING` marker / CAS-publish guard
+    /// against a second concurrent bootstrapper racing the same empty
+    /// root. That build-and-publish machinery is deferred to a later
+    /// phase; this bootstrap only needs to produce a valid, resolvable
+    /// empty generation for the common single-process case.
+    fn bootstrap_empty_generation(
+        settings: Arc<Settings>,
+        layout: IndexLayout,
+    ) -> FacadeResult<Self> {
+        let id = GenerationId::generate();
+        let gen_dir = layout.gen_dir(&id);
+
+        let tantivy_path = layout.tantivy_dir(&id);
+        let document_index = Arc::new(DocumentIndex::new(&tantivy_path, &settings)?);
+
+        let mut meta = IndexMetadata::new();
+        meta.emission_version = Some(EMISSION_SEMANTICS_VERSION);
+        meta.save(&gen_dir)?;
+
+        let now = unix_millis_now();
+        let complete = Complete {
+            id: id.clone(),
+            parent: None,
+            started_at: now,
+            completed_at: now,
+            builder_version: env!("CARGO_PKG_VERSION").to_string(),
+            symbol_count: 0,
+            file_count: 0,
+            files: Vec::new(),
+        };
+        complete.write(&layout)?;
+
+        layout.write_current(&id)?;
+
+        let pipeline = Self::pipeline_for(&settings, &layout, &id);
+
+        Ok(Self {
+            document_index,
+            pipeline,
+            semantic_search: None,
+            embedding_pool: None,
+            settings,
+            indexed_paths: HashSet::new(),
+            layout,
+            generation: id,
             semantic_incompatible: false,
             semantic_metadata_snapshot: None,
             reindex_gate: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -176,13 +280,9 @@ impl IndexFacade {
         pipeline: Pipeline,
         semantic_search: Option<Arc<Mutex<SimpleSemanticSearch>>>,
         settings: Arc<Settings>,
+        layout: IndexLayout,
+        generation: GenerationId,
     ) -> Self {
-        let index_base = if let Some(ref workspace_root) = settings.workspace_root {
-            workspace_root.join(&settings.index_path)
-        } else {
-            settings.index_path.clone()
-        };
-
         Self {
             document_index,
             pipeline,
@@ -190,7 +290,8 @@ impl IndexFacade {
             embedding_pool: None,
             settings,
             indexed_paths: HashSet::new(),
-            index_base,
+            layout,
+            generation,
             semantic_incompatible: false,
             semantic_metadata_snapshot: None,
             reindex_gate: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -212,9 +313,21 @@ impl IndexFacade {
         &self.settings
     }
 
-    /// Get the index base path.
-    pub fn index_base(&self) -> &Path {
-        &self.index_base
+    /// The directory holding this facade's current generation on disk:
+    /// `root/gen/<id>/`.
+    pub fn generation_dir(&self) -> PathBuf {
+        self.layout.gen_dir(&self.generation)
+    }
+
+    /// The semantic-search directory for this facade's current generation:
+    /// `root/gen/<id>/semantic`.
+    pub fn semantic_dir(&self) -> PathBuf {
+        self.layout.semantic_dir(&self.generation)
+    }
+
+    /// The generation this facade currently reads/writes.
+    pub fn generation_id(&self) -> &GenerationId {
+        &self.generation
     }
 
     /// Clone the handle to this facade's reindex gate, used by
@@ -243,7 +356,7 @@ impl IndexFacade {
 
     /// Enable semantic search with the configured model.
     pub fn enable_semantic_search(&mut self) -> FacadeResult<()> {
-        let semantic_path = self.index_base.join("semantic");
+        let semantic_path = self.semantic_dir();
         std::fs::create_dir_all(&semantic_path)?;
 
         let backend = build_embedding_backend(&self.settings.semantic_search)?;
@@ -1304,7 +1417,7 @@ impl IndexFacade {
     /// Uses the Pipeline's cleanup stage to remove symbols and embeddings.
     pub fn remove_file(&mut self, path: impl AsRef<std::path::Path>) -> crate::IndexResult<()> {
         let path = &Self::canonical_or_raw(path.as_ref());
-        let semantic_path = self.settings.index_path.join("semantic");
+        let semantic_path = self.semantic_dir();
 
         use crate::indexing::pipeline::stages::CleanupStage;
         let cleanup_stage = if let Some(ref sem) = self.semantic_search {
@@ -1708,6 +1821,7 @@ impl IndexFacade {
             document_index: Arc::clone(&self.document_index),
             semantic_search: self.semantic_search.clone(),
             embedding_pool: self.embedding_pool.clone(),
+            semantic_dir: self.semantic_dir(),
         })
     }
 }
@@ -1726,6 +1840,10 @@ pub struct ReindexHandles {
     document_index: Arc<DocumentIndex>,
     semantic_search: Option<Arc<Mutex<SimpleSemanticSearch>>>,
     embedding_pool: Option<Arc<EmbeddingBackend>>,
+    /// Generation-aware semantic-embeddings directory, resolved via
+    /// [`IndexFacade::semantic_dir`] at snapshot time so cleanup targets the
+    /// same store `enable_semantic_search` wrote to.
+    semantic_dir: PathBuf,
 }
 
 /// Outcome of an off-lock reindex walk.
@@ -1766,6 +1884,7 @@ impl ReindexHandles {
             document_index,
             semantic_search,
             embedding_pool,
+            semantic_dir,
         } = self;
 
         // A malformed `ignore_patterns` entry is a deterministic misconfig,
@@ -1805,12 +1924,11 @@ impl ReindexHandles {
                         // subsequent call always re-parses, mirroring
                         // `IndexFacade::index_file_with_force`.
                         use crate::indexing::pipeline::stages::CleanupStage;
-                        let semantic_path = pipeline.settings().index_path.join("semantic");
                         let cleanup_stage = if let Some(ref sem) = semantic_search {
-                            CleanupStage::new(Arc::clone(&document_index), &semantic_path)
+                            CleanupStage::new(Arc::clone(&document_index), &semantic_dir)
                                 .with_semantic(Arc::clone(sem))
                         } else {
-                            CleanupStage::new(Arc::clone(&document_index), &semantic_path)
+                            CleanupStage::new(Arc::clone(&document_index), &semantic_dir)
                         };
                         if let Err(e) = cleanup_stage.cleanup_files(&[path.to_path_buf()]) {
                             tracing::warn!(
@@ -2268,11 +2386,17 @@ pub fn build_embedding_backend(
 mod tests {
     use super::*;
 
-    // Regression: facade construction on a corrupt tantivy dir must return
-    // Err, not panic. The CLI/server fallback paths call this exactly when
-    // the index dir failed to load.
+    // Regression: facade construction over a corrupt legacy flat tantivy dir
+    // must not panic. Before generations, this hard-failed at
+    // `DocumentIndex::new`. Generation-aware `new()` migrates the flat
+    // layout first (moving the corrupt data into its own generation
+    // directory), then `resolve_current` finds that migrated generation
+    // fails validation and self-heals by bootstrapping a fresh, empty
+    // generation instead of propagating the corruption as a hard error --
+    // so construction now succeeds, on a brand-new empty generation, rather
+    // than erroring.
     #[test]
-    fn new_returns_err_on_corrupt_tantivy_dir() {
+    fn new_recovers_from_a_corrupt_flat_tantivy_dir() {
         let dir = tempfile::tempdir().unwrap();
         let tantivy_dir = dir.path().join("tantivy");
         std::fs::create_dir_all(&tantivy_dir).unwrap();
@@ -2284,8 +2408,9 @@ mod tests {
             ..Default::default()
         };
 
-        let result = IndexFacade::new(std::sync::Arc::new(settings));
-        assert!(result.is_err());
+        let facade = IndexFacade::new(std::sync::Arc::new(settings))
+            .expect("must self-heal onto a fresh empty generation rather than error");
+        assert_eq!(facade.symbol_count(), 0);
     }
 
     // Regression: file records key off the walk root's textual form. An
@@ -5930,5 +6055,185 @@ mod tests {
             )
             .unwrap();
         assert_cross_root_edge(&facade, "post-edit");
+    }
+
+    // =========================================================================
+    // Generation-aware construction (open / new bootstrap / flat migration)
+    // =========================================================================
+
+    fn settings_for(root: &Path) -> Arc<Settings> {
+        Arc::new(Settings {
+            index_path: root.to_path_buf(),
+            workspace_root: None,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn open_reads_an_existing_generation_fixture() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = IndexLayout::new(dir.path().to_path_buf());
+        let id = GenerationId::generate();
+        let settings = settings_for(dir.path());
+
+        // Build a minimal real generation fixture the same way
+        // `bootstrap_empty_generation` does: DocumentIndex::new creates the
+        // tantivy skeleton, then index.meta + COMPLETE + current are
+        // written directly.
+        {
+            let _doc_index =
+                DocumentIndex::new(layout.tantivy_dir(&id), &settings).expect("seed tantivy dir");
+        }
+        let mut meta = IndexMetadata::new();
+        meta.emission_version = Some(EMISSION_SEMANTICS_VERSION);
+        meta.save(&layout.gen_dir(&id)).expect("save index.meta");
+        Complete {
+            id: id.clone(),
+            parent: None,
+            started_at: 0,
+            completed_at: 0,
+            builder_version: "0.0.0".to_string(),
+            symbol_count: 0,
+            file_count: 0,
+            files: Vec::new(),
+        }
+        .write(&layout)
+        .expect("write COMPLETE manifest");
+        layout.write_current(&id).expect("write current");
+
+        let facade = IndexFacade::open(settings, layout.clone(), id.clone())
+            .expect("open must succeed over a fixture generation dir");
+
+        assert_eq!(facade.generation_id(), &id);
+        assert_eq!(facade.generation_dir(), layout.gen_dir(&id));
+        assert_eq!(
+            facade.pipeline.semantic_dir(),
+            layout.semantic_dir(&id),
+            "the pipeline must write embeddings into the opened generation"
+        );
+    }
+
+    #[test]
+    fn new_over_an_empty_root_bootstraps_and_publishes_an_empty_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = settings_for(dir.path());
+
+        let facade = IndexFacade::new(settings).expect("new must bootstrap an empty generation");
+
+        assert_eq!(facade.symbol_count(), 0);
+
+        let layout = IndexLayout::new(dir.path().to_path_buf());
+        let current = layout
+            .read_current()
+            .expect("read current")
+            .expect("current must be published");
+        assert_eq!(&current, facade.generation_id());
+
+        assert!(
+            facade
+                .generation_dir()
+                .join("tantivy")
+                .join("meta.json")
+                .is_file(),
+            "bootstrap must create the tantivy skeleton under gen/<id>/tantivy"
+        );
+        assert!(
+            !dir.path().join("tantivy").is_dir(),
+            "artifacts must live under gen/, never directly at the index root"
+        );
+    }
+
+    #[test]
+    fn new_over_a_flat_pre_migration_fixture_migrates_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = settings_for(dir.path());
+
+        // Seed a flat (pre-generations) layout directly, bypassing
+        // IndexFacade::new so the flat shape is never migrated up front.
+        {
+            let _doc_index = DocumentIndex::new(dir.path().join("tantivy"), &settings)
+                .expect("seed flat tantivy dir");
+        }
+        let mut meta = IndexMetadata::new();
+        meta.emission_version = Some(EMISSION_SEMANTICS_VERSION);
+        meta.save(dir.path()).expect("save flat index.meta");
+
+        assert!(dir.path().join("tantivy").join("meta.json").is_file());
+        assert!(!dir.path().join("gen").is_dir());
+
+        let facade = IndexFacade::new(settings).expect("new must migrate the flat layout");
+
+        assert!(
+            dir.path().join("gen").is_dir(),
+            "flat layout must be migrated under gen/"
+        );
+        assert!(
+            !dir.path().join("tantivy").is_dir(),
+            "flat tantivy/ must be moved out of the root, not left in place"
+        );
+
+        let layout = IndexLayout::new(dir.path().to_path_buf());
+        let current = layout
+            .read_current()
+            .expect("read current")
+            .expect("current must be published");
+        assert_eq!(&current, facade.generation_id());
+    }
+
+    // A pre-generations flat layout must migrate on the first facade open,
+    // and a second open of the same root must be a no-op: same generation
+    // id, same `index.meta` bytes.
+    #[test]
+    fn new_migrates_a_flat_layout_and_is_idempotent_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("index");
+        let settings = settings_for(&root);
+
+        {
+            let _doc_index =
+                DocumentIndex::new(root.join("tantivy"), &settings).expect("seed flat tantivy");
+        }
+        std::fs::create_dir_all(root.join("semantic")).unwrap();
+        crate::semantic::SemanticMetadata::new("test-model".to_string(), 384, 0)
+            .save(&root.join("semantic"))
+            .unwrap();
+        IndexMetadata::new().save(&root).unwrap();
+        assert!(!root.join("current").is_file(), "fixture precondition");
+        assert!(!root.join("gen").is_dir(), "fixture precondition");
+
+        let _facade = IndexFacade::new(settings.clone()).unwrap();
+
+        assert!(
+            !root.join("tantivy").exists(),
+            "flat tantivy/ must move under gen/"
+        );
+        assert!(
+            !root.join("semantic").exists(),
+            "flat semantic/ must move under gen/"
+        );
+        assert!(
+            !root.join("index.meta").is_file(),
+            "flat index.meta must move under gen/"
+        );
+
+        let layout = IndexLayout::new(root.clone());
+        let first_id = resolve_current(&layout)
+            .unwrap()
+            .expect("migrated generation resolves");
+        let gen_dir = layout.gen_dir(&first_id);
+        assert!(gen_dir.join("tantivy").join("meta.json").is_file());
+        assert!(gen_dir.join("semantic").join("metadata.json").is_file());
+        let meta_after_first_open = std::fs::read(gen_dir.join("index.meta")).unwrap();
+
+        let _facade_again = IndexFacade::new(settings).unwrap();
+        let second_id = resolve_current(&layout)
+            .unwrap()
+            .expect("current still resolves");
+        assert_eq!(first_id, second_id, "reopen must not mint a new generation");
+        assert_eq!(
+            meta_after_first_open,
+            std::fs::read(gen_dir.join("index.meta")).unwrap(),
+            "reopen must leave index.meta untouched"
+        );
     }
 }

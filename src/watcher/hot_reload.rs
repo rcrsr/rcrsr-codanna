@@ -12,6 +12,7 @@ use tracing::{debug, info, warn};
 
 use crate::indexing::facade::IndexFacade;
 use crate::mcp::notifications::{FileChangeEvent, NotificationBroadcaster};
+use crate::storage::IndexLayout;
 use crate::{IndexPersistence, Settings};
 
 /// Watches for external index changes and hot-reloads them.
@@ -40,8 +41,15 @@ impl HotReloadWatcher {
         let index_path = settings.index_path.clone();
         let persistence = IndexPersistence::new(index_path.clone());
 
-        // Get initial modification time of the index metadata file
-        let meta_file_path = index_path.join("tantivy").join("meta.json");
+        // Get initial modification time of the index metadata file. Read
+        // through the already-constructed facade's own generation
+        // directory (`gen/<id>/tantivy/meta.json`) rather than assuming a
+        // flat `index_path/tantivy` layout, since the facade may already
+        // be resolved to a generation.
+        let meta_file_path = facade
+            .try_read()
+            .map(|f| f.generation_dir().join("tantivy").join("meta.json"))
+            .unwrap_or_else(|_| index_path.join("tantivy").join("meta.json"));
         let last_modified = std::fs::metadata(&meta_file_path)
             .ok()
             .and_then(|meta| meta.modified().ok());
@@ -95,18 +103,37 @@ impl HotReloadWatcher {
             return Ok(());
         }
 
-        // Get current modification time of the index metadata file
-        let meta_file_path = self.index_path.join("tantivy").join("meta.json");
-        let metadata = std::fs::metadata(&meta_file_path)?;
-        let current_modified = metadata.modified()?;
+        // An external publish flips `current` to a generation other than
+        // the one this watcher's facade serves. The meta.json mtime poll
+        // stays alongside it for this phase because external scoped writes
+        // still mutate the served generation in place; Phase 3 drops it.
+        let (served_generation, served_meta_path) = {
+            let facade_guard = self.facade.read().await;
+            (
+                facade_guard.generation_id().clone(),
+                facade_guard
+                    .generation_dir()
+                    .join("tantivy")
+                    .join("meta.json"),
+            )
+        };
+        let layout = IndexLayout::new(self.index_path.clone());
+        let on_disk = layout.read_current()?;
+        let generation_changed = on_disk.as_ref().is_some_and(|id| id != &served_generation);
 
-        // Check if file has been modified
-        let should_reload = match self.last_modified {
+        // Poll the generation the reload will open, so the recorded mtime
+        // belongs to the facade that ends up serving.
+        let meta_file_path = match (&on_disk, generation_changed) {
+            (Some(id), true) => layout.tantivy_dir(id).join("meta.json"),
+            _ => served_meta_path,
+        };
+        let current_modified = std::fs::metadata(&meta_file_path)?.modified()?;
+        let mtime_changed = match self.last_modified {
             Some(last) => current_modified > last,
             None => true,
         };
 
-        if !should_reload {
+        if !generation_changed && !mtime_changed {
             tracing::trace!("Index file unchanged");
             return Ok(());
         }
@@ -137,7 +164,7 @@ impl HotReloadWatcher {
                 // Ensure semantic search stays attached after hot reloads
                 let mut restored_semantic = false;
                 if !facade_guard.has_semantic_search() && !facade_guard.is_semantic_incompatible() {
-                    let semantic_path = self.index_path.join("semantic");
+                    let semantic_path = facade_guard.semantic_dir();
                     let metadata_exists = semantic_path.join("metadata.json").exists();
                     if metadata_exists {
                         match facade_guard.load_semantic_search(&semantic_path) {
@@ -254,6 +281,8 @@ pub struct IndexStats {
 mod tests {
     use super::*;
     use crate::config::Settings;
+    use crate::storage::generation::Complete;
+    use crate::storage::{DocumentIndex, EMISSION_SEMANTICS_VERSION, GenerationId, IndexMetadata};
 
     fn test_settings(index_path: PathBuf) -> Arc<Settings> {
         Arc::new(Settings {
@@ -317,6 +346,89 @@ mod tests {
         assert!(
             gate_after_swap.try_acquire_owned().is_err(),
             "permit held before the hot-reload swap must still gate callers after it"
+        );
+    }
+
+    // Publish a second, empty generation under `settings.index_path` by
+    // hand and point `current` at it, the way an external `codanna index`
+    // will once builds are staged. Returns its id.
+    fn publish_empty_generation(settings: &Arc<Settings>) -> GenerationId {
+        let layout = IndexLayout::new(settings.index_path.clone());
+        let id = GenerationId::generate();
+        drop(DocumentIndex::new(layout.tantivy_dir(&id), settings).unwrap());
+        let mut meta = IndexMetadata::new();
+        meta.emission_version = Some(EMISSION_SEMANTICS_VERSION);
+        meta.save(&layout.gen_dir(&id)).unwrap();
+        Complete {
+            id: id.clone(),
+            parent: None,
+            started_at: 0,
+            completed_at: 0,
+            builder_version: "0.0.0".to_string(),
+            symbol_count: 0,
+            file_count: 0,
+            files: Vec::new(),
+        }
+        .write(&layout)
+        .unwrap();
+        layout.write_current(&id).unwrap();
+        id
+    }
+
+    // When `current` still names the served generation and meta.json is
+    // untouched, a tick must neither swap the facade nor broadcast.
+    #[tokio::test]
+    async fn check_and_reload_is_a_no_op_when_current_matches_served_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = test_settings(dir.path().join("index"));
+        let facade = Arc::new(RwLock::new(IndexFacade::new(settings.clone()).unwrap()));
+        let broadcaster = Arc::new(NotificationBroadcaster::new(8));
+        let mut events = broadcaster.subscribe();
+        let mut watcher =
+            HotReloadWatcher::new(facade.clone(), settings.clone(), Duration::from_secs(3600))
+                .with_broadcaster(broadcaster);
+        let served = facade.read().await.generation_id().clone();
+        assert_eq!(
+            IndexLayout::new(settings.index_path.clone())
+                .read_current()
+                .unwrap(),
+            Some(served.clone()),
+            "the bootstrap publishes the served generation"
+        );
+
+        watcher.check_and_reload().await.expect("tick");
+
+        assert_eq!(facade.read().await.generation_id(), &served);
+        assert!(
+            events.try_recv().is_err(),
+            "a no-op tick must not broadcast IndexReloaded"
+        );
+    }
+
+    // When `current` names a different published generation, a tick swaps
+    // the facade to it even though the served generation's meta.json never
+    // changed.
+    #[tokio::test]
+    async fn check_and_reload_swaps_when_current_names_another_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = test_settings(dir.path().join("index"));
+        let facade = Arc::new(RwLock::new(IndexFacade::new(settings.clone()).unwrap()));
+        let broadcaster = Arc::new(NotificationBroadcaster::new(8));
+        let mut events = broadcaster.subscribe();
+        let mut watcher =
+            HotReloadWatcher::new(facade.clone(), settings.clone(), Duration::from_secs(3600))
+                .with_broadcaster(broadcaster);
+        let old = facade.read().await.generation_id().clone();
+
+        let published = publish_empty_generation(&settings);
+        assert_ne!(old, published);
+
+        watcher.check_and_reload().await.expect("tick");
+
+        assert_eq!(facade.read().await.generation_id(), &published);
+        assert!(
+            matches!(events.try_recv(), Ok(FileChangeEvent::IndexReloaded)),
+            "a generation flip must broadcast IndexReloaded"
         );
     }
 }

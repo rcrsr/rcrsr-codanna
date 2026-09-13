@@ -5,7 +5,8 @@
 
 use crate::indexing::facade::IndexFacade;
 use crate::indexing::walk_config;
-use crate::storage::{DataSource, IndexMetadata};
+use crate::storage::generation::{GenerationId, migrate_flat_layout, resolve_current};
+use crate::storage::{DataSource, IndexLayout, IndexMetadata};
 use crate::{IndexError, IndexResult, Settings};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -31,18 +32,26 @@ fn ignore_fingerprint_root(settings: &Settings, fallback: Option<&Path>) -> Path
 /// Manages persistence of the index
 #[derive(Debug)]
 pub struct IndexPersistence {
-    base_path: PathBuf,
+    layout: IndexLayout,
 }
 
 impl IndexPersistence {
     /// Create a new persistence manager
     pub fn new(base_path: PathBuf) -> Self {
-        Self { base_path }
+        Self {
+            layout: IndexLayout::new(base_path),
+        }
     }
 
-    /// Get path for semantic search data
-    fn semantic_path(&self) -> PathBuf {
-        self.base_path.join("semantic")
+    /// Migrate a legacy flat layout (if present), then resolve which
+    /// generation `current` names. Every entry point that answers a
+    /// question about the on-disk index goes through this, so the
+    /// migrate-then-resolve sequence lives in exactly one place and a probe
+    /// (`exists`, `current_metadata`) sees the same generation a subsequent
+    /// load opens.
+    fn resolve_generation(&self) -> IndexResult<Option<GenerationId>> {
+        migrate_flat_layout(&self.layout)?;
+        resolve_current(&self.layout)
     }
 
     // =========================================================================
@@ -63,8 +72,11 @@ impl IndexPersistence {
         self.load_facade_impl(settings, false)
     }
 
-    fn persist_metadata(&self, metadata: &IndexMetadata) -> IndexResult<()> {
-        metadata.save(&self.base_path)?;
+    /// Save `metadata` as `index.meta` inside `gen_dir` (a generation
+    /// directory under this persistence's [`IndexLayout`]), then
+    /// best-effort refresh the project registry.
+    fn persist_metadata(&self, metadata: &IndexMetadata, gen_dir: &Path) -> IndexResult<()> {
+        metadata.save(gen_dir)?;
 
         if let Err(err) = self.update_project_registry(metadata) {
             tracing::debug!(
@@ -82,8 +94,18 @@ impl IndexPersistence {
         settings: Arc<Settings>,
         load_semantic: bool,
     ) -> IndexResult<IndexFacade> {
+        // Migrate a legacy flat layout (if present) and resolve which
+        // generation `current` names, recovering from a missing/torn
+        // pointer the same way `IndexFacade::new` would.
+        let id = self
+            .resolve_generation()?
+            .ok_or_else(|| IndexError::GenerationNotFound {
+                id: "current".to_string(),
+            })?;
+        let gen_dir = self.layout.gen_dir(&id);
+
         // Load metadata to understand data sources
-        let metadata = IndexMetadata::load(&self.base_path).ok();
+        let metadata = IndexMetadata::load(&gen_dir).ok();
 
         // Detect-and-report staleness (issue #28) is surfaced on demand via
         // `mcp::service::ignore_rules_changed`/`get_index_info`, not here:
@@ -92,20 +114,10 @@ impl IndexPersistence {
         // SHA256-of-3-files) for no externally visible effect beyond a
         // `tracing::warn!` line.
 
-        // Check if Tantivy index exists
-        let tantivy_path = self.base_path.join("tantivy");
-        if !tantivy_path.join("meta.json").exists() {
-            return Err(IndexError::FileRead {
-                path: tantivy_path,
-                source: std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "Tantivy index not found",
-                ),
-            });
-        }
-
-        // Create IndexFacade - it will open the existing Tantivy index
-        let mut facade = IndexFacade::new(settings)?;
+        // Open the already-resolved generation directly, rather than
+        // re-deriving it via `IndexFacade::new` (which would re-run
+        // migration/resolution a second time).
+        let mut facade = IndexFacade::open(settings, self.layout.clone(), id.clone())?;
 
         // Display source info with fresh counts
         if let Some(ref meta) = metadata {
@@ -132,13 +144,13 @@ impl IndexPersistence {
         }
 
         // Load semantic search if available and requested
+        let semantic_dir = self.layout.semantic_dir(&id);
         if load_semantic {
-            let semantic_path = self.semantic_path();
             tracing::debug!(
                 "[persistence] semantic path computed as: {}",
-                crate::parsing::paths::render_absolute_path(&semantic_path).display()
+                crate::parsing::paths::render_absolute_path(&semantic_dir).display()
             );
-            match facade.load_semantic_search(&semantic_path) {
+            match facade.load_semantic_search(&semantic_dir) {
                 Ok(true) => {
                     tracing::debug!("[persistence] loaded semantic search for facade");
                 }
@@ -164,9 +176,8 @@ impl IndexPersistence {
             }
         } else {
             tracing::debug!("[persistence] skipping semantic search (lite mode)");
-            let semantic_path = self.semantic_path();
-            if semantic_path.join("metadata.json").exists() {
-                match facade.load_semantic_metadata_snapshot(&semantic_path) {
+            if semantic_dir.join("metadata.json").exists() {
+                match facade.load_semantic_metadata_snapshot(&semantic_dir) {
                     Ok(true) => {
                         tracing::debug!(
                             "[persistence] loaded semantic metadata snapshot for lite facade"
@@ -199,9 +210,10 @@ impl IndexPersistence {
     /// Save metadata for an IndexFacade
     #[must_use = "Save errors should be handled to ensure data is persisted"]
     pub fn save_facade(&self, facade: &IndexFacade) -> IndexResult<()> {
+        let gen_dir = facade.generation_dir();
+
         // Update metadata
-        let mut metadata =
-            IndexMetadata::load(&self.base_path).unwrap_or_else(|_| IndexMetadata::new());
+        let mut metadata = IndexMetadata::load(&gen_dir).unwrap_or_else(|_| IndexMetadata::new());
 
         metadata.update_counts(facade.symbol_count() as u32, facade.file_count());
         // The gate upstream guarantees an existing index only reaches an
@@ -237,18 +249,22 @@ impl IndexPersistence {
             }
         }
 
-        // Update metadata to reflect Tantivy
+        // Update metadata to reflect Tantivy. The recorded path is relative
+        // to the generation directory it lives in: only a `tracing::info!`
+        // line in `load_facade_impl` renders it (for a human-readable log),
+        // so a relative path is both safe and serde-compatible with readers
+        // built against the pre-generation flat-layout `index.meta` format.
         metadata.data_source = DataSource::Tantivy {
-            path: self.base_path.join("tantivy"),
+            path: PathBuf::from("tantivy"),
             doc_count: facade.document_count().unwrap_or(0),
             timestamp: crate::indexing::get_utc_timestamp(),
         };
 
-        self.persist_metadata(&metadata)?;
+        self.persist_metadata(&metadata, &gen_dir)?;
 
         // Save semantic search if enabled
         if facade.has_semantic_search() {
-            let semantic_path = self.semantic_path();
+            let semantic_path = facade.semantic_dir();
             std::fs::create_dir_all(&semantic_path).map_err(|e| {
                 IndexError::General(format!("Failed to create semantic directory: {e}"))
             })?;
@@ -261,65 +277,20 @@ impl IndexPersistence {
         Ok(())
     }
 
-    /// Check if an index exists
+    /// Check if an index exists: whether `current` resolves to a valid
+    /// generation under this persistence's [`IndexLayout`] (after migrating
+    /// a legacy flat layout).
     pub fn exists(&self) -> bool {
-        // Check if Tantivy index exists
-        let tantivy_path = self.base_path.join("tantivy");
-        tantivy_path.join("meta.json").exists()
+        self.resolve_generation().ok().flatten().is_some()
     }
 
-    /// Delete the persisted index
-    pub fn clear(&self) -> Result<(), std::io::Error> {
-        let tantivy_path = self.base_path.join("tantivy");
-        if tantivy_path.exists() {
-            // On Windows, we may need multiple attempts due to file locking
-            let mut attempts = 0;
-            const MAX_ATTEMPTS: u32 = 3;
-
-            loop {
-                match std::fs::remove_dir_all(&tantivy_path) {
-                    Ok(()) => break,
-                    Err(e) if attempts < MAX_ATTEMPTS => {
-                        attempts += 1;
-
-                        // Retry logic for file locking issues
-                        #[cfg(windows)]
-                        {
-                            // Windows-specific: Check for permission denied (code 5)
-                            if e.kind() == std::io::ErrorKind::PermissionDenied {
-                                eprintln!(
-                                    "Attempt {attempts}/{MAX_ATTEMPTS}: Windows permission denied ({e}), retrying after delay..."
-                                );
-
-                                // Force garbage collection to release any handles
-                                std::hint::black_box(());
-
-                                // Brief delay to allow file handles to close
-                                std::thread::sleep(std::time::Duration::from_millis(200));
-                                continue;
-                            }
-                        }
-
-                        // On non-Windows or non-permission errors, log and retry with delay
-                        eprintln!(
-                            "Attempt {attempts}/{MAX_ATTEMPTS}: Failed to remove directory ({e}), retrying..."
-                        );
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                        continue;
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-            // Recreate the empty tantivy directory after clearing
-            std::fs::create_dir_all(&tantivy_path)?;
-
-            // On Windows, add extra delay after recreating directory to ensure filesystem is ready
-            #[cfg(windows)]
-            {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-        }
-        Ok(())
+    /// The current generation's `index.meta`, or `None` when no generation
+    /// resolves or the file fails to parse. Callers that only need the
+    /// metadata (the emission gate, config sync, `dump`) use this instead of
+    /// reading `index.meta` off the index root, which no longer holds one.
+    pub fn current_metadata(&self) -> Option<IndexMetadata> {
+        let id = self.resolve_generation().ok().flatten()?;
+        IndexMetadata::load(&self.layout.gen_dir(&id)).ok()
     }
 
     /// Update the project registry with latest metadata
@@ -369,70 +340,86 @@ impl IndexPersistence {
 mod tests {
     use super::*;
     use crate::semantic::SemanticMetadata;
-    use crate::storage::DocumentIndex;
     use tempfile::TempDir;
 
-    /// Check if semantic data exists (test helper)
-    fn has_semantic_data(persistence: &IndexPersistence) -> bool {
-        // Check if metadata exists - that's the definitive indicator
-        persistence.semantic_path().join("metadata.json").exists()
+    fn settings_for(temp_dir: &TempDir) -> Arc<Settings> {
+        Arc::new(Settings {
+            index_path: temp_dir.path().to_path_buf(),
+            ..Settings::default()
+        })
     }
 
     #[test]
-    fn test_exists() {
+    fn exists_is_false_on_an_empty_root() {
         let temp_dir = TempDir::new().unwrap();
         let persistence = IndexPersistence::new(temp_dir.path().to_path_buf());
 
-        // Initially doesn't exist
         assert!(!persistence.exists());
+    }
 
-        // Create tantivy directory with meta.json
-        let tantivy_path = temp_dir.path().join("tantivy");
-        std::fs::create_dir_all(&tantivy_path).unwrap();
-        std::fs::write(tantivy_path.join("meta.json"), "{}").unwrap();
+    #[test]
+    fn exists_is_true_after_a_publish() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = IndexPersistence::new(temp_dir.path().to_path_buf());
+        let settings = settings_for(&temp_dir);
 
-        // Now it exists
+        // Bootstrapping a facade over an empty root allocates a fresh
+        // generation and publishes it via `IndexLayout::write_current`.
+        let facade = IndexFacade::new(settings).unwrap();
+        persistence.save_facade(&facade).unwrap();
+
         assert!(persistence.exists());
     }
 
     #[test]
-    fn test_semantic_paths() {
+    fn save_then_load_round_trips_through_a_generation() {
         let temp_dir = TempDir::new().unwrap();
         let persistence = IndexPersistence::new(temp_dir.path().to_path_buf());
+        let settings = settings_for(&temp_dir);
 
-        // Test semantic_path
-        let semantic_path = persistence.semantic_path();
-        assert_eq!(semantic_path, temp_dir.path().join("semantic"));
+        let facade = IndexFacade::new(settings.clone()).unwrap();
+        let generation_id = facade.generation_id().clone();
+        persistence.save_facade(&facade).unwrap();
 
-        // Initially has no semantic data
-        assert!(!has_semantic_data(&persistence));
+        // `index.meta` lives under the generation directory, never
+        // directly under the persistence root.
+        let gen_dir = facade.generation_dir();
+        let meta_path = gen_dir.join("index.meta");
+        assert!(meta_path.is_file());
 
-        // Create semantic directory and metadata file
-        std::fs::create_dir_all(&semantic_path).unwrap();
-        std::fs::write(semantic_path.join("metadata.json"), "{}").unwrap();
+        // The saved `data_source` path is relative to the generation
+        // directory, not an absolute path baked in at save time.
+        let saved_metadata = IndexMetadata::load(&gen_dir).unwrap();
+        match saved_metadata.data_source {
+            DataSource::Tantivy { path, .. } => {
+                assert_eq!(path, PathBuf::from("tantivy"));
+                assert!(path.is_relative());
+            }
+            DataSource::Fresh => panic!("expected DataSource::Tantivy after save_facade"),
+        }
 
-        // Now has semantic data
-        assert!(has_semantic_data(&persistence));
+        let loaded = persistence.load_facade_lite(settings).unwrap();
+        assert_eq!(loaded.generation_id(), &generation_id);
+        assert_eq!(loaded.symbol_count(), facade.symbol_count());
+        assert_eq!(loaded.file_count(), facade.file_count());
     }
 
     #[test]
-    fn test_load_facade_lite_preserves_semantic_metadata_snapshot() {
+    fn load_facade_lite_preserves_semantic_metadata_snapshot() {
         let temp_dir = TempDir::new().unwrap();
         let persistence = IndexPersistence::new(temp_dir.path().to_path_buf());
+        let settings = settings_for(&temp_dir);
 
-        let settings = Settings {
-            index_path: temp_dir.path().to_path_buf(),
-            ..Settings::default()
-        };
-        DocumentIndex::new(temp_dir.path().join("tantivy"), &settings).unwrap();
+        let facade = IndexFacade::new(settings.clone()).unwrap();
+        persistence.save_facade(&facade).unwrap();
 
-        let semantic_path = temp_dir.path().join("semantic");
+        let semantic_path = facade.semantic_dir();
         std::fs::create_dir_all(&semantic_path).unwrap();
         let metadata =
             SemanticMetadata::new_remote("snowflake-arctic-embed:latest".to_string(), 1024, 42);
         metadata.save(&semantic_path).unwrap();
 
-        let loaded = persistence.load_facade_lite(Arc::new(settings)).unwrap();
+        let loaded = persistence.load_facade_lite(settings).unwrap();
 
         let snapshot = loaded
             .get_semantic_metadata()

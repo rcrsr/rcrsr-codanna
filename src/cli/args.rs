@@ -163,13 +163,23 @@ pub enum Commands {
         /// else, one array per path argument (indexing runs once per
         /// positional path, so multiple path arguments print multiple
         /// concatenated arrays). Never truncates. Takes precedence over
-        /// --list-all
-        #[arg(long, requires = "dry_run")]
+        /// --list-all. Also used by --status to select JSON output instead
+        /// of the human-readable table. Requires --dry-run or --status
+        /// (rejected at runtime otherwise, since clap's `requires` cannot
+        /// express "one of these two").
+        #[arg(long)]
         json: bool,
 
         /// Maximum number of files to index
         #[arg(long)]
         max_files: Option<usize>,
+
+        /// Print current-plus-per-generation index status (id, age, size,
+        /// state, recorded error) and exit. Read-only: never builds or
+        /// writes the index. Combine with --json for machine-readable
+        /// output.
+        #[arg(long)]
+        status: bool,
     },
 
     /// Add a directory to the indexed paths list

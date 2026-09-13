@@ -739,7 +739,6 @@ async fn run_stdio_server(
         let mut builder = UnifiedWatcher::builder()
             .broadcaster(broadcaster.clone())
             .indexer(facade_arc.clone())
-            .index_path(index_path.clone())
             .workspace_root(workspace_root.clone())
             .debounce_ms(debounce_ms)
             .refresh_on_overflow(config.file_watch.refresh_on_overflow)

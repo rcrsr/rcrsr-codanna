@@ -87,7 +87,6 @@ pub async fn serve_https(config: crate::Settings, watch: bool, bind: String) -> 
         let mut builder = UnifiedWatcher::builder()
             .broadcaster(broadcaster.clone())
             .indexer(indexer.clone())
-            .index_path(config.index_path.clone())
             .workspace_root(workspace_root.clone())
             .debounce_ms(debounce_ms)
             .refresh_on_overflow(config.file_watch.refresh_on_overflow)

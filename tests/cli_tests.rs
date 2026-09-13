@@ -57,6 +57,9 @@ mod test_fields_projection;
 #[path = "cli/test_index_force_invalid_path.rs"]
 mod test_index_force_invalid_path;
 
+#[path = "cli/test_index_status.rs"]
+mod test_index_status;
+
 #[path = "cli/test_serve_stdio_dual_generation.rs"]
 mod test_serve_stdio_dual_generation;
 

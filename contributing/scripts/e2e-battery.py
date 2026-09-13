@@ -114,14 +114,30 @@ def ensure_corpus(out, name, fixture, pin):
     return corpus
 
 
+def current_generation_dir(workspace):
+    """The current generation's data directory for a workspace.
+
+    Reads the `current` pointer file (a bare generation id) under the index
+    root and joins `gen/<id>`. Falls back to the index root itself when
+    there is no `current` pointer (e.g. a legacy flat layout never
+    migrated, or no index built yet).
+    """
+    root = workspace / ".codanna" / "index"
+    current_file = root / "current"
+    if current_file.is_file():
+        gen_id = current_file.read_text().strip()
+        return root / "gen" / gen_id
+    return root
+
+
 def index_meta_path(workspace):
     """Path to the index metadata file for a workspace."""
-    return workspace / ".codanna" / "index" / "index.meta"
+    return current_generation_dir(workspace) / "index.meta"
 
 
 def tantivy_dir_path(workspace):
     """Path to the tantivy index directory for a workspace."""
-    return workspace / ".codanna" / "index" / "tantivy"
+    return current_generation_dir(workspace) / "tantivy"
 
 
 def builder_commit(workspace):
@@ -301,7 +317,8 @@ def verify_semantic_in_log(log_text, want_enabled, context):
 def dump_rows(binary, dump, ws, corpus):
     """Edge rows of the workspace's index in dump_edges TSV form.
 
-    `dump` set: the example binary on the tantivy dir (legacy producer).
+    `dump` set: the example binary, given the index root -- it resolves the
+    current generation's tantivy dir internally (legacy producer).
     Otherwise `codanna dump --edges` in the workspace, each relationship
     envelope rendered back to the TSV row: endpoint paths re-absolutized
     against the corpus root (the verb renders them relative to it), every
@@ -311,7 +328,10 @@ def dump_rows(binary, dump, ws, corpus):
     if not tantivy.is_dir():
         raise SystemExit(f"{ws.name}: no tantivy dir after index")
     if dump is not None:
-        return run([str(dump), str(tantivy)]).stdout.splitlines()
+        # dump_edges takes the index root and resolves the current
+        # generation's tantivy dir internally.
+        index_root = ws / ".codanna" / "index"
+        return run([str(dump), str(index_root)]).stdout.splitlines()
     out = run([str(binary), "dump", "--edges"], cwd=ws).stdout
 
     def endpoint(e):

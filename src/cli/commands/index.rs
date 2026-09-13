@@ -2,11 +2,14 @@
 
 use std::path::{Path, PathBuf};
 
+use serde::Serialize;
+
 use crate::cli::commands::directories::{SkipReason, add_paths_to_settings};
 use crate::config::Settings;
 use crate::indexing::DryRunOutput;
 use crate::indexing::facade::IndexFacade;
 use crate::storage::IndexPersistence;
+use crate::storage::generation::{self, GenerationState, IndexLayout};
 use crate::types::SymbolKind;
 
 /// Arguments for the index command.
@@ -42,6 +45,20 @@ pub fn run(
         cli_config,
         dry_run_output,
     } = args;
+
+    // `--json` only has a defined meaning paired with `--dry-run` (JSON
+    // path list) or `--status` (JSON generation table, handled by
+    // `run_status` before this function is ever called). Reaching this
+    // function with `dry_run_output` set to `Json` but `dry_run` false
+    // means the caller passed bare `--json` with neither modifier;
+    // `--list-all` already rejects that combination at parse time via
+    // `requires = "dry_run"`, so mirror that here now that `--json` no
+    // longer carries the same clap constraint (it must also pair with
+    // `--status`, which clap's single-field `requires` cannot express).
+    if !dry_run && matches!(dry_run_output, DryRunOutput::Json) {
+        eprintln!("Error: --json requires --dry-run or --status");
+        std::process::exit(2);
+    }
 
     // Preflight: construct one parser per enabled language so configuration
     // errors (e.g. malformed parser_options) fail the command here. The
@@ -362,6 +379,112 @@ fn index_directories(
 
             std::process::exit(1);
         }
+    }
+}
+
+/// One row of `codanna index --status` output: a generation's identity,
+/// classified state, on-disk size, age, and (only for `Damaged`
+/// generations) the recorded validation-failure reason.
+#[derive(Debug, Serialize)]
+struct GenerationStatus {
+    id: String,
+    state: &'static str,
+    age_seconds: u64,
+    size_bytes: u64,
+    error: Option<String>,
+}
+
+impl GenerationStatus {
+    fn from_generation(
+        layout: &IndexLayout,
+        id: generation::GenerationId,
+        state: GenerationState,
+        size_bytes: u64,
+        age: std::time::Duration,
+    ) -> Self {
+        // The recorded reason is diagnostic-only forensic text (see
+        // `write_damaged_marker` in `storage::generation::layout`), so a
+        // missing or unreadable `DAMAGED` file degrades to `None` rather
+        // than failing the whole status report.
+        let error = matches!(state, GenerationState::Damaged)
+            .then(|| std::fs::read_to_string(layout.damaged_marker(&id)).ok())
+            .flatten();
+        Self {
+            id: id.to_string(),
+            state: state_label(state),
+            age_seconds: age.as_secs(),
+            size_bytes,
+            error,
+        }
+    }
+}
+
+fn state_label(state: GenerationState) -> &'static str {
+    match state {
+        GenerationState::Current => "current",
+        GenerationState::Previous => "previous",
+        GenerationState::Building => "building",
+        GenerationState::Orphan => "orphan",
+        GenerationState::Damaged => "damaged",
+        GenerationState::Incompatible => "incompatible",
+    }
+}
+
+/// Print current-plus-per-generation index status and exit. Read-only:
+/// never builds, migrates, or writes anything -- pure inspection of what
+/// [`generation::list_generations`] already reports on disk. Callers must
+/// invoke this without first constructing an [`IndexFacade`]: `IndexFacade::new`
+/// migrates a flat-layout index and bootstraps an empty `current` generation
+/// when nothing resolves, both of which are writes that `--status` must
+/// never trigger. On a never-indexed workspace (or one still in the
+/// pre-generation flat layout) `list_generations` reports no rows, and
+/// this prints "No index found." rather than fabricating a generation.
+pub fn run_status(config: &Settings, json: bool) {
+    let layout = IndexLayout::new(config.index_path.clone());
+
+    let rows: Vec<GenerationStatus> = match generation::list_generations(&layout) {
+        Ok(entries) => entries
+            .into_iter()
+            .map(|(id, state, size, age)| {
+                GenerationStatus::from_generation(&layout, id, state, size, age)
+            })
+            .collect(),
+        Err(e) => {
+            eprintln!("Error reading index generation status: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    if json {
+        match serde_json::to_string(&rows) {
+            Ok(s) => println!("{s}"),
+            Err(e) => {
+                eprintln!("Error: failed to serialize index status as JSON: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    if rows.is_empty() {
+        if layout.root().join("tantivy").join("meta.json").is_file() {
+            println!(
+                "Legacy flat index layout, not yet migrated. Any command that opens the index (e.g. `codanna index`) migrates it into a generation."
+            );
+        } else {
+            println!("No index found.");
+        }
+        return;
+    }
+    for row in &rows {
+        print!(
+            "{}  state={}  age={}s  size={}B",
+            row.id, row.state, row.age_seconds, row.size_bytes
+        );
+        if let Some(error) = &row.error {
+            print!("  error={error}");
+        }
+        println!();
     }
 }
 

@@ -17,7 +17,6 @@
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::ErrorKind;
-use std::path::PathBuf;
 use std::time::{Duration, UNIX_EPOCH};
 
 use crate::error::{IndexError, IndexResult};
@@ -41,11 +40,6 @@ pub struct GcSummary {
     pub skipped_locked: bool,
 }
 
-/// Path to the GC advisory lock file: `root/gc.lock`.
-fn gc_lock_path(layout: &IndexLayout) -> PathBuf {
-    layout.root().join("gc.lock")
-}
-
 /// Reclaim disk space used by stale generations under `layout`.
 ///
 /// Acquires an exclusive, non-blocking advisory lock on `root/gc.lock` for
@@ -64,7 +58,7 @@ pub fn gc(layout: &IndexLayout, keep_previous: bool) -> IndexResult<GcSummary> {
         source: e,
     })?;
 
-    let lock_path = gc_lock_path(layout);
+    let lock_path = layout.gc_lock();
     let lock_file = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -495,7 +489,7 @@ mod tests {
         let orphan = write_orphan(&layout);
 
         fs::create_dir_all(layout.root()).expect("create root");
-        let lock_path = gc_lock_path(&layout);
+        let lock_path = layout.gc_lock();
         let holder = OpenOptions::new()
             .create(true)
             .truncate(false)

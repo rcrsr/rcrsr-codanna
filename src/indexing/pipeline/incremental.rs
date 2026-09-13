@@ -119,7 +119,7 @@ impl Pipeline {
         embedding_pool: Option<Arc<crate::semantic::EmbeddingBackend>>,
     ) -> PipelineResult<SingleFileStats> {
         let start = Instant::now();
-        let semantic_path = self.settings.index_path.join("semantic");
+        let semantic_path = self.semantic_dir.clone();
 
         // Normalize path relative to workspace_root
         let normalized_path = if path.is_absolute() {
@@ -454,7 +454,7 @@ impl Pipeline {
         };
 
         let start = Instant::now();
-        let semantic_path = self.settings.index_path.join("semantic");
+        let semantic_path = self.semantic_dir.clone();
 
         // Progress bar options shared between phases
         let bar_options = ProgressBarOptions::default()
@@ -766,7 +766,7 @@ impl Pipeline {
         if !pending.ran {
             return Ok(Phase2Stats::default());
         }
-        let semantic_path = self.settings.index_path.join("semantic");
+        let semantic_path = self.semantic_dir.clone();
 
         let symbol_cache = Arc::new(SymbolLookupCache::from_index(&index)?);
         let phase2_stats = self.run_phase2_maybe_bar(
@@ -812,7 +812,7 @@ impl Pipeline {
         progress: Option<Arc<crate::io::status_line::ProgressBar>>,
     ) -> PipelineResult<IncrementalStats> {
         let start = Instant::now();
-        let semantic_path = self.settings.index_path.join("semantic");
+        let semantic_path = self.semantic_dir.clone();
 
         if force {
             // Force mode: index everything (no cleanup needed for fresh index)
@@ -1013,7 +1013,7 @@ impl Pipeline {
         use std::collections::HashSet;
 
         let start = Instant::now();
-        let semantic_path = self.settings.index_path.join("semantic");
+        let semantic_path = self.semantic_dir.clone();
 
         // Canonicalize both path sets for accurate comparison
         let stored_set: HashSet<PathBuf> = stored_paths

@@ -125,7 +125,7 @@ impl CodeIntelligenceServer {
 
         if !indexer.has_semantic_search() {
             // Check if semantic files exist
-            let semantic_path = indexer.settings().index_path.join("semantic");
+            let semantic_path = indexer.semantic_dir();
             let metadata_exists = semantic_path.join("metadata.json").exists();
             let vectors_exist = semantic_path.join("segment_0.vec").exists();
             let symbol_count = indexer.symbol_count();
@@ -276,7 +276,7 @@ impl CodeIntelligenceServer {
                 indexer.has_semantic_search()
             );
             // Check if semantic files exist
-            let semantic_path = indexer.settings().index_path.join("semantic");
+            let semantic_path = indexer.semantic_dir();
             let metadata_exists = semantic_path.join("metadata.json").exists();
             let vectors_exist = semantic_path.join("segment_0.vec").exists();
 

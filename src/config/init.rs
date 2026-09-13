@@ -53,11 +53,13 @@ impl Settings {
             eprintln!("      Models will be managed via cache directory API instead.");
         }
 
-        // Create index directory structure (including tantivy subdirectory)
+        // Create the index directory itself. The generation-layer build
+        // path (`IndexPersistence`/`IndexFacade`) owns creating `gen/<id>/`,
+        // `tantivy/`, and `semantic/` subdirectories on first build; init
+        // must not pre-create them ahead of a generation existing to claim
+        // them.
         let index_path = PathBuf::from(crate::init::local_dir_name()).join("index");
         std::fs::create_dir_all(&index_path)?;
-        let tantivy_path = index_path.join("tantivy");
-        std::fs::create_dir_all(&tantivy_path)?;
 
         // Check if project is already registered (by path in registry or by local file)
         let local_dir = crate::init::local_dir_name();

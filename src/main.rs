@@ -14,7 +14,7 @@ use codanna::project_resolver::{
     },
     registry::SimpleProviderRegistry,
 };
-use codanna::storage::{EMISSION_SEMANTICS_VERSION, IndexMetadata};
+use codanna::storage::EMISSION_SEMANTICS_VERSION;
 use codanna::{IndexPersistence, Settings};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -344,6 +344,11 @@ async fn main() {
             | Commands::Documents { .. }
             | Commands::Profile { .. }
             | Commands::Ls
+            // `--status` is read-only inspection of on-disk generations
+            // (see `run_status`); it must never trigger
+            // `IndexFacade::new`'s bootstrap-on-open, which writes a fresh
+            // `current` generation to disk when nothing resolves.
+            | Commands::Index { status: true, .. }
     ) && !is_proxy_serve(&cli.command, &config)
         && !is_serve_management_op(&cli.command);
 
@@ -418,19 +423,18 @@ async fn main() {
     // `codanna index` heals by full rebuild; everything else (including
     // dry-run, whose pre-dispatch path sync can write) refuses with the
     // heal command. `--force` clears unconditionally and needs no gate.
-    // Gate only real indexes: serve's own startup manufactures a bare
-    // tantivy skeleton with no index.meta, and a skeleton is empty,
-    // not stale. Every index written since stamping began has
-    // index.meta (pre-stamping ones carry it without the version
-    // field and keep gating).
+    // Every published generation carries `index.meta`: serve's startup
+    // bootstrap stamps the current emission version into an otherwise
+    // empty one, so a manufactured skeleton passes the gate, while
+    // pre-stamping indexes carry `index.meta` without the version field
+    // and keep gating.
     let mut emission_heal = false;
     if needs_indexer
         && persistence.exists()
-        && IndexMetadata::exists(&config.index_path)
         && !matches!(cli.command, Commands::Index { force: true, .. })
     {
-        let stored = IndexMetadata::load(&config.index_path)
-            .ok()
+        let stored = persistence
+            .current_metadata()
             .and_then(|m| m.emission_version);
         if stored != Some(EMISSION_SEMANTICS_VERSION) {
             let stored_txt = stored.map_or_else(|| "none".to_string(), |v| format!("v{v}"));
@@ -474,7 +478,9 @@ async fn main() {
     // Captured before facade creation: creating a facade manufactures the
     // index directory, so persistence.exists() afterwards cannot tell a
     // real index from one this process just created.
-    let index_preexisted = persistence.exists();
+    // Guarded by `needs_indexer`: `exists()` migrates a legacy flat layout,
+    // and read-only commands (`index --status`) must never do that.
+    let index_preexisted = needs_indexer && persistence.exists();
 
     // The force and emission-heal lanes clear the persisted index during
     // facade creation, before the rebuild sources are validated; a
@@ -555,16 +561,17 @@ async fn main() {
                     );
                 }
                 tracing::debug!(target: "cli", "creating new index");
-                // Clear Tantivy index if force re-indexing directory
+                // Phase 2 bridge: `--force`/emission-heal open the current
+                // generation and clear it in place. Phase 3's
+                // `open_build(Fresh)` (P3-3) replaces this with a staged
+                // build published as a new generation.
+                let mut facade = create_facade_or_exit(settings.clone());
                 if force_recreate_index {
-                    // Clear the persisted Tantivy files on disk BEFORE creating indexer
-                    if let Err(e) = persistence.clear() {
-                        eprintln!("Warning: Failed to clear persisted Tantivy index: {e}");
+                    if let Err(e) = facade.clear_index() {
+                        eprintln!("Warning: Failed to clear persisted index: {e}");
                     }
                 }
-
-                // Create a new indexer with the given settings (after clearing)
-                create_facade_or_exit(settings.clone())
+                facade
             }
         })
     };
@@ -730,8 +737,8 @@ async fn main() {
     if let Some(ref mut idx) = indexer {
         if persistence.exists() && !is_force_index && !index_command_fresh_index {
             // Load stored indexed_paths from metadata
-            match IndexMetadata::load(&config.index_path) {
-                Ok(metadata) => {
+            match persistence.current_metadata() {
+                Some(metadata) => {
                     let stored_paths = metadata.indexed_paths.clone();
 
                     // Sync with current config (settings.toml is source of truth)
@@ -788,26 +795,17 @@ async fn main() {
                         }
                     }
                 }
-                Err(e) => {
-                    eprintln!("\nWarning: Could not load index metadata; skipping sync: {e}");
+                None => {
+                    eprintln!("\nWarning: Could not load index metadata; skipping sync");
                     tracing::debug!(
                         target: "cli",
-                        "expected path: {}",
-                        codanna::parsing::paths::render_absolute_path(
-                            &config.index_path.join("metadata.json")
-                        )
-                        .display()
+                        "index root: {}",
+                        codanna::parsing::paths::render_absolute_path(&config.index_path)
+                            .display()
                     );
 
                     eprintln!("\nRecovery steps:");
-                    let suggestions = e.recovery_suggestions();
-                    if suggestions.is_empty() {
-                        eprintln!("  - Run 'codanna index' to rebuild metadata");
-                    } else {
-                        for suggestion in suggestions {
-                            eprintln!("  - {suggestion}");
-                        }
-                    }
+                    eprintln!("  - Run 'codanna index' to rebuild metadata");
                     eprintln!("  - Or use 'codanna index --force' for a full rebuild");
 
                     sync_made_changes = None;
@@ -923,35 +921,42 @@ async fn main() {
             list_all,
             json,
             max_files,
+            status,
         } => {
-            use codanna::cli::commands::index::{IndexArgs, run as run_index};
+            use codanna::cli::commands::index::{IndexArgs, run as run_index, run_status};
             use codanna::indexing::DryRunOutput;
-            // Progress enabled by default from settings, --no-progress overrides
-            let progress = config.indexing.show_progress && !no_progress;
-            // `--json` wins over `--list-all`; both are clap `requires =
-            // "dry_run"` so this only matters when dry_run is set.
-            let dry_run_output = if json {
-                DryRunOutput::Json
-            } else if list_all {
-                DryRunOutput::ListAll
+
+            if status {
+                // Read-only: never builds or writes, so it does not touch
+                // the loaded `indexer` at all.
+                run_status(&config, json);
             } else {
-                DryRunOutput::Summary
-            };
-            run_index(
-                IndexArgs {
-                    paths,
-                    force,
-                    progress,
-                    dry_run,
-                    max_files,
-                    cli_config: cli.config.clone(),
-                    dry_run_output,
-                },
-                &mut config,
-                indexer.as_mut().expect("index requires indexer"),
-                &persistence,
-                sync_made_changes,
-            );
+                // Progress enabled by default from settings, --no-progress overrides
+                let progress = config.indexing.show_progress && !no_progress;
+                // `--json` wins over `--list-all` under `--dry-run`.
+                let dry_run_output = if json {
+                    DryRunOutput::Json
+                } else if list_all {
+                    DryRunOutput::ListAll
+                } else {
+                    DryRunOutput::Summary
+                };
+                run_index(
+                    IndexArgs {
+                        paths,
+                        force,
+                        progress,
+                        dry_run,
+                        max_files,
+                        cli_config: cli.config.clone(),
+                        dry_run_output,
+                    },
+                    &mut config,
+                    indexer.as_mut().expect("index requires indexer"),
+                    &persistence,
+                    sync_made_changes,
+                );
+            }
         }
 
         Commands::AddDir { path } => {

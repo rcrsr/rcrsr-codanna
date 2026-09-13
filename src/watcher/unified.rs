@@ -53,8 +53,6 @@ pub struct UnifiedWatcher {
     document_store: Option<Arc<RwLock<DocumentStore>>>,
     /// Chunking config for document re-indexing.
     chunking_config: ChunkingConfig,
-    /// Path for semantic search persistence.
-    index_path: PathBuf,
     /// Workspace root for path resolution.
     workspace_root: PathBuf,
     /// Whether the index is potentially stale due to a backend overflow/rescan
@@ -1111,7 +1109,6 @@ impl UnifiedWatcher {
                 // slow merge cannot stall the whole watch loop (matches the
                 // pattern used for batch sync above).
                 let facade = Arc::clone(&self.facade);
-                let index_path = self.index_path.clone();
                 let broadcaster = Arc::clone(&self.broadcaster);
                 let handler_name = handler_name.to_string();
                 tokio::task::spawn_blocking(move || {
@@ -1125,7 +1122,7 @@ impl UnifiedWatcher {
 
                                     // Save semantic search
                                     if indexer.has_semantic_search() {
-                                        let semantic_path = index_path.join("semantic");
+                                        let semantic_path = indexer.semantic_dir();
                                         if let Err(e) =
                                             indexer.save_semantic_search(&semantic_path)
                                         {
@@ -1580,7 +1577,6 @@ pub struct UnifiedWatcherBuilder {
     facade: Option<Arc<RwLock<IndexFacade>>>,
     document_store: Option<Arc<RwLock<DocumentStore>>>,
     chunking_config: ChunkingConfig,
-    index_path: Option<PathBuf>,
     workspace_root: Option<PathBuf>,
     debounce_ms: u64,
     refresh_on_overflow: bool,
@@ -1597,7 +1593,6 @@ impl UnifiedWatcherBuilder {
             facade: None,
             document_store: None,
             chunking_config: ChunkingConfig::default(),
-            index_path: None,
             workspace_root: None,
             debounce_ms: 500,
             // Mirrors `FileWatchConfig::refresh_on_overflow`'s `default_true()`
@@ -1644,12 +1639,6 @@ impl UnifiedWatcherBuilder {
     /// Set the chunking config for documents.
     pub fn chunking_config(mut self, config: ChunkingConfig) -> Self {
         self.chunking_config = config;
-        self
-    }
-
-    /// Set the index path for semantic search persistence.
-    pub fn index_path(mut self, path: PathBuf) -> Self {
-        self.index_path = Some(path);
         self
     }
 
@@ -1711,10 +1700,6 @@ impl UnifiedWatcherBuilder {
             .workspace_root
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-        let index_path = self
-            .index_path
-            .unwrap_or_else(|| workspace_root.join(".codanna/index"));
-
         // Create channel for events
         let (tx, rx) = mpsc::channel(100);
 
@@ -1734,7 +1719,6 @@ impl UnifiedWatcherBuilder {
             facade,
             document_store: self.document_store,
             chunking_config: self.chunking_config,
-            index_path,
             workspace_root,
             stale: false,
             stale_since: None,

@@ -2408,10 +2408,20 @@ mod tests {
         // This test queries the production .codanna/index to verify relationships exist
 
         let index_base = Path::new(".codanna/index");
-        let tantivy_path = index_base.join("tantivy");
+        let layout = crate::storage::IndexLayout::new(index_base.to_path_buf());
+        let Some(id) = crate::storage::generation::resolve_current(&layout)
+            .expect("failed to resolve current generation")
+        else {
+            eprintln!(
+                "Skipping test: no current generation under .codanna/index. Run: ./target/release/codanna index test_monorepos/spring-petclinic"
+            );
+            return;
+        };
+        let tantivy_path = layout.tantivy_dir(&id);
         if !tantivy_path.exists() {
             eprintln!(
-                "Skipping test: .codanna/index/tantivy not found. Run: ./target/release/codanna index test_monorepos/spring-petclinic"
+                "Skipping test: {} not found. Run: ./target/release/codanna index test_monorepos/spring-petclinic",
+                tantivy_path.display()
             );
             return;
         }

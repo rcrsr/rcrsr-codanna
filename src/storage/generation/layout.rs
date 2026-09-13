@@ -1,10 +1,12 @@
-//! Minimal filesystem path arithmetic for index generations.
+//! Filesystem path arithmetic for index generations.
 //!
-//! This is the subset of `IndexLayout` needed by [`super::markers`]: the
-//! `gen/<id>/` directory and the two marker file paths inside it. The full
-//! API described in the generations design (`current_file`, `tantivy_dir`,
-//! `semantic_dir`, `meta_path`, `damaged_marker`, `gc_lock`, ...) belongs to
-//! a separate work item and is intentionally not implemented here.
+//! [`IndexLayout`] is the sole owner of every on-disk path derived from an
+//! index root: the `gen/<id>/` directory, the marker files inside it
+//! (`BUILDING`, `COMPLETE`, `DAMAGED`), the per-generation `tantivy/`,
+//! `semantic/`, and `index.meta` paths, the root-level `current` pointer,
+//! and the root-level `gc.lock` advisory lock. Every accessor here is pure
+//! path arithmetic -- no filesystem I/O -- so callers elsewhere in the
+//! crate never inline this derivation themselves.
 
 use std::fs;
 use std::io::Write;
@@ -68,6 +70,29 @@ impl IndexLayout {
     /// Path to the temp file used to atomically replace `current`.
     fn current_tmp_file(&self) -> PathBuf {
         self.root.join("current.tmp")
+    }
+
+    /// Path to the Tantivy index directory inside `id`'s generation
+    /// directory: `gen/<id>/tantivy`.
+    pub fn tantivy_dir(&self, id: &GenerationId) -> PathBuf {
+        self.gen_dir(id).join("tantivy")
+    }
+
+    /// Path to the semantic-search directory inside `id`'s generation
+    /// directory: `gen/<id>/semantic`.
+    pub fn semantic_dir(&self, id: &GenerationId) -> PathBuf {
+        self.gen_dir(id).join("semantic")
+    }
+
+    /// Path to the `index.meta` file inside `id`'s generation directory:
+    /// `gen/<id>/index.meta`.
+    pub fn meta_path(&self, id: &GenerationId) -> PathBuf {
+        self.gen_dir(id).join("index.meta")
+    }
+
+    /// Path to the GC advisory lock file: `root/gc.lock`.
+    pub fn gc_lock(&self) -> PathBuf {
+        self.root.join("gc.lock")
     }
 
     /// Read the generation id pointed to by `current`.
@@ -517,6 +542,15 @@ pub fn migrate_flat_layout(layout: &IndexLayout) -> IndexResult<Option<Generatio
     move_if_present(&root.join("semantic"), &gen_dir.join("semantic"))?;
     move_if_present(&root.join("index.meta"), &gen_dir.join("index.meta"))?;
 
+    // A flat index that only the server-side reindex path ever wrote has no
+    // `index.meta`; `validate_generation` would reject the migrated copy and
+    // its data would be abandoned. Stamp a fresh-empty one (no emission
+    // version, so the gate still demands a heal) to carry it across.
+    let meta_path = gen_dir.join("index.meta");
+    if !meta_path.is_file() {
+        IndexMetadata::new().save(&gen_dir)?;
+    }
+
     if !layout.complete_marker(&id).is_file() {
         let manifest = build_migration_manifest(&id, &gen_dir)?;
         manifest.write(layout)?;
@@ -852,8 +886,10 @@ pub fn list_generations(
 
 /// Current unix-millis timestamp, saturating to 0 on a clock error rather
 /// than panicking (mirrors `markers::unix_millis_now`; not reused directly
-/// since it is private to that module).
-fn unix_millis_now() -> u64 {
+/// since it is private to that module). `pub(crate)` so other subsystems
+/// (e.g. `indexing::facade`) can share this implementation instead of
+/// duplicating it.
+pub(crate) fn unix_millis_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -1275,6 +1311,24 @@ mod tests {
     }
 
     #[test]
+    fn tantivy_semantic_meta_and_gc_lock_paths_join_as_expected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let layout = layout_in(&dir);
+        let id = GenerationId::generate();
+
+        assert_eq!(layout.tantivy_dir(&id), layout.gen_dir(&id).join("tantivy"));
+        assert_eq!(
+            layout.semantic_dir(&id),
+            layout.gen_dir(&id).join("semantic")
+        );
+        assert_eq!(
+            layout.meta_path(&id),
+            layout.gen_dir(&id).join("index.meta")
+        );
+        assert_eq!(layout.gc_lock(), dir.path().join("gc.lock"));
+    }
+
+    #[test]
     fn write_then_read_current_round_trips() {
         let dir = tempfile::tempdir().expect("tempdir");
         let layout = layout_in(&dir);
@@ -1657,6 +1711,24 @@ mod tests {
                 )),
             "manifest must record the migrated segment file"
         );
+    }
+
+    #[test]
+    fn migrate_flat_layout_stamps_index_meta_when_the_flat_layout_has_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let layout = layout_in(&dir);
+        write_flat_layout(&layout);
+        fs::remove_file(layout.root().join("index.meta")).expect("drop flat index.meta");
+
+        let id = migrate_flat_layout(&layout)
+            .expect("migrate flat layout")
+            .expect("a flat layout without index.meta must still migrate");
+
+        assert!(layout.gen_dir(&id).join("index.meta").is_file());
+        let meta = IndexMetadata::load(&layout.gen_dir(&id)).expect("stamped index.meta parses");
+        assert_eq!(meta.emission_version, None);
+        assert!(validate_generation(&layout, &id).is_ok());
+        assert_eq!(layout.read_current().expect("read current"), Some(id));
     }
 
     #[test]
