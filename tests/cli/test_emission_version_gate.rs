@@ -101,15 +101,11 @@ enabled = false
     std::fs::write(codanna_dir.join("settings.toml"), settings).expect("write settings");
 }
 
-fn meta_path(workspace: &Path) -> PathBuf {
-    workspace.join(".codanna/index/index.meta")
-}
-
 /// Rewrite index.meta to look like an index built by a binary with
 /// different emission semantics. `version` None simulates a pre-gate
 /// binary (no field at all).
 fn tamper_emission_version(workspace: &Path, version: Option<u64>) {
-    let path = meta_path(workspace);
+    let path = crate::support::index_meta_path(workspace);
     let raw = std::fs::read_to_string(&path).expect("read index.meta");
     let mut meta: Value = serde_json::from_str(&raw).expect("parse index.meta");
     let obj = meta.as_object_mut().expect("index.meta is an object");
@@ -129,7 +125,8 @@ fn tamper_emission_version(workspace: &Path, version: Option<u64>) {
 }
 
 fn stored_emission_version(workspace: &Path) -> Option<u64> {
-    let raw = std::fs::read_to_string(meta_path(workspace)).expect("read index.meta");
+    let raw = std::fs::read_to_string(crate::support::index_meta_path(workspace))
+        .expect("read index.meta");
     let meta: Value = serde_json::from_str(&raw).expect("parse index.meta");
     meta.get("emission_version").and_then(Value::as_u64)
 }
@@ -483,11 +480,11 @@ fn serve_twice_in_fresh_workspace_serves_all_tools() {
     // Reproducer precondition: the skeleton exists with no stored
     // emission semantics.
     assert!(
-        workspace.path().join(".codanna/index/tantivy").exists(),
+        crate::support::tantivy_dir(workspace.path()).exists(),
         "first serve manufactures the index skeleton"
     );
     assert!(
-        !meta_path(workspace.path()).exists(),
+        !crate::support::index_meta_path(workspace.path()).exists(),
         "the skeleton has no index.meta -- it is empty, not stale"
     );
 

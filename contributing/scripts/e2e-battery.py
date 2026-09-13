@@ -114,6 +114,16 @@ def ensure_corpus(out, name, fixture, pin):
     return corpus
 
 
+def index_meta_path(workspace):
+    """Path to the index metadata file for a workspace."""
+    return workspace / ".codanna" / "index" / "index.meta"
+
+
+def tantivy_dir_path(workspace):
+    """Path to the tantivy index directory for a workspace."""
+    return workspace / ".codanna" / "index" / "tantivy"
+
+
 def builder_commit(workspace):
     """Commit stamped into the index by the binary that wrote it.
 
@@ -121,7 +131,7 @@ def builder_commit(workspace):
     index written before the stamp existed. Either way the caller decides
     what an unknown means; this only reports.
     """
-    meta = workspace / ".codanna" / "index" / "index.meta"
+    meta = index_meta_path(workspace)
     if not meta.exists():
         return None
     try:
@@ -297,7 +307,7 @@ def dump_rows(binary, dump, ws, corpus):
     against the corpus root (the verb renders them relative to it), every
     line column back to the stored 0-indexed value, static flag as `1`/``.
     """
-    tantivy = ws / ".codanna" / "index" / "tantivy"
+    tantivy = tantivy_dir_path(ws)
     if not tantivy.is_dir():
         raise SystemExit(f"{ws.name}: no tantivy dir after index")
     if dump is not None:

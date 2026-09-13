@@ -159,7 +159,7 @@ fn mcp_get_index_info_reports_remote_semantic_status_and_model() {
         "stderr should not claim the local default model in remote mode\nstderr:\n{index_stderr}"
     );
 
-    let index_meta_path = workspace.path().join(".codanna/index/index.meta");
+    let index_meta_path = crate::support::index_meta_path(workspace.path());
     assert!(
         index_meta_path.exists(),
         "index should persist index metadata at {}\nstdout:\n{index_stdout}\nstderr:\n{index_stderr}",

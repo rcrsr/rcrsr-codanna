@@ -101,7 +101,7 @@ enabled = false
 }
 
 fn tamper_emission_version(workspace: &Path) {
-    let path = workspace.join(".codanna/index/index.meta");
+    let path = crate::support::index_meta_path(workspace);
     let raw = std::fs::read_to_string(&path).expect("read index.meta");
     let mut meta: Value = serde_json::from_str(&raw).expect("parse index.meta");
     meta.as_object_mut()

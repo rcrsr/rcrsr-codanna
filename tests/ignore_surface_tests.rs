@@ -932,7 +932,7 @@ fn old_metadata_without_fingerprint_loads_clean_as_unknown() {
 
     // Simulate metadata written before the `ignore_fingerprint` field
     // existed by stripping it from the freshly persisted index.meta.
-    let meta_path = workspace.path().join(".codanna/index/index.meta");
+    let meta_path = support::index_meta_path(workspace.path());
     let mut meta: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&meta_path).expect("read index.meta"))
             .expect("parse index.meta as JSON");

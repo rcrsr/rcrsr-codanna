@@ -66,9 +66,14 @@ SETTINGS
         || { echo "workspace seed failed: $ws" >&2; exit 2; }
 }
 
+index_meta_path() {
+    local ws=$1
+    echo "$ws/.codanna/index/index.meta"
+}
+
 tamper_stale() {
     local ws=$1
-    python3 - "$ws/.codanna/index/index.meta" <<'PY'
+    python3 - "$(index_meta_path "$ws")" <<'PY'
 import json, sys
 path = sys.argv[1]
 meta = json.load(open(path))

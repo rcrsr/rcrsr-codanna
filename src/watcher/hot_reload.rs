@@ -263,6 +263,19 @@ mod tests {
         })
     }
 
+    // Advances the on-disk Tantivy index in place by indexing a small source
+    // tree into it through a second `IndexFacade` over the same directory.
+    // Kept as a standalone helper (rather than inlined in the test) so a
+    // future phase can swap in a different reload trigger without touching
+    // the permit-acquisition or post-swap assertion around it.
+    fn advance_index_in_place(settings: &Arc<Settings>, workspace_root: &std::path::Path) {
+        let mut writer_facade = IndexFacade::new(settings.clone()).unwrap();
+        let source_root = workspace_root.join("src");
+        std::fs::create_dir_all(&source_root).unwrap();
+        std::fs::write(source_root.join("a.rs"), "fn a() {}\n").unwrap();
+        writer_facade.index_directory(&source_root, false).unwrap();
+    }
+
     // Regression for the hot-reload facade-swap race: this drives the real
     // `HotReloadWatcher::check_and_reload` wiring end-to-end (real on-disk
     // Tantivy index, real reload), not just the `adopt_reindex_gate`
@@ -288,13 +301,7 @@ mod tests {
         // Advance the on-disk index (via a second facade over the same
         // Tantivy directory) so `check_and_reload` observes a newer
         // meta.json and actually performs the reload/swap below.
-        {
-            let mut writer_facade = IndexFacade::new(settings.clone()).unwrap();
-            let source_root = dir.path().join("src");
-            std::fs::create_dir_all(&source_root).unwrap();
-            std::fs::write(source_root.join("a.rs"), "fn a() {}\n").unwrap();
-            writer_facade.index_directory(&source_root, false).unwrap();
-        }
+        advance_index_in_place(&settings, dir.path());
 
         watcher
             .check_and_reload()
