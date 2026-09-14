@@ -166,8 +166,10 @@ pub enum Commands {
         /// --list-all. Also used by --status to select JSON output instead
         /// of the human-readable table. Requires --dry-run or --status
         /// (rejected at runtime otherwise, since clap's `requires` cannot
-        /// express "one of these two").
-        #[arg(long)]
+        /// express "one of these two"). Not supported with --gc or
+        /// --rollback, which print a plain-text summary and never a JSON
+        /// payload.
+        #[arg(long, conflicts_with_all = ["gc", "rollback"])]
         json: bool,
 
         /// Maximum number of files to index

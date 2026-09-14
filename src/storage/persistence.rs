@@ -8,7 +8,7 @@ use crate::indexing::walk_config;
 use crate::storage::generation::layout::{self, free_space_preflight_against};
 use crate::storage::generation::markers::{Building, Complete};
 use crate::storage::generation::{
-    GenerationId, clone_generation, gc_logged, list_generations, migrate_flat_layout,
+    GenerationId, clone_generation, gc_logged, generation_size, migrate_flat_layout,
     resolve_current,
 };
 use crate::storage::{DataSource, IndexLayout, IndexMetadata};
@@ -268,16 +268,16 @@ impl IndexPersistence {
     }
 
     /// The on-disk size in bytes of generation `id` under this persistence's
-    /// [`IndexLayout`], or `0` if it does not resolve to a listed generation.
-    /// Path arithmetic and the walk itself live in
-    /// [`crate::storage::generation::list_generations`]; this just reads the
-    /// one entry a build's free-space preflight needs.
+    /// [`IndexLayout`], or `0` if `id` has no generation directory. Path
+    /// arithmetic and the walk itself live in
+    /// [`crate::storage::generation::generation_size`], which walks only
+    /// this one generation's directory rather than every generation under
+    /// `gen/`.
     fn generation_size_bytes(&self, id: &GenerationId) -> IndexResult<u64> {
-        Ok(list_generations(&self.layout)?
-            .into_iter()
-            .find(|(gid, ..)| gid == id)
-            .map(|(_, _, size, _)| size)
-            .unwrap_or(0))
+        if !self.layout.gen_dir(id).is_dir() {
+            return Ok(0);
+        }
+        generation_size(&self.layout, id)
     }
 
     /// Allocate and open a fresh generation to build into.

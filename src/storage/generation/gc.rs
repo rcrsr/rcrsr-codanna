@@ -15,6 +15,7 @@
 //! or background task. [`gc_logged`] is the logging wrapper those call
 //! sites share.
 
+use std::collections::HashSet;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::ErrorKind;
@@ -22,8 +23,8 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use crate::error::{IndexError, IndexResult};
 
-use super::layout::{GenerationState, list_generations};
-use super::markers::Complete;
+use super::layout::{GenerationState, classify_generations};
+use super::markers::{Building, Complete};
 use super::{GenerationId, IndexLayout};
 
 /// Outcome of a single [`gc`] run.
@@ -137,12 +138,25 @@ fn run(layout: &IndexLayout, keep_previous: bool) -> IndexResult<GcSummary> {
     let mut summary = GcSummary::default();
 
     let current_completed_at = current_completed_at_millis(layout);
-    let generations = list_generations(layout)?;
+    let generations = classify_generations(layout)?;
+
+    // A generation named as `parent` by a still-alive `BUILDING` marker is
+    // being hardlink-cloned from right now (see `clone_generation`'s doc
+    // comment: it acquires no locks of its own and relies on its parent
+    // staying quiescent for the duration of the clone). Excluding it here,
+    // regardless of its own classification, closes the window where a slow
+    // `CloneCurrent` build racing a concurrent publish from another process
+    // could have its parent's files deleted mid-hardlink.
+    let live_parents: HashSet<GenerationId> = generations
+        .iter()
+        .filter(|(_, state, _)| *state == GenerationState::Building)
+        .filter_map(|(id, _, _)| Building::live_parent(&layout.building_marker(id)))
+        .collect();
 
     let mut previous_ids: Vec<&GenerationId> = generations
         .iter()
-        .filter(|(_, state, _, _)| *state == GenerationState::Previous)
-        .map(|(id, _, _, _)| id)
+        .filter(|(_, state, _)| *state == GenerationState::Previous)
+        .map(|(id, _, _)| id)
         .collect();
     // `GenerationId` sorts ascending by construction time; newest last.
     previous_ids.sort();
@@ -154,7 +168,7 @@ fn run(layout: &IndexLayout, keep_previous: bool) -> IndexResult<GcSummary> {
         .cloned()
         .collect();
 
-    for (id, state, _size, _age) in &generations {
+    for (id, state, _age) in &generations {
         let should_delete = match state {
             GenerationState::Orphan => true,
             GenerationState::Previous => previous_to_delete.contains(id),
@@ -166,7 +180,7 @@ fn run(layout: &IndexLayout, keep_previous: bool) -> IndexResult<GcSummary> {
             | GenerationState::Incompatible => false,
         };
 
-        if !should_delete {
+        if !should_delete || live_parents.contains(id) {
             continue;
         }
 

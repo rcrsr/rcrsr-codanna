@@ -9,7 +9,7 @@
 
 use crate::error::{IndexError, IndexResult};
 use rand::RngExt;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -26,8 +26,22 @@ const TOTAL_HEX_LEN: usize = TIMESTAMP_HEX_LEN + RANDOM_HEX_LEN;
 /// Construct via [`GenerationId::generate`] for a fresh id, or
 /// [`GenerationId::new`] to validate an existing string (e.g. one read back
 /// from disk or supplied on the CLI).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub struct GenerationId(String);
+
+impl<'de> Deserialize<'de> for GenerationId {
+    /// Round-trips the deserialized string through [`GenerationId::new`] so
+    /// a `COMPLETE`/`BUILDING` marker read back from disk with a malformed
+    /// `id`/`parent` field is rejected here rather than silently bypassing
+    /// the 19-char-lowercase-hex invariant every other constructor enforces.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Self::new(&s).ok_or_else(|| serde::de::Error::custom(format!("invalid generation id: {s}")))
+    }
+}
 
 impl GenerationId {
     /// Validate `s` as a generation id: exactly 19 lowercase

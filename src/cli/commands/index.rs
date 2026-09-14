@@ -576,6 +576,35 @@ pub fn run_rollback(config: &Settings, id: Option<String>) {
         std::process::exit(1);
     }
 
+    // Hold the same `publish_lock` `IndexPersistence::publish` uses around
+    // its own read-current/write-current sequence: `write_current`'s
+    // compare-and-swap is only atomic with respect to other holders of this
+    // lock, not an unlocked reader-then-writer racing a concurrent publish.
+    let lock_path = layout.publish_lock();
+    let lock_file = match std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!(
+                "Error: failed to open publish lock {}: {e}",
+                lock_path.display()
+            );
+            std::process::exit(1);
+        }
+    };
+    #[allow(clippy::incompatible_msrv)]
+    if let Err(e) = lock_file.lock() {
+        eprintln!(
+            "Error: failed to acquire publish lock {}: {e}",
+            lock_path.display()
+        );
+        std::process::exit(1);
+    }
+
     let old_current = match layout.read_current() {
         Ok(current) => current,
         Err(e) => {
@@ -588,6 +617,9 @@ pub fn run_rollback(config: &Settings, id: Option<String>) {
         eprintln!("Error: failed to roll back current generation pointer: {e}");
         std::process::exit(1);
     }
+
+    #[allow(clippy::incompatible_msrv)]
+    let _ = lock_file.unlock();
 
     let old_txt = old_current
         .as_ref()

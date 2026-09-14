@@ -119,11 +119,23 @@ impl Pipeline {
     }
 
     /// Derive a semantic directory from `settings.index_path` alone, for
-    /// callers with no generation-scoped `IndexLayout` at hand.
+    /// callers with no generation-scoped `IndexLayout` at hand (mainly
+    /// tests constructing a bare `Pipeline` via [`Self::new`]/
+    /// [`Self::with_settings`]; production code always goes through
+    /// [`Self::with_semantic_dir`] with an `IndexFacade`'s own layout).
+    ///
+    /// When `settings.index_path` already has a `current` generation on
+    /// disk, this resolves to that generation's own `gen/<id>/semantic`
+    /// directory rather than a root-level `.../semantic` that would
+    /// conflict with the generation layout contract. Only falls back to a
+    /// root-level path when there is no `current` pointer to resolve (a
+    /// fresh index directory, as most tests construct).
     fn derive_semantic_dir(settings: &Settings) -> PathBuf {
-        IndexLayout::new(settings.index_path.clone())
-            .root()
-            .join("semantic")
+        let layout = IndexLayout::new(settings.index_path.clone());
+        match layout.read_current().ok().flatten() {
+            Some(current) => layout.semantic_dir(&current),
+            None => layout.root().join("semantic"),
+        }
     }
 
     /// Get the pipeline configuration.

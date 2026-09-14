@@ -274,6 +274,13 @@ pub fn validate_generation(layout: &IndexLayout, id: &GenerationId) -> IndexResu
                 .iter()
                 .filter(|entry| segment_file_belongs_to(&entry.path, seg_id))
             {
+                if !is_safe_manifest_relative_path(&entry.path) {
+                    return Err(damaged(format!(
+                        "COMPLETE manifest file path '{}' is unsafe (absolute or contains \
+                         '.'/'..' components)",
+                        entry.path
+                    )));
+                }
                 let file_path = gen_dir.join(&entry.path);
                 let actual_size = fs::metadata(&file_path)
                     .map_err(|_| {
@@ -335,6 +342,21 @@ fn extract_segment_ids(meta: &serde_json::Value) -> Result<Vec<String>, String> 
                 .ok_or_else(|| "segment entry missing a string \"segment_id\"".to_string())
         })
         .collect()
+}
+
+/// True when `path` is safe to join onto a generation directory and stat:
+/// relative (not absolute, no Windows drive/UNC prefix), and containing no
+/// `.`/`..` components that could resolve outside `gen_dir`. Used to
+/// validate `CompleteFileEntry.path` values read back from an on-disk
+/// `COMPLETE` manifest before [`validate_generation`] joins them onto
+/// `gen_dir` and calls `fs::metadata`.
+fn is_safe_manifest_relative_path(path: &str) -> bool {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        return false;
+    }
+    path.components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)))
 }
 
 /// True when `path`'s file stem (the file name with its final extension
@@ -882,7 +904,20 @@ pub fn resolve_current_with_recovery(
 /// Classify a single generation's lifecycle state per the table in
 /// `internal/index-generations.md` section 2.10.
 pub fn classify(layout: &IndexLayout, id: &GenerationId) -> GenerationState {
-    let is_current = layout.read_current().ok().flatten().as_ref() == Some(id);
+    let current = layout.read_current().ok().flatten();
+    classify_with_current(layout, id, current.as_ref())
+}
+
+/// Core of [`classify`], taking the already-resolved `current` pointer so a
+/// caller classifying many generations in one pass (e.g.
+/// [`classify_generations`]) reads `current` exactly once instead of once
+/// per generation.
+fn classify_with_current(
+    layout: &IndexLayout,
+    id: &GenerationId,
+    current: Option<&GenerationId>,
+) -> GenerationState {
+    let is_current = current == Some(id);
 
     let building_marker_path = layout.building_marker(id);
     let building_marker_exists = building_marker_path.is_file();
@@ -925,14 +960,18 @@ fn emission_version_compatible(layout: &IndexLayout, id: &GenerationId) -> bool 
     }
 }
 
-/// List every generation under `layout`'s `gen/` directory with its
-/// classified state, on-disk size in bytes, and age derived from the
-/// generation id's embedded millis timestamp.
+/// Classify every generation under `layout`'s `gen/` directory, with age
+/// derived from the generation id's embedded millis timestamp, but without
+/// computing on-disk size -- for callers that only need lifecycle state
+/// (e.g. [`super::gc::run`]) and would otherwise pay for a recursive walk
+/// of every generation directory just to discard the result. See
+/// [`list_generations`] for the size-inclusive variant used by display
+/// surfaces.
 ///
 /// Returns an empty list (not an error) when `gen/` does not exist yet.
-pub fn list_generations(
+pub(crate) fn classify_generations(
     layout: &IndexLayout,
-) -> IndexResult<Vec<(GenerationId, GenerationState, u64, Duration)>> {
+) -> IndexResult<Vec<(GenerationId, GenerationState, Duration)>> {
     let gen_root = layout.root().join("gen");
 
     let entries = match fs::read_dir(&gen_root) {
@@ -947,6 +986,7 @@ pub fn list_generations(
     };
 
     let now_millis = unix_millis_now();
+    let current = layout.read_current().ok().flatten();
     let mut results = Vec::new();
 
     for entry in entries {
@@ -962,13 +1002,38 @@ pub fn list_generations(
             continue;
         };
 
-        let state = classify(layout, &id);
-        let size = dir_size(&entry.path())?;
+        let state = classify_with_current(layout, &id, current.as_ref());
         let age = generation_age(&id, now_millis);
-        results.push((id, state, size, age));
+        results.push((id, state, age));
     }
 
     Ok(results)
+}
+
+/// List every generation under `layout`'s `gen/` directory with its
+/// classified state, on-disk size in bytes, and age derived from the
+/// generation id's embedded millis timestamp.
+///
+/// Returns an empty list (not an error) when `gen/` does not exist yet.
+pub fn list_generations(
+    layout: &IndexLayout,
+) -> IndexResult<Vec<(GenerationId, GenerationState, u64, Duration)>> {
+    classify_generations(layout)?
+        .into_iter()
+        .map(|(id, state, age)| {
+            let size = generation_size(layout, &id)?;
+            Ok((id, state, size, age))
+        })
+        .collect()
+}
+
+/// On-disk size in bytes of exactly one generation's directory, computed by
+/// walking only `layout.gen_dir(id)` rather than every generation under
+/// `gen/`. Callers that need the size of a single known generation (e.g. a
+/// build's free-space preflight) should use this instead of scanning
+/// [`list_generations`] for a matching id.
+pub fn generation_size(layout: &IndexLayout, id: &GenerationId) -> IndexResult<u64> {
+    dir_size(&layout.gen_dir(id))
 }
 
 /// Current unix-millis timestamp, saturating to 0 on a clock error rather

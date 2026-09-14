@@ -243,6 +243,18 @@ impl Building {
             None => false,
         }
     }
+
+    /// The `parent` generation recorded in the `BUILDING` marker at
+    /// `marker_path`, but only when that marker is still
+    /// [`Building::is_alive`] -- a dead or missing builder has no claim on
+    /// its parent, so callers (e.g. `gc::run`, deciding what is safe to
+    /// delete) must not pin a parent based on an abandoned marker.
+    pub(crate) fn live_parent(marker_path: &Path) -> Option<GenerationId> {
+        if !Self::is_alive(marker_path) {
+            return None;
+        }
+        read_marker(marker_path).and_then(|m| m.parent)
+    }
 }
 
 /// Best-effort read of a `BUILDING` marker's content, tolerating a missing

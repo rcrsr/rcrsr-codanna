@@ -23,7 +23,7 @@ pub use gc::{GcSummary, gc, gc_logged};
 pub use id::GenerationId;
 pub use layout::{
     GenerationState, IndexLayout, ResolvedGeneration, classify, clone_generation,
-    free_space_preflight, list_generations, migrate_flat_layout, resolve_current,
+    free_space_preflight, generation_size, list_generations, migrate_flat_layout, resolve_current,
     resolve_current_with_recovery, validate_generation,
 };
 pub use markers::{Building, Complete, CompleteFileEntry};
