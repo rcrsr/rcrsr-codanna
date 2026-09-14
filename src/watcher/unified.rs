@@ -233,14 +233,18 @@ impl UnifiedWatcher {
                     // `tokio::spawn` in `maybe_start_catch_up`, detached from
                     // this `select!`). Dropping `self` here without joining
                     // it would detach, not abort, the spawned future --
-                    // `reindex_locked` could still be between clearing the
-                    // index and finishing the rebuild walk on its own task
-                    // when this process exits. Join to completion rather
-                    // than aborting: phase 1 of that reindex may already
-                    // have cleared the index by the time an abort would
-                    // land, and aborting mid-clear would leave the on-disk
-                    // index partially rebuilt with no task left to finish
-                    // it.
+                    // `reindex_locked` could still be on its own task,
+                    // partway through building the staged generation, when
+                    // this process exits. Staged builds no longer clear the
+                    // live index in phase 1, so aborting mid-build would only
+                    // orphan the half-built generation (swept up by GC on the
+                    // next start) and would leave the live facade untouched;
+                    // joining here is now a cost-avoidance choice (finish
+                    // work already paid for) rather than a correctness
+                    // requirement. We still join rather than abort for Phase
+                    // 4, since it's cheaper and changes no behavior; switching
+                    // to abort-on-shutdown is a documented follow-up, see
+                    // internal/improvement-notes.md section 2.1.
                     if let Some(handle) = self.catch_up_task.take() {
                         crate::log_event!(
                             "watcher",
@@ -652,7 +656,10 @@ impl UnifiedWatcher {
         let facade = Arc::clone(&self.facade);
         self.catch_up_started_at = Some(Instant::now());
         self.catch_up_task = Some(tokio::spawn(async move {
-            crate::indexing::reindex_locked(&facade, None, true, None)
+            // Watcher broadcaster wiring is a later phase; `None` here just
+            // means the catch-up reindex doesn't emit an `IndexReloaded`
+            // notification on the watch lane yet.
+            crate::indexing::reindex_locked(&facade, None, true, None, None)
                 .await
                 .map_err(|source| WatchError::CatchUpReindexFailed { source })
         }));
@@ -3473,22 +3480,19 @@ mod tests {
     /// deleted file's) would also make this test pass.
     ///
     /// The poll loop below requires `gone_marker` absent AND `seed_marker`
-    /// present *in the same sample*, then breaks. This is deliberate:
-    /// `reindex_locked`'s phase 1 commits an emptied index before phase 2
-    /// rebuilds it (see the `clear_index()` call gated by
-    /// `paths_is_none && force` in `reindex_locked`, `src/indexing/facade.rs`
-    /// -- deliberately cited without line numbers, which rot), so there is a
-    /// real, observable window where both markers are absent at once. A poll loop that reads
-    /// `gone_marker` in one sample, latches on its absence, and only *then*
-    /// reads `seed_marker` (possibly in the very same sample, but treating
-    /// the two reads as independent) can land inside that transient
-    /// clear-window and record `seed_marker` as absent even though the
-    /// rebuild is still in flight and will restore it moments later --
-    /// producing a flaky false negative on the positive control. Requiring
-    /// both conditions jointly, and continuing to poll otherwise, makes the
-    /// loop wait out that window rather than sampling inside it. Do not
-    /// split this back into two independent reads across different
-    /// samples; that reintroduces the same race in a different shape.
+    /// present *in the same sample*, then breaks. This is deliberate. A
+    /// `paths: None` catch-up is staged (`reindex_locked` builds a fresh
+    /// generation off-lock and atomically swaps it in, see
+    /// `src/indexing/facade.rs` -- cited without line numbers, which rot),
+    /// so the live index never shows an emptied window; but before the
+    /// swap `gone_marker` is still present, and after it both conditions
+    /// hold at once. Reading the two markers as independent samples could
+    /// still latch a stale pre-swap `gone_marker` read against a post-swap
+    /// `seed_marker` read (or vice versa) and misreport the positive
+    /// control. Requiring both conditions jointly in one sample, and
+    /// continuing to poll otherwise, pins the assertion to a single
+    /// consistent facade view. Do not split this back into two independent
+    /// reads across different samples.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn startup_catch_up_drops_symbols_for_files_deleted_while_watcher_was_down() {
         use crate::config::Settings;

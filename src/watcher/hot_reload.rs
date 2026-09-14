@@ -115,73 +115,8 @@ impl HotReloadWatcher {
 
         // Load the new index as a facade
         match self.persistence.load_facade(self.settings.clone()) {
-            Ok(mut new_facade) => {
-                // Get write lock and replace the facade. Carry the outgoing
-                // facade's reindex gate into the replacement BEFORE
-                // assigning it, so a permit held by an in-flight
-                // `reindex_locked` call is still respected by callers that
-                // read the gate handle after this swap (see the invariant
-                // documented on `IndexFacade::reindex_gate`).
-                let mut facade_guard = self.facade.write().await;
-                new_facade.adopt_reindex_gate(facade_guard.reindex_gate());
-                *facade_guard = new_facade;
-
-                // Ensure semantic search stays attached after hot reloads
-                let mut restored_semantic = false;
-                if !facade_guard.has_semantic_search() && !facade_guard.is_semantic_incompatible() {
-                    let semantic_path = facade_guard.semantic_dir();
-                    let metadata_exists = semantic_path.join("metadata.json").exists();
-                    if metadata_exists {
-                        match facade_guard.load_semantic_search(&semantic_path) {
-                            Ok(true) => {
-                                restored_semantic = true;
-                            }
-                            Ok(false) => {
-                                crate::debug_event!(
-                                    "hot-reload",
-                                    "semantic metadata present but reload returned false"
-                                );
-                            }
-                            Err(crate::IndexError::SemanticSearch(
-                                crate::semantic::SemanticSearchError::DimensionMismatch {
-                                    ref suggestion,
-                                    ..
-                                },
-                            )) => {
-                                warn!(
-                                    "Semantic index dimension mismatch after hot-reload: {suggestion}. \
-                                     Semantic search disabled until re-indexed with --force."
-                                );
-                            }
-                            Err(e) => {
-                                warn!("Failed to reload semantic search after index update: {e}");
-                            }
-                        }
-                    } else {
-                        crate::debug_event!(
-                            "hot-reload",
-                            "semantic metadata missing",
-                            "{}",
-                            crate::parsing::paths::render_absolute_path(&semantic_path).display()
-                        );
-                    }
-                }
-
-                let symbol_count = facade_guard.symbol_count();
-                let has_semantic = facade_guard.has_semantic_search();
-                if restored_semantic {
-                    let count = facade_guard.semantic_search_embedding_count();
-                    crate::debug_event!("hot-reload", "restored semantic", "{count} embeddings");
-                }
-                crate::log_event!("hot-reload", "reloaded", "{symbol_count} symbols");
-                crate::debug_event!("hot-reload", "semantic search", "{has_semantic}");
-
-                // Send notification that index was reloaded
-                if let Some(ref broadcaster) = self.broadcaster {
-                    broadcaster.send(FileChangeEvent::IndexReloaded);
-                    crate::debug_event!("hot-reload", "broadcast", "IndexReloaded");
-                }
-
+            Ok(new_facade) => {
+                IndexFacade::swap_in(&self.facade, new_facade, self.broadcaster.as_deref()).await;
                 Ok(())
             }
             Err(e) => {
@@ -382,6 +317,75 @@ mod tests {
         assert!(
             matches!(events.try_recv(), Ok(FileChangeEvent::IndexReloaded)),
             "a generation flip must broadcast IndexReloaded"
+        );
+    }
+
+    // No-double-fire regression: once an in-process `reindex_locked(paths:
+    // None, force: true, ...)` call has published-and-swapped a new
+    // generation into the SAME facade a `HotReloadWatcher` is watching, the
+    // on-disk `current` pointer already names the facade's new generation.
+    // A subsequent `check_and_reload` tick must therefore be a genuine
+    // no-op -- no second swap, no second broadcast -- reusing the
+    // assertion style of
+    // `check_and_reload_is_a_no_op_when_current_matches_served_generation`
+    // above. This guards against a regression where the in-process publish
+    // path and the hot-reload watcher's `current`-pointer check could
+    // disagree about what "already served" means, causing every reindex to
+    // be immediately followed by a redundant reload.
+    #[tokio::test]
+    async fn reindex_locked_publish_leaves_check_and_reload_a_no_op() {
+        // See `crate::mcp::server::REINDEX_TEST_SERIAL`: this test drives a
+        // real `reindex_locked` walk and must not race `mcp::server`'s own
+        // reindex-driving tests over the shared process-wide
+        // failure-injection flag.
+        let _serial_guard = crate::mcp::server::REINDEX_TEST_SERIAL.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let index_path = dir.path().join("index");
+        let source_dir = dir.path().join("workspace").join("src");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::write(source_dir.join("a.rs"), "pub fn a() {}\n").unwrap();
+
+        let mut settings = Settings {
+            index_path: index_path.clone(),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.indexing.indexed_paths = vec![source_dir.clone()];
+        let settings = Arc::new(settings);
+
+        let facade = Arc::new(RwLock::new(IndexFacade::new(settings.clone()).unwrap()));
+        let broadcaster = Arc::new(NotificationBroadcaster::new(8));
+        let mut events = broadcaster.subscribe();
+        let mut watcher =
+            HotReloadWatcher::new(facade.clone(), settings.clone(), Duration::from_secs(3600))
+                .with_broadcaster(broadcaster);
+
+        // Drive a real in-process full reindex through the same seam the
+        // MCP server uses (`reindex_locked`), letting it build, publish,
+        // and swap the new generation into `facade`.
+        crate::indexing::reindex_locked(&facade, None, true, None, None)
+            .await
+            .expect("in-process force reindex must succeed");
+
+        let published_generation = facade.read().await.generation_id().clone();
+        let layout = IndexLayout::new(index_path);
+        assert_eq!(
+            layout.read_current().unwrap(),
+            Some(published_generation.clone()),
+            "an in-process publish must flip the on-disk `current` pointer to the facade's new \
+             generation before check_and_reload's next tick observes it"
+        );
+
+        watcher
+            .check_and_reload()
+            .await
+            .expect("tick after in-process publish");
+
+        assert_eq!(facade.read().await.generation_id(), &published_generation);
+        assert!(
+            events.try_recv().is_err(),
+            "a tick immediately after an in-process publish must be a no-op: no second swap, \
+             no second broadcast"
         );
     }
 }

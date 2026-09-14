@@ -15,6 +15,28 @@ use crate::Settings;
 use crate::documents::DocumentStore;
 use crate::indexing::facade::IndexFacade;
 
+/// Serializes every test in the crate that drives a real
+/// `ReindexHandles::run` walk, whether directly or via `run_reindex`/
+/// `run_reindex_for_test`/`reindex_locked`, across module boundaries.
+///
+/// `indexing::facade::set_fail_after_walk_for_test` arms a bare
+/// process-wide `AtomicBool` with no correlation to which caller armed it
+/// (see that function's doc comment): the very next `run()` call anywhere
+/// in the test binary consumes it, not necessarily the one belonging to the
+/// test that armed it. Reindex-driving tests live in multiple modules
+/// (`mcp::server`, `watcher::hot_reload`, `indexing::facade`) that all run
+/// concurrently under `cargo test`'s default parallelism, so a module-local
+/// lock cannot prevent one module's test from stealing another module's
+/// injected failure (or lack thereof). Every such test, in every module,
+/// acquires this single crate-wide lock for its full duration before
+/// touching the reindex machinery. Defined here (rather than in
+/// `indexing::facade`, where the failure-injection flag itself lives)
+/// because this module owns the majority of the reindex-driving tests that
+/// need it; other modules reach it via this fully qualified path.
+#[cfg(test)]
+pub(crate) static REINDEX_TEST_SERIAL: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 /// Generate guidance for MCP tool responses
 pub(crate) fn generate_mcp_guidance(
     settings: &Settings,
@@ -315,11 +337,15 @@ impl CodeIntelligenceServer {
     }
 
     /// Run a reindex over the given paths (or all indexed_paths from settings if None),
-    /// optionally clearing the index first when `force` is true.
+    /// rebuilding from scratch (rather than incrementally) when `force` is true.
     ///
-    /// During a force reindex, concurrent readers are no longer blocked but may
-    /// transiently observe an empty/repopulating index (clear-then-rebuild is not
-    /// atomic; atomic build-and-swap is intentionally out of scope for this change).
+    /// For `paths: None`, a force reindex builds a fresh generation off to the
+    /// side and only atomically publishes-and-swaps it in once complete;
+    /// concurrent readers keep serving the current generation throughout and
+    /// never observe a partial or empty index. The older "clear-then-rebuild
+    /// is not atomic" caveat still applies to `paths: Some(..)`, which remains
+    /// an in-place, per-file-granularity update and is not atomic across the
+    /// whole set of paths.
     pub(crate) async fn run_reindex(
         &self,
         paths: Option<Vec<String>>,
@@ -445,41 +471,47 @@ impl CodeIntelligenceServer {
         // brief write lock) lives in `indexing::reindex_locked` so
         // both this handler and the file-watcher's catch-up path share the
         // same phase-ordering guarantee.
-        let outcome = crate::indexing::reindex_locked(&self.facade, paths, force, phase2_started)
-            .await
-            .map_err(|e| match e {
-                // Reindex contention is a client-visible, retryable
-                // condition (another full reindex is already holding the
-                // gate), not an internal fault -- surface it as
-                // INVALID_REQUEST with the recovery guidance attached
-                // rather than flattening it into INTERNAL_ERROR alongside
-                // genuine server-side failures.
-                crate::IndexError::ReindexInProgress => McpError::new(
-                    ErrorCode::INVALID_REQUEST,
-                    // `recovery_suggestions()` entries carry no trailing
-                    // punctuation, so join them as their own sentences
-                    // rather than a bare space that runs them together.
-                    format!("{e}. {}.", e.recovery_suggestions().join(". ")),
-                    None,
-                ),
-                // Same reasoning as `ReindexInProgress` above: this is a
-                // client-side configuration condition (no rebuild source
-                // configured, or every configured path has gone stale) with
-                // concrete recovery steps, not a server fault.
-                // INTERNAL_ERROR tells an agent to retry or give up;
-                // INVALID_REQUEST + "Run 'codanna index <path>'" tells it
-                // what to do instead.
-                crate::IndexError::ReindexHasNothingToRebuild => McpError::new(
-                    ErrorCode::INVALID_REQUEST,
-                    format!("{e}. {}.", e.recovery_suggestions().join(". ")),
-                    None,
-                ),
-                other => McpError::new(
-                    ErrorCode::INTERNAL_ERROR,
-                    format!("Reindex failed: {other}"),
-                    None,
-                ),
-            })?;
+        let outcome = crate::indexing::reindex_locked(
+            &self.facade,
+            paths,
+            force,
+            self.broadcaster.as_deref(),
+            phase2_started,
+        )
+        .await
+        .map_err(|e| match e {
+            // Reindex contention is a client-visible, retryable
+            // condition (another full reindex is already holding the
+            // gate), not an internal fault -- surface it as
+            // INVALID_REQUEST with the recovery guidance attached
+            // rather than flattening it into INTERNAL_ERROR alongside
+            // genuine server-side failures.
+            crate::IndexError::ReindexInProgress => McpError::new(
+                ErrorCode::INVALID_REQUEST,
+                // `recovery_suggestions()` entries carry no trailing
+                // punctuation, so join them as their own sentences
+                // rather than a bare space that runs them together.
+                format!("{e}. {}.", e.recovery_suggestions().join(". ")),
+                None,
+            ),
+            // Same reasoning as `ReindexInProgress` above: this is a
+            // client-side configuration condition (no rebuild source
+            // configured, or every configured path has gone stale) with
+            // concrete recovery steps, not a server fault.
+            // INTERNAL_ERROR tells an agent to retry or give up;
+            // INVALID_REQUEST + "Run 'codanna index <path>'" tells it
+            // what to do instead.
+            crate::IndexError::ReindexHasNothingToRebuild => McpError::new(
+                ErrorCode::INVALID_REQUEST,
+                format!("{e}. {}.", e.recovery_suggestions().join(". ")),
+                None,
+            ),
+            other => McpError::new(
+                ErrorCode::INTERNAL_ERROR,
+                format!("Reindex failed: {other}"),
+                None,
+            ),
+        })?;
 
         let documents = if documents {
             Some(self.run_document_reindex().await?)
@@ -630,6 +662,11 @@ mod tests {
     use crate::config::Settings;
     use std::time::Duration;
 
+    // `REINDEX_TEST_SERIAL` (crate-wide serialization lock for
+    // reindex-driving tests, defined above `mod tests`) is brought in by
+    // `use super::*`. `watcher::hot_reload`'s reindex-driving test acquires
+    // the same lock via `crate::mcp::server::REINDEX_TEST_SERIAL`.
+
     /// Terminal-state / provenance regression for `run_reindex`'s off-lock
     /// phase 2 walk. `run_reindex` is `pub(crate)` and the facade lives
     /// behind `Arc<RwLock<IndexFacade>>` on the server, so only an in-module
@@ -666,6 +703,7 @@ mod tests {
     /// rather than merely before the task has started running.
     #[tokio::test]
     async fn run_reindex_releases_write_lock_during_off_lock_walk() {
+        let _serial_guard = REINDEX_TEST_SERIAL.lock().await;
         let temp = tempfile::tempdir().expect("create temp root");
         let source_dir = temp.path().join("src");
         std::fs::create_dir_all(&source_dir).expect("create source dir");
@@ -795,6 +833,7 @@ mod tests {
     /// `starts_with()` check this test exercises.
     #[tokio::test]
     async fn run_reindex_rejects_explicit_path_outside_workspace_root() {
+        let _serial_guard = REINDEX_TEST_SERIAL.lock().await;
         let temp = tempfile::tempdir().expect("create temp root");
 
         let workspace_root = temp.path().join("workspace");
@@ -907,9 +946,10 @@ mod tests {
     ///
     /// The rejection-only half of this is not sufficient on its own: a gate
     /// that is wired to reject concurrent callers but acquired/released at
-    /// the wrong point relative to phase 1's `clear_index()` and phase 2's
-    /// off-lock walk could still let a losing caller's side effects (or a
-    /// stray double `clear()`) truncate the winning reindex's result. Only
+    /// the wrong point relative to phase 1's staged `open_build` and phase
+    /// 2's off-lock walk could still let a losing caller's side effects (a
+    /// second build published over, or swapped in ahead of, the winner's)
+    /// truncate the winning reindex's result. Only
     /// asserting the winning reindex's terminal symbol count against the
     /// ground-truth oracle (mirroring
     /// `run_reindex_releases_write_lock_during_off_lock_walk` above)
@@ -921,9 +961,10 @@ mod tests {
     /// exactly the window a naive implementation could get wrong by either
     /// acquiring the permit after the write lock (letting a second caller's
     /// phase 1 interleave) or dropping it before phase 2 (letting a second
-    /// caller's `clear_index()` run mid-walk).
+    /// caller open, publish, and swap in its own generation mid-walk).
     #[tokio::test]
     async fn run_reindex_rejects_concurrent_request_without_corrupting_the_completed_reindex() {
+        let _serial_guard = REINDEX_TEST_SERIAL.lock().await;
         let temp = tempfile::tempdir().expect("create temp root");
         let source_dir = temp.path().join("src");
         std::fs::create_dir_all(&source_dir).expect("create source dir");
@@ -1021,6 +1062,7 @@ mod tests {
     /// `ReindexInProgress` forever).
     #[tokio::test]
     async fn run_reindex_permit_is_released_after_completion_allowing_a_subsequent_reindex() {
+        let _serial_guard = REINDEX_TEST_SERIAL.lock().await;
         let temp = tempfile::tempdir().expect("create temp root");
         let source_dir = temp.path().join("src");
         std::fs::create_dir_all(&source_dir).expect("create source dir");
@@ -1091,6 +1133,228 @@ mod tests {
         assert!(
             err.message.contains("codanna index"),
             "expected the recovery suggestion naming 'codanna index <path>' in the message: {err:?}"
+        );
+    }
+
+    /// Atomicity regression: a concurrent reader polling `symbol_count()`
+    /// through a full `force: true, paths: None` reindex must never observe
+    /// a count below the pre-reindex baseline at any sample, and the
+    /// terminal count must match a ground-truth oracle built independently
+    /// over the same source. A naive implementation that clears the live
+    /// index before rebuilding it (rather than building a fresh generation
+    /// off to the side and swapping it in only once complete) would let a
+    /// concurrent reader observe a transient near-zero count mid-reindex;
+    /// only the read-never-dips assertion below, sampled continuously
+    /// across the reindex's whole in-flight duration, discriminates that
+    /// from the current build-then-swap implementation.
+    #[tokio::test]
+    async fn run_reindex_readers_never_observe_a_count_below_pre_reindex_during_atomic_swap() {
+        let _serial_guard = REINDEX_TEST_SERIAL.lock().await;
+        let temp = tempfile::tempdir().expect("create temp root");
+        let source_dir = temp.path().join("src");
+        std::fs::create_dir_all(&source_dir).expect("create source dir");
+
+        // Enough files that phase 2's off-lock walk stays in flight long
+        // enough for the reader task to collect several samples.
+        const FILE_COUNT: usize = 300;
+        write_symbol_fixture(&source_dir, FILE_COUNT);
+
+        let mut settings = Settings {
+            index_path: temp.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.indexing.indexed_paths = vec![source_dir.clone()];
+
+        // Ground-truth oracle: index the same fixture directly via
+        // `index_directory` on an independent facade/index dir.
+        let expected_symbol_count = {
+            let expected_settings = Settings {
+                index_path: temp.path().join("expected_index"),
+                workspace_root: None,
+                ..Default::default()
+            };
+            let mut expected_facade =
+                IndexFacade::new(Arc::new(expected_settings)).expect("create ground-truth facade");
+            expected_facade
+                .index_directory(&source_dir, false)
+                .expect("index fixture directory for ground truth");
+            expected_facade.symbol_count()
+        };
+        assert!(
+            expected_symbol_count > 0,
+            "fixture must produce a non-zero ground-truth symbol count"
+        );
+
+        // Seed the facade under test with the SAME fixture before the
+        // atomicity-under-test reindex runs, so the pre-reindex baseline is
+        // non-zero and a transient near-zero window mid-reindex is
+        // actually detectable.
+        let mut facade =
+            IndexFacade::new(Arc::new(settings)).expect("create facade over temp index dir");
+        facade
+            .index_directory(&source_dir, false)
+            .expect("seed facade before the atomicity-under-test reindex");
+        let pre_reindex_count = facade.symbol_count();
+        assert_eq!(
+            pre_reindex_count, expected_symbol_count,
+            "seeded facade must already match the ground-truth oracle before reindexing"
+        );
+
+        let server = CodeIntelligenceServer::new(facade);
+
+        let (phase2_started_tx, phase2_started_rx) = tokio::sync::oneshot::channel();
+        let reindex_server = server.clone();
+        let reindex_task = tokio::spawn(async move {
+            reindex_server
+                .run_reindex_for_test(None, true, phase2_started_tx)
+                .await
+        });
+
+        phase2_started_rx
+            .await
+            .expect("reindex must signal phase 2 start before completing");
+
+        let reader_facade = server.facade.clone();
+        let reader_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader_stop_flag = Arc::clone(&reader_stop);
+        let reader_task = tokio::spawn(async move {
+            let mut observed_below_baseline: Option<usize> = None;
+            while !reader_stop_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                let count = reader_facade.read().await.symbol_count();
+                if count < pre_reindex_count && observed_below_baseline.is_none() {
+                    observed_below_baseline = Some(count);
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            observed_below_baseline
+        });
+
+        let outcome = reindex_task
+            .await
+            .expect("reindex task must not panic")
+            .expect("reindex must succeed");
+
+        reader_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let observed_below_baseline = reader_task.await.expect("reader task must not panic");
+
+        assert!(
+            observed_below_baseline.is_none(),
+            "reader observed a symbol_count() ({:?}) below the pre-reindex baseline \
+             ({pre_reindex_count}) while a force reindex was in flight -- the swap is not atomic",
+            observed_below_baseline
+        );
+        assert_eq!(
+            outcome.symbols, expected_symbol_count,
+            "expected the reindex to terminate at the ground-truth oracle's symbol count"
+        );
+        assert_eq!(
+            server.facade.read().await.symbol_count(),
+            expected_symbol_count,
+            "expected the live facade's terminal symbol_count to match the ground-truth oracle"
+        );
+    }
+
+    /// Orphan-on-failure regression: when `ReindexHandles::run`'s injected
+    /// post-walk failure fires, `reindex_locked` must return `Err` and the
+    /// live facade must be genuinely untouched -- not merely "an error was
+    /// returned" while the facade was mutated in some other way. The build
+    /// generation that was under construction is abandoned (its `BUILDING`
+    /// guard is released when the build facade drops without ever reaching
+    /// phase 3's publish/swap) rather than promoted to `current`.
+    ///
+    /// The abandoned build must classify as `Orphan` immediately -- even
+    /// though its `BUILDING` marker names this still-running process --
+    /// because the dropped guard released the marker's lock (see
+    /// `Building::is_alive`); otherwise a failed in-process reindex would
+    /// pin an un-GC-able generation for the life of the server.
+    #[tokio::test]
+    async fn reindex_locked_orphans_the_build_generation_on_injected_walk_failure() {
+        let _serial_guard = REINDEX_TEST_SERIAL.lock().await;
+        let temp = tempfile::tempdir().expect("create temp root");
+        let source_dir = temp.path().join("src");
+        std::fs::create_dir_all(&source_dir).expect("create source dir");
+        write_symbol_fixture(&source_dir, 5);
+
+        let mut settings = Settings {
+            index_path: temp.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.indexing.indexed_paths = vec![source_dir.clone()];
+        let index_path = settings.index_path.clone();
+
+        let mut facade =
+            IndexFacade::new(Arc::new(settings)).expect("create facade over temp index dir");
+        facade
+            .index_directory(&source_dir, false)
+            .expect("seed facade before the injected-failure reindex");
+
+        let facade_arc = Arc::new(tokio::sync::RwLock::new(facade));
+        let layout = crate::storage::IndexLayout::new(index_path.clone());
+        let pre_symbol_count = facade_arc.read().await.symbol_count();
+        let pre_generation_id = facade_arc.read().await.generation_id().clone();
+
+        crate::indexing::facade::set_fail_after_walk_for_test(true);
+        let result = crate::indexing::reindex_locked(&facade_arc, None, true, None, None).await;
+        assert!(
+            result.is_err(),
+            "expected reindex_locked to surface the injected post-walk failure as Err"
+        );
+
+        // The live facade must be genuinely untouched by the failed
+        // reindex: same symbol count AND same generation id as before the
+        // call, not just "an error was returned".
+        assert_eq!(
+            facade_arc.read().await.symbol_count(),
+            pre_symbol_count,
+            "live facade symbol_count must be unchanged after a failed reindex"
+        );
+        assert_eq!(
+            facade_arc.read().await.generation_id(),
+            &pre_generation_id,
+            "live facade generation_id must be unchanged after a failed reindex"
+        );
+
+        let generations = crate::storage::generation::list_generations(&layout)
+            .expect("list generations after the injected failure");
+
+        // Exactly one generation besides the untouched `current` one must
+        // exist -- the abandoned build -- and it must already be an
+        // `Orphan`: the guard dropped with the build facade, so the marker's
+        // lock is free even though its pid is this live process.
+        let abandoned: Vec<_> = generations
+            .iter()
+            .filter(|(id, _, _, _)| *id != pre_generation_id)
+            .collect();
+        assert_eq!(
+            abandoned.len(),
+            1,
+            "expected exactly one abandoned build generation left behind by the failed \
+             reindex, got: {generations:?}"
+        );
+        assert_eq!(
+            abandoned[0].1,
+            crate::storage::GenerationState::Orphan,
+            "an abandoned in-process build must classify as Orphan without waiting for \
+             the process to die: {generations:?}"
+        );
+
+        let gc_summary = crate::storage::generation::gc(&layout, true)
+            .expect("gc must succeed after the injected failure");
+        assert_eq!(
+            gc_summary.removed.len(),
+            1,
+            "gc must remove exactly the one orphan generation, got: {gc_summary:?}"
+        );
+
+        let generations_after_gc = crate::storage::generation::list_generations(&layout)
+            .expect("list generations after gc");
+        assert!(
+            generations_after_gc
+                .iter()
+                .all(|(_, state, _, _)| *state != crate::storage::GenerationState::Orphan),
+            "no orphan generation must remain after gc, got: {generations_after_gc:?}"
         );
     }
 }

@@ -1,14 +1,17 @@
 //! Integration tests driving the real public `IndexFacade` API over temp
-//! index/source directories to verify `clear_index()` and full-force
-//! reindex provenance semantics.
+//! index/source directories to verify the fresh-build-and-publish seam
+//! (`IndexPersistence::open_build(Fresh)` -> `publish_into_facade`) and
+//! full-force reindex provenance semantics.
 //!
 //! These tests use real `IndexFacade` instances backed by Tantivy indexes
 //! on disk in temporary directories — no mocks.
 
+use std::os::unix::fs::MetadataExt;
 use std::sync::Arc;
 
 use codanna::config::Settings;
 use codanna::indexing::facade::IndexFacade;
+use codanna::storage::{BuildMode, IndexLayout, IndexPersistence};
 
 /// Write a small set of Python fixture files into `dir`, each defining one
 /// module-level function whose name is derived from the file stem. Returns
@@ -37,11 +40,11 @@ fn settings_for(index_dir: &std::path::Path) -> Settings {
 }
 
 // =============================================================================
-// Group 3a: clear_index() zeroes the index
+// Group 3a: a Fresh build-and-publish zeroes the index
 // =============================================================================
 
 #[test]
-fn clear_index_zeroes_symbol_count_and_drops_known_symbol() {
+fn fresh_build_publish_zeroes_symbol_count_and_drops_known_symbol() {
     let temp = tempfile::tempdir().expect("create temp root");
     let source_dir = temp.path().join("src");
     std::fs::create_dir_all(&source_dir).expect("create source dir");
@@ -51,9 +54,9 @@ fn clear_index_zeroes_symbol_count_and_drops_known_symbol() {
     )
     .expect("write known fixture");
 
-    let settings = settings_for(&temp.path().join("index"));
+    let settings = Arc::new(settings_for(&temp.path().join("index")));
     let mut facade =
-        IndexFacade::new(Arc::new(settings)).expect("create facade over temp index dir");
+        IndexFacade::new(Arc::clone(&settings)).expect("create facade over temp index dir");
 
     facade
         .index_directory(&source_dir, false)
@@ -65,51 +68,64 @@ fn clear_index_zeroes_symbol_count_and_drops_known_symbol() {
     );
     assert!(
         facade.find_symbol("known_symbol").is_some(),
-        "expected known_symbol to resolve before clear_index"
+        "expected known_symbol to resolve before publishing a fresh build"
     );
 
-    facade.clear_index().expect("clear_index should succeed");
+    // Publish a Fresh build generation over the same index root -- the
+    // `IndexPersistence::open_build(Fresh)` -> `publish_into_facade` seam
+    // `reindex_locked` drives for a full force reindex -- and rebind
+    // `facade` to the resulting warm facade.
+    let persistence = IndexPersistence::new(settings.index_path.clone());
+    let build = persistence
+        .open_build(Arc::clone(&settings), BuildMode::Fresh)
+        .expect("open fresh build generation");
+    let (_, facade) = persistence
+        .publish_into_facade(build)
+        .expect("publish fresh build generation");
 
     assert_eq!(
         facade.symbol_count(),
         0,
-        "symbol_count must be zero after clear_index"
+        "symbol_count must be zero after publishing a Fresh build generation"
     );
     assert_eq!(
         facade.semantic_search_embedding_count(),
         0,
-        "semantic embedding count must be zero after clear_index (no-op when semantic disabled)"
+        "semantic embedding count must be zero after publishing a Fresh build generation (no-op when semantic disabled)"
     );
     assert!(
         facade.find_symbol("known_symbol").is_none(),
-        "known_symbol must no longer resolve after clear_index"
+        "known_symbol must no longer resolve after publishing a Fresh build generation"
     );
 }
 
-/// Guards the writer.rs early-return path: calling `clear_index()` on a
-/// facade that has never had anything indexed into it must return `Ok(())`
-/// rather than erroring on a not-yet-populated index.
+/// Guards the publish path on a root that has never had a generation built
+/// into it at all: `open_build(Fresh)` followed by `publish_into_facade`
+/// must return `Ok(())` rather than erroring on a not-yet-populated index.
 #[test]
-fn clear_index_on_never_populated_index_returns_ok() {
+fn fresh_build_publish_on_never_populated_index_returns_ok() {
     let temp = tempfile::tempdir().expect("create temp root");
-    let settings = settings_for(&temp.path().join("index"));
-    let mut facade =
-        IndexFacade::new(Arc::new(settings)).expect("create facade over fresh temp index dir");
+    let settings = Arc::new(settings_for(&temp.path().join("index")));
 
-    // No index_file / index_directory call has ever happened against this
-    // facade — this exercises the early-return guard for an index that has
-    // never been populated.
-    assert_eq!(facade.symbol_count(), 0, "fresh index has no symbols");
+    // No facade / generation has ever been created against this index
+    // root -- this exercises the build-and-publish seam on a genuinely
+    // never-populated index.
+    let persistence = IndexPersistence::new(settings.index_path.clone());
+    let build = persistence
+        .open_build(Arc::clone(&settings), BuildMode::Fresh)
+        .expect("open_build(Fresh) on a never-populated index root must succeed");
 
-    let result = facade.clear_index();
+    let result = persistence.publish_into_facade(build);
     assert!(
         result.is_ok(),
-        "clear_index on a never-initialized index must return Ok(()): {result:?}"
+        "publish_into_facade on a never-populated index root must return Ok(()): {:?}",
+        result.err()
     );
+    let (_, facade) = result.expect("checked Ok above");
     assert_eq!(
         facade.symbol_count(),
         0,
-        "symbol_count remains zero after clearing a never-populated index"
+        "symbol_count remains zero after publishing over a never-populated index root"
     );
 }
 
@@ -130,9 +146,9 @@ fn full_force_reindex_drops_symbols_from_deconfigured_directory() {
     std::fs::write(dir1.join("alpha.py"), "def alpha():\n    pass\n").expect("write alpha");
     std::fs::write(dir2.join("beta.py"), "def beta():\n    pass\n").expect("write beta");
 
-    let settings = settings_for(&temp.path().join("index"));
+    let settings = Arc::new(settings_for(&temp.path().join("index")));
     let mut facade =
-        IndexFacade::new(Arc::new(settings)).expect("create facade over temp index dir");
+        IndexFacade::new(Arc::clone(&settings)).expect("create facade over temp index dir");
 
     // Index both directories into ONE index; both become tracked indexed
     // paths.
@@ -157,17 +173,22 @@ fn full_force_reindex_drops_symbols_from_deconfigured_directory() {
         "beta must resolve after indexing d2"
     );
 
-    // Reconfigure indexed_paths to ONLY d1, then run the full-force path:
-    // clear_index() followed by reindexing over the (now D1-only)
-    // indexed_paths set.
     let d1_only = vec![dir1.canonicalize().expect("canonicalize d1")];
-    facade.set_indexed_paths(d1_only.clone());
 
-    facade
-        .clear_index()
-        .expect("clear_index during full-force path");
+    // Reconfigure indexed_paths to ONLY d1, then run the full-force path:
+    // publish a Fresh build generation over the same index root -- the
+    // `IndexPersistence::open_build(Fresh)` -> `publish_into_facade` seam
+    // `reindex_locked` drives for `paths: None, force: true` -- then reindex
+    // over the (now D1-only) indexed_paths set.
+    let persistence = IndexPersistence::new(settings.index_path.clone());
+    let build = persistence
+        .open_build(Arc::clone(&settings), BuildMode::Fresh)
+        .expect("open fresh build generation during full-force path");
+    let (_, mut facade) = persistence
+        .publish_into_facade(build)
+        .expect("publish fresh build generation during full-force path");
 
-    // clear_index() resets indexed_paths tracking, so re-apply the
+    // A Fresh build starts with empty indexed_paths tracking, so apply the
     // D1-only configuration before reindexing over it.
     facade.set_indexed_paths(d1_only.clone());
 
@@ -267,24 +288,32 @@ fn off_lock_reindex_matches_index_directory_force() {
     let source_dir = temp.path().join("src");
     let names = write_python_fixtures(&source_dir, &["alpha", "beta", "gamma"]);
 
-    // Reference path: the pre-existing facade-level force sequence — clear
-    // the index, then reindex the (now-empty) index via `index_directory`.
-    // This mirrors what `run_reindex`'s Phase 1 (clear under lock) + a
-    // direct (non-off-lock) Phase 2 reindex would do, and is the semantic
-    // definition of "full-force reindex" for the `paths: None` case per
+    // Reference path: the pre-existing facade-level force sequence —
+    // publish a Fresh build generation, then reindex the (now-empty) index
+    // via `index_directory`. This mirrors what `run_reindex`'s Phase 1
+    // (open + publish a Fresh build under lock) + a direct (non-off-lock)
+    // Phase 2 reindex would do, and is the semantic definition of
+    // "full-force reindex" for the `paths: None` case per
     // `ReindexHandles::run`'s doc comment (force is only meaningful there
-    // via a prior clear, not via a `force: true` pipeline call).
-    let settings_a = settings_for(&temp.path().join("index_a"));
-    let mut facade_a = IndexFacade::new(Arc::new(settings_a)).expect("create reference facade");
+    // via a prior fresh-build publish, not via a `force: true` pipeline
+    // call).
+    let settings_a = Arc::new(settings_for(&temp.path().join("index_a")));
+    let mut facade_a = IndexFacade::new(Arc::clone(&settings_a)).expect("create reference facade");
     facade_a
         .index_directory(&source_dir, false)
         .expect("seed reference facade");
-    facade_a
-        .clear_index()
-        .expect("clear_index before reference force reindex");
+
+    let persistence_a = IndexPersistence::new(settings_a.index_path.clone());
+    let build_a = persistence_a
+        .open_build(Arc::clone(&settings_a), BuildMode::Fresh)
+        .expect("open fresh build generation before reference force reindex");
+    let (_, mut facade_a) = persistence_a
+        .publish_into_facade(build_a)
+        .expect("publish fresh build generation before reference force reindex");
+
     let stats_a = facade_a
         .index_directory(&source_dir, false)
-        .expect("reindex via index_directory after clear");
+        .expect("reindex via index_directory after fresh-build publish");
     let symbol_count_a = facade_a.symbol_count();
     for name in &names {
         assert!(
@@ -295,18 +324,28 @@ fn off_lock_reindex_matches_index_directory_force() {
 
     // Off-lock seam: same seed-then-force sequence, but mirroring the actual
     // `run_reindex` Phase 1/Phase 2 split — when `paths` is `None` and
-    // `force` is true, the caller clears the index under lock *before*
-    // snapshotting handles, and `ReindexHandles::run` then walks relying on
-    // that prior clear (see facade.rs `ReindexHandles::run` doc comment).
-    let settings_b =
-        settings_with_indexed_paths(&temp.path().join("index_b"), vec![source_dir.clone()]);
-    let mut facade_b = IndexFacade::new(Arc::new(settings_b)).expect("create off-lock-seam facade");
+    // `force` is true, the caller opens and publishes a Fresh build
+    // generation under lock *before* snapshotting handles, and
+    // `ReindexHandles::run` then walks relying on that prior publish (see
+    // facade.rs `ReindexHandles::run` doc comment).
+    let settings_b = Arc::new(settings_with_indexed_paths(
+        &temp.path().join("index_b"),
+        vec![source_dir.clone()],
+    ));
+    let mut facade_b =
+        IndexFacade::new(Arc::clone(&settings_b)).expect("create off-lock-seam facade");
     facade_b
         .index_directory(&source_dir, false)
         .expect("seed off-lock-seam facade");
-    facade_b
-        .clear_index()
-        .expect("clear_index before off-lock force reindex (mirrors run_reindex Phase 1)");
+
+    let persistence_b = IndexPersistence::new(settings_b.index_path.clone());
+    let build_b = persistence_b
+        .open_build(Arc::clone(&settings_b), BuildMode::Fresh)
+        .expect("open fresh build generation before off-lock force reindex (mirrors run_reindex Phase 1)");
+    let (_, mut facade_b) = persistence_b
+        .publish_into_facade(build_b)
+        .expect("publish fresh build generation before off-lock force reindex (mirrors run_reindex Phase 1)");
+
     let handles = facade_b
         .snapshot_reindex_handles()
         .expect("snapshot reindex handles");
@@ -330,56 +369,63 @@ fn off_lock_reindex_matches_index_directory_force() {
     }
 }
 
-/// Discriminating: driving `ReindexHandles::run` against a facade whose
-/// index was just cleared (mirrors the server's Phase 1 `clear_index()` under
-/// lock, immediately followed by the off-lock Phase 2 walk) must repopulate
-/// the index from scratch rather than leave it empty.
+/// Discriminating: driving `ReindexHandles::run` against a facade produced by
+/// publishing a Fresh build generation (mirrors the server's Phase 1 open+
+/// publish under lock, immediately followed by the off-lock Phase 2 walk)
+/// must repopulate the index from scratch rather than leave it empty.
 #[test]
-fn off_lock_reindex_repopulates_after_clear_index() {
+fn off_lock_reindex_repopulates_after_fresh_build_publish() {
     let temp = tempfile::tempdir().expect("create temp root");
     let source_dir = temp.path().join("src");
     let names = write_python_fixtures(&source_dir, &["alpha", "beta", "gamma"]);
 
-    let settings =
-        settings_with_indexed_paths(&temp.path().join("index"), vec![source_dir.clone()]);
-    let mut facade = IndexFacade::new(Arc::new(settings)).expect("create facade");
+    let settings = Arc::new(settings_with_indexed_paths(
+        &temp.path().join("index"),
+        vec![source_dir.clone()],
+    ));
+    let mut facade = IndexFacade::new(Arc::clone(&settings)).expect("create facade");
 
-    // Seed the index so clear_index() has something to drop.
+    // Seed the index so the fresh-build publish has something to drop.
     facade
         .index_directory(&source_dir, false)
-        .expect("seed facade before clear");
+        .expect("seed facade before fresh-build publish");
     assert!(
         facade.symbol_count() > 0,
-        "facade must have symbols before clear"
+        "facade must have symbols before fresh-build publish"
     );
 
-    // Mirrors run_reindex's Phase 1 (clear under lock, snapshot handles)
-    // immediately followed by Phase 2 (off-lock walk).
-    facade
-        .clear_index()
-        .expect("clear_index before off-lock force reindex");
+    // Mirrors run_reindex's Phase 1 (open + publish a Fresh build under
+    // lock, snapshot handles) immediately followed by Phase 2 (off-lock
+    // walk).
+    let persistence = IndexPersistence::new(settings.index_path.clone());
+    let build = persistence
+        .open_build(Arc::clone(&settings), BuildMode::Fresh)
+        .expect("open fresh build generation before off-lock force reindex");
+    let (_, mut facade) = persistence
+        .publish_into_facade(build)
+        .expect("publish fresh build generation before off-lock force reindex");
     assert_eq!(
         facade.symbol_count(),
         0,
-        "symbol_count must be zero immediately after clear_index"
+        "symbol_count must be zero immediately after publishing a Fresh build generation"
     );
 
     let handles = facade
         .snapshot_reindex_handles()
-        .expect("snapshot reindex handles after clear");
+        .expect("snapshot reindex handles after fresh-build publish");
     let outcome = handles
         .run(None, true)
-        .expect("off-lock reindex walk must repopulate after clear_index");
+        .expect("off-lock reindex walk must repopulate after fresh-build publish");
 
     assert!(
         outcome.symbol_count > 0,
-        "off-lock reindex must repopulate symbols after clear_index, got {}",
+        "off-lock reindex must repopulate symbols after fresh-build publish, got {}",
         outcome.symbol_count
     );
     for name in &names {
         assert!(
             facade.find_symbol(name).is_some(),
-            "{name} must resolve again after off-lock reindex repopulates a cleared index"
+            "{name} must resolve again after off-lock reindex repopulates a freshly published build"
         );
     }
 }
@@ -571,5 +617,136 @@ fn scoped_multi_path_force_reindex_resolves_cross_directory_import() {
          indexed_paths: gating the single-root cache-reuse fast path on indexed_paths.len() \
          alone (ignoring the current batch's path count) scopes each walk's symbol cache to \
          only that walk's own files, dropping this cross-directory edge entirely"
+    );
+}
+
+// =============================================================================
+// Group 3e: incremental staged reindex (`BuildMode::CloneCurrent`) shares
+// Tantivy inodes with the generation it was cloned from
+//
+// Mirrors the inode-sharing check in
+// `tests/cli/test_index_generations_publish.rs`
+// (`second_run_shares_tantivy_inodes_and_publishes_a_new_generation`) and the
+// equivalence-checking approach of `off_lock_reindex_matches_index_directory_non_force`
+// above, applied to the `force: false, paths: None` staged-build path
+// (`open_build(CloneCurrent)` -> `ReindexHandles::run` ->
+// `publish_into_facade`) that `reindex_locked` drives for a non-force full
+// reindex.
+// =============================================================================
+
+/// `(file name, inode)` for every `*.store` Tantivy segment file directly
+/// under `tantivy_dir`. Tantivy may merge some segments away between two
+/// builds (which segments survive unmerged is an implementation detail, not
+/// something a test should pin down), so an inode-sharing assertion must
+/// check "at least one segment file survived unmerged and shares its
+/// inode", not any single named file picked in advance.
+fn segment_store_files(tantivy_dir: &std::path::Path) -> Vec<(String, u64)> {
+    std::fs::read_dir(tantivy_dir)
+        .unwrap_or_else(|e| panic!("read {}: {e}", tantivy_dir.display()))
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            name.ends_with(".store").then_some(name)
+        })
+        .map(|name| {
+            let ino = std::fs::metadata(tantivy_dir.join(&name))
+                .unwrap_or_else(|e| panic!("stat {}: {e}", tantivy_dir.join(&name).display()))
+                .ino();
+            (name, ino)
+        })
+        .collect()
+}
+
+#[test]
+fn incremental_staged_reindex_shares_tantivy_inodes_and_matches_oracle_symbol_set() {
+    let temp = tempfile::tempdir().expect("create temp root");
+    let source_dir = temp.path().join("src");
+    let names = write_python_fixtures(&source_dir, &["alpha", "beta", "gamma"]);
+
+    let settings = Arc::new(settings_with_indexed_paths(
+        &temp.path().join("index"),
+        vec![source_dir.clone()],
+    ));
+    let mut facade = IndexFacade::new(Arc::clone(&settings)).expect("create facade");
+    facade
+        .index_directory(&source_dir, false)
+        .expect("seed facade with the parent generation");
+    let parent_generation = facade.generation_id().clone();
+
+    let layout = IndexLayout::new(settings.index_path.clone());
+    let parent_segments = segment_store_files(&layout.tantivy_dir(&parent_generation));
+    assert!(
+        !parent_segments.is_empty(),
+        "seeded parent generation must have at least one Tantivy segment"
+    );
+
+    // Ground-truth oracle: index the same fixture in-place (no generation
+    // staging at all) via `index_directory`, independent of the staged-build
+    // seam under test.
+    let oracle_settings = Arc::new(settings_for(&temp.path().join("oracle_index")));
+    let mut oracle_facade = IndexFacade::new(oracle_settings).expect("create oracle facade");
+    oracle_facade
+        .index_directory(&source_dir, false)
+        .expect("index fixture directory for the oracle facade");
+    let expected_symbol_count = oracle_facade.symbol_count();
+    assert!(
+        expected_symbol_count > 0,
+        "oracle facade must produce a non-zero symbol count"
+    );
+
+    // Incremental staged reindex: force:false, paths:None -> a
+    // `BuildMode::CloneCurrent` build, hardlinking the parent generation's
+    // Tantivy segments rather than rebuilding from scratch, then the
+    // off-lock walk seam, then publish.
+    let persistence = IndexPersistence::new(settings.index_path.clone());
+    let mut build = persistence
+        .open_build(Arc::clone(&settings), BuildMode::CloneCurrent)
+        .expect("open clone-current build");
+    let handles = build
+        .snapshot_reindex_handles()
+        .expect("snapshot reindex handles from the clone-current build facade");
+    handles
+        .run(None, false)
+        .expect("run incremental staged reindex walk");
+
+    let (_, published_facade) = persistence
+        .publish_into_facade(build)
+        .expect("publish the clone-current build generation");
+
+    assert_eq!(
+        published_facade.symbol_count(),
+        expected_symbol_count,
+        "incremental staged reindex must produce the same symbol set as the in-place oracle facade"
+    );
+    for name in &names {
+        assert!(
+            published_facade.find_symbol(name).is_some(),
+            "{name} must resolve after the incremental staged reindex"
+        );
+    }
+
+    let staged_generation = published_facade.generation_id().clone();
+    assert_ne!(
+        parent_generation, staged_generation,
+        "CloneCurrent must publish a generation distinct from its parent"
+    );
+
+    let staged_tantivy_dir = layout.tantivy_dir(&staged_generation);
+    let shared_unmerged_segment = parent_segments.iter().find_map(|(name, parent_ino)| {
+        let staged_meta = std::fs::metadata(staged_tantivy_dir.join(name)).ok()?;
+        (staged_meta.ino() == *parent_ino).then_some((name.clone(), staged_meta.nlink()))
+    });
+    let (shared_name, shared_nlink) = shared_unmerged_segment.unwrap_or_else(|| {
+        panic!(
+            "expected at least one of the parent generation's segment files \
+             ({parent_segments:?}) to survive unmerged and share its inode with the staged \
+             generation's clone under {}",
+            staged_tantivy_dir.display()
+        )
+    });
+    assert!(
+        shared_nlink >= 2,
+        "segment file {shared_name} shared between the parent and staged generations must have \
+         nlink >= 2, got {shared_nlink}"
     );
 }

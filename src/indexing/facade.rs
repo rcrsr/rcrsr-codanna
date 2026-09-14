@@ -31,7 +31,10 @@ use crate::semantic::{
 };
 use crate::storage::generation::layout::unix_millis_now;
 use crate::storage::generation::{Complete, migrate_flat_layout, resolve_current};
-use crate::storage::{DocumentIndex, EMISSION_SEMANTICS_VERSION, GenerationId, IndexLayout};
+use crate::storage::{
+    BuildFacade, BuildMode, DocumentIndex, EMISSION_SEMANTICS_VERSION, GenerationId, IndexLayout,
+    IndexPersistence,
+};
 use crate::storage::{IndexMetadata, SearchResult};
 use crate::symbol::context::{ContextIncludes, SymbolContext, SymbolRelationships};
 use crate::{FileId, IndexError, RelationKind, Relationship, Symbol, SymbolId, SymbolKind};
@@ -330,6 +333,15 @@ impl IndexFacade {
         &self.generation
     }
 
+    /// The filesystem layout for the index generations this facade's root
+    /// owns. Used by [`reindex_locked`]'s staged-rebuild branch to derive an
+    /// [`IndexPersistence`](crate::storage::IndexPersistence) rooted at the
+    /// same place this facade lives, rather than re-deriving the root from
+    /// `settings` a second way.
+    pub(crate) fn index_layout(&self) -> &IndexLayout {
+        &self.layout
+    }
+
     /// Clone the handle to this facade's reindex gate, used by
     /// [`reindex_locked`] to serialize full-reindex runs.
     pub(crate) fn reindex_gate(&self) -> Arc<tokio::sync::Semaphore> {
@@ -348,6 +360,86 @@ impl IndexFacade {
     /// (the field).
     pub(crate) fn adopt_reindex_gate(&mut self, gate: Arc<tokio::sync::Semaphore>) {
         self.reindex_gate = gate;
+    }
+
+    /// Swap `new` into a shared `Arc<RwLock<IndexFacade>>`, carrying over the
+    /// outgoing facade's reindex gate and re-attaching semantic search if the
+    /// incoming facade didn't already load it.
+    ///
+    /// Callers that replace a facade behind a shared lock (hot-reload,
+    /// force-reindex publish) go through this so the gate-adoption-before-
+    /// assignment ordering documented on [`Self::reindex_gate`] (the field)
+    /// and the post-swap semantic re-attach are done exactly once, in one
+    /// place.
+    pub(crate) async fn swap_in(
+        shared: &Arc<tokio::sync::RwLock<IndexFacade>>,
+        mut new: IndexFacade,
+        broadcaster: Option<&crate::mcp::notifications::NotificationBroadcaster>,
+    ) {
+        // Get write lock and replace the facade. Carry the outgoing
+        // facade's reindex gate into the replacement BEFORE assigning it, so
+        // a permit held by an in-flight `reindex_locked` call is still
+        // respected by callers that read the gate handle after this swap
+        // (see the invariant documented on `IndexFacade::reindex_gate`).
+        let mut guard = shared.write().await;
+        new.adopt_reindex_gate(guard.reindex_gate());
+        *guard = new;
+
+        // Ensure semantic search stays attached after hot reloads
+        let mut restored_semantic = false;
+        if !guard.has_semantic_search() && !guard.is_semantic_incompatible() {
+            let semantic_path = guard.semantic_dir();
+            let metadata_exists = semantic_path.join("metadata.json").exists();
+            if metadata_exists {
+                match guard.load_semantic_search(&semantic_path) {
+                    Ok(true) => {
+                        restored_semantic = true;
+                    }
+                    Ok(false) => {
+                        crate::debug_event!(
+                            "hot-reload",
+                            "semantic metadata present but reload returned false"
+                        );
+                    }
+                    Err(crate::IndexError::SemanticSearch(
+                        crate::semantic::SemanticSearchError::DimensionMismatch {
+                            ref suggestion,
+                            ..
+                        },
+                    )) => {
+                        tracing::warn!(
+                            "Semantic index dimension mismatch after hot-reload: {suggestion}. \
+                             Semantic search disabled until re-indexed with --force."
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to reload semantic search after index update: {e}");
+                    }
+                }
+            } else {
+                crate::debug_event!(
+                    "hot-reload",
+                    "semantic metadata missing",
+                    "{}",
+                    crate::parsing::paths::render_absolute_path(&semantic_path).display()
+                );
+            }
+        }
+
+        let symbol_count = guard.symbol_count();
+        let has_semantic = guard.has_semantic_search();
+        if restored_semantic {
+            let count = guard.semantic_search_embedding_count();
+            crate::debug_event!("hot-reload", "restored semantic", "{count} embeddings");
+        }
+        crate::log_event!("hot-reload", "reloaded", "{symbol_count} symbols");
+        crate::debug_event!("hot-reload", "semantic search", "{has_semantic}");
+
+        // Send notification that index was reloaded
+        if let Some(broadcaster) = broadcaster {
+            broadcaster.send(crate::mcp::notifications::FileChangeEvent::IndexReloaded);
+            crate::debug_event!("hot-reload", "broadcast", "IndexReloaded");
+        }
     }
 
     // =========================================================================
@@ -1431,27 +1523,6 @@ impl IndexFacade {
         Ok(())
     }
 
-    /// Clear all documents from the index.
-    ///
-    /// Reuses the already-open `DocumentIndex`/Tantivy writer handle and the
-    /// in-memory semantic search store rather than removing files on disk or
-    /// constructing new writers. Resets directory tracking so a subsequent
-    /// `index_directory` call re-populates `indexed_paths` from scratch.
-    pub fn clear_index(&mut self) -> FacadeResult<()> {
-        self.document_index.clear()?;
-
-        if let Some(ref semantic) = self.semantic_search {
-            let mut sem = semantic
-                .lock()
-                .map_err(|e| IndexError::LockError(format!("semantic search: {e}")))?;
-            sem.clear();
-        }
-
-        self.indexed_paths.clear();
-
-        Ok(())
-    }
-
     /// Index a directory using the parallel pipeline.
     ///
     /// This is the primary indexing entry point using Pipeline.
@@ -2003,12 +2074,40 @@ impl ReindexHandles {
 
         let symbol_count = document_index.count_symbols().unwrap_or(0);
 
+        // Test-only failure injection: fires after the walk above has fully
+        // completed but before `run` returns `Ok`, so tests can force
+        // `reindex_locked`'s phase 3 publish/swap to never be reached
+        // without needing to fabricate a real walk failure. No effect
+        // (and no runtime cost beyond the `cfg`-gated check) unless a test
+        // has armed it via `set_fail_after_walk_for_test`.
+        #[cfg(test)]
+        if FAIL_AFTER_WALK.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Err(IndexError::General(
+                "test-injected failure after reindex walk completed".to_string(),
+            ));
+        }
+
         Ok(ReindexOutcome {
             reindexed,
             symbol_count,
             indexed_dirs,
         })
     }
+}
+
+/// Test-only failure-injection flag for [`ReindexHandles::run`]. A plain
+/// `AtomicBool` rather than a thread-local: `run` executes on whatever
+/// `spawn_blocking` worker thread the tokio runtime schedules it onto, which
+/// is not the test's own thread, so a thread-local flag set by the test
+/// would never be observed by `run`.
+#[cfg(test)]
+static FAIL_AFTER_WALK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Arms (or disarms) [`ReindexHandles::run`]'s post-walk failure injection
+/// for the next call. Test-only.
+#[cfg(test)]
+pub(crate) fn set_fail_after_walk_for_test(fail: bool) {
+    FAIL_AFTER_WALK.store(fail, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Runs the full 3-phase reindex orchestration (brief write lock ->
@@ -2021,13 +2120,33 @@ impl ReindexHandles {
 /// no lock held, then record indexed directories under lock again) is
 /// guaranteed regardless of caller.
 ///
-/// - Phase 1: acquires a brief write lock. When `paths` is `None` and
-///   `force` is `true`, clears the index first; then snapshots cloneable
-///   reindex handles via [`IndexFacade::snapshot_reindex_handles`].
+/// - Phase 1 branches on `paths`:
+///   - `paths: None` (a full reindex): under the brief write lock, opens a
+///     new generation via [`IndexPersistence::open_build`] -- a
+///     [`BuildMode::Fresh`] generation when `force` is `true`, otherwise a
+///     [`BuildMode::CloneCurrent`] generation hardlinked from the live
+///     generation (cheap, since the live facade is quiescent under the
+///     write lock at clone time) -- then snapshots reindex handles from
+///     that *build* facade rather than the live one. The live facade is
+///     never mutated in this branch.
+///   - `paths: Some(..)` (a scoped reindex): unchanged from before --
+///     snapshots reindex handles directly from the live facade under the
+///     write lock.
 /// - Phase 2: with the write guard already dropped, runs the heavy reindex
-///   walk off-lock via [`ReindexHandles::run`] on a blocking thread.
-/// - Phase 3: acquires a brief write lock again to record any newly
-///   indexed directories via [`IndexFacade::add_indexed_path`].
+///   walk off-lock via [`ReindexHandles::run`] on a blocking thread, against
+///   whichever handles phase 1 snapshotted.
+/// - Phase 3 branches the same way phase 1 did:
+///   - Full reindex: records indexed directories on the build facade, then
+///     [`IndexPersistence::publish_into_facade`]s it and
+///     [`IndexFacade::swap_in`]s the resulting warm facade into `facade`,
+///     broadcasting `IndexReloaded` via `broadcaster` if given. The build
+///     generation's `BUILDING` guard (held inside the build facade for the
+///     whole of phases 1-3) is only released once the publish's
+///     compare-and-swap lands; an error anywhere before that point leaves
+///     the build facade to drop normally, releasing the guard and leaving
+///     an orphan generation for a later `gc()` pass to reclaim.
+///   - Scoped reindex: unchanged -- a brief write lock on the live facade to
+///     record newly indexed directories via [`IndexFacade::add_indexed_path`].
 ///
 /// `phase2_started`, when provided, is signaled the instant phase 1's write
 /// guard has been dropped and before the off-lock walk begins; this exists
@@ -2042,18 +2161,19 @@ impl ReindexHandles {
 /// [`IndexFacade::reindex_gate`]) serializes full reindex runs: only one
 /// `reindex_locked` invocation may be in flight against a given facade at a
 /// time. The permit is acquired strictly before phase 1's write lock and
-/// held across all three phases, including the off-lock phase 2 walk, so a
-/// concurrent caller (e.g. an MCP `reindex(force: true)` racing the
-/// watcher's overflow catch-up reindex) cannot observe phase 1's
-/// `clear_index()` mid-way through another run's phase 2 batch. A caller
-/// that loses the race is rejected immediately with
-/// [`IndexError::ReindexInProgress`] rather than queued, since a queued
-/// duplicate force-reindex would be wasted work that pins the caller open
-/// for the duration of someone else's multi-minute run.
+/// held across all three phases, including the off-lock phase 2 walk and the
+/// phase 3 publish/swap, so a concurrent caller (e.g. an MCP
+/// `reindex(force: true)` racing the watcher's overflow catch-up reindex)
+/// cannot observe a partially published generation. A caller that loses the
+/// race is rejected immediately with [`IndexError::ReindexInProgress`]
+/// rather than queued, since a queued duplicate force-reindex would be
+/// wasted work that pins the caller open for the duration of someone else's
+/// multi-minute run.
 pub(crate) async fn reindex_locked(
     facade: &Arc<tokio::sync::RwLock<IndexFacade>>,
     paths: Option<Vec<String>>,
     force: bool,
+    broadcaster: Option<&crate::mcp::notifications::NotificationBroadcaster>,
     phase2_started: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> FacadeResult<ReindexOutcome> {
     // Take a brief read lock purely to clone the gate handle, then drop it
@@ -2082,8 +2202,9 @@ pub(crate) async fn reindex_locked(
     // .indexed_paths` -- the exact collection `ReindexHandles::run` walks
     // below when `paths` is `None` -- rather than the facade's own
     // `indexed_paths` field, which is a different collection (always empty
-    // on a freshly constructed facade, and wiped by `clear_index()` itself;
-    // see the two-collections trap documented on
+    // on a freshly constructed facade, and discarded wholesale when phase 1
+    // opens a fresh build generation for a full force reindex; see the
+    // two-collections trap documented on
     // `discoverable_dirs_honors_ignore_patterns` above). The predicate
     // mirrors what `ReindexHandles::run`'s `paths: None` branch actually
     // does with this list: it clones it and only rebuilds entries that pass
@@ -2092,7 +2213,7 @@ pub(crate) async fn reindex_locked(
     // list forever, since neither `add_indexed_path` nor
     // `remove_indexed_path` prune against disk -- must not count as "has a
     // rebuild source". Checking `!indexed_paths.is_empty()` alone would let
-    // such stale entries pass, `clear_index()` an emptied index, and phase 2
+    // such stale entries pass, open an empty build generation, and phase 2
     // silently rebuild nothing.
     //
     // Hoisting this ahead of the write guard widens the check-then-act
@@ -2126,39 +2247,70 @@ pub(crate) async fn reindex_locked(
     }
 
     // Phase 1: brief write lock to snapshot cloneable handles for the
-    // off-lock reindex walk, then optionally clear the index. The
-    // has-rebuild-source decision was already made above (before this
-    // guard was acquired), so this closure only needs to snapshot and,
-    // when applicable, clear. `snapshot_reindex_handles` only calls
-    // `ensure_embedding_pool()` and clones `Arc` handles, none of whose
-    // contents `clear_index()` invalidates, so running it ahead of the
-    // clear is behaviorally safe. `clear_index()` performs blocking
-    // Tantivy IO (commit, reader reload), so the owned guard is moved into
-    // `spawn_blocking` rather than doing that work directly on the async
-    // worker while the write lock is held.
+    // off-lock reindex walk. Branches on `paths_is_none`:
+    //
+    // - `paths: None` (staged): opens a new generation (build facade) and
+    //   snapshots handles from *it*, leaving the live facade untouched. The
+    //   build facade rides along as `Some(BuildFacade)` so phase 3 can
+    //   publish it; its `Building` guard keeps the generation's ownership
+    //   lock held for as long as the build facade stays in scope.
+    // - `paths: Some(..)` (scoped, unchanged): snapshots handles directly
+    //   from the live facade, exactly as before.
+    //
+    // Either way, the owned write guard is moved into `spawn_blocking`
+    // since both `snapshot_reindex_handles` (`ensure_embedding_pool`) and
+    // `open_build` (hardlink clone, disk-space preflight) can block.
     let owned_guard = Arc::clone(facade).write_owned().await;
-    let handles = tokio::task::spawn_blocking(move || -> FacadeResult<ReindexHandles> {
-        let mut indexer = owned_guard;
+    let (handles, build) = tokio::task::spawn_blocking(
+        move || -> FacadeResult<(ReindexHandles, Option<BuildFacade>)> {
+            let mut indexer = owned_guard;
 
-        let handles = indexer.snapshot_reindex_handles().inspect_err(|e| {
-            tracing::error!("Failed to snapshot reindex handles: {e}");
-        })?;
+            if paths_is_none {
+                let persistence =
+                    IndexPersistence::new(indexer.index_layout().root().to_path_buf());
+                let mode = if force {
+                    BuildMode::Fresh
+                } else {
+                    BuildMode::CloneCurrent
+                };
+                // Runs while the live write guard is still held, so the
+                // live generation is quiescent for the duration of the
+                // clone (hardlinks only -- fast).
+                let mut build = persistence
+                    .open_build(Arc::clone(indexer.settings()), mode)
+                    .inspect_err(|e| {
+                        tracing::error!("Failed to open build generation for reindex: {e}");
+                    })?;
 
-        if paths_is_none && force {
-            // Log per-phase context for on-call readers, but propagate the
-            // original typed `IndexError` variant (e.g. `LockError`,
-            // `TantivyError`) unchanged rather than flattening it into a
-            // `General(String)`, so `status_code()`/`recovery_suggestions()`
-            // remain available to callers.
-            indexer.clear_index().inspect_err(|e| {
-                tracing::error!("Failed to clear index before force reindex: {e}");
-            })?;
-        }
+                // `CloneCurrent` already loaded semantic search onto the
+                // build facade if the parent generation had it; `Fresh`
+                // starts with none, so create it empty here when the live
+                // facade has it enabled, or phase 2 would have nothing to
+                // populate.
+                if indexer.has_semantic_search() && !build.has_semantic_search() {
+                    build.enable_semantic_search().inspect_err(|e| {
+                        tracing::error!(
+                            "Failed to enable semantic search on build generation: {e}"
+                        );
+                    })?;
+                }
 
-        Ok(handles)
-        // `indexer` (the owned write guard) is dropped here, releasing the
-        // lock before phase 2's off-lock walk begins.
-    })
+                let handles = build.snapshot_reindex_handles().inspect_err(|e| {
+                    tracing::error!("Failed to snapshot reindex handles for build generation: {e}");
+                })?;
+
+                Ok((handles, Some(build)))
+            } else {
+                let handles = indexer.snapshot_reindex_handles().inspect_err(|e| {
+                    tracing::error!("Failed to snapshot reindex handles: {e}");
+                })?;
+
+                Ok((handles, None))
+            }
+            // `indexer` (the owned write guard) is dropped here, releasing the
+            // lock before phase 2's off-lock walk begins.
+        },
+    )
     .await
     .map_err(map_reindex_join_error)??;
 
@@ -2183,11 +2335,35 @@ pub(crate) async fn reindex_locked(
             .map_err(map_reindex_join_error)??
     };
 
-    // Phase 3: brief write lock to record any newly indexed directories.
-    {
-        let mut indexer = facade.write().await;
-        for dir in &outcome.indexed_dirs {
-            indexer.add_indexed_path(dir);
+    // Phase 3 branches the same way phase 1 did.
+    match build {
+        Some(mut build) => {
+            // Record newly indexed directories on the build facade (not the
+            // live one -- the live facade is never touched in this branch).
+            for dir in &outcome.indexed_dirs {
+                build.add_indexed_path(dir);
+            }
+
+            let persistence = IndexPersistence::new(build.index_layout().root().to_path_buf());
+            // `publish_into_facade` performs blocking Tantivy/filesystem IO
+            // (save, manifest write, CAS rename, trailing gc).
+            let (_, new_facade) =
+                tokio::task::spawn_blocking(move || persistence.publish_into_facade(build))
+                    .await
+                    .map_err(map_reindex_join_error)??;
+
+            // The reindex permit (`_reindex_permit`, still in scope) stays
+            // held through this swap, so no concurrent `reindex_locked` call
+            // can observe the facade mid-swap.
+            IndexFacade::swap_in(facade, new_facade, broadcaster).await;
+        }
+        None => {
+            // Scoped reindex, unchanged: brief write lock on the live
+            // facade to record newly indexed directories.
+            let mut indexer = facade.write().await;
+            for dir in &outcome.indexed_dirs {
+                indexer.add_indexed_path(dir);
+            }
         }
     }
 
@@ -2208,8 +2384,8 @@ fn map_reindex_join_error(e: tokio::task::JoinError) -> IndexError {
 // `.await` would not stop that thread, only detach it while it keeps writing
 // through the `document_index`/`pipeline` handles it snapshotted in phase 1.
 // Releasing the reindex permit early would then let a second reindex acquire
-// the gate and call `clear_index()` concurrently with that still-running
-// thread. So the permit stays held for as long as phase 2 runs — that is
+// the gate and open/publish its own build generation concurrently with that
+// still-running thread. So the permit stays held for as long as phase 2 runs — that is
 // correct — and this watchdog exists solely to make an unusually long phase 2
 // loudly visible in logs instead of silent.
 
@@ -5593,9 +5769,9 @@ mod tests {
     // `ReindexHandles::run` actually walks for `paths: None`), not the
     // facade's own `indexed_paths: HashSet` field, which is a different
     // collection that starts empty on every freshly constructed facade (see
-    // `IndexFacade::new`) and is wiped by `clear_index()` itself. Reading
-    // the wrong collection would make these tests pass vacuously in one
-    // direction or the other.
+    // `IndexFacade::new`) and never carries over to the fresh build
+    // generation a full force reindex opens. Reading the wrong collection
+    // would make these tests pass vacuously in one direction or the other.
 
     // Facade built via the shared `test_facade` helper has an empty
     // `settings.indexing.indexed_paths` (never populated by
@@ -5623,7 +5799,7 @@ mod tests {
         );
 
         let facade = Arc::new(tokio::sync::RwLock::new(facade));
-        let err = reindex_locked(&facade, None, true, None)
+        let err = reindex_locked(&facade, None, true, None, None)
             .await
             .expect_err("force reindex with no rebuild source must be refused");
         assert!(
@@ -5680,7 +5856,7 @@ mod tests {
         );
 
         let facade = Arc::new(tokio::sync::RwLock::new(facade));
-        reindex_locked(&facade, None, true, None)
+        reindex_locked(&facade, None, true, None, None)
             .await
             .expect("non-empty settings.indexing.indexed_paths must permit the clear");
 
@@ -5702,7 +5878,7 @@ mod tests {
     // Third leg of the falsifiability trio: `settings.indexing.indexed_paths`
     // is non-empty, but every entry is stale (registered, then removed from
     // disk). `!indexed_paths.is_empty()` alone would pass this case and let
-    // `clear_index()` commit an emptied index with phase 2 rebuilding
+    // phase 1 open an empty build generation with phase 2 rebuilding
     // nothing; the guard must instead check that at least one entry still
     // exists on disk as a directory.
     #[tokio::test]
@@ -5746,7 +5922,7 @@ mod tests {
         );
 
         let facade = Arc::new(tokio::sync::RwLock::new(facade));
-        let err = reindex_locked(&facade, None, true, None)
+        let err = reindex_locked(&facade, None, true, None, None)
             .await
             .expect_err("force reindex with only stale indexed_paths must be refused");
         assert!(
@@ -5787,7 +5963,7 @@ mod tests {
 
         let facade = Arc::new(tokio::sync::RwLock::new(facade));
         let explicit_str = explicit.to_string_lossy().into_owned();
-        reindex_locked(&facade, Some(vec![explicit_str]), true, None)
+        reindex_locked(&facade, Some(vec![explicit_str]), true, None, None)
             .await
             .expect("explicit-paths reindex must succeed");
 
@@ -5804,6 +5980,37 @@ mod tests {
                 .is_empty(),
             "explicit path must still be indexed"
         );
+    }
+
+    // Verifies the low-level failure-injection primitive itself: arming it
+    // makes the very next `ReindexHandles::run` fail after the walk has
+    // already completed (so `indexed_dirs`/`symbol_count` were computed,
+    // proving the walk itself ran to completion), and it disarms itself so
+    // it does not leak into a subsequent, unrelated `run` call. Driving this
+    // through the full `reindex_locked` orchestration to prove phase 3 is
+    // skipped is out of scope here.
+    #[tokio::test]
+    async fn fail_after_walk_hook_fires_once_after_walk_completes() {
+        // `FAIL_AFTER_WALK` is process-global; serialize against the
+        // `reindex_locked` tests in `mcp::server` that also arm it.
+        let _serial_guard = crate::mcp::server::REINDEX_TEST_SERIAL.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut facade = test_facade(&dir);
+        let handles = facade.snapshot_reindex_handles().unwrap();
+
+        set_fail_after_walk_for_test(true);
+        let err = handles
+            .run(None, false)
+            .expect_err("armed hook must fail the run after the walk completes");
+        assert!(
+            matches!(err, IndexError::General(_)),
+            "unexpected error variant: {err:?}"
+        );
+
+        let handles = facade.snapshot_reindex_handles().unwrap();
+        handles
+            .run(None, false)
+            .expect("hook must disarm itself after firing once");
     }
 
     // Error-surface lock for the new variant: both accessors must be wired,

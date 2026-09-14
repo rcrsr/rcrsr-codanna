@@ -433,6 +433,18 @@ impl IndexPersistence {
     ///    the publish itself already succeeded once `current` was flipped.
     #[must_use = "Publish errors should be handled appropriately"]
     pub fn publish(&self, build: BuildFacade) -> IndexResult<GenerationId> {
+        self.publish_into_facade(build).map(|(id, _)| id)
+    }
+
+    /// Same as [`Self::publish`], but also returns the warm [`IndexFacade`]
+    /// that performed the phase-2 writes, so a caller that already holds it
+    /// can keep serving from the same `document_index` `Arc` instead of
+    /// re-opening the generation it just published.
+    #[must_use = "Publish errors should be handled appropriately"]
+    pub fn publish_into_facade(
+        &self,
+        build: BuildFacade,
+    ) -> IndexResult<(GenerationId, IndexFacade)> {
         let BuildFacade {
             facade,
             guard,
@@ -519,7 +531,7 @@ impl IndexPersistence {
             Err(e) => tracing::warn!("[persistence] post-publish gc failed: {e}"),
         }
 
-        Ok(id)
+        Ok((id, facade))
     }
 
     /// Save metadata for an IndexFacade
@@ -986,5 +998,24 @@ mod tests {
             }
             DataSource::Fresh => panic!("expected DataSource::Tantivy after publish"),
         }
+    }
+
+    #[test]
+    fn publish_into_facade_returns_the_warm_facade_that_was_published() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = IndexPersistence::new(temp_dir.path().to_path_buf());
+        let settings = settings_for(&temp_dir);
+
+        let build = persistence
+            .open_build(settings, BuildMode::Fresh)
+            .expect("open fresh build");
+        let expected_symbol_count = build.symbol_count();
+
+        let (id, facade) = persistence
+            .publish_into_facade(build)
+            .expect("publish_into_facade must succeed");
+
+        assert_eq!(facade.generation_id(), &id);
+        assert_eq!(facade.symbol_count(), expected_symbol_count);
     }
 }

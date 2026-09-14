@@ -216,21 +216,29 @@ impl Building {
         // See the msrv note in `Building::start`.
         #[allow(clippy::incompatible_msrv)]
         let lock_result = probe.try_lock();
-        match lock_result {
+        let lock_was_free = match lock_result {
             Err(std::fs::TryLockError::WouldBlock) => return true,
             Ok(()) => {
                 // We only opened this handle to probe; release immediately
                 // so we don't mask this instant with our own lock.
                 #[allow(clippy::incompatible_msrv)]
                 let _ = probe.unlock();
+                true
             }
             Err(std::fs::TryLockError::Error(_)) => {
                 // Inconclusive (e.g. platform/filesystem lock failure);
                 // fall through to the pid-based fallback below.
+                false
             }
-        }
+        };
 
         match read_marker(marker_path) {
+            // A guard alive in this very process would still hold the lock,
+            // so a free lock naming our own pid can only be a dropped
+            // (abandoned) build -- e.g. a failed in-process staged reindex.
+            // Falling through to `pid_is_alive` here would pin that
+            // generation as `Building` for the life of the server.
+            Some(marker) if marker.pid == std::process::id() && lock_was_free => false,
             Some(marker) => pid_is_alive(marker.pid),
             None => false,
         }
@@ -333,6 +341,25 @@ mod tests {
         );
 
         drop(guard);
+    }
+
+    #[test]
+    fn building_guard_marker_is_dead_after_drop_in_same_process() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let layout = layout_in(&dir);
+        let id = GenerationId::generate();
+
+        let guard = Building::start(&layout, &id, None).expect("start building");
+        let marker_path = layout.building_marker(&id);
+        drop(guard);
+
+        // The marker still names this (live) process, but the lock is
+        // free: the build was abandoned, not crashed, and must not be
+        // pinned as alive for as long as this process runs.
+        assert!(
+            !Building::is_alive(&marker_path),
+            "dropped guard in the same process must report not alive"
+        );
     }
 
     #[test]
