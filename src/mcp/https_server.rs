@@ -530,7 +530,7 @@ pub async fn serve_https(config: crate::Settings, watch: bool, bind: String) -> 
             "hot-reload watcher did not settle within {}s of shutdown; exiting now",
             SHUTDOWN_GRACE.as_secs()
         );
-        std::process::exit(0);
+        std::process::exit(crate::mcp::forced_exit_code(&server_result));
     }
     if let Some(handle) = unified_watcher_handle
         && tokio::time::timeout(SHUTDOWN_GRACE, handle).await.is_err()
@@ -539,7 +539,7 @@ pub async fn serve_https(config: crate::Settings, watch: bool, bind: String) -> 
             "unified watcher did not settle within {}s of shutdown; exiting now",
             SHUTDOWN_GRACE.as_secs()
         );
-        std::process::exit(0);
+        std::process::exit(crate::mcp::forced_exit_code(&server_result));
     }
 
     if let Some(result) = server_result {

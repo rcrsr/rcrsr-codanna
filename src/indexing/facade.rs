@@ -1975,6 +1975,14 @@ impl ReindexHandles {
     /// collected into `ReindexOutcome::indexed_dirs` for the caller to record
     /// via `IndexFacade::add_indexed_path`.
     pub fn run(self, paths: Option<Vec<String>>, force: bool) -> FacadeResult<ReindexOutcome> {
+        // Marks the point where phase 2's `spawn_blocking` closure has
+        // actually started running on its worker thread (not merely been
+        // scheduled) -- test observers wait on this instead of the
+        // earlier "quiet window elapsed" arm-only log line so a SIGTERM
+        // sent right after this fires is guaranteed to land while the
+        // catch-up task is genuinely in flight and abortable.
+        crate::log_event!("watcher", "catch-up reindex", "phase 2 walk started");
+
         let ReindexHandles {
             pipeline,
             document_index,
@@ -2095,8 +2103,9 @@ impl ReindexHandles {
                 } else {
                     tracing::warn!(
                         "Skipping stale indexed path '{}': no longer exists as a directory \
-                         on disk. Run 'codanna index --prune-indexed-paths' to remove it \
-                         from tracking",
+                         on disk. Run 'codanna remove-dir {}' to remove it from \
+                         settings.toml's indexing.indexed_paths tracking",
+                        path.display(),
                         path.display()
                     );
                 }
@@ -2281,23 +2290,21 @@ pub(crate) async fn reindex_locked(
     // this check and the clear is a pre-existing race that no ordering here
     // can close.
     if paths_is_none && force {
-        let (has_rebuild_source, ghost_paths) = {
+        let (has_rebuild_source, indexed_paths) = {
             let indexer = facade.read().await;
             let indexed_paths = indexer.pipeline().settings().indexing.indexed_paths.clone();
-            let ghost_paths: Vec<std::path::PathBuf> = indexed_paths
-                .iter()
-                .filter(|p| !p.is_dir())
-                .cloned()
-                .collect();
-            let has_rebuild_source = ghost_paths.len() < indexed_paths.len();
-            (has_rebuild_source, ghost_paths)
+            let has_rebuild_source = indexed_paths.iter().any(|p| p.is_dir());
+            (has_rebuild_source, indexed_paths)
         };
         if !has_rebuild_source {
+            let ghost_paths: Vec<&std::path::PathBuf> =
+                indexed_paths.iter().filter(|p| !p.is_dir()).collect();
             for path in &ghost_paths {
                 tracing::warn!(
                     "Skipping stale indexed path '{}': no longer exists as a directory \
-                     on disk. Run 'codanna index --prune-indexed-paths' to remove it \
-                     from tracking",
+                     on disk. Run 'codanna remove-dir {}' to remove it from \
+                     settings.toml's indexing.indexed_paths tracking",
+                    path.display(),
                     path.display()
                 );
             }

@@ -533,7 +533,10 @@ pub fn run_gc(config: &Settings) {
     }
 }
 
-/// Prune the current generation's tracked `indexed_paths` of entries that
+/// Prune the current generation's tracked `indexed_paths` -- the paths
+/// recorded in the generation's own `index.meta`, NOT `settings.toml`'s
+/// `indexing.indexed_paths` list, which is a separate store this command
+/// never touches (use `codanna remove-dir` for that one) -- of entries that
 /// no longer exist as a directory on disk (ghosts) or are strays: outside
 /// the configured `workspace_root` *and* not covered by any root listed in
 /// `settings.toml`'s `indexing.indexed_paths`. Out-of-tree roots the user

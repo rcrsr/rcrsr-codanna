@@ -199,12 +199,20 @@ pub enum Commands {
 
         /// Prune tracked indexed paths that no longer exist on disk, or that
         /// are outside the workspace root and not listed in settings.toml,
-        /// then print a summary and exit. Distinct from `--gc`, which removes
-        /// stale on-disk index *generations*, not tracked path entries.
-        /// Mutually exclusive with indexing, --status, --gc, and --rollback.
+        /// then print a summary and exit. This prunes the generation's
+        /// tracked `index.meta` paths only -- it does not touch
+        /// settings.toml's indexed-paths list (use `codanna remove-dir` for
+        /// that). Distinct from `--gc`, which removes stale on-disk index
+        /// *generations*, not tracked path entries. Mutually exclusive with
+        /// indexing and every indexing-only option, --status, --gc, and
+        /// --rollback.
         #[arg(
             long = "prune-indexed-paths",
-            conflicts_with_all = ["status", "gc", "rollback", "paths"]
+            conflicts_with_all = [
+                "status", "gc", "rollback", "paths",
+                "force", "dry_run", "json", "threads", "max_files",
+                "no_progress", "list_all",
+            ]
         )]
         prune_indexed_paths: bool,
     },
@@ -379,7 +387,14 @@ pub enum Commands {
         /// With --stop-all, also stop registered proxies (not just backing servers)
         #[arg(
             long,
-            requires = "stop_all",
+            // `requires` targets the `stop_or_kill_all` group (not the bare
+            // `stop_all` field) so the deprecated `--kill-all` alias also
+            // satisfies it -- clap's `requires` only checks the literal id
+            // named, and `--kill-all` never sets `stop_all` itself (`run`
+            // merges them post-parse), so `requires = "stop_all"` would
+            // reject `--kill-all --include-proxies` before that merge ever
+            // runs.
+            requires = "stop_or_kill_all",
             // Belt-and-suspenders: `stop_all` itself has `conflicts_with =
             // "stop"`, and when `--stop` is present clap treats `stop_all`
             // as blocked and silently skips validating `requires` against
@@ -417,7 +432,10 @@ pub enum Commands {
         /// "stop_all"` (mirroring `--include-proxies`) rather than `--stop`.
         #[arg(
             long,
-            requires = "stop_all",
+            // See `include_proxies`'s comment: `requires` targets the
+            // `stop_or_kill_all` group so the deprecated `--kill-all` alias
+            // also satisfies it.
+            requires = "stop_or_kill_all",
             conflicts_with = "stop",
             help = "With --stop-all, also stop unregistered pids that still look like codanna serve"
         )]
@@ -437,7 +455,7 @@ pub enum Commands {
         #[arg(
             long = "include-rogue",
             hide = true,
-            requires = "stop_all",
+            requires = "stop_or_kill_all",
             conflicts_with = "stop",
             help = "[DEPRECATED: use --include-unknown]"
         )]
@@ -928,4 +946,47 @@ pub enum RetrieveQuery {
         #[arg(long, value_delimiter = ',')]
         fields: Option<Vec<String>>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `--include-proxies`/`--include-unknown` `requires` the
+    /// `stop_or_kill_all` group, not the bare `stop_all` field, so the
+    /// deprecated `--kill-all` alias (merged into `stop_all` post-parse by
+    /// `cli::commands::serve::run`) must also satisfy it at parse time.
+    #[test]
+    fn test_kill_all_with_include_proxies_parses() {
+        let cli =
+            Cli::try_parse_from(["codanna", "serve", "--kill-all", "--include-proxies"]).unwrap();
+        match cli.command {
+            Commands::Serve {
+                kill_all,
+                include_proxies,
+                ..
+            } => {
+                assert!(kill_all);
+                assert!(include_proxies);
+            }
+            _ => panic!("expected Commands::Serve"),
+        }
+    }
+
+    #[test]
+    fn test_kill_all_with_include_unknown_parses() {
+        let cli =
+            Cli::try_parse_from(["codanna", "serve", "--kill-all", "--include-unknown"]).unwrap();
+        match cli.command {
+            Commands::Serve {
+                kill_all,
+                include_unknown,
+                ..
+            } => {
+                assert!(kill_all);
+                assert!(include_unknown);
+            }
+            _ => panic!("expected Commands::Serve"),
+        }
+    }
 }

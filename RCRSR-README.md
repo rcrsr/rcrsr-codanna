@@ -317,7 +317,7 @@ it on graceful exit. Each entry records the `codanna` version that wrote it.
 visible to you, merging three sources into one table (PID / KIND / SOURCE /
 PORT / SCHEME / STATUS / WORKSPACE / VERSION): registered backing servers,
 registered proxies attributed to the backing server sharing their workspace
-root, and *rogue* `codanna serve` processes found by a process-table scan with
+root, and *unknown* `codanna serve` processes found by a process-table scan with
 no live registry entry (best-effort enriched from the process cwd,
 `serve.json`, or a `--bind` argument). `ls` never reaps, signals, or rewrites
 anything. `codanna serve --list` is **deprecated for one release cycle**: it
@@ -325,7 +325,7 @@ prints a notice to stderr and delegates to `ls`.
 
 ```bash
 codanna ls                                  # list every codanna server process you own
-codanna serve --stop <pid|workspace-path>   # SIGTERM a registered server
+codanna serve --stop <pid|workspace-path>   # SIGTERM a server; a numeric pid need not be registered, only identity-verified
 codanna serve --stop <pid> --force          # SIGKILL instead
 codanna serve --stop <pid> --timeout 10     # wait 10s (default 5) before escalating
 codanna serve --stop <pid> --no-force       # give up instead of escalating to SIGKILL
@@ -379,23 +379,23 @@ These are lifecycle operations and cannot be combined with
   lockfile — instead of relying on the default disposition.
 
 **VERSION column.** Registered rows show the version the server recorded at
-startup (`-` for entries written by a pre-`version` build). Rogue rows have no
-self-reported version, so the column instead compares the rogue binary on disk
+startup (`-` for entries written by a pre-`version` build). Unknown rows have no
+self-reported version, so the column instead compares the unknown row's binary on disk
 to the `codanna ls` binary — by canonical path first, then by size and bytes if
 the paths differ, so the same build installed at two locations (a mise dir vs
-`~/.local/bin`) still reads as `same`. The rogue process is never exec'd or
+`~/.local/bin`) still reads as `same`. The unknown process is never exec'd or
 `--version`-probed.
 
 - `same` — identical binary, at the same path or a byte-identical copy.
 - `other` — different path and different size/contents (or unreadable for
   comparison).
-- `deleted` — the rogue's binary is gone from disk (the Linux in-place-upgrade
+- `deleted` — the unknown row's binary is gone from disk (the Linux in-place-upgrade
   signature: `/proc/<pid>/exe` ending in `(deleted)`) or unreadable.
 - `-` — the `codanna ls` binary's own path could not be resolved.
 
 **STATUS column.** Registered servers show their self-reported `spawning` or
-`healthy`; rogue rows show `running`. A proxy whose backing server is gone,
-dead, or itself rogue shows `orphaned` instead of the `healthy` it recorded at
+`healthy`; unknown rows show `running`. A proxy whose backing server is gone,
+dead, or itself unknown shows `orphaned` instead of the `healthy` it recorded at
 connect time (a proxy's entry is written once and never updated, so it would
 otherwise stay `healthy` forever). An orphaned proxy is still live and will
 revive a backing server on its next delegated call; stop it with
@@ -505,22 +505,28 @@ run `--status` to see what is there, then `--gc` or remove `.codanna/index`.
 
 ### Tracked indexed paths
 
-Each generation's `index.meta` records the directory roots it was built from.
-Entries can go stale — a scratch directory indexed once and later deleted, or
-a root registered by a session whose `settings.toml` was since edited — and
-every startup catch-up or `--force` rebuild then warns once per such entry
-(`Skipping stale indexed path …`) rather than failing on it.
+Two separate stores track directory roots, and they are pruned differently:
+
+- **`settings.toml`'s `indexing.indexed_paths`** — the roots a startup
+  catch-up or `--force` rebuild walks. Entries can go stale — a scratch
+  directory indexed once and later deleted — and each such rebuild then
+  warns once per stale entry (`Skipping stale indexed path …`) rather than
+  failing on it. The warning points at `codanna remove-dir <path>`, which
+  edits this file.
+- **Each generation's `index.meta`** — the directory roots that generation
+  was actually built from. Its own ghost (no longer a directory on disk) and
+  stray (outside `workspace_root` *and* not listed under
+  `indexing.indexed_paths` in `settings.toml`) entries are pruned with:
 
 ```bash
-codanna index --prune-indexed-paths   # drop ghost and stray roots from the current generation
+codanna index --prune-indexed-paths   # drop ghost and stray roots from the current generation's index.meta
 ```
 
-It drops **ghosts** (no longer a directory on disk) and **strays** (outside
-`workspace_root` *and* not listed under `indexing.indexed_paths` in
-`settings.toml`). Out-of-tree roots you configured deliberately are kept:
-indexing a project from outside its directory is supported upstream, so
-`workspace_root` alone is not a containment boundary. Like `--status`/`--gc`,
-it is a metadata-only edit and never opens a new build generation.
+Out-of-tree roots you configured deliberately are kept: indexing a project
+from outside its directory is supported upstream, so `workspace_root` alone
+is not a containment boundary. Like `--status`/`--gc`, it is a
+metadata-only edit and never opens a new build generation. It does not
+touch `settings.toml` — use `codanna remove-dir` for that store.
 
 ## Reindexing on demand (`reindex` MCP tool)
 

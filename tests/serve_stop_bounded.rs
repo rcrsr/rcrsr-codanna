@@ -270,14 +270,19 @@ fn sigterm_during_catchup_reindex_exits_bounded_and_preserves_live_generation() 
 
     let mut serve = spawn_http_serve(workspace.path());
 
-    // Wait for the watcher to actually start an in-flight catch-up reindex
-    // (armed by `startup_catch_up = true`) before signaling -- this is what
-    // makes the SIGTERM land mid-flight rather than before/after the build.
-    // The needle is the specific "reindexing" log line, not the earlier
-    // "arming a catch-up reindex" arm-only line (which also contains the
-    // substring "catch-up reindex" but fires before any reindex task has
-    // actually been spawned).
-    wait_for_stderr_line(&serve, "quiet window elapsed", Duration::from_secs(30));
+    // Wait for the watcher's catch-up reindex to actually be executing on
+    // its `spawn_blocking` worker thread (armed by `startup_catch_up =
+    // true`) before signaling -- this is what makes the SIGTERM land
+    // mid-flight rather than before/after the build. The needle is the
+    // "phase 2 walk started" log line emitted from inside
+    // `ReindexHandles::run` once it is genuinely running, not the earlier
+    // "quiet window elapsed" line, which is emitted before `tokio::spawn`
+    // in `maybe_start_catch_up` and so can fire before the catch-up task
+    // has even been polled -- a SIGTERM sent right after that earlier line
+    // could race ahead of the task ever starting, so `handle.abort()` in
+    // the watcher's cancellation arm would never actually cancel an
+    // in-flight reindex.
+    wait_for_stderr_line(&serve, "phase 2 walk started", Duration::from_secs(30));
 
     let pid = serve.child.id();
     let sigterm_sent_at = Instant::now();

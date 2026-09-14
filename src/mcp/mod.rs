@@ -31,6 +31,20 @@ pub mod service;
 pub mod stale_server;
 pub mod tools;
 
+/// Exit code for a forced early exit (shutdown-grace timeout) that must not
+/// mask a server future that already failed: the normal `result?` path
+/// below the timeout is never reached once we `exit`, so surface it here.
+#[cfg(feature = "http-server")]
+pub(crate) fn forced_exit_code(server_result: &Option<std::io::Result<()>>) -> i32 {
+    match server_result {
+        Some(Err(err)) => {
+            eprintln!("server error: {err}");
+            1
+        }
+        _ => 0,
+    }
+}
+
 pub(crate) use probe_stdio::probe_tolerant_stdio;
 pub use proxy::{ProxyError, ProxyResult, serve_proxy};
 pub use requests::*;

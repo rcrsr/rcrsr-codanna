@@ -425,7 +425,7 @@ pub async fn repoll_after_sigkill_and_reap(
 /// out), re-polls briefly, and -- since a SIGKILL'd process cannot
 /// self-deregister -- reaps its registry entry directly via `remove_entry`.
 async fn stop_server(selector: &str, force: bool, timeout: u64, no_force: bool) {
-    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System};
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System, UpdateKind};
 
     let Some((pid, was_registered)) = resolve_selector_to_pid(selector) else {
         if let Ok(pid) = selector.parse::<u32>() {
@@ -450,7 +450,9 @@ async fn stop_server(selector: &str, force: bool, timeout: u64, no_force: bool) 
     sys.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[target]),
         true,
-        ProcessRefreshKind::nothing(),
+        ProcessRefreshKind::nothing()
+            .with_cmd(UpdateKind::Always)
+            .with_exe(UpdateKind::Always),
     );
 
     let Some(process) = sys.process(target) else {
@@ -459,6 +461,25 @@ async fn stop_server(selector: &str, force: bool, timeout: u64, no_force: bool) 
         );
         std::process::exit(1);
     };
+
+    // Re-verify identity immediately before signaling: a registered pid may
+    // have been recycled by the OS for an unrelated process since it was
+    // selected, and an unregistered pid was never vouched for by the
+    // registry at all -- so the unregistered case uses the stricter,
+    // `scan_codanna_serve_pids`-style predicate (mirrors
+    // `stop_one_registered_target`/`stop_one_unknown_target`).
+    let identity_ok = if was_registered {
+        crate::io::process::process_looks_like_codanna_serve(process)
+    } else {
+        crate::io::process::process_is_codanna_serve(process)
+    };
+    if !identity_ok {
+        eprintln!(
+            "pid {pid} no longer looks like a codanna serve process; refusing to signal it \
+             (its registry entry may be stale; try --reap)."
+        );
+        std::process::exit(1);
+    }
 
     // Liveness is determinable here: `sys.process(target)` just resolved to
     // a live process above, so report that before signaling it.
@@ -509,21 +530,38 @@ async fn stop_server(selector: &str, force: bool, timeout: u64, no_force: bool) 
         sys.refresh_processes_specifics(
             ProcessesToUpdate::Some(&[target]),
             true,
-            ProcessRefreshKind::nothing(),
+            ProcessRefreshKind::nothing()
+                .with_cmd(UpdateKind::Always)
+                .with_exe(UpdateKind::Always),
         );
         // The target may have exited between `wait_for_exit`'s last poll and
         // this refresh -- nothing to escalate to in that case; fall through
         // to the re-poll below, which will observe it as no longer alive.
         if let Some(process) = sys.process(target) {
-            match send_signal(process, Signal::Kill) {
-                SignalOutcome::Sent => {}
-                SignalOutcome::SendFailed => {
-                    eprintln!("Failed to send SIGKILL to pid {pid}.");
-                    std::process::exit(1);
-                }
-                SignalOutcome::UnsupportedPlatform => {
-                    eprintln!("Sending signals is not supported on this platform (pid {pid}).");
-                    std::process::exit(1);
+            // Re-verify identity before the SIGKILL escalation too: the
+            // SIGTERM timeout window is long enough for the pid to have
+            // been recycled by the OS for an unrelated process.
+            let identity_ok = if was_registered {
+                crate::io::process::process_looks_like_codanna_serve(process)
+            } else {
+                crate::io::process::process_is_codanna_serve(process)
+            };
+            if !identity_ok {
+                eprintln!(
+                    "pid {pid} no longer looks like a codanna serve process; skipping SIGKILL \
+                     escalation (it may have exited and the pid been reused)."
+                );
+            } else {
+                match send_signal(process, Signal::Kill) {
+                    SignalOutcome::Sent => {}
+                    SignalOutcome::SendFailed => {
+                        eprintln!("Failed to send SIGKILL to pid {pid}.");
+                        std::process::exit(1);
+                    }
+                    SignalOutcome::UnsupportedPlatform => {
+                        eprintln!("Sending signals is not supported on this platform (pid {pid}).");
+                        std::process::exit(1);
+                    }
                 }
             }
         }
