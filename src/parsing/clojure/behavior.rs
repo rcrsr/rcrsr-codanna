@@ -215,10 +215,10 @@ impl LanguageBehavior for ClojureBehavior {
             Visibility::Private => false,
             Visibility::Module => {
                 // Same module/namespace
-                if let Some(symbol_module) = &symbol.module_path {
-                    if let Some(from_module) = self.get_module_path_for_file(from_file) {
-                        return symbol_module.as_ref() == from_module;
-                    }
+                if let Some(symbol_module) = &symbol.module_path
+                    && let Some(from_module) = self.get_module_path_for_file(from_file)
+                {
+                    return symbol_module.as_ref() == from_module;
                 }
                 false
             }

@@ -118,10 +118,10 @@ impl ProfilesConfig {
         // From profile references (name@provider)
         for profile_ref in &self.profiles {
             let reference = ProfileReference::parse(profile_ref);
-            if let Some(provider) = reference.provider {
-                if !providers.contains(&provider) {
-                    providers.push(provider);
-                }
+            if let Some(provider) = reference.provider
+                && !providers.contains(&provider)
+            {
+                providers.push(provider);
             }
         }
 

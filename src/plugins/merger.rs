@@ -128,14 +128,13 @@ pub fn remove_mcp_servers(project_mcp_path: &Path, server_keys: &[String]) -> Pl
     let mut project_mcp: Value = serde_json::from_str(&content)?;
 
     // Get mcpServers object
-    if let Some(servers) = project_mcp.as_object_mut() {
-        if let Some(servers_obj) = servers.get_mut("mcpServers") {
-            if let Some(servers_map) = servers_obj.as_object_mut() {
-                // Remove specified keys
-                for key in server_keys {
-                    servers_map.remove(key);
-                }
-            }
+    if let Some(servers) = project_mcp.as_object_mut()
+        && let Some(servers_obj) = servers.get_mut("mcpServers")
+        && let Some(servers_map) = servers_obj.as_object_mut()
+    {
+        // Remove specified keys
+        for key in server_keys {
+            servers_map.remove(key);
         }
     }
 

@@ -57,19 +57,19 @@ impl CParser {
         file_id: FileId,
         imports: &mut Vec<Import>,
     ) {
-        if node.kind() == "preproc_include" {
-            if let Some(path_node) = node.child_by_field_name("path") {
-                let path_text = &code[path_node.byte_range()];
-                // Remove quotes
-                let clean_path = path_text.trim_matches(|c| c == '"' || c == '<' || c == '>');
-                imports.push(Import {
-                    path: clean_path.to_string(),
-                    alias: None,
-                    file_id,
-                    is_glob: false,
-                    is_type_only: false,
-                });
-            }
+        if node.kind() == "preproc_include"
+            && let Some(path_node) = node.child_by_field_name("path")
+        {
+            let path_text = &code[path_node.byte_range()];
+            // Remove quotes
+            let clean_path = path_text.trim_matches(|c| c == '"' || c == '<' || c == '>');
+            imports.push(Import {
+                path: clean_path.to_string(),
+                alias: None,
+                file_id,
+                is_glob: false,
+                is_type_only: false,
+            });
         }
 
         // Recursively process children
@@ -244,19 +244,18 @@ impl CParser {
             "function_definition" => {
                 self.register_handled_node("function_definition", node.kind_id());
                 // C function names are nested in declarator structure
-                if let Some(declarator) = node.child_by_field_name("declarator") {
-                    if let Some(name_node) = Self::find_function_name_node(declarator) {
-                        if let Some(symbol) = self.create_symbol(
-                            counter,
-                            node,
-                            name_node,
-                            SymbolKind::Function,
-                            file_id,
-                            code,
-                        ) {
-                            symbols.push(symbol);
-                        }
-                    }
+                if let Some(declarator) = node.child_by_field_name("declarator")
+                    && let Some(name_node) = Self::find_function_name_node(declarator)
+                    && let Some(symbol) = self.create_symbol(
+                        counter,
+                        node,
+                        name_node,
+                        SymbolKind::Function,
+                        file_id,
+                        code,
+                    )
+                {
+                    symbols.push(symbol);
                 }
 
                 // Enter function scope for nested declarations
@@ -283,17 +282,17 @@ impl CParser {
             }
             "struct_specifier" => {
                 self.register_handled_node("struct_specifier", node.kind_id());
-                if let Some(name_node) = node.child_by_field_name("name") {
-                    if let Some(symbol) = self.create_symbol(
+                if let Some(name_node) = node.child_by_field_name("name")
+                    && let Some(symbol) = self.create_symbol(
                         counter,
                         node,
                         name_node,
                         SymbolKind::Struct,
                         file_id,
                         code,
-                    ) {
-                        symbols.push(symbol);
-                    }
+                    )
+                {
+                    symbols.push(symbol);
                 }
 
                 // Process struct fields
@@ -314,17 +313,17 @@ impl CParser {
             }
             "union_specifier" => {
                 self.register_handled_node("union_specifier", node.kind_id());
-                if let Some(name_node) = node.child_by_field_name("name") {
-                    if let Some(symbol) = self.create_symbol(
+                if let Some(name_node) = node.child_by_field_name("name")
+                    && let Some(symbol) = self.create_symbol(
                         counter,
                         node,
                         name_node,
                         SymbolKind::Struct,
                         file_id,
                         code,
-                    ) {
-                        symbols.push(symbol);
-                    }
+                    )
+                {
+                    symbols.push(symbol);
                 }
 
                 // Process union fields
@@ -345,17 +344,17 @@ impl CParser {
             }
             "enum_specifier" => {
                 self.register_handled_node("enum_specifier", node.kind_id());
-                if let Some(name_node) = node.child_by_field_name("name") {
-                    if let Some(symbol) = self.create_symbol(
+                if let Some(name_node) = node.child_by_field_name("name")
+                    && let Some(symbol) = self.create_symbol(
                         counter,
                         node,
                         name_node,
                         SymbolKind::Enum,
                         file_id,
                         code,
-                    ) {
-                        symbols.push(symbol);
-                    }
+                    )
+                {
+                    symbols.push(symbol);
                 }
 
                 // Process enum values
@@ -363,17 +362,17 @@ impl CParser {
                     for child in body.children(&mut body.walk()) {
                         if child.kind() == "enumerator" {
                             self.register_handled_node("enumerator", child.kind_id());
-                            if let Some(name_node) = child.child_by_field_name("name") {
-                                if let Some(symbol) = self.create_symbol(
+                            if let Some(name_node) = child.child_by_field_name("name")
+                                && let Some(symbol) = self.create_symbol(
                                     counter,
                                     child,
                                     name_node,
                                     SymbolKind::Constant,
                                     file_id,
                                     code,
-                                ) {
-                                    symbols.push(symbol);
-                                }
+                                )
+                            {
+                                symbols.push(symbol);
                             }
                         }
                     }
@@ -383,36 +382,35 @@ impl CParser {
                 self.register_handled_node("declaration", node.kind_id());
                 // Handle variable declarations
                 for child in node.children(&mut node.walk()) {
-                    if child.kind() == "init_declarator" {
-                        if let Some(name_node) = Self::find_declarator_name(child) {
-                            if let Some(symbol) = self.create_symbol(
-                                counter,
-                                child,
-                                name_node,
-                                SymbolKind::Variable,
-                                file_id,
-                                code,
-                            ) {
-                                symbols.push(symbol);
-                            }
-                        }
+                    if child.kind() == "init_declarator"
+                        && let Some(name_node) = Self::find_declarator_name(child)
+                        && let Some(symbol) = self.create_symbol(
+                            counter,
+                            child,
+                            name_node,
+                            SymbolKind::Variable,
+                            file_id,
+                            code,
+                        )
+                    {
+                        symbols.push(symbol);
                     }
                 }
             }
             "init_declarator" => {
                 self.register_handled_node("init_declarator", node.kind_id());
                 // Handle variable initialization (int x = 5, Rectangle *rect = malloc(...), etc.)
-                if let Some(name_node) = Self::find_declarator_name(node) {
-                    if let Some(symbol) = self.create_symbol(
+                if let Some(name_node) = Self::find_declarator_name(node)
+                    && let Some(symbol) = self.create_symbol(
                         counter,
                         node,
                         name_node,
                         SymbolKind::Variable,
                         file_id,
                         code,
-                    ) {
-                        symbols.push(symbol);
-                    }
+                    )
+                {
+                    symbols.push(symbol);
                 }
             }
             "compound_statement" => {
@@ -441,38 +439,36 @@ impl CParser {
             "parameter_declaration" => {
                 self.register_handled_node("parameter_declaration", node.kind_id());
                 // Handle function parameters
-                if let Some(name_node) = Self::find_declarator_name(node) {
-                    if let Some(symbol) = self.create_symbol(
+                if let Some(name_node) = Self::find_declarator_name(node)
+                    && let Some(symbol) = self.create_symbol(
                         counter,
                         node,
                         name_node,
                         SymbolKind::Parameter,
                         file_id,
                         code,
-                    ) {
-                        symbols.push(symbol);
-                    }
+                    )
+                {
+                    symbols.push(symbol);
                 }
             }
             "field_declaration" => {
                 self.register_handled_node("field_declaration", node.kind_id());
                 // Handle struct/union field declarations
                 for child in node.children(&mut node.walk()) {
-                    if child.kind() == "field_declarator" {
-                        if let Some(name_node) = child.child(0) {
-                            if name_node.kind() == "field_identifier" {
-                                if let Some(symbol) = self.create_symbol(
-                                    counter,
-                                    child,
-                                    name_node,
-                                    SymbolKind::Field,
-                                    file_id,
-                                    code,
-                                ) {
-                                    symbols.push(symbol);
-                                }
-                            }
-                        }
+                    if child.kind() == "field_declarator"
+                        && let Some(name_node) = child.child(0)
+                        && name_node.kind() == "field_identifier"
+                        && let Some(symbol) = self.create_symbol(
+                            counter,
+                            child,
+                            name_node,
+                            SymbolKind::Field,
+                            file_id,
+                            code,
+                        )
+                    {
+                        symbols.push(symbol);
                     }
                 }
             }
@@ -729,19 +725,19 @@ impl CParser {
                 self.register_handled_node("preproc_call", node.kind_id());
                 // Function-like macro invocations
                 // These are important for macro expansion analysis
-                if let Some(name_node) = node.child(0) {
-                    if name_node.kind() == "identifier" {
-                        // Track macro calls as macro symbols for analysis
-                        if let Some(symbol) = self.create_symbol(
-                            counter,
-                            node,
-                            name_node,
-                            SymbolKind::Macro,
-                            file_id,
-                            code,
-                        ) {
-                            symbols.push(symbol);
-                        }
+                if let Some(name_node) = node.child(0)
+                    && name_node.kind() == "identifier"
+                {
+                    // Track macro calls as macro symbols for analysis
+                    if let Some(symbol) = self.create_symbol(
+                        counter,
+                        node,
+                        name_node,
+                        SymbolKind::Macro,
+                        file_id,
+                        code,
+                    ) {
+                        symbols.push(symbol);
                     }
                 }
 
@@ -790,12 +786,11 @@ impl CParser {
         code: &'a str,
         current: Option<&'a str>,
     ) -> Option<&'a str> {
-        if node.kind() == "function_definition" {
-            if let Some(declarator) = node.child_by_field_name("declarator") {
-                if let Some(name_node) = Self::find_function_name_node(declarator) {
-                    return Some(&code[name_node.byte_range()]);
-                }
-            }
+        if node.kind() == "function_definition"
+            && let Some(declarator) = node.child_by_field_name("declarator")
+            && let Some(name_node) = Self::find_function_name_node(declarator)
+        {
+            return Some(&code[name_node.byte_range()]);
         }
         current
     }
@@ -807,35 +802,35 @@ impl CParser {
         calls: &mut Vec<MethodCall>,
     ) {
         let enclosing = Self::enclosing_for_node(node, code, enclosing);
-        if node.kind() == "call_expression" {
-            if let Some(function_node) = node.child_by_field_name("function") {
-                let range = Range::new(
-                    node.start_position().row as u32,
-                    node.start_position().column as u16,
-                    node.end_position().row as u32,
-                    node.end_position().column as u16,
-                );
-                let caller = enclosing.unwrap_or("<module>");
+        if node.kind() == "call_expression"
+            && let Some(function_node) = node.child_by_field_name("function")
+        {
+            let range = Range::new(
+                node.start_position().row as u32,
+                node.start_position().column as u16,
+                node.end_position().row as u32,
+                node.end_position().column as u16,
+            );
+            let caller = enclosing.unwrap_or("<module>");
 
-                // C has no method concept; capture struct-field function-pointer calls
-                // (`vtable->draw(ctx)`, `obj.fn(args)`) so receiver type can flow downstream.
-                if function_node.kind() == "field_expression" {
-                    let receiver = function_node
-                        .child_by_field_name("argument")
-                        .map(|n| code[n.byte_range()].trim());
-                    let method_name = function_node
-                        .child_by_field_name("field")
-                        .map(|n| code[n.byte_range()].trim())
-                        .unwrap_or_else(|| code[function_node.byte_range()].trim());
-                    let mut call = MethodCall::new(caller, method_name, range);
-                    if let Some(r) = receiver {
-                        call = call.with_receiver(r);
-                    }
-                    calls.push(call);
-                } else {
-                    let function_name = code[function_node.byte_range()].trim();
-                    calls.push(MethodCall::new(caller, function_name, range));
+            // C has no method concept; capture struct-field function-pointer calls
+            // (`vtable->draw(ctx)`, `obj.fn(args)`) so receiver type can flow downstream.
+            if function_node.kind() == "field_expression" {
+                let receiver = function_node
+                    .child_by_field_name("argument")
+                    .map(|n| code[n.byte_range()].trim());
+                let method_name = function_node
+                    .child_by_field_name("field")
+                    .map(|n| code[n.byte_range()].trim())
+                    .unwrap_or_else(|| code[function_node.byte_range()].trim());
+                let mut call = MethodCall::new(caller, method_name, range);
+                if let Some(r) = receiver {
+                    call = call.with_receiver(r);
                 }
+                calls.push(call);
+            } else {
+                let function_name = code[function_node.byte_range()].trim();
+                calls.push(MethodCall::new(caller, function_name, range));
             }
         }
 
@@ -855,17 +850,17 @@ impl CParser {
         calls: &mut Vec<(&'a str, &'a str, Range)>,
     ) {
         let enclosing = Self::enclosing_for_node(node, code, enclosing);
-        if node.kind() == "call_expression" {
-            if let Some(function_node) = node.child_by_field_name("function") {
-                let target_name = &code[function_node.byte_range()];
-                let range = Range::new(
-                    node.start_position().row as u32,
-                    node.start_position().column as u16,
-                    node.end_position().row as u32,
-                    node.end_position().column as u16,
-                );
-                calls.push((enclosing.unwrap_or("<module>"), target_name, range));
-            }
+        if node.kind() == "call_expression"
+            && let Some(function_node) = node.child_by_field_name("function")
+        {
+            let target_name = &code[function_node.byte_range()];
+            let range = Range::new(
+                node.start_position().row as u32,
+                node.start_position().column as u16,
+                node.end_position().row as u32,
+                node.end_position().column as u16,
+            );
+            calls.push((enclosing.unwrap_or("<module>"), target_name, range));
         }
 
         // Process children
@@ -933,17 +928,17 @@ impl CParser {
             }
         }
         // Preprocessor definitions
-        else if node.kind() == "preproc_def" {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let macro_name = &code[name_node.byte_range()];
-                let range = Range::new(
-                    node.start_position().row as u32,
-                    node.start_position().column as u16,
-                    node.end_position().row as u32,
-                    node.end_position().column as u16,
-                );
-                defines.push((macro_name, "macro", range));
-            }
+        else if node.kind() == "preproc_def"
+            && let Some(name_node) = node.child_by_field_name("name")
+        {
+            let macro_name = &code[name_node.byte_range()];
+            let range = Range::new(
+                node.start_position().row as u32,
+                node.start_position().column as u16,
+                node.end_position().row as u32,
+                node.end_position().column as u16,
+            );
+            defines.push((macro_name, "macro", range));
         }
 
         // Process children

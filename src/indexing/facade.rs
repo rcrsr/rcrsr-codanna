@@ -994,18 +994,17 @@ impl IndexFacade {
             }
         }
 
-        if include.contains(ContextIncludes::DEFINITIONS) {
-            if let Ok(rels) = self
+        if include.contains(ContextIncludes::DEFINITIONS)
+            && let Ok(rels) = self
                 .document_index
                 .get_relationships_from(symbol_id, RelationKind::Defines)
-            {
-                let defines: Vec<Symbol> = rels
-                    .iter()
-                    .filter_map(|(_, to_id, _)| self.get_symbol(*to_id))
-                    .collect();
-                if !defines.is_empty() {
-                    relationships.defines = Some(defines);
-                }
+        {
+            let defines: Vec<Symbol> = rels
+                .iter()
+                .filter_map(|(_, to_id, _)| self.get_symbol(*to_id))
+                .collect();
+            if !defines.is_empty() {
+                relationships.defines = Some(defines);
             }
         }
 
@@ -1494,10 +1493,10 @@ impl IndexFacade {
         path: impl AsRef<std::path::Path>,
     ) -> crate::IndexResult<crate::IndexingResult> {
         let path = &Self::canonical_or_raw(path.as_ref());
-        if self.has_semantic_search() {
-            if let Err(e) = self.ensure_embedding_pool() {
-                tracing::warn!("Failed to initialize embedding pool: {e}");
-            }
+        if self.has_semantic_search()
+            && let Err(e) = self.ensure_embedding_pool()
+        {
+            tracing::warn!("Failed to initialize embedding pool: {e}");
         }
         let stats = self.pipeline.index_file_single(
             path,
@@ -1553,10 +1552,10 @@ impl IndexFacade {
     /// This is the primary indexing entry point using Pipeline.
     pub fn index_directory(&mut self, path: &Path, force: bool) -> FacadeResult<IndexingStats> {
         let path = &Self::canonical_or_raw(path);
-        if self.has_semantic_search() {
-            if let Err(e) = self.ensure_embedding_pool() {
-                tracing::warn!("Failed to initialize embedding pool: {e}");
-            }
+        if self.has_semantic_search()
+            && let Err(e) = self.ensure_embedding_pool()
+        {
+            tracing::warn!("Failed to initialize embedding pool: {e}");
         }
         let stats = self.pipeline.index_incremental(
             path,
@@ -1597,10 +1596,10 @@ impl IndexFacade {
         pending: &mut crate::indexing::pipeline::PendingResolution,
     ) -> FacadeResult<IndexingStats> {
         let path = &Self::canonical_or_raw(path);
-        if self.has_semantic_search() {
-            if let Err(e) = self.ensure_embedding_pool() {
-                tracing::warn!("Failed to initialize embedding pool: {e}");
-            }
+        if self.has_semantic_search()
+            && let Err(e) = self.ensure_embedding_pool()
+        {
+            tracing::warn!("Failed to initialize embedding pool: {e}");
         }
         let stats = self.pipeline.index_incremental_deferred(
             path,
@@ -1750,10 +1749,10 @@ impl IndexFacade {
             // Auto-force mode for empty indexes (clean index behaves like --force)
             let force = force || self.document_count().unwrap_or(0) == 0;
 
-            if self.has_semantic_search() {
-                if let Err(e) = self.ensure_embedding_pool() {
-                    tracing::warn!("Failed to initialize embedding pool: {e}");
-                }
+            if self.has_semantic_search()
+                && let Err(e) = self.ensure_embedding_pool()
+            {
+                tracing::warn!("Failed to initialize embedding pool: {e}");
             }
 
             // Phase 1 only; resolution is deferred until every root walked
@@ -1827,10 +1826,11 @@ impl IndexFacade {
 
         let mut stats = SyncStats::default();
 
-        if self.has_semantic_search() && !to_add.is_empty() {
-            if let Err(e) = self.ensure_embedding_pool() {
-                tracing::warn!("Failed to initialize embedding pool: {e}");
-            }
+        if self.has_semantic_search()
+            && !to_add.is_empty()
+            && let Err(e) = self.ensure_embedding_pool()
+        {
+            tracing::warn!("Failed to initialize embedding pool: {e}");
         }
 
         // Index new directories with progress if enabled.

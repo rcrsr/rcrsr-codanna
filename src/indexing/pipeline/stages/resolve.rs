@@ -241,24 +241,24 @@ impl ResolveStage {
             }
         }
 
-        if let Some(to_id) = context.resolve(&unresolved.to_name) {
-            if self.is_compatible(
+        if let Some(to_id) = context.resolve(&unresolved.to_name)
+            && self.is_compatible(
                 from_kind,
                 to_id,
                 unresolved.kind,
                 caller.file_id,
                 &caller.language_id,
-            ) && self.is_receiver_compat(to_id, unresolved, &caller.language_id)
-                && self.is_instance_type_compatible(
-                    unresolved,
-                    to_id,
-                    &caller.language_id,
-                    context,
-                    extends_by_from,
-                )
-            {
-                return self.accept_unwitnessed_pick(from_id, to_id, unresolved);
-            }
+            )
+            && self.is_receiver_compat(to_id, unresolved, &caller.language_id)
+            && self.is_instance_type_compatible(
+                unresolved,
+                to_id,
+                &caller.language_id,
+                context,
+                extends_by_from,
+            )
+        {
+            return self.accept_unwitnessed_pick(from_id, to_id, unresolved);
         }
 
         // Inheritance witness for bare calls inside a class body, only
@@ -271,16 +271,15 @@ impl ResolveStage {
             && self
                 .get_behavior(&caller.language_id)
                 .is_some_and(|b| b.implicit_this_dispatch())
-        {
-            if let Some(resolved) = self.resolve_inherited_member(
+            && let Some(resolved) = self.resolve_inherited_member(
                 from_id,
                 unresolved,
                 context,
                 &caller,
                 extends_by_from,
-            ) {
-                return Some(resolved);
-            }
+            )
+        {
+            return Some(resolved);
         }
 
         // For qualified static calls (`Type::method` / `Type.method`), the
@@ -602,12 +601,11 @@ impl ResolveStage {
         // Self-aliased receivers never consult bindings — the self-form arm
         // and alias vocabulary own them; a rebound `cls` (metaclass idiom)
         // must not trade a resolvable alias for a method-result guess.
-        if !behavior.self_receiver_aliases().contains(&receiver) {
-            if let Some(type_name) =
+        if !behavior.self_receiver_aliases().contains(&receiver)
+            && let Some(type_name) =
                 self.binding_type_at_call_site(unresolved, receiver, &caller, context)
-            {
-                return Some((type_name, caller));
-            }
+        {
+            return Some((type_name, caller));
         }
 
         let signature = caller.signature.as_deref()?;
@@ -1693,14 +1691,13 @@ impl ResolveStage {
         // or `Type.method`), filter to candidates whose containing type matches
         // the receiver. Skipped when `resolve_static_call` already applied the
         // same filter before delegating here.
-        if !static_pre_filtered && unresolved.kind == RelationKind::Calls {
-            if let Some(survivors) =
+        if !static_pre_filtered
+            && unresolved.kind == RelationKind::Calls
+            && let Some(survivors) =
                 self.filter_by_static_receiver(&filtered, unresolved, language_id)
-            {
-                if survivors.len() == 1 {
-                    return Some(survivors[0]);
-                }
-            }
+            && survivors.len() == 1
+        {
+            return Some(survivors[0]);
         }
         // Instance-call disambiguation via inferred receiver type: filter
         // candidates to those whose containing type matches. Single survivor
@@ -1925,10 +1922,10 @@ impl ResolveStage {
                 }
 
                 // Also check alias
-                if let Some(alias) = &import.alias {
-                    if alias == symbol_name {
-                        return true;
-                    }
+                if let Some(alias) = &import.alias
+                    && alias == symbol_name
+                {
+                    return true;
                 }
             }
             return false;
@@ -1942,10 +1939,10 @@ impl ResolveStage {
             }
 
             // Check alias
-            if let Some(alias) = &import.alias {
-                if alias == symbol_name {
-                    return true;
-                }
+            if let Some(alias) = &import.alias
+                && alias == symbol_name
+            {
+                return true;
             }
 
             // Check if import is from same file as symbol

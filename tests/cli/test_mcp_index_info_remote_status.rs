@@ -32,23 +32,23 @@ fn spawn_embedding_server(max_requests: usize, dimension: usize) -> String {
                 }
                 buffer.extend_from_slice(&chunk[..read]);
 
-                if header_end.is_none() {
-                    if let Some(end) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
-                        header_end = Some(end + 4);
-                        let headers = String::from_utf8_lossy(&buffer[..end + 4]);
-                        for line in headers.lines() {
-                            let lower = line.to_ascii_lowercase();
-                            if let Some(value) = lower.strip_prefix("content-length:") {
-                                content_length = value.trim().parse().expect("content length");
-                            }
+                if header_end.is_none()
+                    && let Some(end) = buffer.windows(4).position(|w| w == b"\r\n\r\n")
+                {
+                    header_end = Some(end + 4);
+                    let headers = String::from_utf8_lossy(&buffer[..end + 4]);
+                    for line in headers.lines() {
+                        let lower = line.to_ascii_lowercase();
+                        if let Some(value) = lower.strip_prefix("content-length:") {
+                            content_length = value.trim().parse().expect("content length");
                         }
                     }
                 }
 
-                if let Some(end) = header_end {
-                    if buffer.len() >= end + content_length {
-                        break;
-                    }
+                if let Some(end) = header_end
+                    && buffer.len() >= end + content_length
+                {
+                    break;
                 }
             }
 

@@ -189,10 +189,10 @@ impl DocumentIndex {
             return crate::parsing::paths::portable_join(path);
         }
         for base in &self.strip_bases {
-            if let Ok(rel) = path.strip_prefix(base) {
-                if let Some(portable) = crate::parsing::paths::portable_join(rel) {
-                    return Some(portable);
-                }
+            if let Ok(rel) = path.strip_prefix(base)
+                && let Some(portable) = crate::parsing::paths::portable_join(rel)
+            {
+                return Some(portable);
             }
         }
         // Unmatched absolutes render verbatim-free; the identity case

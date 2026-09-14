@@ -85,10 +85,10 @@ impl Language {
 
         // Try the registry first for registered languages
         let registry = super::get_registry();
-        if let Ok(registry) = registry.lock() {
-            if let Some(def) = registry.get_by_extension(&ext_lower) {
-                return Self::from_language_id(def.id());
-            }
+        if let Ok(registry) = registry.lock()
+            && let Some(def) = registry.get_by_extension(&ext_lower)
+        {
+            return Self::from_language_id(def.id());
         }
 
         // Fallback to hardcoded for languages not yet in registry

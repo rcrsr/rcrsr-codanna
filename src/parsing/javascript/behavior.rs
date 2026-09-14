@@ -171,25 +171,22 @@ impl LanguageBehavior for JavaScriptBehavior {
                     // Compute segments relative to the jsconfig's directory
                     if let Some(mut segments) =
                         crate::parsing::paths::relative_segments(file_path, &jsconfig_dir)
+                        && let Some(last) = segments.pop()
                     {
-                        if let Some(last) = segments.pop() {
-                            let stem = strip_extension(&last, extensions);
-                            segments.push(stem.to_string());
+                        let stem = strip_extension(&last, extensions);
+                        segments.push(stem.to_string());
 
-                            // index collapses to its directory (directory imports)
-                            while segments.len() > 1
-                                && segments.last().is_some_and(|s| s == "index")
-                            {
-                                segments.pop();
-                            }
-                            let result = segments.join(".");
-
-                            tracing::debug!(
-                                "[javascript] module_path_from_file file_path={file_path:?} -> module_path={result}"
-                            );
-
-                            return Some(result);
+                        // index collapses to its directory (directory imports)
+                        while segments.len() > 1 && segments.last().is_some_and(|s| s == "index") {
+                            segments.pop();
                         }
+                        let result = segments.join(".");
+
+                        tracing::debug!(
+                            "[javascript] module_path_from_file file_path={file_path:?} -> module_path={result}"
+                        );
+
+                        return Some(result);
                     }
                 }
             }
@@ -389,26 +386,26 @@ impl LanguageBehavior for JavaScriptBehavior {
             let mut suffix_matches: Vec<SymbolId> = Vec::new();
             if resolved_symbol.is_none() {
                 for id in cache.lookup_candidates(&local_name) {
-                    if let Some(symbol) = cache.get(id) {
-                        if let Some(module) = symbol.module_path.as_deref() {
-                            if module == target_module {
-                                resolved_symbol = Some(id);
-                                break;
-                            }
-                            if crate::indexing::pipeline::types::segment_suffix_match(
-                                module,
-                                &target_module,
-                            ) {
-                                suffix_matches.push(id);
-                            }
+                    if let Some(symbol) = cache.get(id)
+                        && let Some(module) = symbol.module_path.as_deref()
+                    {
+                        if module == target_module {
+                            resolved_symbol = Some(id);
+                            break;
+                        }
+                        if crate::indexing::pipeline::types::segment_suffix_match(
+                            module,
+                            &target_module,
+                        ) {
+                            suffix_matches.push(id);
                         }
                     }
                 }
             }
-            if resolved_symbol.is_none() {
-                if let [id] = suffix_matches.as_slice() {
-                    resolved_symbol = Some(*id);
-                }
+            if resolved_symbol.is_none()
+                && let [id] = suffix_matches.as_slice()
+            {
+                resolved_symbol = Some(*id);
             }
 
             // Determine origin
@@ -436,12 +433,12 @@ impl LanguageBehavior for JavaScriptBehavior {
 
         // Add local symbols from this file under their module identity
         for sym_id in cache.symbols_in_file(file_id) {
-            if let Some(symbol) = cache.get(sym_id) {
-                if self.is_resolvable_symbol(&symbol) {
-                    context.add_symbol(symbol.name.to_string(), symbol.id, ScopeLevel::Module);
-                    if let Some(module) = symbol.module_path.as_deref() {
-                        context.add_symbol(module.to_string(), symbol.id, ScopeLevel::Module);
-                    }
+            if let Some(symbol) = cache.get(sym_id)
+                && self.is_resolvable_symbol(&symbol)
+            {
+                context.add_symbol(symbol.name.to_string(), symbol.id, ScopeLevel::Module);
+                if let Some(module) = symbol.module_path.as_deref() {
+                    context.add_symbol(module.to_string(), symbol.id, ScopeLevel::Module);
                 }
             }
         }
@@ -553,13 +550,13 @@ impl LanguageBehavior for JavaScriptBehavior {
         }
 
         // Case 2: Complex matching with importing module context
-        if let Some(importing_mod) = importing_module {
-            if import_path.starts_with("./") || import_path.starts_with("../") {
-                let resolved = resolve_relative_path(import_path, importing_mod);
+        if let Some(importing_mod) = importing_module
+            && (import_path.starts_with("./") || import_path.starts_with("../"))
+        {
+            let resolved = resolve_relative_path(import_path, importing_mod);
 
-                if matches_with_index(&resolved, symbol_module_path) {
-                    return true;
-                }
+            if matches_with_index(&resolved, symbol_module_path) {
+                return true;
             }
         }
 

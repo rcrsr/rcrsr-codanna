@@ -126,12 +126,12 @@ impl RemoteEmbedder {
             )
         })?;
 
-        if let Some(expected) = expected_dim {
-            if actual_dim != expected {
-                return Err(SemanticSearchError::ModelInitError(format!(
-                    "Remote embedding dim mismatch: expected {expected}, server returned {actual_dim}"
-                )));
-            }
+        if let Some(expected) = expected_dim
+            && actual_dim != expected
+        {
+            return Err(SemanticSearchError::ModelInitError(format!(
+                "Remote embedding dim mismatch: expected {expected}, server returned {actual_dim}"
+            )));
         }
 
         tracing::info!(

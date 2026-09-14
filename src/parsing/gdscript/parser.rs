@@ -195,18 +195,18 @@ impl GdscriptParser {
             }
             "class_definition" => {
                 // Check for extends clause inside class
-                if let Some(extends_node) = node.child_by_field_name("extends") {
-                    if let Some(target) = extends_node.named_child(0) {
-                        let path = self.text_for_node(code, target).trim().to_string();
-                        if !path.is_empty() {
-                            imports.push(Import {
-                                file_id,
-                                path,
-                                alias: None,
-                                is_glob: false,
-                                is_type_only: false,
-                            });
-                        }
+                if let Some(extends_node) = node.child_by_field_name("extends")
+                    && let Some(target) = extends_node.named_child(0)
+                {
+                    let path = self.text_for_node(code, target).trim().to_string();
+                    if !path.is_empty() {
+                        imports.push(Import {
+                            file_id,
+                            path,
+                            alias: None,
+                            is_glob: false,
+                            is_type_only: false,
+                        });
                     }
                 }
             }
@@ -228,38 +228,36 @@ impl GdscriptParser {
             "call" => {
                 // Check if this is a preload() call
                 // Structure: call node has identifier child "preload" and arguments
-                if let Some(identifier_node) = node.child(0) {
-                    if identifier_node.kind() == "identifier" {
-                        let func_name = self.text_for_node(code, identifier_node).trim();
-                        if func_name == "preload" {
-                            // Find arguments node
-                            let mut cursor = node.walk();
-                            for child in node.children(&mut cursor) {
-                                if child.kind() == "arguments" {
-                                    // Get first string argument
-                                    if let Some(string_node) = child.named_child(0) {
-                                        let mut path = self
-                                            .text_for_node(code, string_node)
-                                            .trim()
-                                            .to_string();
-                                        // Remove quotes
-                                        if (path.starts_with('"') && path.ends_with('"'))
-                                            || (path.starts_with('\'') && path.ends_with('\''))
-                                        {
-                                            path = path[1..path.len() - 1].to_string();
-                                        }
-                                        if !path.is_empty() {
-                                            imports.push(Import {
-                                                file_id,
-                                                path,
-                                                alias: None,
-                                                is_glob: false,
-                                                is_type_only: false,
-                                            });
-                                        }
+                if let Some(identifier_node) = node.child(0)
+                    && identifier_node.kind() == "identifier"
+                {
+                    let func_name = self.text_for_node(code, identifier_node).trim();
+                    if func_name == "preload" {
+                        // Find arguments node
+                        let mut cursor = node.walk();
+                        for child in node.children(&mut cursor) {
+                            if child.kind() == "arguments" {
+                                // Get first string argument
+                                if let Some(string_node) = child.named_child(0) {
+                                    let mut path =
+                                        self.text_for_node(code, string_node).trim().to_string();
+                                    // Remove quotes
+                                    if (path.starts_with('"') && path.ends_with('"'))
+                                        || (path.starts_with('\'') && path.ends_with('\''))
+                                    {
+                                        path = path[1..path.len() - 1].to_string();
                                     }
-                                    break;
+                                    if !path.is_empty() {
+                                        imports.push(Import {
+                                            file_id,
+                                            path,
+                                            alias: None,
+                                            is_glob: false,
+                                            is_type_only: false,
+                                        });
+                                    }
                                 }
+                                break;
                             }
                         }
                     }
@@ -413,21 +411,22 @@ impl GdscriptParser {
                     } else {
                         ""
                     };
-                    if let Some(method_name) = method_name {
-                        if !method_name.is_empty() && !receiver_slice.is_empty() {
-                            let caller = current_function.unwrap_or(SCRIPT_SCOPE);
-                            let range = self.node_to_range(node);
-                            let is_static = receiver_slice
-                                .chars()
-                                .next()
-                                .is_some_and(|c| c.is_ascii_uppercase());
-                            let mut call = MethodCall::new(caller, method_name, range)
-                                .with_receiver(receiver_slice);
-                            if is_static {
-                                call = call.static_method();
-                            }
-                            calls.push(call);
+                    if let Some(method_name) = method_name
+                        && !method_name.is_empty()
+                        && !receiver_slice.is_empty()
+                    {
+                        let caller = current_function.unwrap_or(SCRIPT_SCOPE);
+                        let range = self.node_to_range(node);
+                        let is_static = receiver_slice
+                            .chars()
+                            .next()
+                            .is_some_and(|c| c.is_ascii_uppercase());
+                        let mut call = MethodCall::new(caller, method_name, range)
+                            .with_receiver(receiver_slice);
+                        if is_static {
+                            call = call.static_method();
                         }
+                        calls.push(call);
                     }
                 }
             }
@@ -509,13 +508,13 @@ impl GdscriptParser {
                 if let Some(name_node) = node.child_by_field_name("name") {
                     let class_name = self.text_for_node(code, name_node).trim();
 
-                    if let Some(extends_node) = node.child_by_field_name("extends") {
-                        if let Some(target) = extends_node.named_child(0) {
-                            let base =
-                                self.strip_string_quotes(self.text_for_node(code, target).trim());
-                            if !base.is_empty() {
-                                uses.push((class_name, base, self.node_to_range(extends_node)));
-                            }
+                    if let Some(extends_node) = node.child_by_field_name("extends")
+                        && let Some(target) = extends_node.named_child(0)
+                    {
+                        let base =
+                            self.strip_string_quotes(self.text_for_node(code, target).trim());
+                        if !base.is_empty() {
+                            uses.push((class_name, base, self.node_to_range(extends_node)));
                         }
                     }
 
@@ -589,11 +588,11 @@ impl GdscriptParser {
                         .find(|&child| child.kind() == "call")
                 });
 
-                if let (Some(binding), Some(value_node)) = (binding_name, value_node) {
-                    if let Some(path) = self.extract_preload_path(value_node, code) {
-                        let owner = current_function.unwrap_or(binding);
-                        uses.push((owner, path, self.node_to_range(value_node)));
-                    }
+                if let (Some(binding), Some(value_node)) = (binding_name, value_node)
+                    && let Some(path) = self.extract_preload_path(value_node, code)
+                {
+                    let owner = current_function.unwrap_or(binding);
+                    uses.push((owner, path, self.node_to_range(value_node)));
                 }
                 return;
             }
@@ -1023,12 +1022,12 @@ impl GdscriptParser {
                 if let Some(name_node) = node.child_by_field_name("name") {
                     let class_name = self.text_for_node(code, name_node).trim();
 
-                    if let Some(extends_node) = node.child_by_field_name("extends") {
-                        if let Some(target) = extends_node.named_child(0) {
-                            let base = self.text_for_node(code, target).trim().trim_matches('"');
-                            let range = self.node_to_range(extends_node);
-                            results.push((class_name, base, range));
-                        }
+                    if let Some(extends_node) = node.child_by_field_name("extends")
+                        && let Some(target) = extends_node.named_child(0)
+                    {
+                        let base = self.text_for_node(code, target).trim().trim_matches('"');
+                        let range = self.node_to_range(extends_node);
+                        results.push((class_name, base, range));
                     }
 
                     if let Some(body) = node.child_by_field_name("body") {
@@ -1072,15 +1071,15 @@ impl GdscriptParser {
 /// (`make_thing()`) is a factory whose return type lives in another
 /// signature; not evidence.
 fn binding_type_name<'a>(node: Node, code: &'a str) -> Option<&'a str> {
-    if let Some(ty) = node.child_by_field_name("type") {
-        if ty.kind() == "type" {
-            let mut cursor = ty.walk();
-            if let Some(ident) = ty
-                .named_children(&mut cursor)
-                .find(|c| c.kind() == "identifier")
-            {
-                return Some(&code[ident.byte_range()]);
-            }
+    if let Some(ty) = node.child_by_field_name("type")
+        && ty.kind() == "type"
+    {
+        let mut cursor = ty.walk();
+        if let Some(ident) = ty
+            .named_children(&mut cursor)
+            .find(|c| c.kind() == "identifier")
+        {
+            return Some(&code[ident.byte_range()]);
         }
     }
     let value = node.child_by_field_name("value")?;
@@ -1089,15 +1088,16 @@ fn binding_type_name<'a>(node: Node, code: &'a str) -> Option<&'a str> {
     }
     let mut cursor = value.walk();
     let children: Vec<Node> = value.named_children(&mut cursor).collect();
-    if let [head, call] = children.as_slice() {
-        if head.kind() == "identifier" && call.kind() == "attribute_call" {
-            let mut call_cursor = call.walk();
-            let callee = call
-                .named_children(&mut call_cursor)
-                .find(|c| c.kind() == "identifier")?;
-            if &code[callee.byte_range()] == "new" {
-                return Some(&code[head.byte_range()]);
-            }
+    if let [head, call] = children.as_slice()
+        && head.kind() == "identifier"
+        && call.kind() == "attribute_call"
+    {
+        let mut call_cursor = call.walk();
+        let callee = call
+            .named_children(&mut call_cursor)
+            .find(|c| c.kind() == "identifier")?;
+        if &code[callee.byte_range()] == "new" {
+            return Some(&code[head.byte_range()]);
         }
     }
     None
@@ -1108,19 +1108,19 @@ fn collect_variable_types<'a>(
     code: &'a str,
     bindings: &mut Vec<(&'a str, &'a str, Range)>,
 ) {
-    if node.kind() == "variable_statement" {
-        if let (Some(name), Some(ty)) = (
+    if node.kind() == "variable_statement"
+        && let (Some(name), Some(ty)) = (
             node.child_by_field_name("name"),
             binding_type_name(node, code),
-        ) {
-            let range = Range::new(
-                node.start_position().row as u32,
-                node.start_position().column as u16,
-                node.end_position().row as u32,
-                node.end_position().column as u16,
-            );
-            bindings.push((&code[name.byte_range()], ty, range));
-        }
+        )
+    {
+        let range = Range::new(
+            node.start_position().row as u32,
+            node.start_position().column as u16,
+            node.end_position().row as u32,
+            node.end_position().column as u16,
+        );
+        bindings.push((&code[name.byte_range()], ty, range));
     }
 
     let mut cursor = node.walk();

@@ -802,10 +802,10 @@ impl PipelineSymbolCache for SymbolLookupCache {
                 .next()
                 .or_else(|| import.path.rsplit('.').next())
                 .or_else(|| import.path.rsplit('/').next());
-            if last_segment == Some(name) {
-                if let Some(id) = self.find_by_import_path(&import.path, caller.language_id) {
-                    return ResolveResult::Found(id);
-                }
+            if last_segment == Some(name)
+                && let Some(id) = self.find_by_import_path(&import.path, caller.language_id)
+            {
+                return ResolveResult::Found(id);
             }
         }
 
@@ -925,18 +925,17 @@ impl SymbolLookupCache {
         let mut exact: Vec<SymbolId> = Vec::new();
         let mut suffix: Vec<SymbolId> = Vec::new();
         for id in self.lookup_candidates(name) {
-            if let Some(sym) = self.by_id.get(&id) {
-                if sym.language_id.as_ref() == Some(&language_id) {
-                    if let Some(ref module_path) = sym.module_path {
-                        let module_path: &str = module_path;
-                        if module_path == path || qualifier == Some(module_path) {
-                            exact.push(id);
-                        } else if segment_suffix_match(module_path, path)
-                            || qualifier.is_some_and(|q| segment_suffix_match(module_path, q))
-                        {
-                            suffix.push(id);
-                        }
-                    }
+            if let Some(sym) = self.by_id.get(&id)
+                && sym.language_id.as_ref() == Some(&language_id)
+                && let Some(ref module_path) = sym.module_path
+            {
+                let module_path: &str = module_path;
+                if module_path == path || qualifier == Some(module_path) {
+                    exact.push(id);
+                } else if segment_suffix_match(module_path, path)
+                    || qualifier.is_some_and(|q| segment_suffix_match(module_path, q))
+                {
+                    suffix.push(id);
                 }
             }
         }

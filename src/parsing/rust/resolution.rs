@@ -357,10 +357,10 @@ impl InheritanceResolver for RustTraitResolver {
         // 3. Check if type implements any traits that have this method
         if let Some(traits) = self.type_to_traits.get(type_name) {
             for (trait_name, _) in traits {
-                if let Some(methods) = self.trait_methods.get(trait_name) {
-                    if methods.iter().any(|m| m == method_name) {
-                        return Some(trait_name.clone());
-                    }
+                if let Some(methods) = self.trait_methods.get(trait_name)
+                    && methods.iter().any(|m| m == method_name)
+                {
+                    return Some(trait_name.clone());
                 }
             }
         }
@@ -471,10 +471,10 @@ impl RustTraitResolver {
             let mut matching_traits = Vec::new();
 
             for (trait_name, _) in traits {
-                if let Some(methods) = self.trait_methods.get(trait_name) {
-                    if methods.contains(&method_name.to_string()) {
-                        matching_traits.push(trait_name.as_str());
-                    }
+                if let Some(methods) = self.trait_methods.get(trait_name)
+                    && methods.contains(&method_name.to_string())
+                {
+                    matching_traits.push(trait_name.as_str());
                 }
             }
 

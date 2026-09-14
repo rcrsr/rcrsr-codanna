@@ -205,10 +205,10 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         let status_path = format!("/proc/{pid}/status");
         let became_zombie = loop {
-            if let Ok(contents) = std::fs::read_to_string(&status_path) {
-                if contents.lines().any(|line| line == "State:\tZ (zombie)") {
-                    break true;
-                }
+            if let Ok(contents) = std::fs::read_to_string(&status_path)
+                && contents.lines().any(|line| line == "State:\tZ (zombie)")
+            {
+                break true;
             }
             if Instant::now() >= deadline {
                 break false;

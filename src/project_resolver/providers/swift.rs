@@ -110,14 +110,14 @@ impl SwiftProvider {
         // .target(name: "MyLib", path: "CustomSources/MyLib")
         let mut found_custom_paths = false;
         for line in content.lines() {
-            if let Some(path_start) = line.find("path:") {
-                if let Some(quote_start) = line[path_start..].find('"') {
-                    let after_quote = &line[path_start + quote_start + 1..];
-                    if let Some(quote_end) = after_quote.find('"') {
-                        let custom_path = &after_quote[..quote_end];
-                        source_roots.push(project_dir.join(custom_path));
-                        found_custom_paths = true;
-                    }
+            if let Some(path_start) = line.find("path:")
+                && let Some(quote_start) = line[path_start..].find('"')
+            {
+                let after_quote = &line[path_start + quote_start + 1..];
+                if let Some(quote_end) = after_quote.find('"') {
+                    let custom_path = &after_quote[..quote_end];
+                    source_roots.push(project_dir.join(custom_path));
+                    found_custom_paths = true;
                 }
             }
         }

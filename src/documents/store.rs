@@ -1227,12 +1227,11 @@ impl DocumentStore {
         let mut chunk_ids = Vec::new();
         for (_score, doc_address) in top_docs {
             let doc: Document = searcher.doc(doc_address)?;
-            if let Some(id_value) = doc.get_first(self.schema.chunk_id) {
-                if let Some(id) = id_value.as_u64() {
-                    if let Some(chunk_id) = ChunkId::from_u32(id as u32) {
-                        chunk_ids.push(chunk_id);
-                    }
-                }
+            if let Some(id_value) = doc.get_first(self.schema.chunk_id)
+                && let Some(id) = id_value.as_u64()
+                && let Some(chunk_id) = ChunkId::from_u32(id as u32)
+            {
+                chunk_ids.push(chunk_id);
             }
         }
 
@@ -1252,11 +1251,11 @@ impl DocumentStore {
         let mut scored = Vec::new();
 
         for &chunk_id in candidates {
-            if let Some(vid) = VectorId::new(chunk_id.get()) {
-                if let Some(chunk_vec) = vector_storage.read_vector(vid) {
-                    let similarity = cosine_similarity(query_vec, &chunk_vec);
-                    scored.push((chunk_id, similarity));
-                }
+            if let Some(vid) = VectorId::new(chunk_id.get())
+                && let Some(chunk_vec) = vector_storage.read_vector(vid)
+            {
+                let similarity = cosine_similarity(query_vec, &chunk_vec);
+                scored.push((chunk_id, similarity));
             }
         }
 

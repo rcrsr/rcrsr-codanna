@@ -17,20 +17,21 @@ fn find_parameter_type(node: tree_sitter::Node, code: &str, var_name: &str) -> O
     if node.kind() == "parameter" {
         let mut cursor = node.walk();
         let named: Vec<_> = node.children_by_field_name("name", &mut cursor).collect();
-        if let [ident, ty] = named.as_slice() {
-            if ident.kind() == "simple_identifier" && &code[ident.byte_range()] == var_name {
-                let ty = match ty.kind() {
-                    "optional_type" => ty.child_by_field_name("wrapped")?,
-                    _ => *ty,
-                };
-                if ty.kind() == "user_type" {
-                    let mut type_cursor = ty.walk();
-                    return ty
-                        .named_children(&mut type_cursor)
-                        .filter(|part| part.kind() == "type_identifier")
-                        .last()
-                        .map(|part| code[part.byte_range()].to_string());
-                }
+        if let [ident, ty] = named.as_slice()
+            && ident.kind() == "simple_identifier"
+            && &code[ident.byte_range()] == var_name
+        {
+            let ty = match ty.kind() {
+                "optional_type" => ty.child_by_field_name("wrapped")?,
+                _ => *ty,
+            };
+            if ty.kind() == "user_type" {
+                let mut type_cursor = ty.walk();
+                return ty
+                    .named_children(&mut type_cursor)
+                    .filter(|part| part.kind() == "type_identifier")
+                    .last()
+                    .map(|part| code[part.byte_range()].to_string());
             }
         }
     }
@@ -87,14 +88,12 @@ impl LanguageBehavior for SwiftBehavior {
         // Do not overwrite it here - tree-sitter provides accurate visibility_modifier nodes
 
         // For file modules, use the last segment of the path as the name
-        if symbol.kind == SymbolKind::Module {
-            if let Some(path) = module_path {
-                if let Some(name) = path.rsplit('.').next() {
-                    if !name.is_empty() {
-                        symbol.name = compact_string(name);
-                    }
-                }
-            }
+        if symbol.kind == SymbolKind::Module
+            && let Some(path) = module_path
+            && let Some(name) = path.rsplit('.').next()
+            && !name.is_empty()
+        {
+            symbol.name = compact_string(name);
         }
     }
 
@@ -182,60 +181,55 @@ impl LanguageBehavior for SwiftBehavior {
         }
 
         // Try cached resolution first
-        let cached_result =
-            RULES_CACHE.with(|cache| {
-                let mut cache_ref = cache.borrow_mut();
+        let cached_result = RULES_CACHE.with(|cache| {
+            let mut cache_ref = cache.borrow_mut();
 
-                // Check if cache needs reload (>1 second old or empty)
-                let needs_reload = cache_ref
-                    .as_ref()
-                    .map(|(ts, _)| ts.elapsed() >= Duration::from_secs(1))
-                    .unwrap_or(true);
+            // Check if cache needs reload (>1 second old or empty)
+            let needs_reload = cache_ref
+                .as_ref()
+                .map(|(ts, _)| ts.elapsed() >= Duration::from_secs(1))
+                .unwrap_or(true);
 
-                // Load from disk if needed
-                if needs_reload {
-                    let persistence = ResolutionPersistence::new(std::path::Path::new(
-                        crate::init::local_dir_name(),
-                    ));
-                    if let Ok(index) = persistence.load("swift") {
-                        *cache_ref = Some((Instant::now(), index));
-                    } else {
-                        *cache_ref = None;
-                    }
+            // Load from disk if needed
+            if needs_reload {
+                let persistence =
+                    ResolutionPersistence::new(std::path::Path::new(crate::init::local_dir_name()));
+                if let Ok(index) = persistence.load("swift") {
+                    *cache_ref = Some((Instant::now(), index));
+                } else {
+                    *cache_ref = None;
                 }
+            }
 
-                // Get module path from cached rules
-                if let Some((_, ref index)) = *cache_ref {
-                    // Canonicalize file path for matching
-                    if let Ok(canon_file) = file_path.canonicalize() {
-                        // Find config that applies to this file
-                        if let Some(config_path) = index.get_config_for_file(&canon_file) {
-                            if let Some(rules) = index.rules.get(config_path) {
-                                // Extract module from file path using source roots
-                                for root_path in rules.paths.keys() {
-                                    let root = std::path::Path::new(root_path);
-                                    let canon_root =
-                                        root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+            // Get module path from cached rules
+            if let Some((_, ref index)) = *cache_ref {
+                // Canonicalize file path for matching
+                if let Ok(canon_file) = file_path.canonicalize() {
+                    // Find config that applies to this file
+                    if let Some(config_path) = index.get_config_for_file(&canon_file)
+                        && let Some(rules) = index.rules.get(config_path)
+                    {
+                        // Extract module from file path using source roots
+                        for root_path in rules.paths.keys() {
+                            let root = std::path::Path::new(root_path);
+                            let canon_root =
+                                root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
 
-                                    if let Some(mut segments) =
-                                        crate::parsing::paths::relative_segments(
-                                            &canon_file,
-                                            &canon_root,
-                                        )
-                                    {
-                                        // Package-grained: MyModule/Types/User.swift -> MyModule.Types
-                                        if segments.pop().is_some() {
-                                            return Some(segments.join("."));
-                                        }
-                                    }
+                            if let Some(mut segments) =
+                                crate::parsing::paths::relative_segments(&canon_file, &canon_root)
+                            {
+                                // Package-grained: MyModule/Types/User.swift -> MyModule.Types
+                                if segments.pop().is_some() {
+                                    return Some(segments.join("."));
                                 }
                             }
                         }
                     }
                 }
+            }
 
-                None
-            });
+            None
+        });
 
         // Return cached result if found
         if cached_result.is_some() {
@@ -356,14 +350,13 @@ impl LanguageBehavior for SwiftBehavior {
             let mut resolved_symbol: Option<crate::SymbolId> = None;
             let candidates = cache.lookup_candidates(&local_name);
             for id in candidates {
-                if let Some(symbol) = cache.get(id) {
-                    if let Some(module) = symbol.module_path.as_deref() {
-                        // Swift: import Foundation matches Foundation.* symbols
-                        if module == import.path || module.starts_with(&format!("{}.", import.path))
-                        {
-                            resolved_symbol = Some(id);
-                            break;
-                        }
+                if let Some(symbol) = cache.get(id)
+                    && let Some(module) = symbol.module_path.as_deref()
+                {
+                    // Swift: import Foundation matches Foundation.* symbols
+                    if module == import.path || module.starts_with(&format!("{}.", import.path)) {
+                        resolved_symbol = Some(id);
+                        break;
                     }
                 }
             }
@@ -393,12 +386,12 @@ impl LanguageBehavior for SwiftBehavior {
 
         // Add local symbols from this file under their module identity
         for sym_id in cache.symbols_in_file(file_id) {
-            if let Some(symbol) = cache.get(sym_id) {
-                if self.is_resolvable_symbol(&symbol) {
-                    context.add_symbol(symbol.name.to_string(), symbol.id, ScopeLevel::Module);
-                    if let Some(module) = symbol.module_path.as_deref() {
-                        context.add_symbol(module.to_string(), symbol.id, ScopeLevel::Global);
-                    }
+            if let Some(symbol) = cache.get(sym_id)
+                && self.is_resolvable_symbol(&symbol)
+            {
+                context.add_symbol(symbol.name.to_string(), symbol.id, ScopeLevel::Module);
+                if let Some(module) = symbol.module_path.as_deref() {
+                    context.add_symbol(module.to_string(), symbol.id, ScopeLevel::Global);
                 }
             }
         }

@@ -234,10 +234,9 @@ fn is_member_of(sym: &Symbol, class: &str) -> bool {
     if let Some(crate::symbol::ScopeContext::ClassMember {
         class_name: Some(c),
     }) = &sym.scope_context
+        && (c.as_ref() == class || c.rsplit('.').next() == Some(class))
     {
-        if c.as_ref() == class || c.rsplit('.').next() == Some(class) {
-            return true;
-        }
+        return true;
     }
     matches!(
         sym.kind,

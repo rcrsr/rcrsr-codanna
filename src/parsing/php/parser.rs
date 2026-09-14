@@ -370,32 +370,31 @@ impl PhpParser {
                 // Check if we're at global scope (not inside a class)
                 if self.is_global_scope(node) {
                     // The first child is the name, third child is the value
-                    if let Some(name_node) = node.child(0) {
-                        if name_node.kind() == "name" {
-                            let name = &code[name_node.byte_range()];
-                            let id = counter.next_id();
+                    if let Some(name_node) = node.child(0)
+                        && name_node.kind() == "name"
+                    {
+                        let name = &code[name_node.byte_range()];
+                        let id = counter.next_id();
 
-                            let mut symbol = Symbol::new(
-                                id,
-                                name,
-                                SymbolKind::Constant,
-                                file_id,
-                                self.node_to_range(node),
-                            );
+                        let mut symbol = Symbol::new(
+                            id,
+                            name,
+                            SymbolKind::Constant,
+                            file_id,
+                            self.node_to_range(node),
+                        );
 
-                            // Set scope context
-                            symbol.scope_context = Some(self.context.current_scope_context());
+                        // Set scope context
+                        symbol.scope_context = Some(self.context.current_scope_context());
 
-                            // Try to get the value (third child after name and =)
-                            if let Some(value_node) = node.child(2) {
-                                let value = &code[value_node.byte_range()];
-                                symbol.signature = Some(format!("const {name} = {value}").into());
-                            }
-
-                            symbol.doc_comment =
-                                self.extract_doc_comment(&node, code).map(Into::into);
-                            symbols.push(symbol);
+                        // Try to get the value (third child after name and =)
+                        if let Some(value_node) = node.child(2) {
+                            let value = &code[value_node.byte_range()];
+                            symbol.signature = Some(format!("const {name} = {value}").into());
                         }
+
+                        symbol.doc_comment = self.extract_doc_comment(&node, code).map(Into::into);
+                        symbols.push(symbol);
                     }
                 } else {
                     // This is a class constant, handled elsewhere
@@ -677,26 +676,26 @@ impl PhpParser {
         // Find the property element within the declaration
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            if child.kind() == "property_element" {
-                if let Some(name_node) = child.child_by_field_name("name") {
-                    let name = &code[name_node.byte_range()];
-                    // Remove $ prefix from property name if present
-                    let clean_name = name.strip_prefix('$').unwrap_or(name);
+            if child.kind() == "property_element"
+                && let Some(name_node) = child.child_by_field_name("name")
+            {
+                let name = &code[name_node.byte_range()];
+                // Remove $ prefix from property name if present
+                let clean_name = name.strip_prefix('$').unwrap_or(name);
 
-                    let id = counter.next_id();
+                let id = counter.next_id();
 
-                    let mut symbol = Symbol::new(
-                        id,
-                        clean_name,
-                        SymbolKind::Field,
-                        file_id,
-                        self.node_to_range(node),
-                    );
-                    // Set scope context
-                    symbol.scope_context = Some(self.context.current_scope_context());
-                    symbol.doc_comment = self.extract_doc_comment(&node, code).map(Into::into);
-                    return Some(symbol);
-                }
+                let mut symbol = Symbol::new(
+                    id,
+                    clean_name,
+                    SymbolKind::Field,
+                    file_id,
+                    self.node_to_range(node),
+                );
+                // Set scope context
+                symbol.scope_context = Some(self.context.current_scope_context());
+                symbol.doc_comment = self.extract_doc_comment(&node, code).map(Into::into);
+                return Some(symbol);
             }
         }
         None
@@ -713,22 +712,22 @@ impl PhpParser {
         // Find the const element within the declaration
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            if child.kind() == "const_element" {
-                if let Some(name_node) = child.child_by_field_name("name") {
-                    let name = &code[name_node.byte_range()];
+            if child.kind() == "const_element"
+                && let Some(name_node) = child.child_by_field_name("name")
+            {
+                let name = &code[name_node.byte_range()];
 
-                    let id = counter.next_id();
+                let id = counter.next_id();
 
-                    let mut symbol = Symbol::new(
-                        id,
-                        name,
-                        SymbolKind::Constant,
-                        file_id,
-                        self.node_to_range(node),
-                    );
-                    symbol.doc_comment = self.extract_doc_comment(&node, code).map(Into::into);
-                    return Some(symbol);
-                }
+                let mut symbol = Symbol::new(
+                    id,
+                    name,
+                    SymbolKind::Constant,
+                    file_id,
+                    self.node_to_range(node),
+                );
+                symbol.doc_comment = self.extract_doc_comment(&node, code).map(Into::into);
+                return Some(symbol);
             }
         }
         None
@@ -795,18 +794,18 @@ impl PhpParser {
         let mut value_str = String::new();
 
         for child in arguments.children(&mut cursor) {
-            if child.kind() == "argument" {
-                if let Some(arg_child) = child.child(0) {
-                    let arg_text = &code[arg_child.byte_range()];
-                    if arg_count == 0 {
-                        // First argument is the constant name (remove quotes)
-                        name_str = arg_text.trim_matches('"').trim_matches('\'').to_string();
-                    } else if arg_count == 1 {
-                        // Second argument is the value
-                        value_str = arg_text.to_string();
-                    }
-                    arg_count += 1;
+            if child.kind() == "argument"
+                && let Some(arg_child) = child.child(0)
+            {
+                let arg_text = &code[arg_child.byte_range()];
+                if arg_count == 0 {
+                    // First argument is the constant name (remove quotes)
+                    name_str = arg_text.trim_matches('"').trim_matches('\'').to_string();
+                } else if arg_count == 1 {
+                    // Second argument is the value
+                    value_str = arg_text.to_string();
                 }
+                arg_count += 1;
             }
         }
 
@@ -904,33 +903,33 @@ impl LanguageParser for PhpParser {
 
     fn extract_doc_comment(&self, node: &Node, code: &str) -> Option<String> {
         // Look for a comment node immediately before this node
-        if let Some(prev) = node.prev_sibling() {
-            if prev.kind() == "comment" {
-                let comment_text = &code[prev.byte_range()];
-                // PHP doc comments start with /** or //
-                if comment_text.starts_with("/**") {
-                    // Remove /** and */ and clean up
-                    let cleaned = comment_text
-                        .strip_prefix("/**")
-                        .and_then(|s| s.strip_suffix("*/"))
-                        .map(|s| {
-                            s.lines()
-                                .map(|line| line.trim().trim_start_matches('*').trim())
-                                .filter(|line| !line.is_empty())
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        });
-                    return cleaned;
-                } else if comment_text.starts_with("//") {
-                    // Single line comment
-                    return Some(
-                        comment_text
-                            .strip_prefix("//")
-                            .unwrap_or("")
-                            .trim()
-                            .to_string(),
-                    );
-                }
+        if let Some(prev) = node.prev_sibling()
+            && prev.kind() == "comment"
+        {
+            let comment_text = &code[prev.byte_range()];
+            // PHP doc comments start with /** or //
+            if comment_text.starts_with("/**") {
+                // Remove /** and */ and clean up
+                let cleaned = comment_text
+                    .strip_prefix("/**")
+                    .and_then(|s| s.strip_suffix("*/"))
+                    .map(|s| {
+                        s.lines()
+                            .map(|line| line.trim().trim_start_matches('*').trim())
+                            .filter(|line| !line.is_empty())
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    });
+                return cleaned;
+            } else if comment_text.starts_with("//") {
+                // Single line comment
+                return Some(
+                    comment_text
+                        .strip_prefix("//")
+                        .unwrap_or("")
+                        .trim()
+                        .to_string(),
+                );
             }
         }
         None
@@ -1185,20 +1184,20 @@ impl PhpParser {
         //   class C extends B          ⇒ `base_clause`            (extract_extends_from_node)
         //   class C implements I, J    ⇒ `class_interface_clause` (here)
         // Enums implement interfaces through the same clause.
-        if matches!(node.kind(), "class_declaration" | "enum_declaration") {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let class_name = &code[name_node.byte_range()];
+        if matches!(node.kind(), "class_declaration" | "enum_declaration")
+            && let Some(name_node) = node.child_by_field_name("name")
+        {
+            let class_name = &code[name_node.byte_range()];
 
-                let mut cursor = node.walk();
-                for child in node.children(&mut cursor) {
-                    if child.kind() == "class_interface_clause" {
-                        let mut iface_cursor = child.walk();
-                        for iface_child in child.children(&mut iface_cursor) {
-                            if iface_child.kind() == "name" {
-                                let interface_name = &code[iface_child.byte_range()];
-                                let range = self.node_to_range(iface_child);
-                                implementations.push((class_name, interface_name, range));
-                            }
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() == "class_interface_clause" {
+                    let mut iface_cursor = child.walk();
+                    for iface_child in child.children(&mut iface_cursor) {
+                        if iface_child.kind() == "name" {
+                            let interface_name = &code[iface_child.byte_range()];
+                            let range = self.node_to_range(iface_child);
+                            implementations.push((class_name, interface_name, range));
                         }
                     }
                 }
@@ -1219,20 +1218,20 @@ impl PhpParser {
     ) {
         // PHP allows `extends` on class_declaration (single parent) and on
         // interface_declaration (multiple parents). Both use `base_clause`.
-        if matches!(node.kind(), "class_declaration" | "interface_declaration") {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let derived = &code[name_node.byte_range()];
+        if matches!(node.kind(), "class_declaration" | "interface_declaration")
+            && let Some(name_node) = node.child_by_field_name("name")
+        {
+            let derived = &code[name_node.byte_range()];
 
-                let mut cursor = node.walk();
-                for child in node.children(&mut cursor) {
-                    if child.kind() == "base_clause" {
-                        let mut base_cursor = child.walk();
-                        for base_child in child.children(&mut base_cursor) {
-                            if base_child.kind() == "name" {
-                                let base_name = &code[base_child.byte_range()];
-                                let range = self.node_to_range(base_child);
-                                extends.push((derived, base_name, range));
-                            }
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() == "base_clause" {
+                    let mut base_cursor = child.walk();
+                    for base_child in child.children(&mut base_cursor) {
+                        if base_child.kind() == "name" {
+                            let base_name = &code[base_child.byte_range()];
+                            let range = self.node_to_range(base_child);
+                            extends.push((derived, base_name, range));
                         }
                     }
                 }
@@ -1314,14 +1313,13 @@ impl PhpParser {
                             let mut decl_cursor = child.walk();
                             for decl_child in child.children(&mut decl_cursor) {
                                 // Cases are members of their enum alongside methods.
-                                if matches!(decl_child.kind(), "method_declaration" | "enum_case") {
-                                    if let Some(member_name_node) =
+                                if matches!(decl_child.kind(), "method_declaration" | "enum_case")
+                                    && let Some(member_name_node) =
                                         decl_child.child_by_field_name("name")
-                                    {
-                                        let member_name = &code[member_name_node.byte_range()];
-                                        let range = self.node_to_range(member_name_node);
-                                        defines.push((type_name, member_name, range));
-                                    }
+                                {
+                                    let member_name = &code[member_name_node.byte_range()];
+                                    let range = self.node_to_range(member_name_node);
+                                    defines.push((type_name, member_name, range));
                                 }
                             }
                         }
@@ -1385,22 +1383,20 @@ impl PhpParser {
                 | "require_once_expression"
                 | "include_expression"
                 | "include_once_expression"
-        ) {
-            if let Some(argument) = node.child(1) {
-                if argument.kind() == "string" {
-                    let path = code[argument.byte_range()]
-                        .trim_matches('"')
-                        .trim_matches('\'')
-                        .to_string();
-                    imports.push(Import {
-                        path,
-                        alias: None,
-                        is_glob: false,
-                        file_id,
-                        is_type_only: false,
-                    });
-                }
-            }
+        ) && let Some(argument) = node.child(1)
+            && argument.kind() == "string"
+        {
+            let path = code[argument.byte_range()]
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_string();
+            imports.push(Import {
+                path,
+                alias: None,
+                is_glob: false,
+                file_id,
+                is_type_only: false,
+            });
         }
 
         let mut cursor = node.walk();
@@ -1503,19 +1499,17 @@ impl PhpParser {
         // `$x = new Foo();` — the most direct receiver-typing idiom in php.
         // Only a constructor right-hand side carries a type without full
         // inference; anything else stays unbound rather than guessed.
-        if node.kind() == "assignment_expression" {
-            if let (Some(left), Some(right)) = (
+        if node.kind() == "assignment_expression"
+            && let (Some(left), Some(right)) = (
                 node.child_by_field_name("left"),
                 node.child_by_field_name("right"),
-            ) {
-                if left.kind() == "variable_name"
-                    && right.kind() == "object_creation_expression"
-                    && let Some(class) = Self::constructed_class_name(right, code)
-                {
-                    let range = self.node_to_range(node);
-                    variable_types.push((&code[left.byte_range()], class, range));
-                }
-            }
+            )
+            && left.kind() == "variable_name"
+            && right.kind() == "object_creation_expression"
+            && let Some(class) = Self::constructed_class_name(right, code)
+        {
+            let range = self.node_to_range(node);
+            variable_types.push((&code[left.byte_range()], class, range));
         }
 
         let mut cursor = node.walk();

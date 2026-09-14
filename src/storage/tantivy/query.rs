@@ -659,12 +659,12 @@ impl DocumentIndex {
     /// Get next file ID
     pub fn get_next_file_id(&self) -> StorageResult<u32> {
         // During batch operations, use and increment the pending counter
-        if let Ok(mut pending_guard) = self.pending_file_counter.lock() {
-            if let Some(ref mut counter) = *pending_guard {
-                let next_id = *counter;
-                *counter += 1;
-                return Ok(next_id);
-            }
+        if let Ok(mut pending_guard) = self.pending_file_counter.lock()
+            && let Some(ref mut counter) = *pending_guard
+        {
+            let next_id = *counter;
+            *counter += 1;
+            return Ok(next_id);
         }
 
         // Otherwise, query the committed metadata
@@ -675,12 +675,12 @@ impl DocumentIndex {
     /// Get next symbol ID
     pub fn get_next_symbol_id(&self) -> StorageResult<u32> {
         // During batch operations, use and increment the pending counter
-        if let Ok(mut pending_guard) = self.pending_symbol_counter.lock() {
-            if let Some(ref mut counter) = *pending_guard {
-                let next_id = *counter;
-                *counter += 1;
-                return Ok(next_id);
-            }
+        if let Ok(mut pending_guard) = self.pending_symbol_counter.lock()
+            && let Some(ref mut counter) = *pending_guard
+        {
+            let next_id = *counter;
+            *counter += 1;
+            return Ok(next_id);
         }
 
         // Otherwise, query the committed metadata
@@ -745,10 +745,10 @@ impl DocumentIndex {
             let doc: Document = searcher.doc(doc_address)?;
 
             // Extract file_path field
-            if let Some(path_value) = doc.get_first(self.schema.file_path) {
-                if let Some(path_str) = path_value.as_str() {
-                    paths.push(PathBuf::from(path_str));
-                }
+            if let Some(path_value) = doc.get_first(self.schema.file_path)
+                && let Some(path_str) = path_value.as_str()
+            {
+                paths.push(PathBuf::from(path_str));
             }
         }
 

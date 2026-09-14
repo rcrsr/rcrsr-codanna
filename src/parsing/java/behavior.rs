@@ -244,10 +244,11 @@ impl LanguageBehavior for JavaBehavior {
         }
 
         // Same package: symbols in same package don't need imports
-        if let Some(current_pkg) = importing_module {
-            if !current_pkg.is_empty() && current_pkg == symbol_module_path {
-                return true;
-            }
+        if let Some(current_pkg) = importing_module
+            && !current_pkg.is_empty()
+            && current_pkg == symbol_module_path
+        {
+            return true;
         }
 
         false
@@ -413,13 +414,12 @@ impl LanguageBehavior for JavaBehavior {
             let mut resolved_symbol: Option<crate::SymbolId> = None;
             let candidates = cache.lookup_candidates(&local_name);
             for id in candidates {
-                if let Some(symbol) = cache.get(id) {
-                    if let Some(module) = symbol.module_path.as_deref() {
-                        if module == target_module {
-                            resolved_symbol = Some(id);
-                            break;
-                        }
-                    }
+                if let Some(symbol) = cache.get(id)
+                    && let Some(module) = symbol.module_path.as_deref()
+                    && module == target_module
+                {
+                    resolved_symbol = Some(id);
+                    break;
                 }
             }
 
@@ -448,12 +448,12 @@ impl LanguageBehavior for JavaBehavior {
 
         // Add local symbols from this file under their module identity
         for sym_id in cache.symbols_in_file(file_id) {
-            if let Some(symbol) = cache.get(sym_id) {
-                if self.is_resolvable_symbol(&symbol) {
-                    context.add_symbol(symbol.name.to_string(), symbol.id, ScopeLevel::Module);
-                    if let Some(module) = symbol.module_path.as_deref() {
-                        context.add_symbol(module.to_string(), symbol.id, ScopeLevel::Global);
-                    }
+            if let Some(symbol) = cache.get(sym_id)
+                && self.is_resolvable_symbol(&symbol)
+            {
+                context.add_symbol(symbol.name.to_string(), symbol.id, ScopeLevel::Module);
+                if let Some(module) = symbol.module_path.as_deref() {
+                    context.add_symbol(module.to_string(), symbol.id, ScopeLevel::Global);
                 }
             }
         }
@@ -461,10 +461,10 @@ impl LanguageBehavior for JavaBehavior {
         // Same-package symbols: symbols in the same module get Package scope
         if let Some(ref current_pkg) = importing_module {
             for sym_id in cache.symbols_in_file(file_id) {
-                if let Some(symbol) = cache.get(sym_id) {
-                    if symbol.module_path.as_deref() == Some(current_pkg.as_str()) {
-                        context.add_symbol(symbol.name.to_string(), symbol.id, ScopeLevel::Package);
-                    }
+                if let Some(symbol) = cache.get(sym_id)
+                    && symbol.module_path.as_deref() == Some(current_pkg.as_str())
+                {
+                    context.add_symbol(symbol.name.to_string(), symbol.id, ScopeLevel::Package);
                 }
             }
         }
@@ -594,21 +594,20 @@ impl JavaBehavior {
         // Wildcard imports: import com.example.*
         if let Some(base) = import_path.strip_suffix(".*") {
             // Check if symbol is in this package
-            if let Some(stripped) = symbol_full_path.strip_prefix(base) {
-                if let Some(remainder) = stripped.strip_prefix('.') {
-                    // Only match direct children (no more dots)
-                    return !remainder.contains('.');
-                }
+            if let Some(stripped) = symbol_full_path.strip_prefix(base)
+                && let Some(remainder) = stripped.strip_prefix('.')
+            {
+                // Only match direct children (no more dots)
+                return !remainder.contains('.');
             }
         }
 
         // Same package: no import needed if in same package
-        if let Some(current_pkg) = current_package {
-            if let Some((symbol_pkg, _)) = symbol_full_path.rsplit_once('.') {
-                if current_pkg == symbol_pkg {
-                    return true;
-                }
-            }
+        if let Some(current_pkg) = current_package
+            && let Some((symbol_pkg, _)) = symbol_full_path.rsplit_once('.')
+            && current_pkg == symbol_pkg
+        {
+            return true;
         }
 
         false
@@ -631,17 +630,17 @@ impl JavaBehavior {
         }
 
         // Wildcard match
-        if let Some(base) = import_path.strip_suffix(".*") {
-            if module_path == base {
-                return true;
-            }
+        if let Some(base) = import_path.strip_suffix(".*")
+            && module_path == base
+        {
+            return true;
         }
 
         // Same package
-        if let Some(current_pkg) = current_package {
-            if module_path == current_pkg {
-                return true;
-            }
+        if let Some(current_pkg) = current_package
+            && module_path == current_pkg
+        {
+            return true;
         }
 
         false
@@ -788,10 +787,10 @@ impl JavaBehavior {
                 }
 
                 // Cross-package: check inheritance if context available
-                if let Some(accessing) = accessing_class {
-                    if let Some(containing) = self.get_containing_class(symbol) {
-                        return inheritance.is_subtype(accessing, &containing);
-                    }
+                if let Some(accessing) = accessing_class
+                    && let Some(containing) = self.get_containing_class(symbol)
+                {
+                    return inheritance.is_subtype(accessing, &containing);
                 }
 
                 // No context for inheritance check: be permissive

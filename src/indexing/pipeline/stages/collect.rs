@@ -267,14 +267,14 @@ impl CollectStage {
                 }
 
                 // Send to EMBED channel (if enabled) and report total
-                if let Some(ref tx) = embed_sender {
-                    if !embed_batch.is_empty() {
-                        // Report candidate count for progress display
-                        if let Some(ref callback) = embed_total_callback {
-                            callback(batch_candidates as u64);
-                        }
-                        let _ = tx.send(embed_batch);
+                if let Some(ref tx) = embed_sender
+                    && !embed_batch.is_empty()
+                {
+                    // Report candidate count for progress display
+                    if let Some(ref callback) = embed_total_callback {
+                        callback(batch_candidates as u64);
                     }
+                    let _ = tx.send(embed_batch);
                 }
 
                 output_wait += send_start.elapsed();
@@ -289,14 +289,14 @@ impl CollectStage {
             let embed_batch = state.take_embed_batch();
             let batch_candidates = embed_batch.len() as u32;
             total_embed_candidates += batch_candidates;
-            if let Some(ref tx) = embed_sender {
-                if !embed_batch.is_empty() {
-                    // Report candidate count for progress display
-                    if let Some(ref callback) = embed_total_callback {
-                        callback(batch_candidates as u64);
-                    }
-                    let _ = tx.send(embed_batch);
+            if let Some(ref tx) = embed_sender
+                && !embed_batch.is_empty()
+            {
+                // Report candidate count for progress display
+                if let Some(ref callback) = embed_total_callback {
+                    callback(batch_candidates as u64);
                 }
+                let _ = tx.send(embed_batch);
             }
 
             output_wait += send_start.elapsed();

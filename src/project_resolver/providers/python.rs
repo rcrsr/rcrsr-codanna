@@ -193,80 +193,78 @@ impl PythonProvider {
         let mut info = self.extract_project_metadata(toml_value);
         let mut found_config = false;
 
-        if let Some(tool) = toml_value.get("tool") {
-            if let Some(setuptools) = tool.get("setuptools") {
-                // Check packages.find.where and include
-                if let Some(packages) = setuptools.get("packages") {
-                    if let Some(find) = packages.get("find") {
-                        // Extract source roots from "where"
-                        let source_roots: Vec<PathBuf> = if let Some(where_dirs) = find.get("where")
-                        {
-                            where_dirs
-                                .as_array()
-                                .map(|dirs| {
-                                    dirs.iter()
-                                        .filter_map(|d| d.as_str())
-                                        .map(|s| project_dir.join(s))
-                                        .collect()
-                                })
-                                .unwrap_or_default()
-                        } else {
-                            // Default: project root
-                            vec![project_dir.to_path_buf()]
-                        };
+        if let Some(tool) = toml_value.get("tool")
+            && let Some(setuptools) = tool.get("setuptools")
+        {
+            // Check packages.find.where and include
+            if let Some(packages) = setuptools.get("packages")
+                && let Some(find) = packages.get("find")
+            {
+                // Extract source roots from "where"
+                let source_roots: Vec<PathBuf> = if let Some(where_dirs) = find.get("where") {
+                    where_dirs
+                        .as_array()
+                        .map(|dirs| {
+                            dirs.iter()
+                                .filter_map(|d| d.as_str())
+                                .map(|s| project_dir.join(s))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                } else {
+                    // Default: project root
+                    vec![project_dir.to_path_buf()]
+                };
 
-                        // Extract import names from "include" patterns
-                        let import_names: Vec<String> = if let Some(include) = find.get("include") {
-                            include
-                                .as_array()
-                                .map(|patterns| {
-                                    patterns
-                                        .iter()
-                                        .filter_map(|p| p.as_str())
-                                        .map(|s| self.extract_package_from_pattern(s))
-                                        .collect()
-                                })
-                                .unwrap_or_default()
-                        } else {
-                            // No explicit include - use normalized distribution name
+                // Extract import names from "include" patterns
+                let import_names: Vec<String> = if let Some(include) = find.get("include") {
+                    include
+                        .as_array()
+                        .map(|patterns| {
+                            patterns
+                                .iter()
+                                .filter_map(|p| p.as_str())
+                                .map(|s| self.extract_package_from_pattern(s))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                } else {
+                    // No explicit include - use normalized distribution name
+                    info.distribution_name
+                        .as_ref()
+                        .map(|n| vec![n.replace('-', "_")])
+                        .unwrap_or_default()
+                };
+
+                for root in source_roots {
+                    info.packages.insert(root, import_names.clone());
+                    found_config = true;
+                }
+            }
+
+            // Check package-dir mapping (legacy)
+            if !found_config
+                && let Some(package_dir) = setuptools.get("package-dir")
+                && let Some(table) = package_dir.as_table()
+            {
+                for (pkg, dir) in table {
+                    if let Some(dir_str) = dir.as_str() {
+                        let source_dir = project_dir.join(dir_str);
+                        let import_name = if pkg.is_empty() {
+                            // "" = "src" means root packages in src/
                             info.distribution_name
                                 .as_ref()
-                                .map(|n| vec![n.replace('-', "_")])
+                                .map(|n| n.replace('-', "_"))
                                 .unwrap_or_default()
+                        } else {
+                            pkg.clone()
                         };
 
-                        for root in source_roots {
-                            info.packages.insert(root, import_names.clone());
-                            found_config = true;
-                        }
-                    }
-                }
-
-                // Check package-dir mapping (legacy)
-                if !found_config {
-                    if let Some(package_dir) = setuptools.get("package-dir") {
-                        if let Some(table) = package_dir.as_table() {
-                            for (pkg, dir) in table {
-                                if let Some(dir_str) = dir.as_str() {
-                                    let source_dir = project_dir.join(dir_str);
-                                    let import_name = if pkg.is_empty() {
-                                        // "" = "src" means root packages in src/
-                                        info.distribution_name
-                                            .as_ref()
-                                            .map(|n| n.replace('-', "_"))
-                                            .unwrap_or_default()
-                                    } else {
-                                        pkg.clone()
-                                    };
-
-                                    info.packages
-                                        .entry(source_dir)
-                                        .or_default()
-                                        .push(import_name);
-                                    found_config = true;
-                                }
-                            }
-                        }
+                        info.packages
+                            .entry(source_dir)
+                            .or_default()
+                            .push(import_name);
+                        found_config = true;
                     }
                 }
             }
@@ -305,29 +303,29 @@ impl PythonProvider {
         let mut info = self.extract_project_metadata(toml_value);
         let mut found_config = false;
 
-        if let Some(tool) = toml_value.get("tool") {
-            if let Some(poetry) = tool.get("poetry") {
-                // Check packages array
-                if let Some(packages) = poetry.get("packages") {
-                    if let Some(pkg_array) = packages.as_array() {
-                        for pkg in pkg_array {
-                            // Each package is { include = "name", from = "dir" }
-                            let import_name = pkg
-                                .get("include")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string());
+        if let Some(tool) = toml_value.get("tool")
+            && let Some(poetry) = tool.get("poetry")
+        {
+            // Check packages array
+            if let Some(packages) = poetry.get("packages")
+                && let Some(pkg_array) = packages.as_array()
+            {
+                for pkg in pkg_array {
+                    // Each package is { include = "name", from = "dir" }
+                    let import_name = pkg
+                        .get("include")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
 
-                            let source_root = pkg
-                                .get("from")
-                                .and_then(|v| v.as_str())
-                                .map(|s| project_dir.join(s))
-                                .unwrap_or_else(|| project_dir.to_path_buf());
+                    let source_root = pkg
+                        .get("from")
+                        .and_then(|v| v.as_str())
+                        .map(|s| project_dir.join(s))
+                        .unwrap_or_else(|| project_dir.to_path_buf());
 
-                            if let Some(name) = import_name {
-                                info.packages.entry(source_root).or_default().push(name);
-                                found_config = true;
-                            }
-                        }
+                    if let Some(name) = import_name {
+                        info.packages.entry(source_root).or_default().push(name);
+                        found_config = true;
                     }
                 }
             }
@@ -357,74 +355,65 @@ impl PythonProvider {
         let mut info = self.extract_project_metadata(toml_value);
         let mut found_config = false;
 
-        if let Some(tool) = toml_value.get("tool") {
-            if let Some(hatch) = tool.get("hatch") {
-                if let Some(build) = hatch.get("build") {
-                    if let Some(targets) = build.get("targets") {
-                        if let Some(wheel) = targets.get("wheel") {
-                            // Pattern 1: Explicit packages array (e.g., packages = ["src/mypackage"])
-                            if let Some(packages) = wheel.get("packages") {
-                                if let Some(pkg_array) = packages.as_array() {
-                                    for pkg in pkg_array {
-                                        if let Some(pkg_path) = pkg.as_str() {
-                                            // Package path format: "src/mypackage"
-                                            let (source_root, import_name) =
-                                                self.parse_hatch_package_path(pkg_path);
-                                            let full_path = project_dir.join(source_root);
+        if let Some(tool) = toml_value.get("tool")
+            && let Some(hatch) = tool.get("hatch")
+            && let Some(build) = hatch.get("build")
+            && let Some(targets) = build.get("targets")
+            && let Some(wheel) = targets.get("wheel")
+        {
+            // Pattern 1: Explicit packages array (e.g., packages = ["src/mypackage"])
+            if let Some(packages) = wheel.get("packages")
+                && let Some(pkg_array) = packages.as_array()
+            {
+                for pkg in pkg_array {
+                    if let Some(pkg_path) = pkg.as_str() {
+                        // Package path format: "src/mypackage"
+                        let (source_root, import_name) = self.parse_hatch_package_path(pkg_path);
+                        let full_path = project_dir.join(source_root);
 
-                                            info.packages
-                                                .entry(full_path)
-                                                .or_default()
-                                                .push(import_name.to_string());
-                                            found_config = true;
-                                        }
-                                    }
-                                }
+                        info.packages
+                            .entry(full_path)
+                            .or_default()
+                            .push(import_name.to_string());
+                        found_config = true;
+                    }
+                }
+            }
+
+            // Pattern 2: sources/only-include (e.g., black uses this)
+            // sources = ["src"] means src/ is the source root, discover packages there
+            if !found_config
+                && let Some(sources) = wheel.get("sources")
+                && let Some(sources_array) = sources.as_array()
+            {
+                for source in sources_array {
+                    if let Some(source_dir) = source.as_str() {
+                        let source_path = project_dir.join(source_dir);
+                        if source_path.exists() {
+                            // Discover packages in source directory
+                            let packages = self.discover_packages_in_dir(&source_path);
+                            if !packages.is_empty() {
+                                info.packages.insert(source_path, packages);
+                                found_config = true;
                             }
+                        }
+                    }
+                }
+            }
 
-                            // Pattern 2: sources/only-include (e.g., black uses this)
-                            // sources = ["src"] means src/ is the source root, discover packages there
-                            if !found_config {
-                                if let Some(sources) = wheel.get("sources") {
-                                    if let Some(sources_array) = sources.as_array() {
-                                        for source in sources_array {
-                                            if let Some(source_dir) = source.as_str() {
-                                                let source_path = project_dir.join(source_dir);
-                                                if source_path.exists() {
-                                                    // Discover packages in source directory
-                                                    let packages =
-                                                        self.discover_packages_in_dir(&source_path);
-                                                    if !packages.is_empty() {
-                                                        info.packages.insert(source_path, packages);
-                                                        found_config = true;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Pattern 3: only-include without sources (less common)
-                            if !found_config {
-                                if let Some(only_include) = wheel.get("only-include") {
-                                    if let Some(include_array) = only_include.as_array() {
-                                        for include in include_array {
-                                            if let Some(include_dir) = include.as_str() {
-                                                let include_path = project_dir.join(include_dir);
-                                                if include_path.exists() {
-                                                    let packages = self
-                                                        .discover_packages_in_dir(&include_path);
-                                                    if !packages.is_empty() {
-                                                        info.packages
-                                                            .insert(include_path, packages);
-                                                        found_config = true;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
+            // Pattern 3: only-include without sources (less common)
+            if !found_config
+                && let Some(only_include) = wheel.get("only-include")
+                && let Some(include_array) = only_include.as_array()
+            {
+                for include in include_array {
+                    if let Some(include_dir) = include.as_str() {
+                        let include_path = project_dir.join(include_dir);
+                        if include_path.exists() {
+                            let packages = self.discover_packages_in_dir(&include_path);
+                            if !packages.is_empty() {
+                                info.packages.insert(include_path, packages);
+                                found_config = true;
                             }
                         }
                     }
@@ -461,12 +450,12 @@ impl PythonProvider {
                         })
                         .unwrap_or(false);
 
-                    if init_py.exists() || has_py_files {
-                        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                            // Skip hidden directories and __pycache__
-                            if !name.starts_with('.') && name != "__pycache__" {
-                                packages.push(name.to_string());
-                            }
+                    if (init_py.exists() || has_py_files)
+                        && let Some(name) = path.file_name().and_then(|n| n.to_str())
+                    {
+                        // Skip hidden directories and __pycache__
+                        if !name.starts_with('.') && name != "__pycache__" {
+                            packages.push(name.to_string());
                         }
                     }
                 }
@@ -504,64 +493,62 @@ impl PythonProvider {
         let mut info = self.extract_project_metadata(toml_value);
         let mut found_config = false;
 
-        if let Some(tool) = toml_value.get("tool") {
-            if let Some(maturin) = tool.get("maturin") {
-                // Get python-source directory (explicit source root)
-                let explicit_source = maturin.get("python-source").and_then(|v| v.as_str());
+        if let Some(tool) = toml_value.get("tool")
+            && let Some(maturin) = tool.get("maturin")
+        {
+            // Get python-source directory (explicit source root)
+            let explicit_source = maturin.get("python-source").and_then(|v| v.as_str());
 
-                // Get python-packages (explicit package names)
-                let python_packages: Vec<String> = maturin
-                    .get("python-packages")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str())
-                            .map(|s| s.to_string())
-                            .collect()
-                    })
-                    .unwrap_or_default();
+            // Get python-packages (explicit package names)
+            let python_packages: Vec<String> = maturin
+                .get("python-packages")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
 
-                // Determine source root
-                let source_root = if let Some(src) = explicit_source {
-                    // Explicit python-source specified
-                    project_dir.join(src)
+            // Determine source root
+            let source_root = if let Some(src) = explicit_source {
+                // Explicit python-source specified
+                project_dir.join(src)
+            } else {
+                // Auto-detect: check src/ first, then project root
+                let src_dir = project_dir.join("src");
+                if src_dir.exists() {
+                    src_dir
                 } else {
-                    // Auto-detect: check src/ first, then project root
-                    let src_dir = project_dir.join("src");
-                    if src_dir.exists() {
-                        src_dir
-                    } else {
-                        project_dir.to_path_buf()
-                    }
-                };
-
-                // Determine import names
-                let import_names: Vec<String> = if !python_packages.is_empty() {
-                    // Use explicit python-packages
-                    python_packages
-                } else if let Some(module_name) =
-                    maturin.get("module-name").and_then(|v| v.as_str())
-                {
-                    // Extract from module-name: "pydantic_core._pydantic_core" -> "pydantic_core"
-                    vec![
-                        module_name
-                            .split('.')
-                            .next()
-                            .unwrap_or(module_name)
-                            .to_string(),
-                    ]
-                } else {
-                    // Fall back to normalized distribution name
-                    info.distribution_name
-                        .as_ref()
-                        .map(|n| vec![n.replace('-', "_")])
-                        .unwrap_or_default()
-                };
-
-                if !import_names.is_empty() {
-                    info.packages.insert(source_root, import_names);
-                    found_config = true;
+                    project_dir.to_path_buf()
                 }
+            };
+
+            // Determine import names
+            let import_names: Vec<String> = if !python_packages.is_empty() {
+                // Use explicit python-packages
+                python_packages
+            } else if let Some(module_name) = maturin.get("module-name").and_then(|v| v.as_str()) {
+                // Extract from module-name: "pydantic_core._pydantic_core" -> "pydantic_core"
+                vec![
+                    module_name
+                        .split('.')
+                        .next()
+                        .unwrap_or(module_name)
+                        .to_string(),
+                ]
+            } else {
+                // Fall back to normalized distribution name
+                info.distribution_name
+                    .as_ref()
+                    .map(|n| vec![n.replace('-', "_")])
+                    .unwrap_or_default()
+            };
+
+            if !import_names.is_empty() {
+                info.packages.insert(source_root, import_names);
+                found_config = true;
             }
         }
 
@@ -590,10 +577,10 @@ impl PythonProvider {
     fn extract_project_metadata(&self, toml_value: &toml::Value) -> PyProjectInfo {
         let mut info = PyProjectInfo::default();
 
-        if let Some(project) = toml_value.get("project") {
-            if let Some(name) = project.get("name").and_then(|v| v.as_str()) {
-                info.distribution_name = Some(name.to_string());
-            }
+        if let Some(project) = toml_value.get("project")
+            && let Some(name) = project.get("name").and_then(|v| v.as_str())
+        {
+            info.distribution_name = Some(name.to_string());
         }
 
         info

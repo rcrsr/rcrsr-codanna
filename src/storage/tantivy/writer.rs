@@ -296,10 +296,10 @@ impl DocumentIndex {
 
     /// Update the pending symbol counter (for cross-file symbol ID continuity in batches)
     pub fn update_pending_symbol_counter(&self, new_value: u32) -> StorageResult<()> {
-        if let Ok(mut pending_guard) = self.pending_symbol_counter.lock() {
-            if let Some(ref mut counter) = *pending_guard {
-                *counter = new_value;
-            }
+        if let Ok(mut pending_guard) = self.pending_symbol_counter.lock()
+            && let Some(ref mut counter) = *pending_guard
+        {
+            *counter = new_value;
         }
         Ok(())
     }

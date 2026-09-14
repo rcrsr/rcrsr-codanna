@@ -12,13 +12,12 @@ use super::resolution::{GoInheritanceResolver, GoResolutionContext};
 
 /// AST descent: `parameter_declaration` matched by name field.
 fn find_parameter_type(node: Node, code: &str, var_name: &str) -> Option<String> {
-    if node.kind() == "parameter_declaration" {
-        if let Some(name) = node.child_by_field_name("name") {
-            if &code[name.byte_range()] == var_name {
-                let type_node = node.child_by_field_name("type")?;
-                return reduce_type_to_name(type_node, code);
-            }
-        }
+    if node.kind() == "parameter_declaration"
+        && let Some(name) = node.child_by_field_name("name")
+        && &code[name.byte_range()] == var_name
+    {
+        let type_node = node.child_by_field_name("type")?;
+        return reduce_type_to_name(type_node, code);
     }
     for child in node.children(&mut node.walk()) {
         if let Some(found) = find_parameter_type(child, code, var_name) {
@@ -133,33 +132,36 @@ impl LanguageBehavior for GoBehavior {
         }
 
         // Try cached resolution first
-        let cached_result = RULES_CACHE.with(|cache| {
-            let mut cache_ref = cache.borrow_mut();
+        let cached_result =
+            RULES_CACHE.with(|cache| {
+                let mut cache_ref = cache.borrow_mut();
 
-            // Check if cache needs reload (>1 second old or empty)
-            let needs_reload = cache_ref
-                .as_ref()
-                .map(|(ts, _)| ts.elapsed() >= Duration::from_secs(1))
-                .unwrap_or(true);
+                // Check if cache needs reload (>1 second old or empty)
+                let needs_reload = cache_ref
+                    .as_ref()
+                    .map(|(ts, _)| ts.elapsed() >= Duration::from_secs(1))
+                    .unwrap_or(true);
 
-            // Load from disk if needed
-            if needs_reload {
-                let persistence =
-                    ResolutionPersistence::new(std::path::Path::new(crate::init::local_dir_name()));
-                if let Ok(index) = persistence.load("go") {
-                    *cache_ref = Some((Instant::now(), index));
-                } else {
-                    *cache_ref = None;
+                // Load from disk if needed
+                if needs_reload {
+                    let persistence = ResolutionPersistence::new(std::path::Path::new(
+                        crate::init::local_dir_name(),
+                    ));
+                    if let Ok(index) = persistence.load("go") {
+                        *cache_ref = Some((Instant::now(), index));
+                    } else {
+                        *cache_ref = None;
+                    }
                 }
-            }
 
-            // Get module path from cached rules
-            if let Some((_, ref index)) = *cache_ref {
-                // Canonicalize file path for matching
-                if let Ok(canon_file) = file_path.canonicalize() {
-                    // Find config that applies to this file
-                    if let Some(config_path) = index.get_config_for_file(&canon_file) {
-                        if let Some(rules) = index.rules.get(config_path) {
+                // Get module path from cached rules
+                if let Some((_, ref index)) = *cache_ref {
+                    // Canonicalize file path for matching
+                    if let Ok(canon_file) = file_path.canonicalize() {
+                        // Find config that applies to this file
+                        if let Some(config_path) = index.get_config_for_file(&canon_file)
+                            && let Some(rules) = index.rules.get(config_path)
+                        {
                             // Get baseUrl (Go module name from go.mod)
                             if let Some(ref base_url) = rules.base_url {
                                 // Find matching source root
@@ -187,10 +189,9 @@ impl LanguageBehavior for GoBehavior {
                         }
                     }
                 }
-            }
 
-            None
-        });
+                None
+            });
 
         // Return cached result if found
         if cached_result.is_some() {

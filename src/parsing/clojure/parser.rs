@@ -130,43 +130,43 @@ impl ClojureParser {
 
         if node.kind() == "list_lit" {
             // Check if this is a definition form
-            if let Some(first_child) = node.named_child(0) {
-                if first_child.kind() == "sym_lit" {
-                    let form_name = &code[first_child.byte_range()];
-                    match form_name {
-                        "defn" | "defn-" => {
-                            self.process_defn(
-                                node,
-                                code,
-                                file_id,
-                                symbols,
-                                counter,
-                                form_name == "defn-",
-                            );
-                        }
-                        "def" => {
-                            self.process_def(node, code, file_id, symbols, counter);
-                        }
-                        "defmacro" => {
-                            self.process_defmacro(node, code, file_id, symbols, counter);
-                        }
-                        "defprotocol" => {
-                            self.process_defprotocol(node, code, file_id, symbols, counter);
-                        }
-                        "defrecord" | "deftype" => {
-                            self.process_defrecord(node, code, file_id, symbols, counter);
-                        }
-                        "defmulti" => {
-                            self.process_defmulti(node, code, file_id, symbols, counter);
-                        }
-                        "defmethod" => {
-                            self.process_defmethod(node, code, file_id, symbols, counter);
-                        }
-                        "ns" => {
-                            self.process_ns(node, code, file_id, symbols, counter);
-                        }
-                        _ => {}
+            if let Some(first_child) = node.named_child(0)
+                && first_child.kind() == "sym_lit"
+            {
+                let form_name = &code[first_child.byte_range()];
+                match form_name {
+                    "defn" | "defn-" => {
+                        self.process_defn(
+                            node,
+                            code,
+                            file_id,
+                            symbols,
+                            counter,
+                            form_name == "defn-",
+                        );
                     }
+                    "def" => {
+                        self.process_def(node, code, file_id, symbols, counter);
+                    }
+                    "defmacro" => {
+                        self.process_defmacro(node, code, file_id, symbols, counter);
+                    }
+                    "defprotocol" => {
+                        self.process_defprotocol(node, code, file_id, symbols, counter);
+                    }
+                    "defrecord" | "deftype" => {
+                        self.process_defrecord(node, code, file_id, symbols, counter);
+                    }
+                    "defmulti" => {
+                        self.process_defmulti(node, code, file_id, symbols, counter);
+                    }
+                    "defmethod" => {
+                        self.process_defmethod(node, code, file_id, symbols, counter);
+                    }
+                    "ns" => {
+                        self.process_ns(node, code, file_id, symbols, counter);
+                    }
+                    _ => {}
                 }
             }
         }
@@ -267,40 +267,40 @@ impl ClojureParser {
 
         let name_node = children.get(1);
 
-        if let Some(name_node) = name_node {
-            if name_node.kind() == "sym_lit" {
-                let var_name = &code[name_node.byte_range()];
-                let visibility = if var_name.starts_with('-') {
-                    Visibility::Private
+        if let Some(name_node) = name_node
+            && name_node.kind() == "sym_lit"
+        {
+            let var_name = &code[name_node.byte_range()];
+            let visibility = if var_name.starts_with('-') {
+                Visibility::Private
+            } else {
+                Visibility::Public
+            };
+
+            // Check for docstring
+            let doc_string = children.get(2).and_then(|c| {
+                if c.kind() == "str_lit" {
+                    Some(code[c.byte_range()].trim_matches('"').to_string())
                 } else {
-                    Visibility::Public
-                };
+                    None
+                }
+            });
 
-                // Check for docstring
-                let doc_string = children.get(2).and_then(|c| {
-                    if c.kind() == "str_lit" {
-                        Some(code[c.byte_range()].trim_matches('"').to_string())
-                    } else {
-                        None
-                    }
-                });
+            let signature = format!("(def {var_name} ...)");
 
-                let signature = format!("(def {var_name} ...)");
+            let mut symbol = Symbol::new(
+                counter.next_id(),
+                var_name.to_string(),
+                SymbolKind::Variable,
+                file_id,
+                Self::range_from_node(&node),
+            );
+            symbol.signature = Some(signature.into());
+            symbol.doc_comment = doc_string.map(|s| s.into());
+            symbol.module_path = self.current_namespace.as_ref().map(|s| s.clone().into());
+            symbol.visibility = visibility;
 
-                let mut symbol = Symbol::new(
-                    counter.next_id(),
-                    var_name.to_string(),
-                    SymbolKind::Variable,
-                    file_id,
-                    Self::range_from_node(&node),
-                );
-                symbol.signature = Some(signature.into());
-                symbol.doc_comment = doc_string.map(|s| s.into());
-                symbol.module_path = self.current_namespace.as_ref().map(|s| s.clone().into());
-                symbol.visibility = visibility;
-
-                symbols.push(symbol);
-            }
+            symbols.push(symbol);
         }
     }
 
@@ -316,23 +316,23 @@ impl ClojureParser {
         let mut cursor = node.walk();
         let children: Vec<_> = node.named_children(&mut cursor).collect();
 
-        if let Some(name_node) = children.get(1) {
-            if name_node.kind() == "sym_lit" {
-                let macro_name = &code[name_node.byte_range()];
+        if let Some(name_node) = children.get(1)
+            && name_node.kind() == "sym_lit"
+        {
+            let macro_name = &code[name_node.byte_range()];
 
-                let mut symbol = Symbol::new(
-                    counter.next_id(),
-                    macro_name.to_string(),
-                    SymbolKind::Macro,
-                    file_id,
-                    Self::range_from_node(&node),
-                );
-                symbol.signature = Some(format!("(defmacro {macro_name} ...)").into());
-                symbol.module_path = self.current_namespace.as_ref().map(|s| s.clone().into());
-                symbol.visibility = Visibility::Public;
+            let mut symbol = Symbol::new(
+                counter.next_id(),
+                macro_name.to_string(),
+                SymbolKind::Macro,
+                file_id,
+                Self::range_from_node(&node),
+            );
+            symbol.signature = Some(format!("(defmacro {macro_name} ...)").into());
+            symbol.module_path = self.current_namespace.as_ref().map(|s| s.clone().into());
+            symbol.visibility = Visibility::Public;
 
-                symbols.push(symbol);
-            }
+            symbols.push(symbol);
         }
     }
 
@@ -348,23 +348,23 @@ impl ClojureParser {
         let mut cursor = node.walk();
         let children: Vec<_> = node.named_children(&mut cursor).collect();
 
-        if let Some(name_node) = children.get(1) {
-            if name_node.kind() == "sym_lit" {
-                let protocol_name = &code[name_node.byte_range()];
+        if let Some(name_node) = children.get(1)
+            && name_node.kind() == "sym_lit"
+        {
+            let protocol_name = &code[name_node.byte_range()];
 
-                let mut symbol = Symbol::new(
-                    counter.next_id(),
-                    protocol_name.to_string(),
-                    SymbolKind::Interface,
-                    file_id,
-                    Self::range_from_node(&node),
-                );
-                symbol.signature = Some(format!("(defprotocol {protocol_name} ...)").into());
-                symbol.module_path = self.current_namespace.as_ref().map(|s| s.clone().into());
-                symbol.visibility = Visibility::Public;
+            let mut symbol = Symbol::new(
+                counter.next_id(),
+                protocol_name.to_string(),
+                SymbolKind::Interface,
+                file_id,
+                Self::range_from_node(&node),
+            );
+            symbol.signature = Some(format!("(defprotocol {protocol_name} ...)").into());
+            symbol.module_path = self.current_namespace.as_ref().map(|s| s.clone().into());
+            symbol.visibility = Visibility::Public;
 
-                symbols.push(symbol);
-            }
+            symbols.push(symbol);
         }
     }
 
@@ -380,29 +380,29 @@ impl ClojureParser {
         let mut cursor = node.walk();
         let children: Vec<_> = node.named_children(&mut cursor).collect();
 
-        if let Some(name_node) = children.get(1) {
-            if name_node.kind() == "sym_lit" {
-                let record_name = &code[name_node.byte_range()];
+        if let Some(name_node) = children.get(1)
+            && name_node.kind() == "sym_lit"
+        {
+            let record_name = &code[name_node.byte_range()];
 
-                let signature = code[node.byte_range()]
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-                    .to_string();
+            let signature = code[node.byte_range()]
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_string();
 
-                let mut symbol = Symbol::new(
-                    counter.next_id(),
-                    record_name.to_string(),
-                    SymbolKind::Struct,
-                    file_id,
-                    Self::range_from_node(&node),
-                );
-                symbol.signature = Some(signature.into());
-                symbol.module_path = self.current_namespace.as_ref().map(|s| s.clone().into());
-                symbol.visibility = Visibility::Public;
+            let mut symbol = Symbol::new(
+                counter.next_id(),
+                record_name.to_string(),
+                SymbolKind::Struct,
+                file_id,
+                Self::range_from_node(&node),
+            );
+            symbol.signature = Some(signature.into());
+            symbol.module_path = self.current_namespace.as_ref().map(|s| s.clone().into());
+            symbol.visibility = Visibility::Public;
 
-                symbols.push(symbol);
-            }
+            symbols.push(symbol);
         }
     }
 
@@ -418,23 +418,23 @@ impl ClojureParser {
         let mut cursor = node.walk();
         let children: Vec<_> = node.named_children(&mut cursor).collect();
 
-        if let Some(name_node) = children.get(1) {
-            if name_node.kind() == "sym_lit" {
-                let multi_name = &code[name_node.byte_range()];
+        if let Some(name_node) = children.get(1)
+            && name_node.kind() == "sym_lit"
+        {
+            let multi_name = &code[name_node.byte_range()];
 
-                let mut symbol = Symbol::new(
-                    counter.next_id(),
-                    multi_name.to_string(),
-                    SymbolKind::Function,
-                    file_id,
-                    Self::range_from_node(&node),
-                );
-                symbol.signature = Some(format!("(defmulti {multi_name} ...)").into());
-                symbol.module_path = self.current_namespace.as_ref().map(|s| s.clone().into());
-                symbol.visibility = Visibility::Public;
+            let mut symbol = Symbol::new(
+                counter.next_id(),
+                multi_name.to_string(),
+                SymbolKind::Function,
+                file_id,
+                Self::range_from_node(&node),
+            );
+            symbol.signature = Some(format!("(defmulti {multi_name} ...)").into());
+            symbol.module_path = self.current_namespace.as_ref().map(|s| s.clone().into());
+            symbol.visibility = Visibility::Public;
 
-                symbols.push(symbol);
-            }
+            symbols.push(symbol);
         }
     }
 
@@ -491,23 +491,23 @@ impl ClojureParser {
         let mut cursor = node.walk();
         let children: Vec<_> = node.named_children(&mut cursor).collect();
 
-        if let Some(name_node) = children.get(1) {
-            if name_node.kind() == "sym_lit" {
-                let ns_name = &code[name_node.byte_range()];
-                self.current_namespace = Some(ns_name.to_string());
+        if let Some(name_node) = children.get(1)
+            && name_node.kind() == "sym_lit"
+        {
+            let ns_name = &code[name_node.byte_range()];
+            self.current_namespace = Some(ns_name.to_string());
 
-                let mut symbol = Symbol::new(
-                    counter.next_id(),
-                    ns_name.to_string(),
-                    SymbolKind::Module,
-                    file_id,
-                    Self::range_from_node(&node),
-                );
-                symbol.signature = Some(format!("(ns {ns_name} ...)").into());
-                symbol.visibility = Visibility::Public;
+            let mut symbol = Symbol::new(
+                counter.next_id(),
+                ns_name.to_string(),
+                SymbolKind::Module,
+                file_id,
+                Self::range_from_node(&node),
+            );
+            symbol.signature = Some(format!("(ns {ns_name} ...)").into());
+            symbol.visibility = Visibility::Public;
 
-                symbols.push(symbol);
-            }
+            symbols.push(symbol);
         }
     }
 
@@ -534,47 +534,47 @@ impl ClojureParser {
 
         if node.kind() == "list_lit" {
             // First child of a list is typically the function being called
-            if let Some(first) = node.named_child(0) {
-                if first.kind() == "sym_lit" {
-                    let callee = &code[first.byte_range()];
-                    // Skip special forms
-                    if !matches!(
-                        callee,
-                        "defn"
-                            | "defn-"
-                            | "def"
-                            | "defmacro"
-                            | "defprotocol"
-                            | "defrecord"
-                            | "deftype"
-                            | "defmulti"
-                            | "defmethod"
-                            | "ns"
-                            | "if"
-                            | "let"
-                            | "do"
-                            | "fn"
-                            | "loop"
-                            | "recur"
-                            | "try"
-                            | "catch"
-                            | "finally"
-                            | "throw"
-                            | "quote"
-                            | "require"
-                            | "import"
-                            | "use"
-                    ) {
-                        // Interop forms (`(.method obj)`, `(Class/staticMethod ...)`)
-                        // are emitted via `find_method_calls` with receiver + stripped
-                        // method name. Skip here so the pipeline dedupe gate, which
-                        // compares `to_name` literally, doesn't double-emit.
-                        let is_instance_interop = callee.len() > 1 && callee.starts_with('.');
-                        let is_static_interop = first.child_by_field_name("namespace").is_some();
-                        if !is_instance_interop && !is_static_interop {
-                            let caller = current_function.unwrap_or(MODULE_SCOPE);
-                            calls.push((caller, callee, Self::range_from_node(&node)));
-                        }
+            if let Some(first) = node.named_child(0)
+                && first.kind() == "sym_lit"
+            {
+                let callee = &code[first.byte_range()];
+                // Skip special forms
+                if !matches!(
+                    callee,
+                    "defn"
+                        | "defn-"
+                        | "def"
+                        | "defmacro"
+                        | "defprotocol"
+                        | "defrecord"
+                        | "deftype"
+                        | "defmulti"
+                        | "defmethod"
+                        | "ns"
+                        | "if"
+                        | "let"
+                        | "do"
+                        | "fn"
+                        | "loop"
+                        | "recur"
+                        | "try"
+                        | "catch"
+                        | "finally"
+                        | "throw"
+                        | "quote"
+                        | "require"
+                        | "import"
+                        | "use"
+                ) {
+                    // Interop forms (`(.method obj)`, `(Class/staticMethod ...)`)
+                    // are emitted via `find_method_calls` with receiver + stripped
+                    // method name. Skip here so the pipeline dedupe gate, which
+                    // compares `to_name` literally, doesn't double-emit.
+                    let is_instance_interop = callee.len() > 1 && callee.starts_with('.');
+                    let is_static_interop = first.child_by_field_name("namespace").is_some();
+                    if !is_instance_interop && !is_static_interop {
+                        let caller = current_function.unwrap_or(MODULE_SCOPE);
+                        calls.push((caller, callee, Self::range_from_node(&node)));
                     }
                 }
             }
@@ -597,39 +597,38 @@ impl ClojureParser {
         let new_function: Option<&str> = function_boundary_name(node, code);
         let func_context = new_function.or(current_function);
 
-        if node.kind() == "list_lit" {
-            if let Some(head) = node.named_child(0) {
-                if head.kind() == "sym_lit" {
-                    let head_text = &code[head.byte_range()];
-                    // Instance interop: `(.method obj)`. Bare `(. obj method)`
-                    // out of scope (handled by future story).
-                    if head_text.len() > 1 && head_text.starts_with('.') {
-                        if let Some(recv) = node.named_child(1) {
-                            if recv.kind() == "sym_lit" {
-                                let receiver = &code[recv.byte_range()];
-                                let method = &head_text[1..];
-                                let caller = func_context.unwrap_or(MODULE_SCOPE);
-                                out.push(
-                                    MethodCall::new(caller, method, Self::range_from_node(&node))
-                                        .with_receiver(receiver),
-                                );
-                            }
-                        }
-                    } else if let (Some(ns), Some(nm)) = (
-                        head.child_by_field_name("namespace"),
-                        head.child_by_field_name("name"),
-                    ) {
-                        // Static interop: `(Class/staticMethod ...)`
-                        let receiver = &code[ns.byte_range()];
-                        let method = &code[nm.byte_range()];
-                        let caller = func_context.unwrap_or(MODULE_SCOPE);
-                        out.push(
-                            MethodCall::new(caller, method, Self::range_from_node(&node))
-                                .with_receiver(receiver)
-                                .static_method(),
-                        );
-                    }
+        if node.kind() == "list_lit"
+            && let Some(head) = node.named_child(0)
+            && head.kind() == "sym_lit"
+        {
+            let head_text = &code[head.byte_range()];
+            // Instance interop: `(.method obj)`. Bare `(. obj method)`
+            // out of scope (handled by future story).
+            if head_text.len() > 1 && head_text.starts_with('.') {
+                if let Some(recv) = node.named_child(1)
+                    && recv.kind() == "sym_lit"
+                {
+                    let receiver = &code[recv.byte_range()];
+                    let method = &head_text[1..];
+                    let caller = func_context.unwrap_or(MODULE_SCOPE);
+                    out.push(
+                        MethodCall::new(caller, method, Self::range_from_node(&node))
+                            .with_receiver(receiver),
+                    );
                 }
+            } else if let (Some(ns), Some(nm)) = (
+                head.child_by_field_name("namespace"),
+                head.child_by_field_name("name"),
+            ) {
+                // Static interop: `(Class/staticMethod ...)`
+                let receiver = &code[ns.byte_range()];
+                let method = &code[nm.byte_range()];
+                let caller = func_context.unwrap_or(MODULE_SCOPE);
+                out.push(
+                    MethodCall::new(caller, method, Self::range_from_node(&node))
+                        .with_receiver(receiver)
+                        .static_method(),
+                );
             }
         }
 
@@ -657,17 +656,16 @@ impl ClojureParser {
         file_id: FileId,
         imports: &mut Vec<Import>,
     ) {
-        if node.kind() == "list_lit" {
-            if let Some(first) = node.named_child(0) {
-                if first.kind() == "kwd_lit" || first.kind() == "sym_lit" {
-                    let form = &code[first.byte_range()];
-                    if form == ":require" || form == "require" {
-                        // Parse require clauses
-                        let mut cursor = node.walk();
-                        for child in node.named_children(&mut cursor).skip(1) {
-                            self.parse_require_clause(child, code, file_id, imports);
-                        }
-                    }
+        if node.kind() == "list_lit"
+            && let Some(first) = node.named_child(0)
+            && (first.kind() == "kwd_lit" || first.kind() == "sym_lit")
+        {
+            let form = &code[first.byte_range()];
+            if form == ":require" || form == "require" {
+                // Parse require clauses
+                let mut cursor = node.walk();
+                for child in node.named_children(&mut cursor).skip(1) {
+                    self.parse_require_clause(child, code, file_id, imports);
                 }
             }
         }
@@ -719,10 +717,10 @@ impl ClojureParser {
                             i += 1;
                         }
                         ":refer" => {
-                            if let Some(refer_node) = children.get(i + 1) {
-                                if &code[refer_node.byte_range()] == ":all" {
-                                    is_refer_all = true;
-                                }
+                            if let Some(refer_node) = children.get(i + 1)
+                                && &code[refer_node.byte_range()] == ":all"
+                            {
+                                is_refer_all = true;
                             }
                             i += 1;
                         }
@@ -785,11 +783,11 @@ impl LanguageParser for ClojureParser {
     fn extract_doc_comment(&self, node: &Node, code: &str) -> Option<String> {
         // In Clojure, docstrings are inside the form, not before
         // Check for comment nodes above
-        if let Some(prev) = node.prev_sibling() {
-            if prev.kind() == "comment" {
-                let comment = &code[prev.byte_range()];
-                return Some(comment.trim_start_matches(';').trim().to_string());
-            }
+        if let Some(prev) = node.prev_sibling()
+            && prev.kind() == "comment"
+        {
+            let comment = &code[prev.byte_range()];
+            return Some(comment.trim_start_matches(';').trim().to_string());
         }
         None
     }

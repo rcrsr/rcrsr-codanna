@@ -69,21 +69,19 @@ impl FileWalker {
                 let path = entry.path();
 
                 // Skip hidden files (files starting with .)
-                if let Some(file_name) = path.file_name() {
-                    if let Some(name_str) = file_name.to_str() {
-                        if name_str.starts_with('.') {
-                            return None;
-                        }
-                    }
+                if let Some(file_name) = path.file_name()
+                    && let Some(name_str) = file_name.to_str()
+                    && name_str.starts_with('.')
+                {
+                    return None;
                 }
 
                 // Check if this file extension is enabled
-                if let Some(extension) = path.extension() {
-                    if let Some(ext_str) = extension.to_str() {
-                        if enabled_extensions.iter().any(|ext| ext == ext_str) {
-                            return Some(path.to_path_buf());
-                        }
-                    }
+                if let Some(extension) = path.extension()
+                    && let Some(ext_str) = extension.to_str()
+                    && enabled_extensions.iter().any(|ext| ext == ext_str)
+                {
+                    return Some(path.to_path_buf());
                 }
 
                 None
@@ -161,19 +159,17 @@ impl FileWalker {
             }
 
             let path = entry.path();
-            if let Some(file_name) = path.file_name() {
-                if let Some(name_str) = file_name.to_str() {
-                    if name_str.starts_with('.') {
-                        continue;
-                    }
-                }
+            if let Some(file_name) = path.file_name()
+                && let Some(name_str) = file_name.to_str()
+                && name_str.starts_with('.')
+            {
+                continue;
             }
-            if let Some(extension) = path.extension() {
-                if let Some(ext_str) = extension.to_str() {
-                    if enabled_extensions.iter().any(|ext| ext == ext_str) {
-                        files.push(path.to_path_buf());
-                    }
-                }
+            if let Some(extension) = path.extension()
+                && let Some(ext_str) = extension.to_str()
+                && enabled_extensions.iter().any(|ext| ext == ext_str)
+            {
+                files.push(path.to_path_buf());
             }
         }
 

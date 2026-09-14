@@ -120,10 +120,10 @@ impl ResolutionScope for JavaResolutionContext {
             }
             ScopeLevel::Module => {
                 // If we're inside a class, treat as class member; otherwise file-level
-                if matches!(self.scope_stack.last(), Some(ScopeType::Class)) {
-                    if let Some(scope) = self.current_class_scope_mut() {
-                        scope.insert(name.clone(), symbol_id);
-                    }
+                if matches!(self.scope_stack.last(), Some(ScopeType::Class))
+                    && let Some(scope) = self.current_class_scope_mut()
+                {
+                    scope.insert(name.clone(), symbol_id);
                 }
                 self.file_scope.entry(name).or_insert(symbol_id);
             }

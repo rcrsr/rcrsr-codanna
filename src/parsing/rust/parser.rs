@@ -338,15 +338,14 @@ impl RustParser {
                     SymbolKind::Function
                 };
 
-                if let Some(name_node) = node.child_by_field_name("name") {
-                    if let Some(mut symbol) =
+                if let Some(name_node) = node.child_by_field_name("name")
+                    && let Some(mut symbol) =
                         self.create_symbol(counter, node, name_node, kind, file_id, code)
-                    {
-                        // Extract and add function signature
-                        let signature = self.extract_signature(node, code);
-                        symbol = symbol.with_signature(signature);
-                        symbols.push(symbol);
-                    }
+                {
+                    // Extract and add function signature
+                    let signature = self.extract_signature(node, code);
+                    symbol = symbol.with_signature(signature);
+                    symbols.push(symbol);
                 }
 
                 // Enter function scope for nested items
@@ -425,17 +424,17 @@ impl RustParser {
                     for child in field_list.children(&mut field_list.walk()) {
                         if child.kind() == "field_declaration" {
                             self.register_handled_node("field_declaration", child.kind_id());
-                            if let Some(name_node) = child.child_by_field_name("name") {
-                                if let Some(symbol) = self.create_symbol(
+                            if let Some(name_node) = child.child_by_field_name("name")
+                                && let Some(symbol) = self.create_symbol(
                                     counter,
                                     child,
                                     name_node,
                                     SymbolKind::Field,
                                     file_id,
                                     code,
-                                ) {
-                                    symbols.push(symbol);
-                                }
+                                )
+                            {
+                                symbols.push(symbol);
                             }
                         }
                     }
@@ -487,17 +486,17 @@ impl RustParser {
                     for child in body.children(&mut body.walk()) {
                         if child.kind() == "enum_variant" {
                             self.register_handled_node("enum_variant", child.kind_id());
-                            if let Some(name_node) = child.child_by_field_name("name") {
-                                if let Some(symbol) = self.create_symbol(
+                            if let Some(name_node) = child.child_by_field_name("name")
+                                && let Some(symbol) = self.create_symbol(
                                     counter,
                                     child,
                                     name_node,
                                     SymbolKind::Constant,
                                     file_id,
                                     code,
-                                ) {
-                                    symbols.push(symbol);
-                                }
+                                )
+                            {
+                                symbols.push(symbol);
                             }
                         }
                     }
@@ -593,20 +592,20 @@ impl RustParser {
                             {
                                 // Register the nested node types for audit tracking
                                 self.register_handled_node(child.kind(), child.kind_id());
-                                if let Some(method_name_node) = child.child_by_field_name("name") {
-                                    if let Some(mut method_symbol) = self.create_symbol(
+                                if let Some(method_name_node) = child.child_by_field_name("name")
+                                    && let Some(mut method_symbol) = self.create_symbol(
                                         counter,
                                         child,
                                         method_name_node,
                                         SymbolKind::Method,
                                         file_id,
                                         code,
-                                    ) {
-                                        // Extract and add method signature
-                                        let signature = self.extract_signature(child, code);
-                                        method_symbol = method_symbol.with_signature(signature);
-                                        symbols.push(method_symbol);
-                                    }
+                                    )
+                                {
+                                    // Extract and add method signature
+                                    let signature = self.extract_signature(child, code);
+                                    method_symbol = method_symbol.with_signature(signature);
+                                    symbols.push(method_symbol);
                                 }
                             }
                         }
@@ -818,41 +817,41 @@ impl RustParser {
     ) {
         let containing_function = self.find_containing_function(node, code);
 
-        if node.kind() == "call_expression" {
-            if let Some(function_node) = node.child_by_field_name("function") {
+        if node.kind() == "call_expression"
+            && let Some(function_node) = node.child_by_field_name("function")
+        {
+            // Enable via tracing::trace! when needed
+            // tracing::trace!("[parser] call_expression, function node kind: {}", function_node.kind());
+            let mut target_name = None;
+
+            // Handle direct function calls (e.g., `my_function()`)
+            if function_node.kind() == "identifier" {
+                target_name = Some(&code[function_node.byte_range()]);
+            }
+            // Handle method calls (e.g., `variable.method()`)
+            else if function_node.kind() == "field_expression" {
+                if let Some(field_node) = function_node.child_by_field_name("field") {
+                    // For method calls, just return the method name
+                    // The receiver info is better handled by find_method_calls()
+                    target_name = Some(&code[field_node.byte_range()]);
+                }
+            }
+            // Handle associated functions (e.g., `String::new()`)
+            else if function_node.kind() == "scoped_identifier" {
+                // Extract the full qualified path
+                target_name = Some(&code[function_node.byte_range()]);
+            }
+
+            if let (Some(target), Some(caller)) = (target_name, containing_function) {
+                let range = Range::new(
+                    node.start_position().row as u32,
+                    node.start_position().column as u16,
+                    node.end_position().row as u32,
+                    node.end_position().column as u16,
+                );
                 // Enable via tracing::trace! when needed
-                // tracing::trace!("[parser] call_expression, function node kind: {}", function_node.kind());
-                let mut target_name = None;
-
-                // Handle direct function calls (e.g., `my_function()`)
-                if function_node.kind() == "identifier" {
-                    target_name = Some(&code[function_node.byte_range()]);
-                }
-                // Handle method calls (e.g., `variable.method()`)
-                else if function_node.kind() == "field_expression" {
-                    if let Some(field_node) = function_node.child_by_field_name("field") {
-                        // For method calls, just return the method name
-                        // The receiver info is better handled by find_method_calls()
-                        target_name = Some(&code[field_node.byte_range()]);
-                    }
-                }
-                // Handle associated functions (e.g., `String::new()`)
-                else if function_node.kind() == "scoped_identifier" {
-                    // Extract the full qualified path
-                    target_name = Some(&code[function_node.byte_range()]);
-                }
-
-                if let (Some(target), Some(caller)) = (target_name, containing_function) {
-                    let range = Range::new(
-                        node.start_position().row as u32,
-                        node.start_position().column as u16,
-                        node.end_position().row as u32,
-                        node.end_position().column as u16,
-                    );
-                    // Enable via tracing::trace! when needed
-                    // tracing::trace!("[parser] adding call '{}' -> '{}'", caller, target);
-                    calls.push((caller, target, range));
-                }
+                // tracing::trace!("[parser] adding call '{}' -> '{}'", caller, target);
+                calls.push((caller, target, range));
             }
         }
 
@@ -864,10 +863,10 @@ impl RustParser {
 
     fn find_containing_function<'a>(&self, mut node: Node, code: &'a str) -> Option<&'a str> {
         loop {
-            if node.kind() == "function_item" {
-                if let Some(name_node) = node.child_by_field_name("name") {
-                    return Some(&code[name_node.byte_range()]);
-                }
+            if node.kind() == "function_item"
+                && let Some(name_node) = node.child_by_field_name("name")
+            {
+                return Some(&code[name_node.byte_range()]);
             }
 
             node = node.parent()?;
@@ -886,81 +885,33 @@ impl RustParser {
     ) {
         let containing_function = self.find_containing_function(node, code);
 
-        if node.kind() == "call_expression" {
-            if let Some(function_node) = node.child_by_field_name("function") {
-                // Handle direct function calls (e.g., `my_function()`)
-                if function_node.kind() == "identifier" {
-                    let method_name = code[function_node.byte_range()].to_string();
-                    if let Some(caller) = containing_function {
-                        let range = Range::new(
-                            node.start_position().row as u32,
-                            node.start_position().column as u16,
-                            node.end_position().row as u32,
-                            node.end_position().column as u16,
-                        );
-                        let method_call = MethodCall::new(caller, &method_name, range);
-                        // Debug: Found function call (enable debug mode to see)
-                        // eprintln!("DEBUG: Found function call: {caller} -> {method_name}");
-                        method_calls.push(method_call);
-                    }
+        if node.kind() == "call_expression"
+            && let Some(function_node) = node.child_by_field_name("function")
+        {
+            // Handle direct function calls (e.g., `my_function()`)
+            if function_node.kind() == "identifier" {
+                let method_name = code[function_node.byte_range()].to_string();
+                if let Some(caller) = containing_function {
+                    let range = Range::new(
+                        node.start_position().row as u32,
+                        node.start_position().column as u16,
+                        node.end_position().row as u32,
+                        node.end_position().column as u16,
+                    );
+                    let method_call = MethodCall::new(caller, &method_name, range);
+                    // Debug: Found function call (enable debug mode to see)
+                    // eprintln!("DEBUG: Found function call: {caller} -> {method_name}");
+                    method_calls.push(method_call);
                 }
-                // Handle method calls (e.g., `variable.method()`)
-                else if function_node.kind() == "field_expression" {
-                    if let Some(field_node) = function_node.child_by_field_name("field") {
-                        let method_name = code[field_node.byte_range()].to_string();
+            }
+            // Handle method calls (e.g., `variable.method()`)
+            else if function_node.kind() == "field_expression" {
+                if let Some(field_node) = function_node.child_by_field_name("field") {
+                    let method_name = code[field_node.byte_range()].to_string();
 
-                        // Extract receiver from field_expression
-                        if let Some(value_node) = function_node.child_by_field_name("value") {
-                            let receiver_text = code[value_node.byte_range()].to_string();
-
-                            if let Some(caller) = containing_function {
-                                let range = Range::new(
-                                    node.start_position().row as u32,
-                                    node.start_position().column as u16,
-                                    node.end_position().row as u32,
-                                    node.end_position().column as u16,
-                                );
-
-                                let method_call = match value_node.kind() {
-                                    "self" => {
-                                        // TODO: Add debug logging
-                                        // eprintln!("DEBUG: Found self method call: {} -> self.{}", caller, method_name);
-                                        MethodCall::new(caller, &method_name, range)
-                                            .with_receiver("self")
-                                    }
-                                    "identifier" => {
-                                        // TODO: Add debug logging
-                                        // eprintln!("DEBUG: Found instance method call: {} -> {}.{}", caller, receiver_text, method_name);
-                                        MethodCall::new(caller, &method_name, range)
-                                            .with_receiver(&receiver_text)
-                                    }
-                                    "field_expression" => {
-                                        // Chained calls like self.field.method()
-                                        // TODO: Add debug logging
-                                        // eprintln!("DEBUG: Found chained method call: {} -> {}.{}", caller, receiver_text, method_name);
-                                        MethodCall::new(caller, &method_name, range)
-                                            .with_receiver(&receiver_text)
-                                    }
-                                    _ => {
-                                        // TODO: Add debug logging
-                                        // eprintln!("DEBUG: Found method call with unknown receiver type: {} -> {}.{}", caller, receiver_text, method_name);
-                                        MethodCall::new(caller, &method_name, range)
-                                            .with_receiver(&receiver_text)
-                                    }
-                                };
-                                method_calls.push(method_call);
-                            }
-                        }
-                    }
-                }
-                // Handle static method calls (e.g., `String::new()`)
-                else if function_node.kind() == "scoped_identifier" {
-                    let full_path = code[function_node.byte_range()].to_string();
-
-                    // Parse Type::method pattern
-                    if let Some(scope_pos) = full_path.rfind("::") {
-                        let type_name = &full_path[..scope_pos];
-                        let method_name = &full_path[scope_pos + 2..];
+                    // Extract receiver from field_expression
+                    if let Some(value_node) = function_node.child_by_field_name("value") {
+                        let receiver_text = code[value_node.byte_range()].to_string();
 
                         if let Some(caller) = containing_function {
                             let range = Range::new(
@@ -970,14 +921,62 @@ impl RustParser {
                                 node.end_position().column as u16,
                             );
 
-                            let method_call = MethodCall::new(caller, method_name, range)
-                                .with_receiver(type_name)
-                                .static_method();
-
-                            // TODO: Add debug logging
-                            // eprintln!("DEBUG: Found static method call: {} -> {}::{}", caller, type_name, method_name);
+                            let method_call = match value_node.kind() {
+                                "self" => {
+                                    // TODO: Add debug logging
+                                    // eprintln!("DEBUG: Found self method call: {} -> self.{}", caller, method_name);
+                                    MethodCall::new(caller, &method_name, range)
+                                        .with_receiver("self")
+                                }
+                                "identifier" => {
+                                    // TODO: Add debug logging
+                                    // eprintln!("DEBUG: Found instance method call: {} -> {}.{}", caller, receiver_text, method_name);
+                                    MethodCall::new(caller, &method_name, range)
+                                        .with_receiver(&receiver_text)
+                                }
+                                "field_expression" => {
+                                    // Chained calls like self.field.method()
+                                    // TODO: Add debug logging
+                                    // eprintln!("DEBUG: Found chained method call: {} -> {}.{}", caller, receiver_text, method_name);
+                                    MethodCall::new(caller, &method_name, range)
+                                        .with_receiver(&receiver_text)
+                                }
+                                _ => {
+                                    // TODO: Add debug logging
+                                    // eprintln!("DEBUG: Found method call with unknown receiver type: {} -> {}.{}", caller, receiver_text, method_name);
+                                    MethodCall::new(caller, &method_name, range)
+                                        .with_receiver(&receiver_text)
+                                }
+                            };
                             method_calls.push(method_call);
                         }
+                    }
+                }
+            }
+            // Handle static method calls (e.g., `String::new()`)
+            else if function_node.kind() == "scoped_identifier" {
+                let full_path = code[function_node.byte_range()].to_string();
+
+                // Parse Type::method pattern
+                if let Some(scope_pos) = full_path.rfind("::") {
+                    let type_name = &full_path[..scope_pos];
+                    let method_name = &full_path[scope_pos + 2..];
+
+                    if let Some(caller) = containing_function {
+                        let range = Range::new(
+                            node.start_position().row as u32,
+                            node.start_position().column as u16,
+                            node.end_position().row as u32,
+                            node.end_position().column as u16,
+                        );
+
+                        let method_call = MethodCall::new(caller, method_name, range)
+                            .with_receiver(type_name)
+                            .static_method();
+
+                        // TODO: Add debug logging
+                        // eprintln!("DEBUG: Found static method call: {} -> {}::{}", caller, type_name, method_name);
+                        method_calls.push(method_call);
                     }
                 }
             }
@@ -997,20 +996,20 @@ impl RustParser {
     ) {
         if node.kind() == "impl_item" {
             // Check if this is a trait implementation (has trait field)
-            if let Some(trait_node) = node.child_by_field_name("trait") {
-                if let Some(type_node) = node.child_by_field_name("type") {
-                    let trait_name = self.extract_type_name(trait_node, code);
-                    let type_name = self.extract_type_name(type_node, code);
+            if let Some(trait_node) = node.child_by_field_name("trait")
+                && let Some(type_node) = node.child_by_field_name("type")
+            {
+                let trait_name = self.extract_type_name(trait_node, code);
+                let type_name = self.extract_type_name(type_node, code);
 
-                    if let (Some(trait_name), Some(type_name)) = (trait_name, type_name) {
-                        let range = Range::new(
-                            node.start_position().row as u32,
-                            node.start_position().column as u16,
-                            node.end_position().row as u32,
-                            node.end_position().column as u16,
-                        );
-                        implementations.push((type_name, trait_name, range));
-                    }
+                if let (Some(trait_name), Some(type_name)) = (trait_name, type_name) {
+                    let range = Range::new(
+                        node.start_position().row as u32,
+                        node.start_position().column as u16,
+                        node.end_position().row as u32,
+                        node.end_position().column as u16,
+                    );
+                    implementations.push((type_name, trait_name, range));
                 }
             }
         }
@@ -1312,19 +1311,17 @@ impl RustParser {
                     // Find field list
                     if let Some(body) = node.child_by_field_name("body") {
                         for child in body.children(&mut body.walk()) {
-                            if child.kind() == "field_declaration" {
-                                if let Some(type_node) = child.child_by_field_name("type") {
-                                    if let Some(type_name) = self.extract_type_name(type_node, code)
-                                    {
-                                        let range = Range::new(
-                                            type_node.start_position().row as u32,
-                                            type_node.start_position().column as u16,
-                                            type_node.end_position().row as u32,
-                                            type_node.end_position().column as u16,
-                                        );
-                                        uses.push((struct_name, type_name, range));
-                                    }
-                                }
+                            if child.kind() == "field_declaration"
+                                && let Some(type_node) = child.child_by_field_name("type")
+                                && let Some(type_name) = self.extract_type_name(type_node, code)
+                            {
+                                let range = Range::new(
+                                    type_node.start_position().row as u32,
+                                    type_node.start_position().column as u16,
+                                    type_node.end_position().row as u32,
+                                    type_node.end_position().column as u16,
+                                );
+                                uses.push((struct_name, type_name, range));
                             }
                         }
                     }
@@ -1341,34 +1338,32 @@ impl RustParser {
                     // Find parameters
                     if let Some(params) = node.child_by_field_name("parameters") {
                         for param in params.children(&mut params.walk()) {
-                            if param.kind() == "parameter" {
-                                if let Some(type_node) = param.child_by_field_name("type") {
-                                    if let Some(type_name) = self.extract_type_name(type_node, code)
-                                    {
-                                        let range = Range::new(
-                                            type_node.start_position().row as u32,
-                                            type_node.start_position().column as u16,
-                                            type_node.end_position().row as u32,
-                                            type_node.end_position().column as u16,
-                                        );
-                                        uses.push((context_name, type_name, range));
-                                    }
-                                }
+                            if param.kind() == "parameter"
+                                && let Some(type_node) = param.child_by_field_name("type")
+                                && let Some(type_name) = self.extract_type_name(type_node, code)
+                            {
+                                let range = Range::new(
+                                    type_node.start_position().row as u32,
+                                    type_node.start_position().column as u16,
+                                    type_node.end_position().row as u32,
+                                    type_node.end_position().column as u16,
+                                );
+                                uses.push((context_name, type_name, range));
                             }
                         }
                     }
 
                     // Find return type - check the return_type field
-                    if let Some(return_type_node) = node.child_by_field_name("return_type") {
-                        if let Some(type_name) = self.extract_type_name(return_type_node, code) {
-                            let range = Range::new(
-                                return_type_node.start_position().row as u32,
-                                return_type_node.start_position().column as u16,
-                                return_type_node.end_position().row as u32,
-                                return_type_node.end_position().column as u16,
-                            );
-                            uses.push((context_name, type_name, range));
-                        }
+                    if let Some(return_type_node) = node.child_by_field_name("return_type")
+                        && let Some(type_name) = self.extract_type_name(return_type_node, code)
+                    {
+                        let range = Range::new(
+                            return_type_node.start_position().row as u32,
+                            return_type_node.start_position().column as u16,
+                            return_type_node.end_position().row as u32,
+                            return_type_node.end_position().column as u16,
+                        );
+                        uses.push((context_name, type_name, range));
                     }
                 }
             }
@@ -1395,19 +1390,18 @@ impl RustParser {
                     if let Some(body) = node.child_by_field_name("body") {
                         for child in body.children(&mut body.walk()) {
                             // Handle both function_signature_item and function_item
-                            if child.kind() == "function_signature_item"
-                                || child.kind() == "function_item"
+                            if (child.kind() == "function_signature_item"
+                                || child.kind() == "function_item")
+                                && let Some(method_name_node) = child.child_by_field_name("name")
                             {
-                                if let Some(method_name_node) = child.child_by_field_name("name") {
-                                    let method_name = &code[method_name_node.byte_range()];
-                                    let range = Range::new(
-                                        child.start_position().row as u32,
-                                        child.start_position().column as u16,
-                                        child.end_position().row as u32,
-                                        child.end_position().column as u16,
-                                    );
-                                    defines.push((trait_name, method_name, range));
-                                }
+                                let method_name = &code[method_name_node.byte_range()];
+                                let range = Range::new(
+                                    child.start_position().row as u32,
+                                    child.start_position().column as u16,
+                                    child.end_position().row as u32,
+                                    child.end_position().column as u16,
+                                );
+                                defines.push((trait_name, method_name, range));
                             }
                         }
                     }
@@ -1417,25 +1411,23 @@ impl RustParser {
                 // NOTE: This method extracts ALL impl methods (inherent + trait)
                 // For trait-only methods, use find_implementations + trait method tracking
                 // Get the type being implemented
-                if let Some(type_node) = node.child_by_field_name("type") {
-                    if let Some(type_name) = self.extract_type_name(type_node, code) {
-                        // Find all methods defined in this impl block
-                        if let Some(body) = node.child_by_field_name("body") {
-                            for child in body.children(&mut body.walk()) {
-                                if child.kind() == "function_item" {
-                                    if let Some(method_name_node) =
-                                        child.child_by_field_name("name")
-                                    {
-                                        let method_name = &code[method_name_node.byte_range()];
-                                        let range = Range::new(
-                                            child.start_position().row as u32,
-                                            child.start_position().column as u16,
-                                            child.end_position().row as u32,
-                                            child.end_position().column as u16,
-                                        );
-                                        defines.push((type_name, method_name, range));
-                                    }
-                                }
+                if let Some(type_node) = node.child_by_field_name("type")
+                    && let Some(type_name) = self.extract_type_name(type_node, code)
+                {
+                    // Find all methods defined in this impl block
+                    if let Some(body) = node.child_by_field_name("body") {
+                        for child in body.children(&mut body.walk()) {
+                            if child.kind() == "function_item"
+                                && let Some(method_name_node) = child.child_by_field_name("name")
+                            {
+                                let method_name = &code[method_name_node.byte_range()];
+                                let range = Range::new(
+                                    child.start_position().row as u32,
+                                    child.start_position().column as u16,
+                                    child.end_position().row as u32,
+                                    child.end_position().column as u16,
+                                );
+                                defines.push((type_name, method_name, range));
                             }
                         }
                     }
@@ -1458,30 +1450,26 @@ impl RustParser {
     ) {
         if node.kind() == "impl_item" {
             // Check if this is an inherent impl (no trait field)
-            if node.child_by_field_name("trait").is_none() {
-                if let Some(type_node) = node.child_by_field_name("type") {
-                    // Extract the full type name including generics
-                    let type_name = self.extract_full_type_name(type_node, code);
+            if node.child_by_field_name("trait").is_none()
+                && let Some(type_node) = node.child_by_field_name("type")
+            {
+                // Extract the full type name including generics
+                let type_name = self.extract_full_type_name(type_node, code);
 
-                    // Find method definitions in the impl body
-                    if let Some(body_node) = node.child_by_field_name("body") {
-                        for child in body_node.children(&mut body_node.walk()) {
-                            if child.kind() == "function_item" {
-                                if let Some(method_name_node) = child.child_by_field_name("name") {
-                                    let method_name = &code[method_name_node.byte_range()];
-                                    let range = Range::new(
-                                        child.start_position().row as u32,
-                                        child.start_position().column as u16,
-                                        child.end_position().row as u32,
-                                        child.end_position().column as u16,
-                                    );
-                                    methods.push((
-                                        type_name.clone(),
-                                        method_name.to_string(),
-                                        range,
-                                    ));
-                                }
-                            }
+                // Find method definitions in the impl body
+                if let Some(body_node) = node.child_by_field_name("body") {
+                    for child in body_node.children(&mut body_node.walk()) {
+                        if child.kind() == "function_item"
+                            && let Some(method_name_node) = child.child_by_field_name("name")
+                        {
+                            let method_name = &code[method_name_node.byte_range()];
+                            let range = Range::new(
+                                child.start_position().row as u32,
+                                child.start_position().column as u16,
+                                child.end_position().row as u32,
+                                child.end_position().column as u16,
+                            );
+                            methods.push((type_name.clone(), method_name.to_string(), range));
                         }
                     }
                 }
@@ -1615,21 +1603,21 @@ impl RustParser {
 
         for child in node.children(&mut cursor) {
             if matches!(child.kind(), "line_comment" | "block_comment") {
-                if let Ok(text) = child.utf8_text(code.as_bytes()) {
-                    if self.is_inner_doc_comment(text) {
-                        if text.starts_with("//!") {
-                            let content = text.trim_start_matches("//!").trim();
-                            if !content.is_empty() {
-                                parts.push(content);
-                            }
-                        } else if text.starts_with("/*!") {
-                            let content = text.trim_start_matches("/*!").trim_end_matches("*/");
-                            // Process block content, work with borrowed strings
-                            for line in content.lines() {
-                                let cleaned = line.trim().trim_start_matches('*').trim();
-                                if !cleaned.is_empty() {
-                                    parts.push(cleaned);
-                                }
+                if let Ok(text) = child.utf8_text(code.as_bytes())
+                    && self.is_inner_doc_comment(text)
+                {
+                    if text.starts_with("//!") {
+                        let content = text.trim_start_matches("//!").trim();
+                        if !content.is_empty() {
+                            parts.push(content);
+                        }
+                    } else if text.starts_with("/*!") {
+                        let content = text.trim_start_matches("/*!").trim_end_matches("*/");
+                        // Process block content, work with borrowed strings
+                        for line in content.lines() {
+                            let cleaned = line.trim().trim_start_matches('*').trim();
+                            if !cleaned.is_empty() {
+                                parts.push(cleaned);
                             }
                         }
                     }

@@ -93,13 +93,13 @@ pub fn add_plugin(
 
     let mut lockfile = load_lockfile(&paths)?;
     let previous_entry = lockfile.get_plugin(plugin_name).cloned();
-    if let Some(ref existing) = previous_entry {
-        if !force {
-            return Err(PluginError::AlreadyInstalled {
-                name: plugin_name.to_string(),
-                version: existing.version.clone(),
-            });
-        }
+    if let Some(ref existing) = previous_entry
+        && !force
+    {
+        return Err(PluginError::AlreadyInstalled {
+            name: plugin_name.to_string(),
+            version: existing.version.clone(),
+        });
     }
 
     let plan = prepare_plugin(
@@ -218,31 +218,28 @@ pub fn update_plugin(
         resolve_remote_commit(&existing, git_ref)
     };
 
-    if !force {
-        if let Some(commit) = remote_commit.as_ref() {
-            if commit == &existing.commit {
-                if dry_run {
-                    println!(
-                        "DRY RUN: Would update plugin '{plugin_name}' (already at commit {commit})"
-                    );
-                    println!(
-                        "  Target workspace: {}",
-                        crate::parsing::paths::render_absolute_path(&paths.root).display()
-                    );
-                    return Ok(());
-                }
+    if !force
+        && let Some(commit) = remote_commit.as_ref()
+        && commit == &existing.commit
+    {
+        if dry_run {
+            println!("DRY RUN: Would update plugin '{plugin_name}' (already at commit {commit})");
+            println!(
+                "  Target workspace: {}",
+                crate::parsing::paths::render_absolute_path(&paths.root).display()
+            );
+            return Ok(());
+        }
 
-                match verify_entry(&paths, &existing, false) {
-                    Ok(_) => {
-                        println!("Plugin '{plugin_name}' already up to date (commit {commit})");
-                        return Ok(());
-                    }
-                    Err(err) => {
-                        tracing::debug!(
-                            "[plugins] existing install failed verification, reinstalling: {err}"
-                        );
-                    }
-                }
+        match verify_entry(&paths, &existing, false) {
+            Ok(_) => {
+                println!("Plugin '{plugin_name}' already up to date (commit {commit})");
+                return Ok(());
+            }
+            Err(err) => {
+                tracing::debug!(
+                    "[plugins] existing install failed verification, reinstalling: {err}"
+                );
             }
         }
     }
@@ -743,10 +740,10 @@ fn load_plugin_mcp(plugin_root: &Path, manifest: &PluginManifest) -> PluginResul
     if default_mcp.exists() {
         let content = fs::read_to_string(&default_mcp)?;
         let json: Value = serde_json::from_str(&content)?;
-        if let Some(servers) = json.get("mcpServers") {
-            if servers.is_object() {
-                return Ok(Some(servers.clone()));
-            }
+        if let Some(servers) = json.get("mcpServers")
+            && servers.is_object()
+        {
+            return Ok(Some(servers.clone()));
         }
     }
 

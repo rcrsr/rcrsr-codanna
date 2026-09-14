@@ -275,10 +275,10 @@ impl InheritanceResolver for CInheritanceResolver {
         let resolved_type = self.resolve_typedef(type_name);
 
         // Check if the type itself defines the method (function pointer)
-        if let Some(methods) = self.type_methods.get(&resolved_type) {
-            if methods.contains(&method.to_string()) {
-                return Some(resolved_type);
-            }
+        if let Some(methods) = self.type_methods.get(&resolved_type)
+            && methods.contains(&method.to_string())
+        {
+            return Some(resolved_type);
         }
 
         // Check composed/embedded types

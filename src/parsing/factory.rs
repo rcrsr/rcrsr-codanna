@@ -111,15 +111,15 @@ impl ParserFactory {
     pub fn create_parser(&self, language: Language) -> IndexResult<Box<dyn LanguageParser>> {
         // Validate language enablement before expensive parser creation
         let lang_key = language.config_key();
-        if let Some(config) = self.settings.languages.get(lang_key) {
-            if !config.enabled {
-                return Err(IndexError::ConfigError {
-                    reason: format!(
-                        "Language {} is disabled in configuration. Enable it in your settings to use.",
-                        language.name()
-                    ),
-                });
-            }
+        if let Some(config) = self.settings.languages.get(lang_key)
+            && !config.enabled
+        {
+            return Err(IndexError::ConfigError {
+                reason: format!(
+                    "Language {} is disabled in configuration. Enable it in your settings to use.",
+                    language.name()
+                ),
+            });
         }
 
         match language {
@@ -215,15 +215,15 @@ impl ParserFactory {
     ) -> IndexResult<ParserWithBehavior> {
         // Validate language enablement
         let lang_key = language.config_key();
-        if let Some(config) = self.settings.languages.get(lang_key) {
-            if !config.enabled {
-                return Err(IndexError::ConfigError {
-                    reason: format!(
-                        "Language {} is disabled in configuration. Enable it in your settings to use.",
-                        language.name()
-                    ),
-                });
-            }
+        if let Some(config) = self.settings.languages.get(lang_key)
+            && !config.enabled
+        {
+            return Err(IndexError::ConfigError {
+                reason: format!(
+                    "Language {} is disabled in configuration. Enable it in your settings to use.",
+                    language.name()
+                ),
+            });
         }
 
         // Create parser and behavior pair

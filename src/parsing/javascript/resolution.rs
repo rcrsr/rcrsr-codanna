@@ -496,17 +496,17 @@ impl InheritanceResolver for JavaScriptInheritanceResolver {
 
     fn resolve_method(&self, type_name: &str, method_name: &str) -> Option<String> {
         // Check if the type has this method
-        if let Some(methods) = self.type_methods.get(type_name) {
-            if methods.iter().any(|m| m == method_name) {
-                return Some(type_name.to_string());
-            }
+        if let Some(methods) = self.type_methods.get(type_name)
+            && methods.iter().any(|m| m == method_name)
+        {
+            return Some(type_name.to_string());
         }
 
         // Check parent class
-        if let Some(parent) = self.class_extends.get(type_name) {
-            if let Some(resolved) = self.resolve_method(parent, method_name) {
-                return Some(resolved);
-            }
+        if let Some(parent) = self.class_extends.get(type_name)
+            && let Some(resolved) = self.resolve_method(parent, method_name)
+        {
+            return Some(resolved);
         }
 
         None
@@ -518,14 +518,14 @@ impl InheritanceResolver for JavaScriptInheritanceResolver {
         visited.insert(type_name.to_string());
 
         // Add parent class
-        if let Some(parent) = self.class_extends.get(type_name) {
-            if visited.insert(parent.clone()) {
-                chain.push(parent.clone());
-                // Recursively get parent's chain
-                for ancestor in self.get_inheritance_chain(parent) {
-                    if visited.insert(ancestor.clone()) {
-                        chain.push(ancestor);
-                    }
+        if let Some(parent) = self.class_extends.get(type_name)
+            && visited.insert(parent.clone())
+        {
+            chain.push(parent.clone());
+            // Recursively get parent's chain
+            for ancestor in self.get_inheritance_chain(parent) {
+                if visited.insert(ancestor.clone()) {
+                    chain.push(ancestor);
                 }
             }
         }

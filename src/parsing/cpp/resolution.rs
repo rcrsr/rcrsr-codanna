@@ -300,10 +300,10 @@ impl InheritanceResolver for CppInheritanceResolver {
 
     fn resolve_method(&self, type_name: &str, method: &str) -> Option<String> {
         // Check if the type itself defines the method
-        if let Some(methods) = self.type_methods.get(type_name) {
-            if methods.contains(&method.to_string()) {
-                return Some(type_name.to_string());
-            }
+        if let Some(methods) = self.type_methods.get(type_name)
+            && methods.contains(&method.to_string())
+        {
+            return Some(type_name.to_string());
         }
 
         // Search through inheritance chain using depth-first search

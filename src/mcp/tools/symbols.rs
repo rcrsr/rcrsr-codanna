@@ -405,115 +405,115 @@ impl CodeIntelligenceServer {
                 let mut has_relationships = false;
 
                 // What traits this type implements
-                if let Some(impls) = &ctx.relationships.implements {
-                    if !impls.is_empty() {
-                        result.push_str(&format!("Implements: {} trait(s)\n", impls.len()));
-                        for trait_sym in impls.iter().take(5) {
-                            result.push_str(&format!(
-                                "  -> {} at {}\n",
-                                trait_sym.name,
-                                crate::symbol::context::SymbolContext::symbol_location(trait_sym)
-                            ));
-                        }
-                        if impls.len() > 5 {
-                            result.push_str(&format!("  ... and {} more\n", impls.len() - 5));
-                        }
-                        has_relationships = true;
+                if let Some(impls) = &ctx.relationships.implements
+                    && !impls.is_empty()
+                {
+                    result.push_str(&format!("Implements: {} trait(s)\n", impls.len()));
+                    for trait_sym in impls.iter().take(5) {
+                        result.push_str(&format!(
+                            "  -> {} at {}\n",
+                            trait_sym.name,
+                            crate::symbol::context::SymbolContext::symbol_location(trait_sym)
+                        ));
                     }
+                    if impls.len() > 5 {
+                        result.push_str(&format!("  ... and {} more\n", impls.len() - 5));
+                    }
+                    has_relationships = true;
                 }
 
                 // What types implement this trait
-                if let Some(impls) = &ctx.relationships.implemented_by {
-                    if !impls.is_empty() {
-                        result.push_str(&format!("Implemented by: {} type(s)\n", impls.len()));
-                        for impl_sym in impls.iter().take(5) {
-                            result.push_str(&format!(
-                                "  <- {} at {}\n",
-                                impl_sym.name,
-                                crate::symbol::context::SymbolContext::symbol_location(impl_sym)
-                            ));
-                        }
-                        if impls.len() > 5 {
-                            result.push_str(&format!("  ... and {} more\n", impls.len() - 5));
-                        }
-                        has_relationships = true;
+                if let Some(impls) = &ctx.relationships.implemented_by
+                    && !impls.is_empty()
+                {
+                    result.push_str(&format!("Implemented by: {} type(s)\n", impls.len()));
+                    for impl_sym in impls.iter().take(5) {
+                        result.push_str(&format!(
+                            "  <- {} at {}\n",
+                            impl_sym.name,
+                            crate::symbol::context::SymbolContext::symbol_location(impl_sym)
+                        ));
                     }
+                    if impls.len() > 5 {
+                        result.push_str(&format!("  ... and {} more\n", impls.len() - 5));
+                    }
+                    has_relationships = true;
                 }
 
-                if let Some(defines) = &ctx.relationships.defines {
-                    if !defines.is_empty() {
-                        result.push_str(&format_defines_line(defines.iter().map(|s| s.kind)));
-                        has_relationships = true;
-                    }
+                if let Some(defines) = &ctx.relationships.defines
+                    && !defines.is_empty()
+                {
+                    result.push_str(&format_defines_line(defines.iter().map(|s| s.kind)));
+                    has_relationships = true;
                 }
 
-                if let Some(callers) = &ctx.relationships.called_by {
-                    if !callers.is_empty() {
-                        result.push_str(&format!("Called by: {} function(s)\n", callers.len()));
-                        has_relationships = true;
-                    }
+                if let Some(callers) = &ctx.relationships.called_by
+                    && !callers.is_empty()
+                {
+                    result.push_str(&format!("Called by: {} function(s)\n", callers.len()));
+                    has_relationships = true;
                 }
 
                 // What base class(es) this extends
-                if let Some(extends) = &ctx.relationships.extends {
-                    if !extends.is_empty() {
-                        result.push_str(&format!("Extends: {} class(es)\n", extends.len()));
-                        for base in extends.iter().take(3) {
-                            result.push_str(&format!(
-                                "  -> {} at {}\n",
-                                base.name,
-                                crate::symbol::context::SymbolContext::symbol_location(base)
-                            ));
-                        }
-                        if extends.len() > 3 {
-                            result.push_str(&format!("  ... and {} more\n", extends.len() - 3));
-                        }
-                        has_relationships = true;
+                if let Some(extends) = &ctx.relationships.extends
+                    && !extends.is_empty()
+                {
+                    result.push_str(&format!("Extends: {} class(es)\n", extends.len()));
+                    for base in extends.iter().take(3) {
+                        result.push_str(&format!(
+                            "  -> {} at {}\n",
+                            base.name,
+                            crate::symbol::context::SymbolContext::symbol_location(base)
+                        ));
                     }
+                    if extends.len() > 3 {
+                        result.push_str(&format!("  ... and {} more\n", extends.len() - 3));
+                    }
+                    has_relationships = true;
                 }
 
                 // What classes extend this
-                if let Some(extended_by) = &ctx.relationships.extended_by {
-                    if !extended_by.is_empty() {
-                        result.push_str(&format!("Extended by: {} class(es)\n", extended_by.len()));
-                        for derived in extended_by.iter().take(3) {
-                            result.push_str(&format!(
-                                "  <- {} at {}\n",
-                                derived.name,
-                                crate::symbol::context::SymbolContext::symbol_location(derived)
-                            ));
-                        }
-                        if extended_by.len() > 3 {
-                            result.push_str(&format!("  ... and {} more\n", extended_by.len() - 3));
-                        }
-                        has_relationships = true;
+                if let Some(extended_by) = &ctx.relationships.extended_by
+                    && !extended_by.is_empty()
+                {
+                    result.push_str(&format!("Extended by: {} class(es)\n", extended_by.len()));
+                    for derived in extended_by.iter().take(3) {
+                        result.push_str(&format!(
+                            "  <- {} at {}\n",
+                            derived.name,
+                            crate::symbol::context::SymbolContext::symbol_location(derived)
+                        ));
                     }
+                    if extended_by.len() > 3 {
+                        result.push_str(&format!("  ... and {} more\n", extended_by.len() - 3));
+                    }
+                    has_relationships = true;
                 }
 
                 // What types this symbol uses
-                if let Some(uses) = &ctx.relationships.uses {
-                    if !uses.is_empty() {
-                        result.push_str(&format!("Uses: {} type(s)\n", uses.len()));
-                        for used in uses.iter().take(3) {
-                            result.push_str(&format!(
-                                "  -> {} at {}\n",
-                                used.name,
-                                crate::symbol::context::SymbolContext::symbol_location(used)
-                            ));
-                        }
-                        if uses.len() > 3 {
-                            result.push_str(&format!("  ... and {} more\n", uses.len() - 3));
-                        }
-                        has_relationships = true;
+                if let Some(uses) = &ctx.relationships.uses
+                    && !uses.is_empty()
+                {
+                    result.push_str(&format!("Uses: {} type(s)\n", uses.len()));
+                    for used in uses.iter().take(3) {
+                        result.push_str(&format!(
+                            "  -> {} at {}\n",
+                            used.name,
+                            crate::symbol::context::SymbolContext::symbol_location(used)
+                        ));
                     }
+                    if uses.len() > 3 {
+                        result.push_str(&format!("  ... and {} more\n", uses.len() - 3));
+                    }
+                    has_relationships = true;
                 }
 
                 // What symbols use this type
-                if let Some(used_by) = &ctx.relationships.used_by {
-                    if !used_by.is_empty() {
-                        result.push_str(&format!("Used by: {} symbol(s)\n", used_by.len()));
-                        has_relationships = true;
-                    }
+                if let Some(used_by) = &ctx.relationships.used_by
+                    && !used_by.is_empty()
+                {
+                    result.push_str(&format!("Used by: {} symbol(s)\n", used_by.len()));
+                    has_relationships = true;
                 }
 
                 if !has_relationships && symbol.kind == crate::SymbolKind::Function {

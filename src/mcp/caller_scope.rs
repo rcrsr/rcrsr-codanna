@@ -370,11 +370,11 @@ fn scan_token_tree(node: Node, code: &str, has_test: &mut bool, disqualified: &m
                     let mut j = i + 1;
                     let mut nested = None;
                     while j < child_count {
-                        if let Some(candidate) = node.child(j as u32) {
-                            if candidate.kind() == "token_tree" {
-                                nested = Some(candidate);
-                                break;
-                            }
+                        if let Some(candidate) = node.child(j as u32)
+                            && candidate.kind() == "token_tree"
+                        {
+                            nested = Some(candidate);
+                            break;
                         }
                         j += 1;
                     }

@@ -910,10 +910,10 @@ impl UnifiedWatcher {
             };
 
             for dir in dirs {
-                if self.registry.add_watch_dir(dir.clone()) {
-                    if let Err(e) = self.watch_directory(&dir) {
-                        tracing::warn!("[watcher] failed to watch created dir: {e}");
-                    }
+                if self.registry.add_watch_dir(dir.clone())
+                    && let Err(e) = self.watch_directory(&dir)
+                {
+                    tracing::warn!("[watcher] failed to watch created dir: {e}");
                 }
             }
             if !files.is_empty() {
@@ -945,10 +945,10 @@ impl UnifiedWatcher {
             roots.extend(handler_roots);
         }
         for root in &roots {
-            if self.registry.add_watch_dir(root.clone()) {
-                if let Err(e) = self.watch_directory(root) {
-                    tracing::warn!("[watcher] failed to watch root: {e}");
-                }
+            if self.registry.add_watch_dir(root.clone())
+                && let Err(e) = self.watch_directory(root)
+            {
+                tracing::warn!("[watcher] failed to watch root: {e}");
             }
         }
         self.handler_roots = roots;
@@ -1010,10 +1010,9 @@ impl UnifiedWatcher {
                 .batch_sync_roots
                 .iter()
                 .find(|root| path.starts_with(root))
+                && !roots.contains(root)
             {
-                if !roots.contains(root) {
-                    roots.push(root.clone());
-                }
+                roots.push(root.clone());
             }
         }
 

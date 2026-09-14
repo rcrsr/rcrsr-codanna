@@ -13,13 +13,12 @@ use tree_sitter::{Language, Node};
 /// type field to the bare type-identifier name. Out-of-scope kinds (tuple, fn,
 /// impl Trait, dyn Trait, type parameters) yield `None`.
 fn find_parameter_type(node: Node, code: &str, var_name: &str) -> Option<String> {
-    if node.kind() == "parameter" {
-        if let Some(pattern) = node.child_by_field_name("pattern") {
-            if &code[pattern.byte_range()] == var_name {
-                let type_node = node.child_by_field_name("type")?;
-                return reduce_type_to_name(type_node, code);
-            }
-        }
+    if node.kind() == "parameter"
+        && let Some(pattern) = node.child_by_field_name("pattern")
+        && &code[pattern.byte_range()] == var_name
+    {
+        let type_node = node.child_by_field_name("type")?;
+        return reduce_type_to_name(type_node, code);
     }
     for child in node.children(&mut node.walk()) {
         if let Some(found) = find_parameter_type(child, code, var_name) {
@@ -205,10 +204,9 @@ impl LanguageBehavior for RustBehavior {
             if let Some(crate::symbol::ScopeContext::ClassMember {
                 class_name: Some(class),
             }) = candidate.scope_context.as_ref()
+                && &**class == resolved
             {
-                if &**class == resolved {
-                    return true;
-                }
+                return true;
             }
             let suffix = format!("::{resolved}");
             return candidate
@@ -240,10 +238,9 @@ impl LanguageBehavior for RustBehavior {
         if let Some(crate::symbol::ScopeContext::ClassMember {
             class_name: Some(class),
         }) = candidate.scope_context.as_ref()
+            && &**class == receiver
         {
-            if &**class == receiver {
-                return true;
-            }
+            return true;
         }
         let suffix = format!("::{receiver}");
         candidate
@@ -431,13 +428,13 @@ impl LanguageBehavior for RustBehavior {
                 }
 
                 // crate:: prefix normalization (import has crate::, symbol doesn't)
-                if let Some(without_crate) = import_prefix.strip_prefix("crate::") {
-                    if symbol_module_path.starts_with(&format!("{without_crate}::")) {
-                        tracing::debug!(
-                            "[rust] re-export heuristic matched (import had crate::): import='{import_path}', symbol='{symbol_module_path}'"
-                        );
-                        return true;
-                    }
+                if let Some(without_crate) = import_prefix.strip_prefix("crate::")
+                    && symbol_module_path.starts_with(&format!("{without_crate}::"))
+                {
+                    tracing::debug!(
+                        "[rust] re-export heuristic matched (import had crate::): import='{import_path}', symbol='{symbol_module_path}'"
+                    );
+                    return true;
                 }
 
                 // crate:: prefix normalization (symbol has crate::, import doesn't)
@@ -456,30 +453,30 @@ impl LanguageBehavior for RustBehavior {
         }
 
         // Case 2: Handle super:: imports
-        if import_path.starts_with("super::") {
-            if let Some(importing_mod) = importing_module {
-                let relative_path = import_path.strip_prefix("super::").unwrap(); // Safe: we checked starts_with
+        if import_path.starts_with("super::")
+            && let Some(importing_mod) = importing_module
+        {
+            let relative_path = import_path.strip_prefix("super::").unwrap(); // Safe: we checked starts_with
 
-                // super:: means go up one level from the importing module
-                // Example: In crate::parsing::rust, super::LanguageBehavior -> crate::parsing::LanguageBehavior
-                if let Some(parent) = importing_mod.rsplit_once("::") {
-                    let candidate = format!("{}::{}", parent.0, relative_path);
-                    if candidate == symbol_module_path {
-                        return true;
-                    }
+            // super:: means go up one level from the importing module
+            // Example: In crate::parsing::rust, super::LanguageBehavior -> crate::parsing::LanguageBehavior
+            if let Some(parent) = importing_mod.rsplit_once("::") {
+                let candidate = format!("{}::{}", parent.0, relative_path);
+                if candidate == symbol_module_path {
+                    return true;
+                }
 
-                    // Re-export heuristic for super:: imports:
-                    // If the symbol lives deeper under the parent module but has the same tail name,
-                    // consider it a match (common re-export pattern)
-                    if symbol_module_path.ends_with(&format!("::{relative_path}"))
-                        && (symbol_module_path.starts_with(&format!("{}::", parent.0))
-                            || symbol_module_path == parent.0)
-                    {
-                        tracing::debug!(
-                            "[rust] re-export heuristic matched (super): import='{import_path}', symbol='{symbol_module_path}'"
-                        );
-                        return true;
-                    }
+                // Re-export heuristic for super:: imports:
+                // If the symbol lives deeper under the parent module but has the same tail name,
+                // consider it a match (common re-export pattern)
+                if symbol_module_path.ends_with(&format!("::{relative_path}"))
+                    && (symbol_module_path.starts_with(&format!("{}::", parent.0))
+                        || symbol_module_path == parent.0)
+                {
+                    tracing::debug!(
+                        "[rust] re-export heuristic matched (super): import='{import_path}', symbol='{symbol_module_path}'"
+                    );
+                    return true;
                 }
             }
         }
@@ -501,16 +498,15 @@ impl LanguageBehavior for RustBehavior {
                 }
 
                 // Re-export heuristic for relative import under importing module
-                if let Some((base, name)) = candidate.rsplit_once("::") {
-                    if symbol_module_path.ends_with(&format!("::{name}"))
-                        && (symbol_module_path.starts_with(&format!("{base}::"))
-                            || symbol_module_path == base)
-                    {
-                        tracing::debug!(
-                            "[rust] re-export heuristic matched (relative): import='{import_path}', symbol='{symbol_module_path}'"
-                        );
-                        return true;
-                    }
+                if let Some((base, name)) = candidate.rsplit_once("::")
+                    && symbol_module_path.ends_with(&format!("::{name}"))
+                    && (symbol_module_path.starts_with(&format!("{base}::"))
+                        || symbol_module_path == base)
+                {
+                    tracing::debug!(
+                        "[rust] re-export heuristic matched (relative): import='{import_path}', symbol='{symbol_module_path}'"
+                    );
+                    return true;
                 }
 
                 // Try as sibling module (same parent)
@@ -522,16 +518,15 @@ impl LanguageBehavior for RustBehavior {
                     }
 
                     // Re-export heuristic for sibling resolution
-                    if let Some((base, name)) = sibling.rsplit_once("::") {
-                        if symbol_module_path.ends_with(&format!("::{name}"))
-                            && (symbol_module_path.starts_with(&format!("{base}::"))
-                                || symbol_module_path == base)
-                        {
-                            tracing::debug!(
-                                "[rust] re-export heuristic matched (sibling): import='{import_path}', symbol='{symbol_module_path}'"
-                            );
-                            return true;
-                        }
+                    if let Some((base, name)) = sibling.rsplit_once("::")
+                        && symbol_module_path.ends_with(&format!("::{name}"))
+                        && (symbol_module_path.starts_with(&format!("{base}::"))
+                            || symbol_module_path == base)
+                    {
+                        tracing::debug!(
+                            "[rust] re-export heuristic matched (sibling): import='{import_path}', symbol='{symbol_module_path}'"
+                        );
+                        return true;
                     }
                 }
             }

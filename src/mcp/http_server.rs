@@ -751,15 +751,15 @@ pub async fn serve_http(config: crate::Settings, watch: bool, bind: String) -> a
             let launch_token = launch_token.clone();
             async move {
                 let mut headers = axum::http::HeaderMap::new();
-                if let Some(dev) = workspace_dev {
-                    if let Ok(value) = axum::http::HeaderValue::from_str(&dev.to_string()) {
-                        headers.insert("x-codanna-workspace-dev", value);
-                    }
+                if let Some(dev) = workspace_dev
+                    && let Ok(value) = axum::http::HeaderValue::from_str(&dev.to_string())
+                {
+                    headers.insert("x-codanna-workspace-dev", value);
                 }
-                if let Some(ino) = workspace_ino {
-                    if let Ok(value) = axum::http::HeaderValue::from_str(&ino.to_string()) {
-                        headers.insert("x-codanna-workspace-ino", value);
-                    }
+                if let Some(ino) = workspace_ino
+                    && let Ok(value) = axum::http::HeaderValue::from_str(&ino.to_string())
+                {
+                    headers.insert("x-codanna-workspace-ino", value);
                 }
                 (headers, launch_token)
             }

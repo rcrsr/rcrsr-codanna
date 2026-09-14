@@ -190,10 +190,10 @@ pub fn walk_and_stream(
     }
 
     // Stop traversing if we've reached max depth
-    if let Some(max) = max_depth {
-        if depth >= max {
-            return Ok(());
-        }
+    if let Some(max) = max_depth
+        && depth >= max
+    {
+        return Ok(());
     }
 
     // Recursively walk children

@@ -246,39 +246,37 @@ fn test_resolution_with_project_rules() {
     // This tests the load_project_rules_for_file path
 
     // First ensure settings are configured with TypeScript config files
-    if let Ok(settings) = Settings::load() {
-        if let Some(ts_config) = settings.languages.get("typescript") {
-            if !ts_config.config_files.is_empty() {
-                println!(
-                    "Found {} TypeScript config files",
-                    ts_config.config_files.len()
-                );
+    if let Ok(settings) = Settings::load()
+        && let Some(ts_config) = settings.languages.get("typescript")
+        && !ts_config.config_files.is_empty()
+    {
+        println!(
+            "Found {} TypeScript config files",
+            ts_config.config_files.len()
+        );
 
-                // Create provider and build cache
-                let provider = TypeScriptProvider::new();
+        // Create provider and build cache
+        let provider = TypeScriptProvider::new();
 
-                use codanna::project_resolver::provider::ProjectResolutionProvider;
-                if let Err(e) = provider.rebuild_cache(&settings) {
-                    println!("Warning: Could not build cache: {e}");
-                    return;
-                }
+        use codanna::project_resolver::provider::ProjectResolutionProvider;
+        if let Err(e) = provider.rebuild_cache(&settings) {
+            println!("Warning: Could not build cache: {e}");
+            return;
+        }
 
-                // Load the persisted rules
-                let persistence = ResolutionPersistence::new(Path::new(".codanna"));
-                if let Ok(index) = persistence.load("typescript") {
-                    println!("Loaded {} resolution rules", index.rules.len());
+        // Load the persisted rules
+        let persistence = ResolutionPersistence::new(Path::new(".codanna"));
+        if let Ok(index) = persistence.load("typescript") {
+            println!("Loaded {} resolution rules", index.rules.len());
 
-                    // Test enhancement with loaded rules
-                    if let Some(rules) = index.rules.values().next() {
-                        let enhancer = TypeScriptProjectEnhancer::new(rules.clone());
-                        let file_id = FileId::new(1).unwrap();
+            // Test enhancement with loaded rules
+            if let Some(rules) = index.rules.values().next() {
+                let enhancer = TypeScriptProjectEnhancer::new(rules.clone());
+                let file_id = FileId::new(1).unwrap();
 
-                        if let Some(enhanced) =
-                            enhancer.enhance_import_path("@/components/Button", file_id)
-                        {
-                            println!("Successfully enhanced: @/components/Button -> {enhanced}");
-                        }
-                    }
+                if let Some(enhanced) = enhancer.enhance_import_path("@/components/Button", file_id)
+                {
+                    println!("Successfully enhanced: @/components/Button -> {enhanced}");
                 }
             }
         }

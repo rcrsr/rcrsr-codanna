@@ -126,12 +126,11 @@ impl DiscoverStage {
                 let path = entry.path();
 
                 // Skip hidden files (files starting with .) - matches FileWalker behavior
-                if let Some(file_name) = path.file_name() {
-                    if let Some(name_str) = file_name.to_str() {
-                        if name_str.starts_with('.') {
-                            return ignore::WalkState::Continue;
-                        }
-                    }
+                if let Some(file_name) = path.file_name()
+                    && let Some(name_str) = file_name.to_str()
+                    && name_str.starts_with('.')
+                {
+                    return ignore::WalkState::Continue;
                 }
 
                 // Filter by extension
@@ -298,12 +297,11 @@ impl DiscoverStage {
             let path = entry.path();
 
             // Skip hidden files (files starting with .) - matches FileWalker behavior
-            if let Some(file_name) = path.file_name() {
-                if let Some(name_str) = file_name.to_str() {
-                    if name_str.starts_with('.') {
-                        continue;
-                    }
-                }
+            if let Some(file_name) = path.file_name()
+                && let Some(name_str) = file_name.to_str()
+                && name_str.starts_with('.')
+            {
+                continue;
             }
 
             if has_supported_extension(path, &extensions) {

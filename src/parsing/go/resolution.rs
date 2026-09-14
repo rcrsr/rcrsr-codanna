@@ -426,10 +426,10 @@ impl GoResolutionContext {
     /// Get the current file's module path for package comparison
     fn get_current_module_path(&self, document_index: &DocumentIndex) -> Option<String> {
         // Try to find a symbol from this file to get its module path
-        if let Ok(file_symbols) = document_index.find_symbols_by_file(self.file_id) {
-            if let Some(symbol) = file_symbols.first() {
-                return symbol.module_path.as_ref().map(|s| s.as_ref().to_string());
-            }
+        if let Ok(file_symbols) = document_index.find_symbols_by_file(self.file_id)
+            && let Some(symbol) = file_symbols.first()
+        {
+            return symbol.module_path.as_ref().map(|s| s.as_ref().to_string());
         }
         None
     }
@@ -504,27 +504,24 @@ impl GoResolutionContext {
 
             if effective_name == package_name {
                 // 1. Check if it's a relative import
-                if import_path.starts_with("./") || import_path.starts_with("../") {
-                    if let Some(current_path) = current_package_path {
-                        if let Some(resolved_path) =
-                            self.resolve_relative_import(import_path, current_path)
-                        {
-                            return self.resolve_symbol_in_package(
-                                &resolved_path,
-                                symbol_name,
-                                document_index,
-                            );
-                        }
-                    }
+                if (import_path.starts_with("./") || import_path.starts_with("../"))
+                    && let Some(current_path) = current_package_path
+                    && let Some(resolved_path) =
+                        self.resolve_relative_import(import_path, current_path)
+                {
+                    return self.resolve_symbol_in_package(
+                        &resolved_path,
+                        symbol_name,
+                        document_index,
+                    );
                 }
 
                 // 2. Check vendor directory if project root is available
-                if let Some(root) = project_root {
-                    if let Some(vendor_symbol) =
+                if let Some(root) = project_root
+                    && let Some(vendor_symbol) =
                         self.resolve_vendor_import(import_path, root, document_index)
-                    {
-                        return Some(vendor_symbol);
-                    }
+                {
+                    return Some(vendor_symbol);
                 }
 
                 // 3. Standard resolution for absolute imports
@@ -646,11 +643,11 @@ impl GoResolutionContext {
             }
             // Parse replace directives
             else if line.starts_with("replace ") {
-                if let Some(replace_part) = line.strip_prefix("replace ") {
-                    if let Some((from, to)) = replace_part.split_once(" => ") {
-                        info.replacements
-                            .insert(from.trim().to_string(), to.trim().to_string());
-                    }
+                if let Some(replace_part) = line.strip_prefix("replace ")
+                    && let Some((from, to)) = replace_part.split_once(" => ")
+                {
+                    info.replacements
+                        .insert(from.trim().to_string(), to.trim().to_string());
                 }
             }
             // Parse require directive - handle both inline and block forms
@@ -732,10 +729,10 @@ impl GoResolutionContext {
             let resolved_path = self.apply_module_replacements(module_path, &go_mod_info);
 
             // 3. Check if it's a local module (starts with module name)
-            if let Some(ref module_name) = go_mod_info.module_name {
-                if resolved_path.starts_with(module_name) {
-                    return Some(resolved_path);
-                }
+            if let Some(ref module_name) = go_mod_info.module_name
+                && resolved_path.starts_with(module_name)
+            {
+                return Some(resolved_path);
             }
 
             return Some(resolved_path);
@@ -778,19 +775,19 @@ impl GoResolutionContext {
 
         for go_mod_path in &go_mod_files {
             // Check if this go.mod is in a parent directory of the current file
-            if let Some(go_mod_parent) = go_mod_path.parent() {
-                if current_path.starts_with(go_mod_parent) {
-                    // Calculate the distance (number of directory levels)
-                    let distance = current_path
-                        .strip_prefix(go_mod_parent)
-                        .ok()?
-                        .components()
-                        .count();
+            if let Some(go_mod_parent) = go_mod_path.parent()
+                && current_path.starts_with(go_mod_parent)
+            {
+                // Calculate the distance (number of directory levels)
+                let distance = current_path
+                    .strip_prefix(go_mod_parent)
+                    .ok()?
+                    .components()
+                    .count();
 
-                    if distance < nearest_distance {
-                        nearest_distance = distance;
-                        nearest_go_mod = Some(go_mod_path);
-                    }
+                if distance < nearest_distance {
+                    nearest_distance = distance;
+                    nearest_go_mod = Some(go_mod_path);
                 }
             }
         }
@@ -801,10 +798,10 @@ impl GoResolutionContext {
         }
 
         // Parse the nearest go.mod file
-        if let Some(go_mod_path) = nearest_go_mod {
-            if let Some(go_mod_str) = go_mod_path.to_str() {
-                return self.parse_go_mod(go_mod_str);
-            }
+        if let Some(go_mod_path) = nearest_go_mod
+            && let Some(go_mod_str) = go_mod_path.to_str()
+        {
+            return self.parse_go_mod(go_mod_str);
         }
 
         None
@@ -1170,19 +1167,19 @@ impl InheritanceResolver for GoInheritanceResolver {
 
     fn resolve_method(&self, type_name: &str, method_name: &str) -> Option<String> {
         // Check if the type has this method directly
-        if let Some(methods) = self.type_methods.get(type_name) {
-            if methods.iter().any(|m| m == method_name) {
-                return Some(type_name.to_string());
-            }
+        if let Some(methods) = self.type_methods.get(type_name)
+            && methods.iter().any(|m| m == method_name)
+        {
+            return Some(type_name.to_string());
         }
 
         // For structs: check implemented interfaces
         if let Some(interfaces) = self.struct_implements.get(type_name) {
             for interface in interfaces {
-                if let Some(methods) = self.type_methods.get(interface) {
-                    if methods.iter().any(|m| m == method_name) {
-                        return Some(interface.clone());
-                    }
+                if let Some(methods) = self.type_methods.get(interface)
+                    && methods.iter().any(|m| m == method_name)
+                {
+                    return Some(interface.clone());
                 }
                 // Recursively check embedded interfaces
                 if let Some(resolved) = self.resolve_method(interface, method_name) {

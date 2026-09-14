@@ -58,14 +58,14 @@ fn simulate_streaming(spinner: Arc<Spinner>, fail_after: Option<u64>) {
             spinner.add_extra(1);
         }
 
-        if let Some(target) = fail_after {
-            if i == target {
-                spinner.mark_failure(
-                    ExitCode::BlockingError,
-                    "Simulated upstream cancellation during streaming",
-                );
-                break;
-            }
+        if let Some(target) = fail_after
+            && i == target
+        {
+            spinner.mark_failure(
+                ExitCode::BlockingError,
+                "Simulated upstream cancellation during streaming",
+            );
+            break;
         }
 
         thread::sleep(Duration::from_millis(1));

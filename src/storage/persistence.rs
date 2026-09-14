@@ -254,14 +254,14 @@ impl IndexPersistence {
         }
 
         // Restore indexed_paths from metadata
-        if let Some(ref meta) = metadata {
-            if let Some(ref stored_paths) = meta.indexed_paths {
-                facade.set_indexed_paths(stored_paths.clone());
-                tracing::debug!(
-                    "[persistence] restored {} indexed paths from metadata",
-                    stored_paths.len()
-                );
-            }
+        if let Some(ref meta) = metadata
+            && let Some(ref stored_paths) = meta.indexed_paths
+        {
+            facade.set_indexed_paths(stored_paths.clone());
+            tracing::debug!(
+                "[persistence] restored {} indexed paths from metadata",
+                stored_paths.len()
+            );
         }
 
         Ok(facade)
@@ -383,14 +383,14 @@ impl IndexPersistence {
             }
 
             let metadata = IndexMetadata::load(&self.layout.gen_dir(&id)).ok();
-            if let Some(ref meta) = metadata {
-                if let Some(ref stored_paths) = meta.indexed_paths {
-                    facade.set_indexed_paths(stored_paths.clone());
-                    tracing::debug!(
-                        "[persistence] restored {} indexed paths for build facade",
-                        stored_paths.len()
-                    );
-                }
+            if let Some(ref meta) = metadata
+                && let Some(ref stored_paths) = meta.indexed_paths
+            {
+                facade.set_indexed_paths(stored_paths.clone());
+                tracing::debug!(
+                    "[persistence] restored {} indexed paths for build facade",
+                    stored_paths.len()
+                );
             }
         }
 

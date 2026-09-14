@@ -283,17 +283,17 @@ fn mcp_headers<'a>(method: &'a str, extra: &[(&'a str, &'a str)]) -> Vec<(&'a st
 /// SSE-framed (`data: {...}`) or plain JSON.
 fn response_payload(body: &str) -> Value {
     for line in body.lines() {
-        if let Some(rest) = line.strip_prefix("data: ") {
-            if let Ok(v) = serde_json::from_str(rest) {
-                return v;
-            }
+        if let Some(rest) = line.strip_prefix("data: ")
+            && let Ok(v) = serde_json::from_str(rest)
+        {
+            return v;
         }
     }
     for line in body.lines() {
-        if line.trim_start().starts_with('{') {
-            if let Ok(v) = serde_json::from_str(line.trim_start()) {
-                return v;
-            }
+        if line.trim_start().starts_with('{')
+            && let Ok(v) = serde_json::from_str(line.trim_start())
+        {
+            return v;
         }
     }
     panic!("no JSON-RPC payload in response body:\n{body}");

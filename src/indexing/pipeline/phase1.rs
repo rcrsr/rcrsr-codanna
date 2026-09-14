@@ -92,17 +92,17 @@ impl Pipeline {
         opts: Phase1Options,
     ) -> PipelineResult<Phase1Result> {
         // Empty file list short-circuits: no counters read, no threads spawned.
-        if let FileSource::List(files) = &source {
-            if files.is_empty() {
-                return Ok((
-                    IndexStats::new(),
-                    Vec::new(),
-                    HashMap::new(),
-                    HashMap::new(),
-                    SymbolLookupCache::with_capacity(0),
-                    None,
-                ));
-            }
+        if let FileSource::List(files) = &source
+            && files.is_empty()
+        {
+            return Ok((
+                IndexStats::new(),
+                Vec::new(),
+                HashMap::new(),
+                HashMap::new(),
+                SymbolLookupCache::with_capacity(0),
+                None,
+            ));
         }
 
         let start = Instant::now();

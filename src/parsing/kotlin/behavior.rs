@@ -128,10 +128,10 @@ impl KotlinBehavior {
             Visibility::Module => {
                 // Kotlin protected - accessible to subclasses
                 // Check inheritance if context available
-                if let Some(accessing) = accessing_class {
-                    if let Some(containing) = self.get_containing_class(symbol) {
-                        return inheritance.is_subtype(accessing, &containing);
-                    }
+                if let Some(accessing) = accessing_class
+                    && let Some(containing) = self.get_containing_class(symbol)
+                {
+                    return inheritance.is_subtype(accessing, &containing);
                 }
 
                 // No context for inheritance check: be permissive
@@ -192,14 +192,12 @@ impl LanguageBehavior for KotlinBehavior {
         }
 
         // For file modules, use the last segment of the path as the name
-        if symbol.kind == SymbolKind::Module {
-            if let Some(path) = module_path {
-                if let Some(name) = path.rsplit('.').next() {
-                    if !name.is_empty() {
-                        symbol.name = compact_string(name);
-                    }
-                }
-            }
+        if symbol.kind == SymbolKind::Module
+            && let Some(path) = module_path
+            && let Some(name) = path.rsplit('.').next()
+            && !name.is_empty()
+        {
+            symbol.name = compact_string(name);
         }
     }
 
@@ -284,24 +282,20 @@ impl LanguageBehavior for KotlinBehavior {
                 }
             }
 
-            if let Some((_, ref index)) = *cache_ref {
-                if let Ok(canon_file) = file_path.canonicalize() {
-                    if let Some(config_path) = index.get_config_for_file(&canon_file) {
-                        if let Some(rules) = index.rules.get(config_path) {
-                            for root_path in rules.paths.keys() {
-                                let root = std::path::Path::new(root_path);
-                                let canon_root =
-                                    root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+            if let Some((_, ref index)) = *cache_ref
+                && let Ok(canon_file) = file_path.canonicalize()
+                && let Some(config_path) = index.get_config_for_file(&canon_file)
+                && let Some(rules) = index.rules.get(config_path)
+            {
+                for root_path in rules.paths.keys() {
+                    let root = std::path::Path::new(root_path);
+                    let canon_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
 
-                                if let Ok(relative) = canon_file.strip_prefix(&canon_root) {
-                                    if let Some(parent) = relative.parent() {
-                                        let module_path =
-                                            parent.to_string_lossy().replace(['/', '\\'], ".");
-                                        return Some(module_path);
-                                    }
-                                }
-                            }
-                        }
+                    if let Ok(relative) = canon_file.strip_prefix(&canon_root)
+                        && let Some(parent) = relative.parent()
+                    {
+                        let module_path = parent.to_string_lossy().replace(['/', '\\'], ".");
+                        return Some(module_path);
                     }
                 }
             }
@@ -400,10 +394,9 @@ impl LanguageBehavior for KotlinBehavior {
         if let Some(kotlin_ctx) = context
             .as_any_mut()
             .downcast_mut::<crate::parsing::kotlin::KotlinResolutionContext>()
+            && let Some(entries) = self.expression_types.write().remove(&file_id)
         {
-            if let Some(entries) = self.expression_types.write().remove(&file_id) {
-                kotlin_ctx.set_expression_types(entries);
-            }
+            kotlin_ctx.set_expression_types(entries);
         }
     }
 

@@ -129,25 +129,25 @@ impl JavaParser {
         let mut current = node.prev_sibling();
 
         // Special case: if previous sibling is package_declaration, check its children
-        if let Some(sibling) = current {
-            if sibling.kind() == NODE_PACKAGE_DECLARATION {
-                let mut cursor = sibling.walk();
-                for child in sibling.named_children(&mut cursor) {
-                    let child_kind = child.kind();
-                    if child_kind == NODE_BLOCK_COMMENT || child_kind == NODE_LINE_COMMENT {
-                        let raw = self.text_for_node(code, child);
-                        if let Some(cleaned) = self.extract_comment_text(raw) {
-                            if has_comment {
-                                result.push('\n');
-                            }
-                            result.push_str(cleaned);
-                            has_comment = true;
+        if let Some(sibling) = current
+            && sibling.kind() == NODE_PACKAGE_DECLARATION
+        {
+            let mut cursor = sibling.walk();
+            for child in sibling.named_children(&mut cursor) {
+                let child_kind = child.kind();
+                if child_kind == NODE_BLOCK_COMMENT || child_kind == NODE_LINE_COMMENT {
+                    let raw = self.text_for_node(code, child);
+                    if let Some(cleaned) = self.extract_comment_text(raw) {
+                        if has_comment {
+                            result.push('\n');
                         }
+                        result.push_str(cleaned);
+                        has_comment = true;
                     }
                 }
-                if has_comment {
-                    return Some(result);
-                }
+            }
+            if has_comment {
+                return Some(result);
             }
         }
 
@@ -160,13 +160,13 @@ impl JavaParser {
             }
 
             let raw = self.text_for_node(code, sibling);
-            if stack_len < comment_stack.len() {
-                if let Some(cleaned) = self.extract_comment_text(raw) {
-                    comment_stack[stack_len] = Some(cleaned);
-                    stack_len += 1;
-                    current = sibling.prev_sibling();
-                    continue;
-                }
+            if stack_len < comment_stack.len()
+                && let Some(cleaned) = self.extract_comment_text(raw)
+            {
+                comment_stack[stack_len] = Some(cleaned);
+                stack_len += 1;
+                current = sibling.prev_sibling();
+                continue;
             }
             break;
         }
@@ -842,13 +842,13 @@ impl JavaParser {
         calls: &mut Vec<(&'a str, &'a str, Range)>,
         current_method: Option<&'a str>,
     ) {
-        if node.kind() == NODE_METHOD_INVOCATION {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let caller = current_method.unwrap_or(FILE_SCOPE);
-                let callee = self.text_for_node(code, name_node).trim();
-                if !callee.is_empty() {
-                    calls.push((caller, callee, self.node_to_range(node)));
-                }
+        if node.kind() == NODE_METHOD_INVOCATION
+            && let Some(name_node) = node.child_by_field_name("name")
+        {
+            let caller = current_method.unwrap_or(FILE_SCOPE);
+            let callee = self.text_for_node(code, name_node).trim();
+            if !callee.is_empty() {
+                calls.push((caller, callee, self.node_to_range(node)));
             }
         }
 
@@ -877,34 +877,34 @@ impl JavaParser {
         method_calls: &mut Vec<MethodCall>,
         current_method: Option<&str>,
     ) {
-        if node.kind() == NODE_METHOD_INVOCATION {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let method_name = self.text_for_node(code, name_node).trim().to_string();
+        if node.kind() == NODE_METHOD_INVOCATION
+            && let Some(name_node) = node.child_by_field_name("name")
+        {
+            let method_name = self.text_for_node(code, name_node).trim().to_string();
 
-                // Extract receiver if present (object field)
-                let receiver = node
-                    .child_by_field_name("object")
-                    .map(|obj| self.text_for_node(code, obj).trim().to_string());
+            // Extract receiver if present (object field)
+            let receiver = node
+                .child_by_field_name("object")
+                .map(|obj| self.text_for_node(code, obj).trim().to_string());
 
-                if !method_name.is_empty() {
-                    let caller = current_method.unwrap_or(FILE_SCOPE).to_string();
-                    let range = self.node_to_range(node);
+            if !method_name.is_empty() {
+                let caller = current_method.unwrap_or(FILE_SCOPE).to_string();
+                let range = self.node_to_range(node);
 
-                    // Pascal-leading heuristic; this./super. receivers stay lowercase ⇒ instance.
-                    let is_static = receiver
-                        .as_deref()
-                        .and_then(|r| r.chars().next())
-                        .is_some_and(|c| c.is_ascii_uppercase());
+                // Pascal-leading heuristic; this./super. receivers stay lowercase ⇒ instance.
+                let is_static = receiver
+                    .as_deref()
+                    .and_then(|r| r.chars().next())
+                    .is_some_and(|c| c.is_ascii_uppercase());
 
-                    method_calls.push(MethodCall {
-                        caller,
-                        method_name,
-                        receiver,
-                        is_static,
-                        range,
-                        caller_range: None,
-                    });
-                }
+                method_calls.push(MethodCall {
+                    caller,
+                    method_name,
+                    receiver,
+                    is_static,
+                    range,
+                    caller_range: None,
+                });
             }
         }
 
@@ -933,26 +933,26 @@ impl JavaParser {
         implements: &mut Vec<(&'a str, &'a str, Range)>,
     ) {
         // Check for class/enum with super_interfaces field
-        if node.kind() == NODE_CLASS_DECLARATION || node.kind() == NODE_ENUM_DECLARATION {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let class_name = self.text_for_node(code, name_node).trim();
+        if (node.kind() == NODE_CLASS_DECLARATION || node.kind() == NODE_ENUM_DECLARATION)
+            && let Some(name_node) = node.child_by_field_name("name")
+        {
+            let class_name = self.text_for_node(code, name_node).trim();
 
-                // Get interfaces field (super_interfaces)
-                if let Some(interfaces_node) = node.child_by_field_name("interfaces") {
-                    // super_interfaces contains type_list with individual types
-                    let mut cursor = interfaces_node.walk();
-                    for child in interfaces_node.children(&mut cursor) {
-                        if child.kind() == "type_list" {
-                            let mut type_cursor = child.walk();
-                            for type_node in child.children(&mut type_cursor) {
-                                let interface_name = self.text_for_node(code, type_node).trim();
-                                if !interface_name.is_empty() {
-                                    implements.push((
-                                        class_name,
-                                        interface_name,
-                                        self.node_to_range(type_node),
-                                    ));
-                                }
+            // Get interfaces field (super_interfaces)
+            if let Some(interfaces_node) = node.child_by_field_name("interfaces") {
+                // super_interfaces contains type_list with individual types
+                let mut cursor = interfaces_node.walk();
+                for child in interfaces_node.children(&mut cursor) {
+                    if child.kind() == "type_list" {
+                        let mut type_cursor = child.walk();
+                        for type_node in child.children(&mut type_cursor) {
+                            let interface_name = self.text_for_node(code, type_node).trim();
+                            if !interface_name.is_empty() {
+                                implements.push((
+                                    class_name,
+                                    interface_name,
+                                    self.node_to_range(type_node),
+                                ));
                             }
                         }
                     }
@@ -975,50 +975,49 @@ impl JavaParser {
         extends: &mut Vec<(&'a str, &'a str, Range)>,
     ) {
         // Class extends (superclass field)
-        if node.kind() == NODE_CLASS_DECLARATION {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let class_name = self.text_for_node(code, name_node).trim();
+        if node.kind() == NODE_CLASS_DECLARATION
+            && let Some(name_node) = node.child_by_field_name("name")
+        {
+            let class_name = self.text_for_node(code, name_node).trim();
 
-                if let Some(superclass_node) = node.child_by_field_name("superclass") {
-                    // superclass node contains "extends Person", we need just "Person"
-                    // Extract the type_identifier child
-                    if let Some(type_node) = superclass_node
-                        .child_by_field_name("type_identifier")
-                        .or_else(|| superclass_node.named_child(0))
-                    {
-                        let parent_name = self.text_for_node(code, type_node).trim();
-                        if !parent_name.is_empty() {
-                            extends.push((class_name, parent_name, self.node_to_range(type_node)));
-                        }
+            if let Some(superclass_node) = node.child_by_field_name("superclass") {
+                // superclass node contains "extends Person", we need just "Person"
+                // Extract the type_identifier child
+                if let Some(type_node) = superclass_node
+                    .child_by_field_name("type_identifier")
+                    .or_else(|| superclass_node.named_child(0))
+                {
+                    let parent_name = self.text_for_node(code, type_node).trim();
+                    if !parent_name.is_empty() {
+                        extends.push((class_name, parent_name, self.node_to_range(type_node)));
                     }
                 }
             }
         }
 
         // Interface extends (extends_interfaces child)
-        if node.kind() == NODE_INTERFACE_DECLARATION {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let interface_name = self.text_for_node(code, name_node).trim();
+        if node.kind() == NODE_INTERFACE_DECLARATION
+            && let Some(name_node) = node.child_by_field_name("name")
+        {
+            let interface_name = self.text_for_node(code, name_node).trim();
 
-                // Look for extends_interfaces in children
-                let mut cursor = node.walk();
-                for child in node.children(&mut cursor) {
-                    if child.kind() == "extends_interfaces" {
-                        // extends_interfaces contains type_list
-                        let mut ext_cursor = child.walk();
-                        for ext_child in child.children(&mut ext_cursor) {
-                            if ext_child.kind() == "type_list" {
-                                let mut type_cursor = ext_child.walk();
-                                for type_node in ext_child.children(&mut type_cursor) {
-                                    let parent_interface =
-                                        self.text_for_node(code, type_node).trim();
-                                    if !parent_interface.is_empty() {
-                                        extends.push((
-                                            interface_name,
-                                            parent_interface,
-                                            self.node_to_range(type_node),
-                                        ));
-                                    }
+            // Look for extends_interfaces in children
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() == "extends_interfaces" {
+                    // extends_interfaces contains type_list
+                    let mut ext_cursor = child.walk();
+                    for ext_child in child.children(&mut ext_cursor) {
+                        if ext_child.kind() == "type_list" {
+                            let mut type_cursor = ext_child.walk();
+                            for type_node in ext_child.children(&mut type_cursor) {
+                                let parent_interface = self.text_for_node(code, type_node).trim();
+                                if !parent_interface.is_empty() {
+                                    extends.push((
+                                        interface_name,
+                                        parent_interface,
+                                        self.node_to_range(type_node),
+                                    ));
                                 }
                             }
                         }
@@ -1062,38 +1061,31 @@ impl JavaParser {
         let context = new_context.or(current_context);
 
         // Collect type references from field declarations
-        if node.kind() == NODE_FIELD_DECLARATION {
-            if let Some(ctx) = context {
-                if let Some(type_node) = node.child_by_field_name("type") {
-                    if let Some(type_name) = self.extract_type_name(type_node, code) {
-                        if !primitives.contains(type_name) {
-                            uses.push((ctx, type_name, self.node_to_range(type_node)));
-                        }
-                    }
-                }
-            }
+        if node.kind() == NODE_FIELD_DECLARATION
+            && let Some(ctx) = context
+            && let Some(type_node) = node.child_by_field_name("type")
+            && let Some(type_name) = self.extract_type_name(type_node, code)
+            && !primitives.contains(type_name)
+        {
+            uses.push((ctx, type_name, self.node_to_range(type_node)));
         }
 
         // Collect type references from method return types
-        if node.kind() == NODE_METHOD_DECLARATION {
-            if let Some(ctx) = context {
-                if let Some(type_node) = node.child_by_field_name("type") {
-                    if let Some(type_name) = self.extract_type_name(type_node, code) {
-                        if !primitives.contains(type_name) {
-                            uses.push((ctx, type_name, self.node_to_range(type_node)));
-                        }
-                    }
-                }
-            }
+        if node.kind() == NODE_METHOD_DECLARATION
+            && let Some(ctx) = context
+            && let Some(type_node) = node.child_by_field_name("type")
+            && let Some(type_name) = self.extract_type_name(type_node, code)
+            && !primitives.contains(type_name)
+        {
+            uses.push((ctx, type_name, self.node_to_range(type_node)));
         }
 
         // Collect type references from method/constructor parameters
-        if node.kind() == NODE_METHOD_DECLARATION || node.kind() == NODE_CONSTRUCTOR_DECLARATION {
-            if let Some(ctx) = context {
-                if let Some(params_node) = node.child_by_field_name("parameters") {
-                    self.collect_parameter_types(params_node, code, uses, ctx, primitives);
-                }
-            }
+        if (node.kind() == NODE_METHOD_DECLARATION || node.kind() == NODE_CONSTRUCTOR_DECLARATION)
+            && let Some(ctx) = context
+            && let Some(params_node) = node.child_by_field_name("parameters")
+        {
+            self.collect_parameter_types(params_node, code, uses, ctx, primitives);
         }
 
         // Recursively process children
@@ -1114,14 +1106,12 @@ impl JavaParser {
     ) {
         let mut cursor = params_node.walk();
         for param in params_node.children(&mut cursor) {
-            if param.kind() == "formal_parameter" {
-                if let Some(type_node) = param.child_by_field_name("type") {
-                    if let Some(type_name) = self.extract_type_name(type_node, code) {
-                        if !primitives.contains(type_name) {
-                            uses.push((context, type_name, self.node_to_range(type_node)));
-                        }
-                    }
-                }
+            if param.kind() == "formal_parameter"
+                && let Some(type_node) = param.child_by_field_name("type")
+                && let Some(type_name) = self.extract_type_name(type_node, code)
+                && !primitives.contains(type_name)
+            {
+                uses.push((context, type_name, self.node_to_range(type_node)));
             }
         }
     }

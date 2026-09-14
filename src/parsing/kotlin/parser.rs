@@ -176,25 +176,25 @@ impl KotlinParser {
         let mut current = node.prev_sibling();
 
         // Special case: if previous sibling is package_header, check its children for comments
-        if let Some(sibling) = current {
-            if sibling.kind() == NODE_PACKAGE_HEADER {
-                let mut cursor = sibling.walk();
-                for child in sibling.named_children(&mut cursor) {
-                    let child_kind = child.kind();
-                    if child_kind == NODE_MULTILINE_COMMENT || child_kind == NODE_LINE_COMMENT {
-                        let raw = self.text_for_node(code, child);
-                        if let Some(cleaned) = self.extract_comment_text(raw, &mut result) {
-                            if has_comment {
-                                result.push('\n');
-                            }
-                            result.push_str(cleaned);
-                            has_comment = true;
+        if let Some(sibling) = current
+            && sibling.kind() == NODE_PACKAGE_HEADER
+        {
+            let mut cursor = sibling.walk();
+            for child in sibling.named_children(&mut cursor) {
+                let child_kind = child.kind();
+                if child_kind == NODE_MULTILINE_COMMENT || child_kind == NODE_LINE_COMMENT {
+                    let raw = self.text_for_node(code, child);
+                    if let Some(cleaned) = self.extract_comment_text(raw, &mut result) {
+                        if has_comment {
+                            result.push('\n');
                         }
+                        result.push_str(cleaned);
+                        has_comment = true;
                     }
                 }
-                if has_comment {
-                    return Some(result);
-                }
+            }
+            if has_comment {
+                return Some(result);
             }
         }
 
@@ -208,13 +208,13 @@ impl KotlinParser {
 
             let raw = self.text_for_node(code, sibling);
             // Try to use stack allocation for small numbers of comments
-            if stack_len < comment_stack.len() {
-                if let Some(cleaned) = self.peek_comment_text(raw) {
-                    comment_stack[stack_len] = Some(cleaned);
-                    stack_len += 1;
-                    current = sibling.prev_sibling();
-                    continue;
-                }
+            if stack_len < comment_stack.len()
+                && let Some(cleaned) = self.peek_comment_text(raw)
+            {
+                comment_stack[stack_len] = Some(cleaned);
+                stack_len += 1;
+                current = sibling.prev_sibling();
+                continue;
             }
             break;
         }
@@ -405,13 +405,13 @@ impl KotlinParser {
             return;
         }
 
-        if node.kind() == NODE_FUNCTION_DECLARATION {
-            if let Some(signature) = self.extract_function_signature(node, code) {
-                signatures
-                    .entry(signature.name)
-                    .or_default()
-                    .push(signature);
-            }
+        if node.kind() == NODE_FUNCTION_DECLARATION
+            && let Some(signature) = self.extract_function_signature(node, code)
+        {
+            signatures
+                .entry(signature.name)
+                .or_default()
+                .push(signature);
         }
 
         let mut cursor = node.walk();
@@ -1342,20 +1342,20 @@ impl KotlinParser {
 
         // Lazy body traversal: Only traverse if body contains declarations
         // This optimization skips traversing function bodies that don't define nested symbols
-        if let Some(body) = body_node {
-            if self.body_contains_declarations(body) {
-                let mut body_cursor = body.walk();
-                for body_child in body.children(&mut body_cursor) {
-                    self.extract_symbols_from_node(
-                        body_child,
-                        code,
-                        file_id,
-                        symbols,
-                        counter,
-                        context,
-                        depth + 1,
-                    );
-                }
+        if let Some(body) = body_node
+            && self.body_contains_declarations(body)
+        {
+            let mut body_cursor = body.walk();
+            for body_child in body.children(&mut body_cursor) {
+                self.extract_symbols_from_node(
+                    body_child,
+                    code,
+                    file_id,
+                    symbols,
+                    counter,
+                    context,
+                    depth + 1,
+                );
             }
         }
 
@@ -1514,19 +1514,19 @@ impl KotlinParser {
         file_id: FileId,
         imports: &mut Vec<Import>,
     ) {
-        if node.kind() == "import_header" {
-            if let Some(identifier) = node.child_by_field_name("identifier") {
-                let path = self.text_for_node(code, identifier).trim().to_string();
-                if !path.is_empty() {
-                    let is_glob = path.ends_with(".*") || path.contains("*");
-                    imports.push(Import {
-                        file_id,
-                        path,
-                        alias: None,
-                        is_glob,
-                        is_type_only: false,
-                    });
-                }
+        if node.kind() == "import_header"
+            && let Some(identifier) = node.child_by_field_name("identifier")
+        {
+            let path = self.text_for_node(code, identifier).trim().to_string();
+            if !path.is_empty() {
+                let is_glob = path.ends_with(".*") || path.contains("*");
+                imports.push(Import {
+                    file_id,
+                    path,
+                    alias: None,
+                    is_glob,
+                    is_type_only: false,
+                });
             }
         }
 
@@ -1544,18 +1544,18 @@ impl KotlinParser {
         calls: &mut Vec<(&'a str, &'a str, Range)>,
         current_function: Option<&'a str>,
     ) {
-        if node.kind() == NODE_CALL_EXPRESSION {
-            if let Some(callee) = node.child(0) {
-                // Skip method calls (where callee is a navigation_expression like foo(3).bar)
-                // Those are handled by find_method_calls
-                if callee.kind() == "navigation_expression" {
-                    // This is a method call, not a function call
-                } else {
-                    let caller = current_function.unwrap_or(FILE_SCOPE);
-                    let callee_text = self.text_for_node(code, callee).trim();
-                    if !callee_text.is_empty() {
-                        calls.push((caller, callee_text, self.node_to_range(node)));
-                    }
+        if node.kind() == NODE_CALL_EXPRESSION
+            && let Some(callee) = node.child(0)
+        {
+            // Skip method calls (where callee is a navigation_expression like foo(3).bar)
+            // Those are handled by find_method_calls
+            if callee.kind() == "navigation_expression" {
+                // This is a method call, not a function call
+            } else {
+                let caller = current_function.unwrap_or(FILE_SCOPE);
+                let callee_text = self.text_for_node(code, callee).trim();
+                if !callee_text.is_empty() {
+                    calls.push((caller, callee_text, self.node_to_range(node)));
                 }
             }
         }
@@ -1604,42 +1604,41 @@ impl KotlinParser {
             };
 
             // Get the navigation_suffix (right side of the dot)
-            if let Some(nav_suffix) = node.child(1) {
-                if nav_suffix.kind() == "navigation_suffix" {
-                    // Find the simple_identifier child (skip the dot)
-                    let mut method_name = String::new();
-                    let mut cursor = nav_suffix.walk();
-                    for child in nav_suffix.children(&mut cursor) {
-                        if child.kind() == NODE_SIMPLE_IDENTIFIER {
-                            method_name = self.text_for_node(code, child).trim().to_string();
-                            break;
-                        }
+            if let Some(nav_suffix) = node.child(1)
+                && nav_suffix.kind() == "navigation_suffix"
+            {
+                // Find the simple_identifier child (skip the dot)
+                let mut method_name = String::new();
+                let mut cursor = nav_suffix.walk();
+                for child in nav_suffix.children(&mut cursor) {
+                    if child.kind() == NODE_SIMPLE_IDENTIFIER {
+                        method_name = self.text_for_node(code, child).trim().to_string();
+                        break;
                     }
+                }
 
-                    if !method_name.is_empty() {
-                        // Check if this is followed by a call_suffix (making it a method call)
-                        let parent = node.parent();
-                        let is_method_call =
-                            parent.is_some_and(|p| p.kind() == NODE_CALL_EXPRESSION);
+                if !method_name.is_empty() {
+                    // Check if this is followed by a call_suffix (making it a method call)
+                    let parent = node.parent();
+                    let is_method_call = parent.is_some_and(|p| p.kind() == NODE_CALL_EXPRESSION);
 
-                        if is_method_call {
-                            let caller = current_function.unwrap_or(FILE_SCOPE);
-                            let range = self.node_to_range(node);
+                    if is_method_call {
+                        let caller = current_function.unwrap_or(FILE_SCOPE);
+                        let range = self.node_to_range(node);
 
-                            // Pascal-leading receiver ⇒ companion-object / static call.
-                            let is_static = receiver_text
-                                .chars()
-                                .next()
-                                .is_some_and(|c| c.is_ascii_uppercase());
+                        // Pascal-leading receiver ⇒ companion-object / static call.
+                        let is_static = receiver_text
+                            .chars()
+                            .next()
+                            .is_some_and(|c| c.is_ascii_uppercase());
 
-                            let mut call = MethodCall::new(caller, &method_name, range)
-                                .with_receiver(receiver_text);
-                            if is_static {
-                                call = call.static_method();
-                            }
-
-                            method_calls.push(call);
+                        let mut call = MethodCall::new(caller, &method_name, range)
+                            .with_receiver(receiver_text);
+                        if is_static {
+                            call = call.static_method();
                         }
+
+                        method_calls.push(call);
                     }
                 }
             }
@@ -1826,16 +1825,15 @@ impl KotlinParser {
         let class_context = new_class.or(current_class);
 
         // Look for delegation specifiers (: SuperClass, Interface)
-        if node.kind() == NODE_DELEGATION_SPECIFIER {
-            if let Some(derived) = class_context {
-                if let Some(type_node) = node.child(0) {
-                    let base = self.text_for_node(code, type_node).trim();
-                    // Remove constructor call syntax if present
-                    let base_clean = base.split('(').next().unwrap_or(base).trim();
-                    if !base_clean.is_empty() {
-                        results.push((derived, base_clean, self.node_to_range(node)));
-                    }
-                }
+        if node.kind() == NODE_DELEGATION_SPECIFIER
+            && let Some(derived) = class_context
+            && let Some(type_node) = node.child(0)
+        {
+            let base = self.text_for_node(code, type_node).trim();
+            // Remove constructor call syntax if present
+            let base_clean = base.split('(').next().unwrap_or(base).trim();
+            if !base_clean.is_empty() {
+                results.push((derived, base_clean, self.node_to_range(node)));
             }
         }
 
@@ -1937,10 +1935,9 @@ impl KotlinParser {
                             } else if (var_child.kind() == NODE_USER_TYPE
                                 || var_child.kind() == NODE_TYPE_REFERENCE)
                                 && prop_type.is_none()
+                                && let Some(type_name) = self.extract_type_name(var_child, code)
                             {
-                                if let Some(type_name) = self.extract_type_name(var_child, code) {
-                                    prop_type = Some((type_name, self.node_to_range(var_child)));
-                                }
+                                prop_type = Some((type_name, self.node_to_range(var_child)));
                             }
                         }
                         break;
@@ -1976,10 +1973,10 @@ impl KotlinParser {
                 // Look for user_type or type_reference nodes within the parameter
                 let mut param_cursor = param.walk();
                 for child in param.children(&mut param_cursor) {
-                    if child.kind() == NODE_USER_TYPE || child.kind() == NODE_TYPE_REFERENCE {
-                        if let Some(type_name) = self.extract_type_name(child, code) {
-                            uses.push((context_name, type_name, self.node_to_range(child)));
-                        }
+                    if (child.kind() == NODE_USER_TYPE || child.kind() == NODE_TYPE_REFERENCE)
+                        && let Some(type_name) = self.extract_type_name(child, code)
+                    {
+                        uses.push((context_name, type_name, self.node_to_range(child)));
                     }
                 }
             }

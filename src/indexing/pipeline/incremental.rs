@@ -273,36 +273,36 @@ impl Pipeline {
         }
 
         // Generate embeddings for symbols with doc_comments
-        if let (Some(pool), Some(sem)) = (&embedding_pool, &semantic) {
-            if !embed_batch.candidates.is_empty() {
-                tracing::info!(
-                    target: "pipeline",
-                    "Generating {} embeddings for {}",
-                    embed_batch.candidates.len(),
-                    path.display()
-                );
+        if let (Some(pool), Some(sem)) = (&embedding_pool, &semantic)
+            && !embed_batch.candidates.is_empty()
+        {
+            tracing::info!(
+                target: "pipeline",
+                "Generating {} embeddings for {}",
+                embed_batch.candidates.len(),
+                path.display()
+            );
 
-                // Convert to the format expected by embed_parallel
-                let items: Vec<_> = embed_batch
-                    .candidates
-                    .iter()
-                    .map(|(id, doc, lang)| (*id, doc.as_ref(), lang.as_ref()))
-                    .collect();
+            // Convert to the format expected by embed_parallel
+            let items: Vec<_> = embed_batch
+                .candidates
+                .iter()
+                .map(|(id, doc, lang)| (*id, doc.as_ref(), lang.as_ref()))
+                .collect();
 
-                // Generate embeddings
-                let embeddings = pool
-                    .embed_parallel(&items)
-                    .map_err(|e| PipelineError::Parse {
-                        path: path.to_path_buf(),
-                        reason: format!("Embedding generation failed: {e}"),
-                    })?;
+            // Generate embeddings
+            let embeddings = pool
+                .embed_parallel(&items)
+                .map_err(|e| PipelineError::Parse {
+                    path: path.to_path_buf(),
+                    reason: format!("Embedding generation failed: {e}"),
+                })?;
 
-                // store_embeddings warns internally on any dropped embeddings.
-                if !embeddings.is_empty() {
-                    if let Ok(mut guard) = sem.lock() {
-                        guard.store_embeddings(embeddings);
-                    }
-                }
+            // store_embeddings warns internally on any dropped embeddings.
+            if !embeddings.is_empty()
+                && let Ok(mut guard) = sem.lock()
+            {
+                guard.store_embeddings(embeddings);
             }
         }
 

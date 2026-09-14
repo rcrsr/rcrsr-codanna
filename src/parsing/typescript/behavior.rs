@@ -441,26 +441,26 @@ impl LanguageBehavior for TypeScriptBehavior {
             let mut suffix_matches: Vec<SymbolId> = Vec::new();
             if resolved_symbol.is_none() {
                 for id in cache.lookup_candidates(&local_name) {
-                    if let Some(symbol) = cache.get(id) {
-                        if let Some(ref module_path) = symbol.module_path {
-                            if module_path.as_ref() == target_module {
-                                resolved_symbol = Some(id);
-                                break;
-                            }
-                            if crate::indexing::pipeline::types::segment_suffix_match(
-                                module_path,
-                                &target_module,
-                            ) {
-                                suffix_matches.push(id);
-                            }
+                    if let Some(symbol) = cache.get(id)
+                        && let Some(ref module_path) = symbol.module_path
+                    {
+                        if module_path.as_ref() == target_module {
+                            resolved_symbol = Some(id);
+                            break;
+                        }
+                        if crate::indexing::pipeline::types::segment_suffix_match(
+                            module_path,
+                            &target_module,
+                        ) {
+                            suffix_matches.push(id);
                         }
                     }
                 }
             }
-            if resolved_symbol.is_none() {
-                if let [id] = suffix_matches.as_slice() {
-                    resolved_symbol = Some(*id);
-                }
+            if resolved_symbol.is_none()
+                && let [id] = suffix_matches.as_slice()
+            {
+                resolved_symbol = Some(*id);
             }
 
             // Determine origin
@@ -488,12 +488,12 @@ impl LanguageBehavior for TypeScriptBehavior {
 
         // Add local symbols from this file
         for sym_id in cache.symbols_in_file(file_id) {
-            if let Some(symbol) = cache.get(sym_id) {
-                if self.is_resolvable_symbol(&symbol) {
-                    context.add_symbol(symbol.name.to_string(), symbol.id, ScopeLevel::Module);
-                    if let Some(ref module_path) = symbol.module_path {
-                        context.add_symbol(module_path.to_string(), symbol.id, ScopeLevel::Module);
-                    }
+            if let Some(symbol) = cache.get(sym_id)
+                && self.is_resolvable_symbol(&symbol)
+            {
+                context.add_symbol(symbol.name.to_string(), symbol.id, ScopeLevel::Module);
+                if let Some(ref module_path) = symbol.module_path {
+                    context.add_symbol(module_path.to_string(), symbol.id, ScopeLevel::Module);
                 }
             }
         }

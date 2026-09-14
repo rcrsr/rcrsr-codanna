@@ -777,11 +777,11 @@ async fn get_or_create_certificate(bind: &str) -> anyhow::Result<(Vec<u8>, Vec<u
     ];
 
     // If binding to 0.0.0.0, include local network IP
-    if bind.starts_with("0.0.0.0") {
-        if let Ok(local_ip) = local_ip_address::local_ip() {
-            eprintln!("Including local network IP in certificate: {local_ip}");
-            subject_alt_names.push(local_ip.to_string());
-        }
+    if bind.starts_with("0.0.0.0")
+        && let Ok(local_ip) = local_ip_address::local_ip()
+    {
+        eprintln!("Including local network IP in certificate: {local_ip}");
+        subject_alt_names.push(local_ip.to_string());
     }
 
     // Generate certificate using the simpler API but with better parameters

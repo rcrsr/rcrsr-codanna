@@ -90,12 +90,11 @@ impl SwiftResolutionContext {
 
     fn resolve_in_extensions(&self, name: &str) -> Option<SymbolId> {
         // Check if we have a current type context
-        if let Some(ref type_name) = self.current_type {
-            if let Some(ext_methods) = self.extension_scope.get(type_name) {
-                if let Some(&id) = ext_methods.get(name) {
-                    return Some(id);
-                }
-            }
+        if let Some(ref type_name) = self.current_type
+            && let Some(ext_methods) = self.extension_scope.get(type_name)
+            && let Some(&id) = ext_methods.get(name)
+        {
+            return Some(id);
         }
 
         // Also check all extensions (for static resolution)
@@ -128,10 +127,10 @@ impl ResolutionScope for SwiftResolutionContext {
             }
             ScopeLevel::Module => {
                 // If we're inside a type, add to type scope; otherwise module scope
-                if matches!(self.scope_stack.last(), Some(ScopeType::Class)) {
-                    if let Some(scope) = self.current_type_scope_mut() {
-                        scope.insert(name.clone(), symbol_id);
-                    }
+                if matches!(self.scope_stack.last(), Some(ScopeType::Class))
+                    && let Some(scope) = self.current_type_scope_mut()
+                {
+                    scope.insert(name.clone(), symbol_id);
                 }
                 self.module_scope.entry(name).or_insert(symbol_id);
             }
@@ -177,12 +176,12 @@ impl ResolutionScope for SwiftResolutionContext {
         }
 
         // Handle qualified names like "Type.member"
-        if let Some((head, tail)) = name.split_once('.') {
-            if self.resolve(head).is_some() {
-                // Try to resolve the member in type scope
-                if let Some(id) = self.resolve_in_types(tail) {
-                    return Some(id);
-                }
+        if let Some((head, tail)) = name.split_once('.')
+            && self.resolve(head).is_some()
+        {
+            // Try to resolve the member in type scope
+            if let Some(id) = self.resolve_in_types(tail) {
+                return Some(id);
             }
         }
 
@@ -385,10 +384,10 @@ impl SwiftInheritanceResolver {
         }
 
         // 3. Check parent class
-        if let Some(parent) = self.class_inheritance.get(ty) {
-            if let Some(found) = self.resolve_method_recursive(parent, method, visited) {
-                return Some(found);
-            }
+        if let Some(parent) = self.class_inheritance.get(ty)
+            && let Some(found) = self.resolve_method_recursive(parent, method, visited)
+        {
+            return Some(found);
         }
 
         // 4. Check protocol conformance and protocol extensions

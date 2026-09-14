@@ -400,10 +400,10 @@ impl ProjectRegistry {
 
         self.projects.iter().find_map(|(id, info)| {
             // Compare canonicalized paths to handle symlinks and relative paths
-            if let Ok(project_path) = info.path.canonicalize() {
-                if project_path == search_path {
-                    return Some((id.clone(), info));
-                }
+            if let Ok(project_path) = info.path.canonicalize()
+                && project_path == search_path
+            {
+                return Some((id.clone(), info));
             }
             None
         })
@@ -467,19 +467,19 @@ pub fn resolve_index_path(
     }
 
     // If we loaded from a specific config file, resolve relative to it
-    if let Some(cfg_path) = config_path {
-        if let Some(parent) = cfg_path.parent() {
-            // Check if parent is our local config directory
-            let local_dir = local_dir_name();
-            if parent.file_name() == Some(std::ffi::OsStr::new(local_dir)) {
-                // Go up one more level to get workspace root
-                if let Some(workspace) = parent.parent() {
-                    return workspace.join(&settings.index_path);
-                }
+    if let Some(cfg_path) = config_path
+        && let Some(parent) = cfg_path.parent()
+    {
+        // Check if parent is our local config directory
+        let local_dir = local_dir_name();
+        if parent.file_name() == Some(std::ffi::OsStr::new(local_dir)) {
+            // Go up one more level to get workspace root
+            if let Some(workspace) = parent.parent() {
+                return workspace.join(&settings.index_path);
             }
-            // Otherwise resolve relative to config directory
-            return parent.join(&settings.index_path);
         }
+        // Otherwise resolve relative to config directory
+        return parent.join(&settings.index_path);
     }
 
     // If workspace_root is set in settings, use it

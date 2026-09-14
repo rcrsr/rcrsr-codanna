@@ -190,10 +190,10 @@ impl InheritanceResolver for LuaInheritanceResolver {
                 continue;
             }
 
-            if let Some(methods) = self.type_methods.get(&current) {
-                if methods.iter().any(|m| m == method) {
-                    return Some(current);
-                }
+            if let Some(methods) = self.type_methods.get(&current)
+                && methods.iter().any(|m| m == method)
+            {
+                return Some(current);
             }
 
             if let Some(parents) = self.inheritance.get(&current) {

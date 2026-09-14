@@ -719,13 +719,13 @@ fn find_go_fixtures() -> Vec<PathBuf> {
     let mut fixtures = Vec::new();
     let fixtures_dir = PathBuf::from("tests/fixtures/go");
 
-    if fixtures_dir.exists() {
-        if let Ok(entries) = fs::read_dir(fixtures_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file() && path.extension().is_some_and(|ext| ext == "go") {
-                    fixtures.push(path);
-                }
+    if fixtures_dir.exists()
+        && let Ok(entries) = fs::read_dir(fixtures_dir)
+    {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() && path.extension().is_some_and(|ext| ext == "go") {
+                fixtures.push(path);
             }
         }
     }

@@ -610,26 +610,26 @@ impl InheritanceResolver for TypeScriptInheritanceResolver {
 
     fn resolve_method(&self, type_name: &str, method_name: &str) -> Option<String> {
         // Check if the type has this method
-        if let Some(methods) = self.type_methods.get(type_name) {
-            if methods.iter().any(|m| m == method_name) {
-                return Some(type_name.to_string());
-            }
+        if let Some(methods) = self.type_methods.get(type_name)
+            && methods.iter().any(|m| m == method_name)
+        {
+            return Some(type_name.to_string());
         }
 
         // Check parent class
-        if let Some(parent) = self.class_extends.get(type_name) {
-            if let Some(resolved) = self.resolve_method(parent, method_name) {
-                return Some(resolved);
-            }
+        if let Some(parent) = self.class_extends.get(type_name)
+            && let Some(resolved) = self.resolve_method(parent, method_name)
+        {
+            return Some(resolved);
         }
 
         // Check implemented interfaces
         if let Some(interfaces) = self.class_implements.get(type_name) {
             for interface in interfaces {
-                if let Some(methods) = self.type_methods.get(interface) {
-                    if methods.iter().any(|m| m == method_name) {
-                        return Some(interface.clone());
-                    }
+                if let Some(methods) = self.type_methods.get(interface)
+                    && methods.iter().any(|m| m == method_name)
+                {
+                    return Some(interface.clone());
                 }
             }
         }
@@ -652,14 +652,14 @@ impl InheritanceResolver for TypeScriptInheritanceResolver {
         visited.insert(type_name.to_string());
 
         // For classes: add parent class
-        if let Some(parent) = self.class_extends.get(type_name) {
-            if visited.insert(parent.clone()) {
-                chain.push(parent.clone());
-                // Recursively get parent's chain
-                for ancestor in self.get_inheritance_chain(parent) {
-                    if visited.insert(ancestor.clone()) {
-                        chain.push(ancestor);
-                    }
+        if let Some(parent) = self.class_extends.get(type_name)
+            && visited.insert(parent.clone())
+        {
+            chain.push(parent.clone());
+            // Recursively get parent's chain
+            for ancestor in self.get_inheritance_chain(parent) {
+                if visited.insert(ancestor.clone()) {
+                    chain.push(ancestor);
                 }
             }
         }
