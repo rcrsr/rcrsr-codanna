@@ -60,6 +60,15 @@ mod test_index_force_invalid_path;
 #[path = "cli/test_index_status.rs"]
 mod test_index_status;
 
+#[path = "cli/test_index_gc_rollback.rs"]
+mod test_index_gc_rollback;
+
+#[path = "cli/test_index_force_retains_previous_generation.rs"]
+mod test_index_force_retains_previous_generation;
+
+#[path = "cli/test_index_generations_publish.rs"]
+mod test_index_generations_publish;
+
 #[path = "cli/test_serve_stdio_dual_generation.rs"]
 mod test_serve_stdio_dual_generation;
 

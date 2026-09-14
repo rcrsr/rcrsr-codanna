@@ -180,6 +180,20 @@ pub enum Commands {
         /// output.
         #[arg(long)]
         status: bool,
+
+        /// Run garbage collection over on-disk generations (removes
+        /// orphaned, superseded, and damaged generations no longer
+        /// referenced by `current`) and print a summary, then exit.
+        /// Mutually exclusive with indexing, --status, and --rollback.
+        #[arg(long = "gc", conflicts_with_all = ["status", "rollback", "paths"])]
+        gc: bool,
+
+        /// Roll `current` back to a specific generation id, or (with no
+        /// value given) the newest `Previous`-state generation, then exit.
+        /// Refuses a target generation that fails validation. Mutually
+        /// exclusive with indexing, --status, and --gc.
+        #[arg(long = "rollback", num_args = 0..=1, conflicts_with_all = ["status", "gc", "paths"])]
+        rollback: Option<Option<String>>,
     },
 
     /// Add a directory to the indexed paths list

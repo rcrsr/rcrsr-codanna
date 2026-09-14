@@ -66,8 +66,10 @@ fn unix_millis_now() -> u64 {
 /// build directory is a garbage-collection decision, not this guard's.
 pub struct Building {
     // Held only to keep the advisory lock alive for the guard's lifetime;
-    // never read after `start` returns.
+    // never read after `start` returns except via `_lock`'s drop, and via
+    // `finish`, which consumes it to release the lock explicitly.
     _lock: std::fs::File,
+    started_at: u64,
 }
 
 impl Building {
@@ -134,9 +136,10 @@ impl Building {
         }
 
         let mut rng = rand::rng();
+        let started_at = unix_millis_now();
         let marker = BuildingMarker {
             pid: std::process::id(),
-            started_at: unix_millis_now(),
+            started_at,
             launch_token: rng.random(),
             builder_version: env!("CARGO_PKG_VERSION").to_string(),
             parent,
@@ -165,7 +168,33 @@ impl Building {
             source: e,
         })?;
 
-        Ok(Self { _lock: file })
+        Ok(Self {
+            _lock: file,
+            started_at,
+        })
+    }
+
+    /// The unix-millis timestamp this build claimed ownership, as recorded
+    /// in the `BUILDING` marker by [`Building::start`].
+    pub fn started_at(&self) -> u64 {
+        self.started_at
+    }
+
+    /// Release this guard's advisory lock and remove the `BUILDING` marker
+    /// for `id`, signaling the build is no longer in progress. The marker
+    /// having already been removed (e.g. by a previous call, or externally)
+    /// is not an error.
+    pub fn finish(self, layout: &IndexLayout, id: &GenerationId) -> IndexResult<()> {
+        let marker_path = layout.building_marker(id);
+        drop(self);
+        match std::fs::remove_file(&marker_path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(IndexError::FileWrite {
+                path: marker_path,
+                source: e,
+            }),
+        }
     }
 
     /// True when the `BUILDING` marker at `marker_path` describes a build
@@ -361,6 +390,27 @@ mod tests {
         let marker = read_marker(&layout.building_marker(&id)).expect("read marker back");
         assert_eq!(marker.parent, Some(parent));
         assert_eq!(marker.pid, std::process::id());
+    }
+
+    #[test]
+    fn finish_removes_the_building_marker_and_releases_the_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let layout = layout_in(&dir);
+        let id = GenerationId::generate();
+
+        let guard = Building::start(&layout, &id, None).expect("start building");
+        let marker_path = layout.building_marker(&id);
+
+        guard.finish(&layout, &id).expect("finish building");
+
+        assert!(
+            !marker_path.is_file(),
+            "BUILDING marker must be removed after finish"
+        );
+        assert!(
+            !Building::is_alive(&marker_path),
+            "finish must release the advisory lock"
+        );
     }
 
     #[test]

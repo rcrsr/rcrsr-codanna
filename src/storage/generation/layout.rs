@@ -95,6 +95,20 @@ impl IndexLayout {
         self.root.join("gc.lock")
     }
 
+    /// Path to the publish advisory lock file: `root/publish.lock`.
+    ///
+    /// Guards the short compare-and-swap critical section in
+    /// [`crate::storage::persistence::IndexPersistence::publish`] that reads
+    /// `current` and, if it still matches the build's recorded parent,
+    /// flips it to the newly published generation. Deliberately a separate
+    /// lock file from [`Self::gc_lock`] -- `publish` must never nest inside
+    /// the GC lock (or vice versa), since either ordering risks a deadlock
+    /// against a concurrent caller that acquires the two locks in the
+    /// opposite order.
+    pub fn publish_lock(&self) -> PathBuf {
+        self.root.join("publish.lock")
+    }
+
     /// Read the generation id pointed to by `current`.
     ///
     /// `current` is advisory state: callers reconcile it against the
@@ -505,10 +519,9 @@ pub fn clone_generation(
 ///   without a `COMPLETE` manifest -- covering both "crashed mid-move" and
 ///   "crashed after the manifest was written but before `write_current`
 ///   landed"), that is a torn migration from an interrupted previous call.
-///   [`migrate_flat_layout`] is the only writer of `gen/` entries reachable
-///   in this phase (no production caller builds generations any other way
-///   yet), so any such directory is unambiguously the migration to resume,
-///   not another builder's unrelated in-progress build. Resumption reuses
+///   In-progress or orphaned builds are recognisable by their `BUILDING`
+///   marker and are skipped (see `find_torn_migration`), so any other
+///   such directory is the migration to resume. Resumption reuses
 ///   that directory's id rather than allocating a new one, and each step is
 ///   individually idempotent: a move whose `from` path no longer exists
 ///   (already renamed by a previous call) is a no-op, and the manifest is
@@ -564,13 +577,16 @@ pub fn migrate_flat_layout(layout: &IndexLayout) -> IndexResult<Option<Generatio
 /// Find the generation directory under `layout`'s `gen/` left behind by an
 /// interrupted previous [`migrate_flat_layout`] call, if any. Called only
 /// once [`migrate_flat_layout`] has already confirmed `current` does not
-/// exist, so any generation directory found here -- whether or not it
-/// already has a `COMPLETE` manifest -- is unambiguously a torn migration
-/// to resume: this function is the only writer of `gen/` entries reachable
-/// in this phase (no production caller builds generations any other way
-/// yet), and a directory with `COMPLETE` but no `current` is exactly the
-/// "crashed after writing the manifest but before `write_current` landed"
-/// case. When more than one candidate exists (unexpected in practice), the
+/// exist. Directories carrying a `BUILDING` marker are skipped: migration
+/// never writes one, so they are in-progress or orphaned builds from
+/// `IndexPersistence::open_build`, left for GC. Any other generation
+/// directory -- whether or not it already has a `COMPLETE` manifest -- is
+/// a torn migration to resume; a directory with `COMPLETE` but no `current`
+/// is exactly the "crashed after writing the manifest but before
+/// `write_current` landed" case (also what a build that died between
+/// releasing its marker and flipping `current` looks like, and adopting it
+/// is the right recovery there too). When more than one candidate exists
+/// (unexpected in practice), the
 /// newest by [`GenerationId`] `Ord` is chosen, mirroring [`resolve_current`]'s
 /// recovery scan.
 fn find_torn_migration(layout: &IndexLayout) -> IndexResult<Option<GenerationId>> {
@@ -598,6 +614,12 @@ fn find_torn_migration(layout: &IndexLayout) -> IndexResult<Option<GenerationId>
         let Some(id) = entry.file_name().to_str().and_then(GenerationId::new) else {
             continue;
         };
+        // Migration never writes `BUILDING`; a directory carrying one is an
+        // in-progress or orphaned build (`IndexPersistence::open_build`),
+        // not a migration to resume.
+        if layout.building_marker(&id).is_file() {
+            continue;
+        }
         candidates.push(id);
     }
 
@@ -634,6 +656,31 @@ fn build_migration_manifest(id: &GenerationId, gen_dir: &Path) -> IndexResult<Co
         Err(_) => (0, 0),
     };
 
+    let files = manifest_files(gen_dir)?;
+
+    Ok(Complete {
+        id: id.clone(),
+        parent: None,
+        started_at: migration_started_at(id),
+        completed_at: unix_millis_now(),
+        builder_version: env!("CARGO_PKG_VERSION").to_string(),
+        symbol_count,
+        file_count,
+        files,
+    })
+}
+
+/// Walk every regular file under `gen_dir` and record its path (relative to
+/// `gen_dir`, with backslashes normalized to forward slashes so a manifest
+/// written on Windows reads identically on unix) and size, for use as a
+/// `COMPLETE` manifest's `files` list.
+///
+/// Skips the `COMPLETE`, `BUILDING`, and `DAMAGED` marker files themselves --
+/// none of these describe index content, and including them would make a
+/// manifest self-referential. Shared by [`migrate_flat_layout`]'s manifest
+/// synthesis and the generation-publish path so both derive the same file
+/// list from the same walk instead of each inlining their own.
+pub(crate) fn manifest_files(gen_dir: &Path) -> IndexResult<Vec<CompleteFileEntry>> {
     let mut files = Vec::new();
     for entry in walkdir::WalkDir::new(gen_dir) {
         let entry = entry.map_err(|e| IndexError::FileRead {
@@ -643,11 +690,6 @@ fn build_migration_manifest(id: &GenerationId, gen_dir: &Path) -> IndexResult<Co
         if !entry.file_type().is_file() {
             continue;
         }
-        // Defensive: neither marker exists yet at this point in the normal
-        // flow (this manifest is built before it is written, and no
-        // `BUILDING`/`DAMAGED` marker is ever written for a migration), but
-        // excluding them keeps a resumed/racing call's manifest honest if
-        // that ever changes.
         if matches!(
             entry.file_name().to_str(),
             Some("COMPLETE") | Some("BUILDING") | Some("DAMAGED")
@@ -670,17 +712,7 @@ fn build_migration_manifest(id: &GenerationId, gen_dir: &Path) -> IndexResult<Co
             size,
         });
     }
-
-    Ok(Complete {
-        id: id.clone(),
-        parent: None,
-        started_at: migration_started_at(id),
-        completed_at: unix_millis_now(),
-        builder_version: env!("CARGO_PKG_VERSION").to_string(),
-        symbol_count,
-        file_count,
-        files,
-    })
+    Ok(files)
 }
 
 /// Best-effort `started_at` for a migrated generation: the millis timestamp
@@ -742,10 +774,6 @@ pub fn resolve_current(layout: &IndexLayout) -> IndexResult<Option<GenerationId>
                 write_damaged_marker(layout, id, &e.to_string())?;
             }
         }
-    } else {
-        tracing::warn!(
-            "[generation] current pointer is missing or torn; scanning gen/ for a valid fallback"
-        );
     }
 
     let gen_root = layout.root().join("gen");
@@ -759,6 +787,11 @@ pub fn resolve_current(layout: &IndexLayout) -> IndexResult<Option<GenerationId>
             });
         }
     };
+    if current_id.is_none() {
+        tracing::warn!(
+            "[generation] current pointer is missing or torn; scanning gen/ for a valid fallback"
+        );
+    }
 
     let mut candidates: Vec<GenerationId> = Vec::new();
     for entry in entries {
@@ -976,7 +1009,11 @@ pub fn free_space_preflight(layout: &IndexLayout, needed_bytes: u64) -> IndexRes
 /// `(mount_point, available_bytes)` pairs as a plain iterator so tests can
 /// inject fake disks instead of depending on the real machine's disk
 /// layout being in any particular state.
-fn free_space_preflight_against<'a>(
+///
+/// `pub(crate)` so [`crate::storage::persistence::IndexPersistence::open_build_in`]
+/// can reuse it as its own ENOSPC-injection test seam, rather than
+/// depending on the real `sysinfo::Disks` enumeration.
+pub(crate) fn free_space_preflight_against<'a>(
     root: &Path,
     needed_bytes: u64,
     disks: impl Iterator<Item = (&'a Path, u64)>,
@@ -1326,6 +1363,7 @@ mod tests {
             layout.gen_dir(&id).join("index.meta")
         );
         assert_eq!(layout.gc_lock(), dir.path().join("gc.lock"));
+        assert_eq!(layout.publish_lock(), dir.path().join("publish.lock"));
     }
 
     #[test]
@@ -1814,6 +1852,34 @@ mod tests {
 
         assert_eq!(resumed, Some(id.clone()));
         assert_eq!(layout.read_current().expect("read current"), Some(id));
+    }
+
+    #[test]
+    fn migrate_flat_layout_ignores_an_orphaned_build_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let layout = layout_in(&dir);
+        let id = GenerationId::generate();
+        // A build that died before publishing: `gen/<id>/BUILDING` exists,
+        // `current` does not, and there is no flat layout to migrate.
+        let guard = Building::start(&layout, &id, None).expect("start building");
+        drop(guard);
+        assert!(layout.building_marker(&id).is_file());
+
+        let migrated = migrate_flat_layout(&layout).expect("migrate");
+
+        assert_eq!(migrated, None);
+        assert!(
+            !layout.current_file().exists(),
+            "orphan must not become current"
+        );
+        assert!(
+            !layout.complete_marker(&id).is_file(),
+            "orphan must not be manifested"
+        );
+        assert!(
+            layout.building_marker(&id).is_file(),
+            "orphan is left for gc"
+        );
     }
 
     #[test]

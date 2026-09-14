@@ -17,15 +17,16 @@ use crate::{IndexPersistence, Settings};
 
 /// Watches for external index changes and hot-reloads them.
 ///
-/// This watcher polls `meta.json` and `state.json` to detect when the index
-/// is modified by external processes (e.g., `codanna index` in another terminal,
-/// CI/CD pipelines). It does NOT watch source files - that's handled by UnifiedWatcher.
+/// This watcher compares the on-disk `current` generation pointer against the
+/// generation its facade currently serves, and polls `state.json` to detect
+/// when the document store is modified by external processes (e.g., `codanna
+/// index` in another terminal, CI/CD pipelines). It does NOT watch source
+/// files - that's handled by UnifiedWatcher.
 pub struct HotReloadWatcher {
     index_path: PathBuf,
     facade: Arc<RwLock<IndexFacade>>,
     settings: Arc<Settings>,
     persistence: IndexPersistence,
-    last_modified: Option<SystemTime>,
     last_doc_modified: Option<SystemTime>,
     check_interval: Duration,
     broadcaster: Option<Arc<NotificationBroadcaster>>,
@@ -41,19 +42,6 @@ impl HotReloadWatcher {
         let index_path = settings.index_path.clone();
         let persistence = IndexPersistence::new(index_path.clone());
 
-        // Get initial modification time of the index metadata file. Read
-        // through the already-constructed facade's own generation
-        // directory (`gen/<id>/tantivy/meta.json`) rather than assuming a
-        // flat `index_path/tantivy` layout, since the facade may already
-        // be resolved to a generation.
-        let meta_file_path = facade
-            .try_read()
-            .map(|f| f.generation_dir().join("tantivy").join("meta.json"))
-            .unwrap_or_else(|_| index_path.join("tantivy").join("meta.json"));
-        let last_modified = std::fs::metadata(&meta_file_path)
-            .ok()
-            .and_then(|meta| meta.modified().ok());
-
         // Get initial modification time of document store state.json
         let doc_state_path = index_path.join("documents").join("state.json");
         let last_doc_modified = std::fs::metadata(&doc_state_path)
@@ -65,7 +53,6 @@ impl HotReloadWatcher {
             facade,
             settings,
             persistence,
-            last_modified,
             last_doc_modified,
             check_interval,
             broadcaster: None,
@@ -104,36 +91,17 @@ impl HotReloadWatcher {
         }
 
         // An external publish flips `current` to a generation other than
-        // the one this watcher's facade serves. The meta.json mtime poll
-        // stays alongside it for this phase because external scoped writes
-        // still mutate the served generation in place; Phase 3 drops it.
-        let (served_generation, served_meta_path) = {
+        // the one this watcher's facade serves; that flip alone drives the
+        // reload.
+        let served_generation = {
             let facade_guard = self.facade.read().await;
-            (
-                facade_guard.generation_id().clone(),
-                facade_guard
-                    .generation_dir()
-                    .join("tantivy")
-                    .join("meta.json"),
-            )
+            facade_guard.generation_id().clone()
         };
         let layout = IndexLayout::new(self.index_path.clone());
         let on_disk = layout.read_current()?;
         let generation_changed = on_disk.as_ref().is_some_and(|id| id != &served_generation);
 
-        // Poll the generation the reload will open, so the recorded mtime
-        // belongs to the facade that ends up serving.
-        let meta_file_path = match (&on_disk, generation_changed) {
-            (Some(id), true) => layout.tantivy_dir(id).join("meta.json"),
-            _ => served_meta_path,
-        };
-        let current_modified = std::fs::metadata(&meta_file_path)?.modified()?;
-        let mtime_changed = match self.last_modified {
-            Some(last) => current_modified > last,
-            None => true,
-        };
-
-        if !generation_changed && !mtime_changed {
+        if !generation_changed {
             tracing::trace!("Index file unchanged");
             return Ok(());
         }
@@ -157,9 +125,6 @@ impl HotReloadWatcher {
                 let mut facade_guard = self.facade.write().await;
                 new_facade.adopt_reindex_gate(facade_guard.reindex_gate());
                 *facade_guard = new_facade;
-
-                // Update last modified time
-                self.last_modified = Some(current_modified);
 
                 // Ensure semantic search stays attached after hot reloads
                 let mut restored_semantic = false;
@@ -263,7 +228,6 @@ impl HotReloadWatcher {
         let indexer = self.facade.read().await;
         IndexStats {
             symbol_count: indexer.symbol_count(),
-            last_modified: self.last_modified,
             index_path: self.index_path.clone(),
         }
     }
@@ -273,7 +237,6 @@ impl HotReloadWatcher {
 #[derive(Debug, Clone)]
 pub struct IndexStats {
     pub symbol_count: usize,
-    pub last_modified: Option<SystemTime>,
     pub index_path: PathBuf,
 }
 
@@ -281,8 +244,8 @@ pub struct IndexStats {
 mod tests {
     use super::*;
     use crate::config::Settings;
-    use crate::storage::generation::Complete;
-    use crate::storage::{DocumentIndex, EMISSION_SEMANTICS_VERSION, GenerationId, IndexMetadata};
+    use crate::storage::GenerationId;
+    use crate::storage::persistence::BuildMode;
 
     fn test_settings(index_path: PathBuf) -> Arc<Settings> {
         Arc::new(Settings {
@@ -292,17 +255,22 @@ mod tests {
         })
     }
 
-    // Advances the on-disk Tantivy index in place by indexing a small source
-    // tree into it through a second `IndexFacade` over the same directory.
-    // Kept as a standalone helper (rather than inlined in the test) so a
-    // future phase can swap in a different reload trigger without touching
-    // the permit-acquisition or post-swap assertion around it.
+    // Advances the on-disk index by publishing a new generation cloned from
+    // `current`, so `check_and_reload` observes a real `current` flip
+    // instead of an in-place file mutation. Kept as a standalone helper
+    // (rather than inlined in the test) so a future phase can swap in a
+    // different reload trigger without touching the permit-acquisition or
+    // post-swap assertion around it.
     fn advance_index_in_place(settings: &Arc<Settings>, workspace_root: &std::path::Path) {
-        let mut writer_facade = IndexFacade::new(settings.clone()).unwrap();
+        let persistence = IndexPersistence::new(settings.index_path.clone());
+        let mut build = persistence
+            .open_build(settings.clone(), BuildMode::CloneCurrent)
+            .expect("open clone-current build");
         let source_root = workspace_root.join("src");
         std::fs::create_dir_all(&source_root).unwrap();
         std::fs::write(source_root.join("a.rs"), "fn a() {}\n").unwrap();
-        writer_facade.index_directory(&source_root, false).unwrap();
+        build.index_directory(&source_root, false).unwrap();
+        persistence.publish(build).expect("publish new generation");
     }
 
     // Regression for the hot-reload facade-swap race: this drives the real
@@ -349,30 +317,15 @@ mod tests {
         );
     }
 
-    // Publish a second, empty generation under `settings.index_path` by
-    // hand and point `current` at it, the way an external `codanna index`
-    // will once builds are staged. Returns its id.
+    // Publish a second, empty generation under `settings.index_path` and
+    // point `current` at it, the way an external `codanna index` will once
+    // builds are staged. Returns its id.
     fn publish_empty_generation(settings: &Arc<Settings>) -> GenerationId {
-        let layout = IndexLayout::new(settings.index_path.clone());
-        let id = GenerationId::generate();
-        drop(DocumentIndex::new(layout.tantivy_dir(&id), settings).unwrap());
-        let mut meta = IndexMetadata::new();
-        meta.emission_version = Some(EMISSION_SEMANTICS_VERSION);
-        meta.save(&layout.gen_dir(&id)).unwrap();
-        Complete {
-            id: id.clone(),
-            parent: None,
-            started_at: 0,
-            completed_at: 0,
-            builder_version: "0.0.0".to_string(),
-            symbol_count: 0,
-            file_count: 0,
-            files: Vec::new(),
-        }
-        .write(&layout)
-        .unwrap();
-        layout.write_current(&id).unwrap();
-        id
+        let persistence = IndexPersistence::new(settings.index_path.clone());
+        let build = persistence
+            .open_build(settings.clone(), BuildMode::Fresh)
+            .expect("open fresh build");
+        persistence.publish(build).expect("publish new generation")
     }
 
     // When `current` still names the served generation and meta.json is

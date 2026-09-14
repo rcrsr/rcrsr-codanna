@@ -8,5 +8,5 @@ pub use error::{StorageError, StorageResult};
 pub use generation::{GcSummary, GenerationId, GenerationState, IndexLayout};
 pub use metadata::{DataSource, EMISSION_SEMANTICS_VERSION, IndexMetadata};
 pub use metadata_keys::MetadataKey;
-pub use persistence::IndexPersistence;
+pub use persistence::{BuildFacade, BuildMode, IndexPersistence};
 pub use tantivy::{DocumentIndex, SearchResult};

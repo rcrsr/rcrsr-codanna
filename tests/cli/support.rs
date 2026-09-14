@@ -37,16 +37,27 @@ pub fn codanna_binary() -> PathBuf {
     debug_bin
 }
 
-pub fn run_cli(workspace: &Path, args: &[&str]) -> (i32, String, String) {
+/// Build the `codanna <args>` [`Command`] for `workspace`, with an isolated
+/// `HOME`/`XDG_CONFIG_HOME` under the workspace so the process never reads
+/// or writes a developer's real home directory. Shared by [`run_cli`]
+/// (blocks on completion) and [`spawn_cli`] (returns the live child so a
+/// test can observe on-disk state while the process is still running).
+fn command_for(workspace: &Path, args: &[&str]) -> Command {
     let bin = codanna_binary();
     let test_home = workspace.join(".home");
     std::fs::create_dir_all(&test_home).expect("create test home");
 
-    let output = Command::new(&bin)
+    let mut command = Command::new(&bin);
+    command
         .args(args)
         .current_dir(workspace)
         .env("HOME", &test_home)
-        .env("XDG_CONFIG_HOME", &test_home)
+        .env("XDG_CONFIG_HOME", &test_home);
+    command
+}
+
+pub fn run_cli(workspace: &Path, args: &[&str]) -> (i32, String, String) {
+    let output = command_for(workspace, args)
         .output()
         .expect("run codanna CLI");
 
@@ -55,6 +66,21 @@ pub fn run_cli(workspace: &Path, args: &[&str]) -> (i32, String, String) {
         String::from_utf8_lossy(&output.stdout).to_string(),
         String::from_utf8_lossy(&output.stderr).to_string(),
     )
+}
+
+/// Spawn `codanna <args>` in `workspace` without waiting for it to exit.
+///
+/// For tests that need to observe on-disk state while the process is still
+/// running (e.g. poll for a `BUILDING` marker) and then kill it, rather than
+/// [`run_cli`]'s block-until-exit behavior. Stdout/stderr are discarded
+/// (`Stdio::null`) since nothing reads them before the process is killed.
+#[allow(dead_code)]
+pub fn spawn_cli(workspace: &Path, args: &[&str]) -> std::process::Child {
+    command_for(workspace, args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn codanna CLI")
 }
 
 /// The on-disk index root for a workspace: the workspace-level container

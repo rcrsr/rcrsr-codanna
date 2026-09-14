@@ -5,9 +5,14 @@
 
 use crate::indexing::facade::IndexFacade;
 use crate::indexing::walk_config;
-use crate::storage::generation::{GenerationId, migrate_flat_layout, resolve_current};
+use crate::storage::generation::layout::{self, free_space_preflight_against};
+use crate::storage::generation::markers::{Building, Complete};
+use crate::storage::generation::{
+    GenerationId, clone_generation, gc, list_generations, migrate_flat_layout, resolve_current,
+};
 use crate::storage::{DataSource, IndexLayout, IndexMetadata};
 use crate::{IndexError, IndexResult, Settings};
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -33,6 +38,60 @@ fn ignore_fingerprint_root(settings: &Settings, fallback: Option<&Path>) -> Path
 #[derive(Debug)]
 pub struct IndexPersistence {
     layout: IndexLayout,
+}
+
+/// How [`IndexPersistence::open_build`] should seed a newly allocated
+/// generation before handing it to the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildMode {
+    /// Start from nothing: an empty generation with no parent.
+    Fresh,
+    /// Seed the new generation from the current generation's on-disk data
+    /// (hardlinked Tantivy segments, copied semantic/metadata files) before
+    /// handing it to the caller, so an incremental build only has to touch
+    /// what actually changed.
+    CloneCurrent,
+}
+
+/// An in-progress generation build: an [`IndexFacade`] opened onto a freshly
+/// allocated generation directory, plus the [`Building`] ownership guard
+/// that must stay alive for as long as this build is in progress, and the
+/// parent generation (if any) it was seeded from.
+///
+/// Derefs to [`IndexFacade`] so callers can drive the build the same way
+/// they would drive any other facade.
+pub struct BuildFacade {
+    facade: IndexFacade,
+    // Held only to keep this generation's `BUILDING` ownership lock alive
+    // for the build's lifetime; never read directly (mirrors
+    // `markers::Building`'s own `_lock` field for the same reason).
+    #[allow(dead_code)]
+    guard: Building,
+    parent: Option<GenerationId>,
+}
+
+impl BuildFacade {
+    /// The generation this build was seeded from, or `None` for a
+    /// [`BuildMode::Fresh`] build (including a [`BuildMode::CloneCurrent`]
+    /// build that fell back to fresh semantics because no generation was
+    /// current yet).
+    pub fn parent(&self) -> Option<&GenerationId> {
+        self.parent.as_ref()
+    }
+}
+
+impl Deref for BuildFacade {
+    type Target = IndexFacade;
+
+    fn deref(&self) -> &IndexFacade {
+        &self.facade
+    }
+}
+
+impl DerefMut for BuildFacade {
+    fn deref_mut(&mut self) -> &mut IndexFacade {
+        &mut self.facade
+    }
 }
 
 impl IndexPersistence {
@@ -205,6 +264,262 @@ impl IndexPersistence {
         }
 
         Ok(facade)
+    }
+
+    /// The on-disk size in bytes of generation `id` under this persistence's
+    /// [`IndexLayout`], or `0` if it does not resolve to a listed generation.
+    /// Path arithmetic and the walk itself live in
+    /// [`crate::storage::generation::list_generations`]; this just reads the
+    /// one entry a build's free-space preflight needs.
+    fn generation_size_bytes(&self, id: &GenerationId) -> IndexResult<u64> {
+        Ok(list_generations(&self.layout)?
+            .into_iter()
+            .find(|(gid, ..)| gid == id)
+            .map(|(_, _, size, _)| size)
+            .unwrap_or(0))
+    }
+
+    /// Allocate and open a fresh generation to build into.
+    ///
+    /// Runs a best-effort [`gc()`] pass first to reclaim headroom, resolves
+    /// `mode`'s parent generation, checks free disk space for a
+    /// [`BuildMode::Fresh`] build, then claims ownership of the new
+    /// generation via [`Building::start`] before seeding and opening it. See
+    /// [`BuildMode`] for what "seeding" means for each mode.
+    #[must_use = "Build errors should be handled appropriately"]
+    pub fn open_build(&self, settings: Arc<Settings>, mode: BuildMode) -> IndexResult<BuildFacade> {
+        let disks = sysinfo::Disks::new_with_refreshed_list();
+        let candidates = disks
+            .list()
+            .iter()
+            .map(|disk| (disk.mount_point(), disk.available_space()));
+        self.open_build_in(settings, mode, candidates)
+    }
+
+    /// Testable core of [`Self::open_build`]: takes the candidate
+    /// `(mount_point, available_bytes)` pairs as a plain iterator, exactly
+    /// like [`crate::storage::generation::layout::free_space_preflight_against`]
+    /// does for the crate's real disk-backed preflight, so tests can inject
+    /// a fake tiny disk instead of depending on the real machine's disk
+    /// layout being in any particular state.
+    pub(crate) fn open_build_in<'a>(
+        &self,
+        settings: Arc<Settings>,
+        mode: BuildMode,
+        disks: impl Iterator<Item = (&'a Path, u64)>,
+    ) -> IndexResult<BuildFacade> {
+        // (1) Reclaim headroom before allocating a new generation. A run
+        // that finds the GC lock already held by a concurrent process is
+        // not an error for this build -- `skipped_locked` is simply noted.
+        let gc_summary = gc(&self.layout, true)?;
+        tracing::info!(
+            "[persistence] pre-build gc: removed={} retried_later={} skipped_locked={}",
+            gc_summary.removed.len(),
+            gc_summary.retried_later.len(),
+            gc_summary.skipped_locked
+        );
+
+        // (2) Resolve the parent generation for `mode`. A `CloneCurrent`
+        // build over an index with no current generation yet has nothing to
+        // clone, so it silently degrades to `Fresh` semantics: `parent`
+        // stays `None`, and the seed step below becomes a no-op.
+        let parent = match mode {
+            BuildMode::Fresh => None,
+            BuildMode::CloneCurrent => resolve_current(&self.layout)?,
+        };
+
+        // (3) Free-space preflight, `Fresh` builds only: a `CloneCurrent`
+        // build's new generation starts out hardlinked to the parent's
+        // Tantivy segments, so it does not need headroom equal to the
+        // parent's full on-disk size the way a from-scratch build does.
+        if matches!(mode, BuildMode::Fresh) {
+            let needed = match resolve_current(&self.layout)? {
+                Some(ref current_id) => self.generation_size_bytes(current_id)?,
+                None => 0,
+            };
+            free_space_preflight_against(self.layout.root(), needed, disks)?;
+        }
+
+        // (4) Allocate the new generation's id.
+        let id = GenerationId::generate();
+
+        // (5) Claim ownership before touching the new generation directory
+        // any further, so a concurrent builder racing the same id is
+        // rejected rather than silently clobbered.
+        let guard = Building::start(&self.layout, &id, parent.clone())?;
+
+        let seeded_from_parent = matches!(mode, BuildMode::CloneCurrent) && parent.is_some();
+
+        // (6) Seed the new generation from its parent, `CloneCurrent` only.
+        if seeded_from_parent {
+            let parent_id = parent.as_ref().expect("checked by seeded_from_parent");
+            clone_generation(&self.layout, parent_id, &id)?;
+        }
+
+        // (7) Open the facade onto the (possibly seeded) generation.
+        let mut facade = IndexFacade::open(settings, self.layout.clone(), id.clone())?;
+
+        // (8) `CloneCurrent` only: replicate `load_facade_impl`'s post-open
+        // steps exactly, so a cloned build starts with the same semantic
+        // search and indexed-paths state a normal load of that data would
+        // produce -- a semantic load failure never fails the build, it just
+        // continues without semantic search.
+        if seeded_from_parent {
+            let semantic_dir = self.layout.semantic_dir(&id);
+            match facade.load_semantic_search(&semantic_dir) {
+                Ok(true) => {
+                    tracing::debug!("[persistence] loaded semantic search for build facade");
+                }
+                Ok(false) => {
+                    tracing::debug!("[persistence] no semantic data found for build (optional)");
+                }
+                Err(IndexError::SemanticSearch(
+                    crate::semantic::SemanticSearchError::DimensionMismatch {
+                        ref suggestion, ..
+                    },
+                )) => {
+                    tracing::error!(
+                        "[persistence] semantic search disabled for build — index incompatible: {suggestion}"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("[persistence] failed to load semantic search for build: {e}");
+                }
+            }
+
+            let metadata = IndexMetadata::load(&self.layout.gen_dir(&id)).ok();
+            if let Some(ref meta) = metadata {
+                if let Some(ref stored_paths) = meta.indexed_paths {
+                    facade.set_indexed_paths(stored_paths.clone());
+                    tracing::debug!(
+                        "[persistence] restored {} indexed paths for build facade",
+                        stored_paths.len()
+                    );
+                }
+            }
+        }
+
+        // (9)
+        Ok(BuildFacade {
+            facade,
+            guard,
+            parent,
+        })
+    }
+
+    /// Publish a finished build: persist its metadata, write a `COMPLETE`
+    /// manifest, and atomically flip `current` to it -- but only if `current`
+    /// still names the generation this build was seeded from.
+    ///
+    /// Order of operations:
+    /// 1. [`Self::save_facade`] writes `index.meta` and semantic data into
+    ///    the build's own generation directory (never the index root).
+    /// 2. A [`Complete`] manifest is written for the build's generation,
+    ///    recording every file the build actually produced.
+    /// 3. A short critical section under [`IndexLayout::publish_lock`] --
+    ///    deliberately never nested inside [`gc()`]'s lock, so the two can
+    ///    never deadlock against each other -- re-reads `current` and
+    ///    compares it against the parent this build was seeded from. For an
+    ///    incremental build (`parent.is_some()`), if `current` no longer
+    ///    matches, this returns [`IndexError::GenerationSuperseded`] and
+    ///    leaves the build's `BUILDING` marker in place: the build is
+    ///    orphaned, to be reclaimed by a later [`gc()`] run. A
+    ///    [`BuildMode::Fresh`] build (`parent.is_none()`) always wins the
+    ///    race, since it never depended on any particular starting state.
+    ///    Otherwise, the [`Building`] guard is finished (removing the
+    ///    `BUILDING` marker) and `current` is flipped to the new generation.
+    /// 4. A trailing best-effort [`gc()`] pass reclaims the generation this
+    ///    build superseded. Its failure is logged only, never propagated --
+    ///    the publish itself already succeeded once `current` was flipped.
+    #[must_use = "Publish errors should be handled appropriately"]
+    pub fn publish(&self, build: BuildFacade) -> IndexResult<GenerationId> {
+        let BuildFacade {
+            facade,
+            guard,
+            parent,
+        } = build;
+
+        // (1) Persist index.meta + semantic data into the build's own
+        // generation directory.
+        self.save_facade(&facade)?;
+
+        let id = facade.generation_id().clone();
+        let gen_dir = facade.generation_dir();
+
+        // (2) Write the COMPLETE manifest for this generation.
+        let manifest = Complete {
+            id: id.clone(),
+            parent: parent.clone(),
+            started_at: guard.started_at(),
+            completed_at: layout::unix_millis_now(),
+            builder_version: env!("CARGO_PKG_VERSION").to_string(),
+            symbol_count: facade.symbol_count() as u64,
+            file_count: u64::from(facade.file_count()),
+            files: layout::manifest_files(&gen_dir)?,
+        };
+        manifest.write(&self.layout)?;
+
+        // (3) Compare-and-swap `current` under the publish lock.
+        std::fs::create_dir_all(self.layout.root()).map_err(|e| IndexError::FileWrite {
+            path: self.layout.root().to_path_buf(),
+            source: e,
+        })?;
+        let lock_path = self.layout.publish_lock();
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| IndexError::FileWrite {
+                path: lock_path.clone(),
+                source: e,
+            })?;
+        // Blocking: publish's critical section is short (a read, and either
+        // a rename or nothing), so waiting out a concurrent publisher is
+        // preferable to the skip-on-contention behavior `gc` uses for its
+        // much coarser, best-effort pass.
+        #[allow(clippy::incompatible_msrv)]
+        lock_file.lock().map_err(|e| IndexError::FileWrite {
+            path: lock_path.clone(),
+            source: e,
+        })?;
+
+        let observed = self.layout.read_current()?;
+        let cas_result = if parent.is_some() && observed != parent {
+            Err(IndexError::GenerationSuperseded {
+                expected: parent
+                    .as_ref()
+                    .map(GenerationId::to_string)
+                    .unwrap_or_default(),
+                actual: observed
+                    .as_ref()
+                    .map(GenerationId::to_string)
+                    .unwrap_or_else(|| "none".to_string()),
+            })
+        } else {
+            guard.finish(&self.layout, &id)?;
+            self.layout.write_current(&id)?;
+            Ok(())
+        };
+
+        #[allow(clippy::incompatible_msrv)]
+        let _ = lock_file.unlock();
+
+        cas_result?;
+
+        // (4) Best-effort trailing GC: never fails a publish that already
+        // landed.
+        match gc(&self.layout, true) {
+            Ok(summary) => tracing::info!(
+                "[persistence] post-publish gc: removed={} retried_later={} skipped_locked={}",
+                summary.removed.len(),
+                summary.retried_later.len(),
+                summary.skipped_locked
+            ),
+            Err(e) => tracing::warn!("[persistence] post-publish gc failed: {e}"),
+        }
+
+        Ok(id)
     }
 
     /// Save metadata for an IndexFacade
@@ -433,5 +748,243 @@ mod tests {
             metadata.embedding_count
         );
         assert!(!loaded.has_semantic_search());
+    }
+
+    /// Settings configured with a remote embedding backend, so semantic
+    /// save/load round-trips in these tests never touch a local fastembed
+    /// model or the network: `SimpleSemanticSearch::new_empty` always tags
+    /// its metadata `remote`, and `load`/`load_semantic_search` delegate a
+    /// `remote`-tagged index straight to `load_remote`, which only reads
+    /// vector storage off disk.
+    fn remote_settings_for(temp_dir: &TempDir) -> Arc<Settings> {
+        let mut settings = Settings {
+            index_path: temp_dir.path().to_path_buf(),
+            ..Settings::default()
+        };
+        settings.semantic_search.remote_url = Some("http://127.0.0.1:0".to_string());
+        settings.semantic_search.remote_dim = Some(8);
+        Arc::new(settings)
+    }
+
+    #[test]
+    fn open_build_clone_current_shares_tantivy_inodes_and_loads_semantics() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = IndexPersistence::new(temp_dir.path().to_path_buf());
+        let settings = remote_settings_for(&temp_dir);
+
+        let facade = IndexFacade::new(settings.clone()).unwrap();
+        persistence.save_facade(&facade).unwrap();
+        let current_id = facade.generation_id().clone();
+
+        // A full (albeit empty) semantic index on the current generation, so
+        // the build's clone step has something real to load.
+        crate::semantic::SimpleSemanticSearch::new_empty(8, "test-model")
+            .save(&facade.semantic_dir())
+            .unwrap();
+
+        let build = persistence
+            .open_build(settings, BuildMode::CloneCurrent)
+            .expect("clone-current build over an existing generation must succeed");
+
+        assert_eq!(build.parent(), Some(&current_id));
+        assert_ne!(build.generation_id(), &current_id);
+        assert!(
+            build.has_semantic_search(),
+            "cloned build must load the parent's semantic index"
+        );
+
+        // Tantivy's meta.json must be hardlinked (same inode), not copied,
+        // from the parent generation into the build's generation.
+        let parent_meta = facade.generation_dir().join("tantivy").join("meta.json");
+        let build_meta = build.generation_dir().join("tantivy").join("meta.json");
+        assert_eq!(
+            std::fs::metadata(&parent_meta).unwrap().ino(),
+            std::fs::metadata(&build_meta).unwrap().ino(),
+            "cloned tantivy files must share inodes with the parent generation"
+        );
+    }
+
+    #[test]
+    fn open_build_clone_current_over_no_index_falls_back_to_fresh() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = IndexPersistence::new(temp_dir.path().to_path_buf());
+        let settings = settings_for(&temp_dir);
+
+        let build = persistence
+            .open_build(settings, BuildMode::CloneCurrent)
+            .expect("clone-current over an empty root must fall back to a fresh build");
+
+        assert!(
+            build.parent().is_none(),
+            "no current generation means no parent to report"
+        );
+        assert_eq!(build.symbol_count(), 0);
+        assert_eq!(build.file_count(), 0);
+    }
+
+    #[test]
+    fn open_build_fresh_preflight_refuses_via_injected_disks() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = IndexPersistence::new(temp_dir.path().to_path_buf());
+        let settings = settings_for(&temp_dir);
+
+        // A real current generation with nonzero on-disk size, so `Fresh`'s
+        // preflight has a positive `needed_bytes` to compare against the
+        // injected disk's tiny reported availability.
+        let facade = IndexFacade::new(settings.clone()).unwrap();
+        persistence.save_facade(&facade).unwrap();
+
+        let root = temp_dir.path().canonicalize().unwrap();
+        let fake_disks = vec![(root.as_path(), 1u64)];
+
+        let result = persistence.open_build_in(settings, BuildMode::Fresh, fake_disks.into_iter());
+
+        match result {
+            Err(IndexError::IndexNotSpaceForBuild { .. }) => {}
+            Err(e) => panic!("expected IndexNotSpaceForBuild, got {e:?}"),
+            Ok(_) => panic!("a tiny injected disk must refuse the fresh build"),
+        }
+    }
+
+    #[test]
+    fn publish_flips_current_and_classifies_current_not_building() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = IndexPersistence::new(temp_dir.path().to_path_buf());
+        let settings = settings_for(&temp_dir);
+
+        let build = persistence
+            .open_build(settings, BuildMode::Fresh)
+            .expect("open fresh build");
+        let id = build.generation_id().clone();
+
+        let published_id = persistence.publish(build).expect("publish must succeed");
+        assert_eq!(published_id, id);
+
+        assert_eq!(
+            persistence.layout.read_current().expect("read current"),
+            Some(id.clone())
+        );
+        assert!(
+            !persistence.layout.building_marker(&id).is_file(),
+            "BUILDING marker must be removed once published"
+        );
+        assert_eq!(
+            crate::storage::generation::classify(&persistence.layout, &id),
+            crate::storage::generation::GenerationState::Current
+        );
+    }
+
+    #[test]
+    fn publish_incremental_refuses_when_current_moved_off_parent() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = IndexPersistence::new(temp_dir.path().to_path_buf());
+        let settings = settings_for(&temp_dir);
+
+        // Base generation P, published and current.
+        let base = persistence
+            .open_build(settings.clone(), BuildMode::Fresh)
+            .expect("open fresh base build");
+        let base_id = persistence.publish(base).expect("publish base");
+
+        // Two independent CloneCurrent builds, both cloned from P.
+        let b1 = persistence
+            .open_build(settings.clone(), BuildMode::CloneCurrent)
+            .expect("open b1");
+        let b2 = persistence
+            .open_build(settings.clone(), BuildMode::CloneCurrent)
+            .expect("open b2");
+        assert_eq!(b1.parent(), Some(&base_id));
+        assert_eq!(b2.parent(), Some(&base_id));
+
+        let id1 = b1.generation_id().clone();
+        let b2_id = b2.generation_id().clone();
+        let published1 = persistence.publish(b1).expect("publish b1 must succeed");
+        assert_eq!(published1, id1);
+
+        let err = persistence
+            .publish(b2)
+            .expect_err("publish b2 must be superseded");
+        match err {
+            IndexError::GenerationSuperseded { expected, actual } => {
+                assert_eq!(expected, base_id.to_string());
+                assert_eq!(actual, id1.to_string());
+            }
+            other => panic!("expected GenerationSuperseded, got {other:?}"),
+        }
+
+        // A superseded publish never removes the build's BUILDING marker --
+        // that only happens once `guard.finish` runs, which the CAS failure
+        // path deliberately skips so the build is left to be reclaimed by a
+        // later gc run rather than torn down here.
+        let b2_dir = persistence.layout.gen_dir(&b2_id);
+        assert!(
+            persistence.layout.building_marker(&b2_id).is_file(),
+            "the superseded build's BUILDING marker must survive publish's CAS failure"
+        );
+        assert!(b2_dir.is_dir());
+    }
+
+    #[test]
+    fn publish_fresh_wins_regardless_of_current() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = IndexPersistence::new(temp_dir.path().to_path_buf());
+        let settings = settings_for(&temp_dir);
+
+        let base = persistence
+            .open_build(settings.clone(), BuildMode::Fresh)
+            .expect("open fresh base build");
+        persistence.publish(base).expect("publish base");
+
+        // Open a fresh build (no parent) before `current` moves again.
+        let fresh = persistence
+            .open_build(settings.clone(), BuildMode::Fresh)
+            .expect("open fresh build");
+        assert!(fresh.parent().is_none());
+        let fresh_id = fresh.generation_id().clone();
+
+        // Move `current` out from under it before publishing.
+        let other = persistence
+            .open_build(settings.clone(), BuildMode::Fresh)
+            .expect("open other fresh build");
+        persistence.publish(other).expect("publish other");
+
+        let published = persistence
+            .publish(fresh)
+            .expect("a Fresh build (no parent) must win regardless of current");
+        assert_eq!(published, fresh_id);
+    }
+
+    #[test]
+    fn publish_writes_index_meta_into_the_generation() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = IndexPersistence::new(temp_dir.path().to_path_buf());
+        let settings = settings_for(&temp_dir);
+
+        let build = persistence
+            .open_build(settings, BuildMode::Fresh)
+            .expect("open fresh build");
+        let gen_dir = build.generation_dir();
+
+        persistence.publish(build).expect("publish must succeed");
+
+        let meta_path = gen_dir.join("index.meta");
+        assert!(
+            meta_path.is_file(),
+            "index.meta must be written into the generation directory"
+        );
+
+        let metadata = IndexMetadata::load(&gen_dir).expect("load index.meta");
+        match metadata.data_source {
+            DataSource::Tantivy { path, .. } => {
+                assert!(
+                    path.is_relative(),
+                    "tantivy data_source path must be relative, got {path:?}"
+                );
+                assert_eq!(path, PathBuf::from("tantivy"));
+            }
+            DataSource::Fresh => panic!("expected DataSource::Tantivy after publish"),
+        }
     }
 }

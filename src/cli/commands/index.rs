@@ -8,8 +8,7 @@ use crate::cli::commands::directories::{SkipReason, add_paths_to_settings};
 use crate::config::Settings;
 use crate::indexing::DryRunOutput;
 use crate::indexing::facade::IndexFacade;
-use crate::storage::IndexPersistence;
-use crate::storage::generation::{self, GenerationState, IndexLayout};
+use crate::storage::generation::{self, GenerationId, GenerationState, IndexLayout};
 use crate::types::SymbolKind;
 
 /// Arguments for the index command.
@@ -29,13 +28,19 @@ pub struct IndexArgs {
 ///
 /// This command handles both file and directory indexing with options for
 /// force re-indexing, progress display, dry-run mode, and file limits.
+/// Drives `indexer` (an [`IndexFacade`], or a [`crate::storage::BuildFacade`]
+/// borrowed via `&mut *build` -- `BuildFacade` derefs to `IndexFacade`) and
+/// returns whether it made any changes. This function never persists
+/// anything itself: the caller decides what "changes were made" means for
+/// its own persistence strategy (e.g. publishing a build vs. dropping an
+/// orphaned one), and issues the actual save/publish call after `run`
+/// returns.
 pub fn run(
     args: IndexArgs,
     config: &mut Settings,
     indexer: &mut IndexFacade,
-    persistence: &IndexPersistence,
     sync_made_changes: Option<bool>,
-) {
+) -> bool {
     let IndexArgs {
         paths,
         force,
@@ -145,12 +150,10 @@ pub fn run(
         if !force {
             match sync_made_changes {
                 Some(true) => {
-                    // Sync added new directories, already indexed - save and return
-                    if let Err(e) = persistence.save_facade(indexer) {
-                        eprintln!("Error saving index: {e}");
-                        std::process::exit(1);
-                    }
-                    return;
+                    // Sync added new directories, already indexed. Report
+                    // changes made and let the caller decide how to persist
+                    // them; this function no longer saves on its own.
+                    return true;
                 }
                 Some(false) | None => {
                     // No directory changes - check file-level changes via incremental
@@ -159,8 +162,20 @@ pub fn run(
             }
         }
 
-        // Run incremental (force=false) or full reindex (force=true)
-        config_paths
+        // Run incremental (force=false) or full reindex (force=true).
+        // A configured root that has since been deleted is skipped (the
+        // pre-dispatch seed already warned about it); aborting here would
+        // abandon the build for every other root.
+        let (present, missing): (Vec<PathBuf>, Vec<PathBuf>) =
+            config_paths.into_iter().partition(|p| p.exists());
+        for path in &missing {
+            tracing::debug!(target: "indexing", "skipping missing configured path {}", path.display());
+        }
+        if present.is_empty() {
+            eprintln!("Error: None of the configured paths exist");
+            std::process::exit(1);
+        }
+        present
     };
 
     // Process each path, tracking total changes. Directories index as
@@ -198,12 +213,14 @@ pub fn run(
         );
     }
 
-    // Only save if changes were made and not in dry-run mode
-    if !dry_run && total_indexed > 0 {
-        save_index(indexer, persistence, config);
-    } else if !dry_run && total_indexed == 0 {
+    if !dry_run && total_indexed == 0 {
         tracing::debug!(target: "indexing", "no changes detected, skipping save");
     }
+
+    // `--dry-run` never mutates the index even when `total_indexed` reports
+    // a nonzero preview count, so it must never report "changes made" to a
+    // caller that would otherwise save/publish.
+    !dry_run && total_indexed > 0
 }
 
 /// Preview a single explicit file path under `--dry-run`, mirroring the
@@ -488,23 +505,91 @@ pub fn run_status(config: &Settings, json: bool) {
     }
 }
 
-fn save_index(indexer: &mut IndexFacade, persistence: &IndexPersistence, config: &Settings) {
-    // Save the index
-    eprintln!(
-        "\nSaving index with {} total symbols, {} total relationships...",
-        indexer.symbol_count(),
-        indexer.relationship_count()
-    );
-    match persistence.save_facade(indexer) {
-        Ok(_) => {
+/// Run garbage collection over on-disk generations and print a summary,
+/// then exit. Constructs the [`IndexLayout`] directly rather than opening
+/// an [`IndexFacade`] -- mirroring [`run_status`]'s read-first-no-facade
+/// pattern -- so this never triggers `IndexFacade::new`'s
+/// bootstrap-on-open, which would write a fresh `current` generation to a
+/// never-indexed workspace.
+pub fn run_gc(config: &Settings) {
+    let layout = IndexLayout::new(config.index_path.clone());
+
+    match generation::gc(&layout, true) {
+        Ok(summary) => {
             println!(
-                "Index saved to: {}",
-                crate::parsing::paths::render_absolute_path(&config.index_path).display()
+                "gc: removed={} retried_later={} skipped_locked={}",
+                summary.removed.len(),
+                summary.retried_later.len(),
+                summary.skipped_locked
             );
         }
         Err(e) => {
-            eprintln!("Error: Could not save index: {e}");
+            eprintln!("Error running garbage collection: {e}");
             std::process::exit(1);
         }
     }
+}
+
+/// Roll `current` back to `id` (or, when `id` is `None`, the newest
+/// [`GenerationState::Previous`] generation), then exit. Same
+/// no-facade pattern as [`run_status`]/[`run_gc`]. Refuses -- loudly,
+/// leaving `current` untouched -- to roll back onto a generation that
+/// fails [`generation::validate_generation`], surfacing the recorded
+/// damage reason rather than silently flipping to a broken generation.
+pub fn run_rollback(config: &Settings, id: Option<String>) {
+    let layout = IndexLayout::new(config.index_path.clone());
+
+    let target = match id {
+        Some(raw) => match GenerationId::new(&raw) {
+            Some(gid) => gid,
+            None => {
+                eprintln!("Error: invalid generation id: {raw}");
+                std::process::exit(2);
+            }
+        },
+        None => {
+            let rows = match generation::list_generations(&layout) {
+                Ok(rows) => rows,
+                Err(e) => {
+                    eprintln!("Error reading index generation status: {e}");
+                    std::process::exit(1);
+                }
+            };
+            match rows
+                .into_iter()
+                .filter(|(_, state, ..)| matches!(state, GenerationState::Previous))
+                .max_by(|a, b| a.0.cmp(&b.0))
+            {
+                Some((gid, ..)) => gid,
+                None => {
+                    eprintln!("Error: no previous generation available to roll back to");
+                    std::process::exit(1);
+                }
+            }
+        }
+    };
+
+    if let Err(e) = generation::validate_generation(&layout, &target) {
+        eprintln!("Error: refusing to roll back to a damaged generation: {e}");
+        std::process::exit(1);
+    }
+
+    let old_current = match layout.read_current() {
+        Ok(current) => current,
+        Err(e) => {
+            eprintln!("Error reading current generation pointer: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(e) = layout.write_current(&target) {
+        eprintln!("Error: failed to roll back current generation pointer: {e}");
+        std::process::exit(1);
+    }
+
+    let old_txt = old_current
+        .as_ref()
+        .map(GenerationId::to_string)
+        .unwrap_or_else(|| "none".to_string());
+    println!("Rolled back current generation: {old_txt} -> {target}");
 }
