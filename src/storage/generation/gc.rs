@@ -101,6 +101,36 @@ pub fn gc(layout: &IndexLayout, keep_previous: bool) -> IndexResult<GcSummary> {
     result
 }
 
+/// Run [`gc`] and log its outcome, so every caller shares one logging
+/// policy instead of duplicating the gating logic at each call site.
+///
+/// Logs at INFO only when `summary.removed` is non-empty (a no-op run stays
+/// silent); the INFO line also reports `retried_later`/`skipped_locked` so a
+/// reader can distinguish "nothing to collect" from "collection was
+/// deferred". `context` tags the line with the caller's situation (e.g.
+/// `"startup"`, `"post-publish"`) so log output disambiguates the two
+/// callers. A `gc` error is always logged at WARN, regardless of
+/// `context` -- GC is best-effort and a failure here must never propagate
+/// as a hard error to either caller.
+pub fn gc_logged(
+    layout: &IndexLayout,
+    keep_previous: bool,
+    context: &str,
+) -> IndexResult<GcSummary> {
+    let result = gc(layout, keep_previous);
+    match &result {
+        Ok(summary) if !summary.removed.is_empty() => tracing::info!(
+            "[gc:{context}] removed={} retried_later={} skipped_locked={}",
+            summary.removed.len(),
+            summary.retried_later.len(),
+            summary.skipped_locked
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!("[gc:{context}] failed: {e}"),
+    }
+    result
+}
+
 /// The actual collection pass, run while the GC lock is held.
 fn run(layout: &IndexLayout, keep_previous: bool) -> IndexResult<GcSummary> {
     let mut summary = GcSummary::default();
@@ -508,5 +538,93 @@ mod tests {
         assert!(layout.gen_dir(&orphan).is_dir());
 
         drop(holder);
+    }
+
+    /// An in-memory `io::Write` sink so a test can assert on the exact text
+    /// `tracing` emitted, without depending on a dedicated log-capture crate
+    /// (none is a project dependency).
+    #[derive(Clone, Default)]
+    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("captured-logs mutex poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CapturedLogs {
+        fn as_string(&self) -> String {
+            String::from_utf8(self.0.lock().expect("captured-logs mutex poisoned").clone())
+                .expect("tracing output must be valid utf-8")
+        }
+    }
+
+    /// Run `f` under a `tracing` subscriber that writes formatted events into
+    /// the returned buffer, so a test can assert on log-line presence/
+    /// absence rather than only on the returned [`GcSummary`].
+    fn capture_tracing_output(f: impl FnOnce()) -> CapturedLogs {
+        let captured = CapturedLogs::default();
+        let make_writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || make_writer.clone())
+            .with_ansi(false)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, f);
+        captured
+    }
+
+    #[test]
+    fn gc_logged_stays_silent_at_info_when_nothing_was_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let layout = layout_in(&dir);
+        let current = GenerationId::generate();
+        write_valid_generation(&layout, &current, 0);
+        layout.write_current(&current).expect("write current");
+
+        let mut summary = None;
+        let output = capture_tracing_output(|| {
+            summary = Some(gc_logged(&layout, true, "startup").expect("gc_logged run"));
+        });
+
+        let summary = summary.expect("gc_logged must have run");
+        assert!(summary.removed.is_empty());
+        assert!(
+            !output.as_string().contains("[gc:startup]"),
+            "an empty removed-set must not produce an INFO gc_logged line: {}",
+            output.as_string()
+        );
+    }
+
+    #[test]
+    fn gc_logged_logs_at_info_when_something_was_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let layout = layout_in(&dir);
+        let current = GenerationId::generate();
+        write_valid_generation(&layout, &current, 0);
+        layout.write_current(&current).expect("write current");
+        let orphan = write_orphan(&layout);
+
+        let mut summary = None;
+        let output = capture_tracing_output(|| {
+            summary = Some(gc_logged(&layout, true, "startup").expect("gc_logged run"));
+        });
+
+        let summary = summary.expect("gc_logged must have run");
+        assert!(summary.removed.contains(&orphan));
+        let text = output.as_string();
+        assert!(
+            text.contains("[gc:startup]") && text.contains("removed=1"),
+            "a non-empty removed-set must produce an INFO gc_logged line tagged with the \
+             caller's context and including the removed count: {text}"
+        );
     }
 }

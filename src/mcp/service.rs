@@ -897,6 +897,18 @@ pub struct SemanticSearchInfo {
     pub updated: Option<String>,
 }
 
+/// Index-generation lifecycle info shown by `get_index_info`.
+#[derive(Debug, Clone, Serialize)]
+pub struct GenerationInfo {
+    pub id: String,
+    pub state: &'static str,
+    /// The generation `current` was rolled back from at startup, when the
+    /// facade's load path had to recover from a damaged or missing/torn
+    /// `current` pointer. `None` on a clean load.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovered_from: Option<String>,
+}
+
 /// The `get_index_info` JSON data payload.
 #[derive(Debug, Clone, Serialize)]
 pub struct IndexInfo {
@@ -927,6 +939,7 @@ pub struct IndexInfo {
     /// reported as `Some(true)` ("changed"). Detect-and-report only: this
     /// does not trigger reindexing or reconciliation (issue #28).
     pub ignore_rules_changed: Option<bool>,
+    pub generation: GenerationInfo,
 }
 
 /// Compares the ignore-rule fingerprint stored at the last index build
@@ -1002,6 +1015,15 @@ pub fn index_info_data(facade: &IndexFacade) -> IndexInfo {
         languages,
         semantic_search,
         ignore_rules_changed: ignore_rules_changed(facade),
+        generation: GenerationInfo {
+            id: facade.generation_id().as_str().to_string(),
+            state: crate::storage::generation::classify(
+                facade.index_layout(),
+                facade.generation_id(),
+            )
+            .as_str(),
+            recovered_from: facade.recovered_from().map(|id| id.as_str().to_string()),
+        },
     }
 }
 

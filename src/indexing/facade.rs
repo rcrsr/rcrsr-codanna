@@ -30,7 +30,9 @@ use crate::semantic::{
     EmbeddingBackend, EmbeddingPool, RemoteEmbedder, SemanticSearchError, SimpleSemanticSearch,
 };
 use crate::storage::generation::layout::unix_millis_now;
-use crate::storage::generation::{Complete, migrate_flat_layout, resolve_current};
+#[cfg(test)]
+use crate::storage::generation::resolve_current;
+use crate::storage::generation::{Complete, migrate_flat_layout, resolve_current_with_recovery};
 use crate::storage::{
     BuildFacade, BuildMode, DocumentIndex, EMISSION_SEMANTICS_VERSION, GenerationId, IndexLayout,
     IndexPersistence,
@@ -144,6 +146,13 @@ pub struct IndexFacade {
     /// in-flight `reindex_locked` permit held against the outgoing facade
     /// silently stops gating callers that read the handle after the swap.
     reindex_gate: Arc<tokio::sync::Semaphore>,
+
+    /// The generation `current` was rolled back from at startup, when
+    /// [`IndexFacade::new`]'s load path had to recover from a damaged or
+    /// missing/torn `current` pointer. `None` on a clean load. Populated
+    /// only by the startup load path in [`Self::new`] -- mid-run
+    /// hot-reloads/`swap_in` leave this field unchanged.
+    recovered_from: Option<GenerationId>,
 }
 
 impl IndexFacade {
@@ -182,8 +191,12 @@ impl IndexFacade {
         let layout = Self::resolve_layout(&settings);
         migrate_flat_layout(&layout)?;
 
-        match resolve_current(&layout)? {
-            Some(id) => Self::open(settings, layout, id),
+        match resolve_current_with_recovery(&layout)? {
+            Some(resolved) => {
+                let mut facade = Self::open(settings, layout, resolved.id)?;
+                facade.recovered_from = resolved.recovered_from;
+                Ok(facade)
+            }
             None => Self::bootstrap_empty_generation(settings, layout),
         }
     }
@@ -215,6 +228,7 @@ impl IndexFacade {
             semantic_incompatible: false,
             semantic_metadata_snapshot: None,
             reindex_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            recovered_from: None,
         })
     }
 
@@ -274,6 +288,7 @@ impl IndexFacade {
             semantic_incompatible: false,
             semantic_metadata_snapshot: None,
             reindex_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            recovered_from: None,
         })
     }
 
@@ -298,6 +313,7 @@ impl IndexFacade {
             semantic_incompatible: false,
             semantic_metadata_snapshot: None,
             reindex_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            recovered_from: None,
         }
     }
 
@@ -331,6 +347,15 @@ impl IndexFacade {
     /// The generation this facade currently reads/writes.
     pub fn generation_id(&self) -> &GenerationId {
         &self.generation
+    }
+
+    /// The generation `current` was rolled back from at startup, when
+    /// this facade's load path had to recover from a damaged or
+    /// missing/torn `current` pointer. `None` on a clean load, and only
+    /// ever populated by the startup path in [`Self::new`] -- a later
+    /// hot-reload/`swap_in` does not update this field.
+    pub fn recovered_from(&self) -> Option<&GenerationId> {
+        self.recovered_from.as_ref()
     }
 
     /// The filesystem layout for the index generations this facade's root

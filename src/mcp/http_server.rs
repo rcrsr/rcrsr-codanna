@@ -252,6 +252,11 @@ pub async fn serve_http(config: crate::Settings, watch: bool, bind: String) -> a
         crate::log_event!("http", "starting", "no existing index");
         IndexFacade::new(settings.clone())?
     };
+
+    // Startup GC: reclaim stale generations left behind by a prior run, once
+    // per process start, before the watcher (if any) starts below.
+    let _ = crate::storage::generation::gc_logged(facade.index_layout(), true, "startup");
+
     let indexer = Arc::new(RwLock::new(facade));
 
     // Create cancellation token for coordinated shutdown

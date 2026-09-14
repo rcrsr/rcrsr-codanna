@@ -18,10 +18,11 @@ pub mod id;
 pub mod layout;
 pub mod markers;
 
-pub use gc::{GcSummary, gc};
+pub use gc::{GcSummary, gc, gc_logged};
 pub use id::GenerationId;
 pub use layout::{
-    GenerationState, IndexLayout, classify, clone_generation, free_space_preflight,
-    list_generations, migrate_flat_layout, resolve_current, validate_generation,
+    GenerationState, IndexLayout, ResolvedGeneration, classify, clone_generation,
+    free_space_preflight, list_generations, migrate_flat_layout, resolve_current,
+    resolve_current_with_recovery, validate_generation,
 };
 pub use markers::{Building, Complete, CompleteFileEntry};

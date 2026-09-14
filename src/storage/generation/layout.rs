@@ -209,6 +209,21 @@ pub enum GenerationState {
     Incompatible,
 }
 
+impl GenerationState {
+    /// Stable string form of this state, used for machine-readable surfaces
+    /// (e.g. MCP `get_index_info`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            GenerationState::Current => "current",
+            GenerationState::Previous => "previous",
+            GenerationState::Building => "building",
+            GenerationState::Orphan => "orphan",
+            GenerationState::Damaged => "damaged",
+            GenerationState::Incompatible => "incompatible",
+        }
+    }
+}
+
 /// Read-only structural validation of a generation's on-disk contents.
 ///
 /// Never opens the index: this is file/JSON inspection only, cheap enough to
@@ -741,6 +756,23 @@ fn write_damaged_marker(layout: &IndexLayout, id: &GenerationId, reason: &str) -
 }
 
 /// Resolve which generation `current` should point at, recovering from a
+/// missing, torn, or invalid pointer. Thin wrapper over
+/// [`resolve_current_with_recovery`] that drops the recovery provenance;
+/// see that function for the fast-path / recovery semantics.
+pub fn resolve_current(layout: &IndexLayout) -> IndexResult<Option<GenerationId>> {
+    resolve_current_with_recovery(layout).map(|o| o.map(|r| r.id))
+}
+
+/// Outcome of [`resolve_current_with_recovery`]: the resolved generation and,
+/// when recovery kicked in because `current` named a specific generation that
+/// failed validation, the id that was rolled back from.
+#[derive(Debug, Clone)]
+pub struct ResolvedGeneration {
+    pub id: GenerationId,
+    pub recovered_from: Option<GenerationId>,
+}
+
+/// Resolve which generation `current` should point at, recovering from a
 /// missing, torn, or invalid pointer.
 ///
 /// Fast path: [`IndexLayout::read_current`] returns `Some(id)` and `id`
@@ -761,17 +793,26 @@ fn write_damaged_marker(layout: &IndexLayout, id: &GenerationId, reason: &str) -
 /// If no generation on disk validates at all, returns `Ok(None)` and leaves
 /// every directory untouched -- nothing is deleted or rewritten, preserving
 /// the evidence for forensics.
-pub fn resolve_current(layout: &IndexLayout) -> IndexResult<Option<GenerationId>> {
+pub fn resolve_current_with_recovery(
+    layout: &IndexLayout,
+) -> IndexResult<Option<ResolvedGeneration>> {
     let current_id = layout.read_current()?;
+    let mut failed: Option<(GenerationId, String)> = None;
 
     if let Some(id) = &current_id {
         match validate_generation(layout, id) {
-            Ok(()) => return Ok(Some(id.clone())),
+            Ok(()) => {
+                return Ok(Some(ResolvedGeneration {
+                    id: id.clone(),
+                    recovered_from: None,
+                }));
+            }
             Err(e) => {
                 tracing::warn!(
                     "[generation] current pointer names {id} but it failed validation ({e}); scanning gen/ for a valid fallback"
                 );
                 write_damaged_marker(layout, id, &e.to_string())?;
+                failed = Some((id.clone(), e.to_string()));
             }
         }
     }
@@ -822,7 +863,20 @@ pub fn resolve_current(layout: &IndexLayout) -> IndexResult<Option<GenerationId>
     };
 
     layout.write_current(&newest)?;
-    Ok(Some(newest))
+    match &failed {
+        Some((failed_id, reason)) => {
+            tracing::warn!(
+                "[generation] recovered: current now points to {newest} (rolled back from {failed_id}: {reason})"
+            );
+        }
+        None => {
+            tracing::warn!("[generation] recovered: current now points to {newest}");
+        }
+    }
+    Ok(Some(ResolvedGeneration {
+        id: newest,
+        recovered_from: failed.map(|(id, _)| id),
+    }))
 }
 
 /// Classify a single generation's lifecycle state per the table in
@@ -1070,6 +1124,39 @@ mod tests {
 
     fn layout_in(dir: &tempfile::TempDir) -> IndexLayout {
         IndexLayout::new(dir.path().to_path_buf())
+    }
+
+    /// Minimal `tracing_subscriber::fmt::MakeWriter` that clones a shared
+    /// buffer handle on every write-site lookup, so a scoped
+    /// `tracing::subscriber::with_default` subscriber's output can be
+    /// asserted on directly rather than inferred from state alone.
+    mod recovery_warn_test_support {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        pub(super) struct VecWriter(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for VecWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        #[derive(Clone)]
+        pub(super) struct SharedVecMakeWriter(pub(super) Arc<Mutex<Vec<u8>>>);
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedVecMakeWriter {
+            type Writer = VecWriter;
+
+            fn make_writer(&'a self) -> Self::Writer {
+                VecWriter(Arc::clone(&self.0))
+            }
+        }
     }
 
     /// A fixture segment: its id and the bytes written to disk for it.
@@ -1592,6 +1679,18 @@ mod tests {
             "no specific generation failed validation from a torn pointer, so nothing is marked DAMAGED"
         );
         assert!(!layout.damaged_marker(&newer).is_file());
+
+        // A torn (not merely missing) pointer names no specific generation,
+        // so there is nothing to blame: `recovered_from` must be `None`.
+        fs::write(layout.current_file(), "not-a-valid-generation-id\n")
+            .expect("re-write torn current pointer");
+        let resolved = resolve_current_with_recovery(&layout).expect("resolve current");
+        let resolved = resolved.expect("a valid generation must still be found");
+        assert_eq!(resolved.id, newer);
+        assert_eq!(
+            resolved.recovered_from, None,
+            "a torn pointer names no specific generation to blame"
+        );
     }
 
     #[test]
@@ -1624,6 +1723,48 @@ mod tests {
         assert!(
             !layout.damaged_marker(&fallback).is_file(),
             "the healthy fallback generation must not be marked DAMAGED"
+        );
+
+        // Re-point `current` at the damaged generation again and use the
+        // recovery-detail API: `recovered_from` must name the damaged id,
+        // and a WARN naming the recovered-to id (plus the rolled-back-from
+        // id, since a specific generation was blamed) must actually fire.
+        layout.write_current(&damaged).expect("write current");
+
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(recovery_warn_test_support::SharedVecMakeWriter(
+                std::sync::Arc::clone(&buf),
+            ))
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .without_time()
+            .finish();
+
+        let resolved = tracing::subscriber::with_default(subscriber, || {
+            resolve_current_with_recovery(&layout).expect("resolve current")
+        });
+        let resolved = resolved.expect("a valid fallback generation must be found");
+        assert_eq!(resolved.id, fallback);
+        assert_eq!(
+            resolved.recovered_from,
+            Some(damaged.clone()),
+            "recovered_from must name the generation that was rolled back from"
+        );
+
+        let captured = String::from_utf8(buf.lock().unwrap().clone())
+            .expect("tracing-subscriber's fmt output must be valid UTF-8");
+        let recovered_line = captured
+            .lines()
+            .find(|l| l.contains("recovered:"))
+            .unwrap_or_else(|| panic!("expected a 'recovered:' WARN, got: {captured:?}"));
+        assert!(
+            recovered_line.contains(fallback.as_str()),
+            "recovered WARN must name the id current now points to, got: {recovered_line}"
+        );
+        assert!(
+            recovered_line.contains(damaged.as_str()),
+            "recovered WARN must name the id it was rolled back from, got: {recovered_line}"
         );
     }
 

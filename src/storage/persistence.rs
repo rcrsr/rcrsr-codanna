@@ -8,7 +8,8 @@ use crate::indexing::walk_config;
 use crate::storage::generation::layout::{self, free_space_preflight_against};
 use crate::storage::generation::markers::{Building, Complete};
 use crate::storage::generation::{
-    GenerationId, clone_generation, gc, list_generations, migrate_flat_layout, resolve_current,
+    GenerationId, clone_generation, gc, gc_logged, list_generations, migrate_flat_layout,
+    resolve_current,
 };
 use crate::storage::{DataSource, IndexLayout, IndexMetadata};
 use crate::{IndexError, IndexResult, Settings};
@@ -520,16 +521,10 @@ impl IndexPersistence {
         cas_result?;
 
         // (4) Best-effort trailing GC: never fails a publish that already
-        // landed.
-        match gc(&self.layout, true) {
-            Ok(summary) => tracing::info!(
-                "[persistence] post-publish gc: removed={} retried_later={} skipped_locked={}",
-                summary.removed.len(),
-                summary.retried_later.len(),
-                summary.skipped_locked
-            ),
-            Err(e) => tracing::warn!("[persistence] post-publish gc failed: {e}"),
-        }
+        // landed. `gc_logged` owns the conditional-log gating (INFO only
+        // when something was actually removed); this call site never
+        // duplicates that logic.
+        let _ = gc_logged(&self.layout, true, "post-publish");
 
         Ok((id, facade))
     }
