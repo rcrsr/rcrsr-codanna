@@ -1991,6 +1991,13 @@ impl ReindexHandles {
             semantic_dir,
         } = self;
 
+        // Test-only mid-walk barrier: parks this thread here, before the
+        // walk touches any file, when a test has armed it for this run's
+        // index root via `arm_mid_walk_barrier_for_test`. No effect (and no
+        // runtime cost beyond the `cfg`-gated check) otherwise.
+        #[cfg(test)]
+        wait_at_mid_walk_barrier_for_test(&semantic_dir);
+
         // A malformed `ignore_patterns` entry is a deterministic misconfig,
         // not a transient per-path failure: it fails identically on every
         // path in the loop below. Validate once, up front, and propagate a
@@ -2174,6 +2181,82 @@ fn take_fail_after_walk_for_test(semantic_dir: &Path) -> bool {
     }
 }
 
+/// Test-only mid-walk barrier for [`ReindexHandles::run`]: the index root
+/// whose next walk must park before touching any file, until released via
+/// [`release_mid_walk_barrier_for_test`]. Lets a test observe on-disk state
+/// (e.g. a generation's `BUILDING` marker) while phase 2's walk is
+/// genuinely still in flight on its `spawn_blocking` worker thread, rather
+/// than racing a real walk's completion. Process-global for the same reason
+/// as `FAIL_AFTER_WALK_ROOT`: `run` executes on whatever `spawn_blocking`
+/// worker thread the runtime picks, never the test's own thread.
+#[cfg(test)]
+static MID_WALK_BARRIER_ROOT: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// `true` once [`release_mid_walk_barrier_for_test`] has been called for the
+/// currently armed barrier; a parked walk thread waits on this via
+/// `MID_WALK_BARRIER_CONDVAR`.
+#[cfg(test)]
+static MID_WALK_BARRIER_RELEASED: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+
+#[cfg(test)]
+static MID_WALK_BARRIER_CONDVAR: std::sync::Condvar = std::sync::Condvar::new();
+
+/// Arms the mid-walk barrier for the next walk over a generation under
+/// `index_root`. Test-only.
+#[cfg(test)]
+pub(crate) fn arm_mid_walk_barrier_for_test(index_root: &Path) {
+    let mut armed = MID_WALK_BARRIER_ROOT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *armed = Some(index_root.to_path_buf());
+    let mut released = MID_WALK_BARRIER_RELEASED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *released = false;
+}
+
+/// Releases a walk thread parked at the mid-walk barrier, letting it
+/// proceed. Also disarms the barrier so it does not leak into a later,
+/// unrelated test's walk. Test-only.
+#[cfg(test)]
+pub(crate) fn release_mid_walk_barrier_for_test() {
+    {
+        let mut armed = MID_WALK_BARRIER_ROOT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *armed = None;
+    }
+    let mut released = MID_WALK_BARRIER_RELEASED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *released = true;
+    MID_WALK_BARRIER_CONDVAR.notify_all();
+}
+
+/// Parks the calling (walk) thread if the barrier is armed for the index
+/// root that `semantic_dir` (a generation directory under that root)
+/// belongs to; otherwise returns immediately. Test-only.
+#[cfg(test)]
+fn wait_at_mid_walk_barrier_for_test(semantic_dir: &Path) {
+    let armed_for_this_root = {
+        let armed = MID_WALK_BARRIER_ROOT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        armed
+            .as_ref()
+            .is_some_and(|root| semantic_dir.starts_with(root))
+    };
+    if !armed_for_this_root {
+        return;
+    }
+    let guard = MID_WALK_BARRIER_RELEASED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = MID_WALK_BARRIER_CONDVAR
+        .wait_while(guard, |released| !*released)
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+}
+
 /// Runs the full 3-phase reindex orchestration (brief write lock ->
 /// off-lock walk -> brief write lock) against a shared, lock-guarded
 /// facade.
@@ -2212,6 +2295,17 @@ fn take_fail_after_walk_for_test(semantic_dir: &Path) -> bool {
 ///   - Scoped reindex: unchanged -- a brief write lock on the live facade to
 ///     record newly indexed directories via [`IndexFacade::add_indexed_path`].
 ///
+/// `cancellation`, when provided, is checked once, as the first statement
+/// inside phase 3's publish `spawn_blocking` closure, strictly before
+/// [`IndexPersistence::publish_into_facade`] runs. If cancelled, `build` (the
+/// generation's `BUILDING` guard) drops without publishing -- a clean orphan
+/// -- and this function returns [`IndexError::ReindexCancelled`] instead of
+/// swapping a new facade in. This is the shutdown seam: the watcher's
+/// catch-up path passes its own shutdown token so an abort mid-walk cannot
+/// publish a new served generation after the awaiting continuation
+/// (`IndexFacade::swap_in`) has stopped being polled. Every other call site
+/// passes `None`.
+///
 /// `phase2_started`, when provided, is signaled the instant phase 1's write
 /// guard has been dropped and before the off-lock walk begins; this exists
 /// for test synchronization and is `None` in production call sites.
@@ -2238,6 +2332,7 @@ pub(crate) async fn reindex_locked(
     paths: Option<Vec<String>>,
     force: bool,
     broadcaster: Option<&crate::mcp::notifications::NotificationBroadcaster>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
     phase2_started: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> FacadeResult<ReindexOutcome> {
     // Take a brief read lock purely to clone the gate handle, then drop it
@@ -2403,17 +2498,39 @@ pub(crate) async fn reindex_locked(
 
     // Phase 2: run the heavy reindex walk with no facade lock held.
     //
+    // `build` (holding the generation's `BUILDING` ownership guard) is
+    // captured INTO this closure rather than left bound in this async fn's
+    // own frame. If a caller aborts the task driving this `reindex_locked`
+    // future (e.g. `HotReloadWatcher`'s catch-up task on shutdown), the
+    // outer future is dropped at whatever `.await` point it is suspended
+    // at -- including this one -- but `spawn_blocking`'s closure keeps
+    // running to completion on its worker thread regardless of whether
+    // anything still awaits its `JoinHandle` (this is `spawn_blocking`'s
+    // documented behavior, unlike `spawn`). Keeping `build` bound out here
+    // would drop it -- and release `BUILDING` -- the instant the outer
+    // future is dropped, while the detached walk thread keeps writing into
+    // that generation directory; a next-startup `gc()` could then delete a
+    // generation still being written. Returning `build` back out of the
+    // closure instead ties its lifetime to the walk actually finishing: the
+    // guard is held until the blocking closure's return value (this tuple)
+    // is produced and dropped, whether or not anyone is still around to
+    // read it.
+    //
     // The watchdog is observability only — see its doc comment. It holds
     // neither the facade lock nor the reindex permit, and its guard's Drop
     // impl aborts it on every exit from this scope (success, `?`
     // propagation below, or a panic unwinding through here), so it never
     // outlives phase 2 regardless of how phase 2 finishes.
-    let outcome = {
+    let (outcome_result, build): (FacadeResult<ReindexOutcome>, Option<BuildFacade>) = {
         let _watchdog = spawn_reindex_phase2_watchdog();
-        tokio::task::spawn_blocking(move || handles.run(paths, force))
-            .await
-            .map_err(map_reindex_join_error)??
+        tokio::task::spawn_blocking(move || {
+            let outcome_result = handles.run(paths, force);
+            (outcome_result, build)
+        })
+        .await
+        .map_err(map_reindex_join_error)?
     };
+    let outcome = outcome_result?;
 
     // Phase 3 branches the same way phase 1 did.
     match build {
@@ -2425,17 +2542,49 @@ pub(crate) async fn reindex_locked(
             }
 
             let persistence = IndexPersistence::new(build.index_layout().root().to_path_buf());
+            let cancel = cancellation.clone();
             // `publish_into_facade` performs blocking Tantivy/filesystem IO
-            // (save, manifest write, CAS rename, trailing gc).
-            let (_, new_facade) =
-                tokio::task::spawn_blocking(move || persistence.publish_into_facade(build))
-                    .await
-                    .map_err(map_reindex_join_error)??;
+            // (save, manifest write, CAS rename, trailing gc). The
+            // cancellation check is the first statement in this closure --
+            // strictly before that IO starts -- so an abort of the task
+            // driving this future (which drops the outer future at whatever
+            // `.await` it is suspended at, but leaves this `spawn_blocking`
+            // closure running to completion regardless, per
+            // `spawn_blocking`'s documented behavior) cannot land a
+            // compare-and-swap that flips `current` to a new served
+            // generation after the awaiting continuation (`swap_in` below)
+            // has stopped being polled. When cancelled, `build` -- moved
+            // into this closure -- simply drops here: the generation's
+            // `BUILDING` guard is released, `current` is never touched, and
+            // a later `gc()` reclaims the orphaned directory.
+            //
+            // Residual window: if cancellation lands *after* this check
+            // passes but *during* `publish_into_facade`'s own IO, the CAS
+            // still completes. This is accepted, not closed: the walk phase
+            // is multi-second while the CAS itself is sub-millisecond, so
+            // the harm is a complete, valid generation published during
+            // shutdown -- never corruption. Closing this fully would require
+            // threading the token into `publish_into_facade`
+            // (`src/storage/persistence.rs`), which is out of scope here.
+            let published = tokio::task::spawn_blocking(move || {
+                if cancel.as_ref().is_some_and(|t| t.is_cancelled()) {
+                    return Ok::<_, IndexError>(None);
+                }
+                persistence.publish_into_facade(build).map(Some)
+            })
+            .await
+            .map_err(map_reindex_join_error)??;
 
-            // The reindex permit (`_reindex_permit`, still in scope) stays
-            // held through this swap, so no concurrent `reindex_locked` call
-            // can observe the facade mid-swap.
-            IndexFacade::swap_in(facade, new_facade, broadcaster).await;
+            match published {
+                Some((_, new_facade)) => {
+                    // The reindex permit (`_reindex_permit`, still in scope)
+                    // stays held through this swap, so no concurrent
+                    // `reindex_locked` call can observe the facade
+                    // mid-swap.
+                    IndexFacade::swap_in(facade, new_facade, broadcaster).await;
+                }
+                None => return Err(IndexError::ReindexCancelled),
+            }
         }
         None => {
             // Scoped reindex, unchanged: brief write lock on the live
@@ -5879,7 +6028,7 @@ mod tests {
         );
 
         let facade = Arc::new(tokio::sync::RwLock::new(facade));
-        let err = reindex_locked(&facade, None, true, None, None)
+        let err = reindex_locked(&facade, None, true, None, None, None)
             .await
             .expect_err("force reindex with no rebuild source must be refused");
         assert!(
@@ -5936,7 +6085,7 @@ mod tests {
         );
 
         let facade = Arc::new(tokio::sync::RwLock::new(facade));
-        reindex_locked(&facade, None, true, None, None)
+        reindex_locked(&facade, None, true, None, None, None)
             .await
             .expect("non-empty settings.indexing.indexed_paths must permit the clear");
 
@@ -6002,7 +6151,7 @@ mod tests {
         );
 
         let facade = Arc::new(tokio::sync::RwLock::new(facade));
-        let err = reindex_locked(&facade, None, true, None, None)
+        let err = reindex_locked(&facade, None, true, None, None, None)
             .await
             .expect_err("force reindex with only stale indexed_paths must be refused");
         assert!(
@@ -6043,7 +6192,7 @@ mod tests {
 
         let facade = Arc::new(tokio::sync::RwLock::new(facade));
         let explicit_str = explicit.to_string_lossy().into_owned();
-        reindex_locked(&facade, Some(vec![explicit_str]), true, None, None)
+        reindex_locked(&facade, Some(vec![explicit_str]), true, None, None, None)
             .await
             .expect("explicit-paths reindex must succeed");
 
@@ -6091,6 +6240,125 @@ mod tests {
             .expect("hook must disarm itself after firing once");
     }
 
+    // W-1 regression: `build` (the generation's `BUILDING` ownership guard)
+    // must survive phase 2 even if the task driving `reindex_locked` is
+    // aborted while phase 2's off-lock walk is still in flight on its
+    // `spawn_blocking` worker thread. Before the fix, `build` was bound in
+    // `reindex_locked`'s own async-fn frame and got dropped -- releasing
+    // the generation's `BUILDING` lock -- the instant that frame was
+    // dropped by `.abort()`, while the detached walk thread kept writing
+    // into the same generation directory; a next-startup `gc()` could then
+    // reclaim a generation still being written. Parking the walk at a
+    // mid-walk barrier lets this test observe the marker's liveness while
+    // phase 2 is genuinely still in flight, past the abort, rather than
+    // racing a real walk's completion.
+    #[tokio::test]
+    async fn reindex_locked_keeps_building_guard_alive_across_outer_task_abort() {
+        let _serial_guard = crate::mcp::server::REINDEX_TEST_SERIAL.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let index_root = dir.path().join("index");
+        let facade = test_facade(&dir);
+        let layout = IndexLayout::new(index_root.clone());
+
+        let current_before = layout
+            .read_current()
+            .unwrap()
+            .expect("bootstrap must publish an initial current generation");
+
+        arm_mid_walk_barrier_for_test(&index_root);
+        // Guarantees the barrier is released even if an assertion below
+        // panics, so a failing run reports as a normal test failure
+        // instead of hanging the whole binary: dropping the `#[tokio::test]`
+        // runtime waits for outstanding `spawn_blocking` tasks to finish,
+        // and one would stay parked at the barrier forever otherwise.
+        // Releasing twice (once here, once at the explicit call point
+        // below on the success path) is harmless -- see
+        // `release_mid_walk_barrier_for_test`'s doc comment.
+        struct ReleaseBarrierOnDrop;
+        impl Drop for ReleaseBarrierOnDrop {
+            fn drop(&mut self) {
+                release_mid_walk_barrier_for_test();
+            }
+        }
+        let _release_on_drop = ReleaseBarrierOnDrop;
+
+        let facade = Arc::new(tokio::sync::RwLock::new(facade));
+        let (phase2_tx, phase2_rx) = tokio::sync::oneshot::channel();
+        let facade_for_task = Arc::clone(&facade);
+        let task = tokio::spawn(async move {
+            reindex_locked(&facade_for_task, None, false, None, None, Some(phase2_tx)).await
+        });
+
+        phase2_rx
+            .await
+            .expect("reindex must signal phase 2 start before completing");
+
+        // Phase 1 has already opened the build generation (its `BUILDING`
+        // marker is on disk) by the time phase 2 is signaled; phase 2's
+        // off-lock walk either has started or is about to, and either way
+        // will park at the mid-walk barrier before touching any file.
+        let build_id = crate::storage::generation::list_generations(&layout)
+            .unwrap()
+            .into_iter()
+            .map(|(id, _, _, _)| id)
+            .find(|id| *id != current_before)
+            .expect("phase 1 must have opened a new build generation");
+        let marker_path = layout.building_marker(&build_id);
+        assert!(
+            marker_path.is_file(),
+            "BUILDING marker must exist once phase 1 has opened the build"
+        );
+
+        task.abort();
+        let _ = task.await;
+
+        // Liveness is judged the same way `gc` does: via the marker's
+        // advisory lock, not mere file presence -- the marker file itself
+        // is never deleted by dropping the `Building` guard (see
+        // `Building`'s doc comment), so an existence check alone would
+        // pass both with and without the fix. This is the assertion that
+        // fails without the W-1 fix (the guard, and its lock, would
+        // already be gone here) and passes with it (the guard now lives
+        // inside phase 2's `spawn_blocking` closure, unaffected by the
+        // outer task's abort).
+        assert!(
+            crate::storage::generation::Building::is_alive(&marker_path),
+            "BUILDING marker must still be alive immediately after abort, while \
+             phase 2's walk thread is still parked at the barrier"
+        );
+
+        release_mid_walk_barrier_for_test();
+
+        // Bounded poll: the walk thread drains almost immediately once
+        // released (there is nothing registered to walk here), but a
+        // generous window is used rather than assuming a specific number
+        // of scheduler yields.
+        let mut released = false;
+        for _ in 0..200 {
+            if !crate::storage::generation::Building::is_alive(&marker_path) {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            released,
+            "BUILDING marker must be released once the walk thread finishes draining"
+        );
+
+        assert_eq!(
+            layout.read_current().unwrap(),
+            Some(current_before),
+            "an aborted reindex must never publish; `current` must be unchanged"
+        );
+
+        let summary = crate::storage::generation::gc(&layout, false).unwrap();
+        assert!(
+            summary.removed.contains(&build_id),
+            "gc must reclaim the orphaned build generation left behind by the aborted reindex"
+        );
+    }
+
     // Error-surface lock for the new variant: both accessors must be wired,
     // not just the `#[error(...)]` message, or the error is invisible to
     // MCP clients that key off `status_code()`/`recovery_suggestions()`
@@ -6106,6 +6374,90 @@ mod tests {
         assert!(
             err.to_string().contains("codanna index"),
             "message must name the recovery command: {err}"
+        );
+    }
+
+    // W-2: the phase-3 checkpoint must observe cancellation and refuse to
+    // publish, rather than letting an already-detached `spawn_blocking`
+    // closure run `publish_into_facade` (including its CAS-rename of
+    // `current`) to completion after the caller has stopped awaiting.
+    // Unlike the W-1 abort test above, this test never calls `.abort()` --
+    // it lets the spawned task run to completion normally, so the only
+    // thing under test is the in-closure `is_cancelled()` check itself.
+    // Without the W-2 fix, `cancellation` would not exist as a parameter at
+    // all, `current` would flip to the new generation, and this call would
+    // return `Ok(..)` instead of `Err(IndexError::ReindexCancelled)`.
+    #[tokio::test]
+    async fn reindex_locked_orphans_the_build_when_cancelled_before_publish() {
+        let _serial_guard = crate::mcp::server::REINDEX_TEST_SERIAL.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let index_root = dir.path().join("index");
+        let facade = test_facade(&dir);
+        let layout = IndexLayout::new(index_root.clone());
+
+        let current_before = layout
+            .read_current()
+            .unwrap()
+            .expect("bootstrap must publish an initial current generation");
+
+        let facade = Arc::new(tokio::sync::RwLock::new(facade));
+        let token = tokio_util::sync::CancellationToken::new();
+        let (phase2_tx, phase2_rx) = tokio::sync::oneshot::channel();
+
+        let facade_for_task = Arc::clone(&facade);
+        let token_for_task = token.clone();
+        let task = tokio::spawn(async move {
+            // `force: false` (staged clone-current), matching the W-1 abort
+            // test above: `force: true` with `paths: None` would trip the
+            // "nothing to rebuild from" refuse-before-cost guard on this
+            // fixture, since `test_facade` registers no
+            // `indexing.indexed_paths`, and never reach phase 2 at all.
+            reindex_locked(
+                &facade_for_task,
+                None,
+                false,
+                None,
+                Some(token_for_task),
+                Some(phase2_tx),
+            )
+            .await
+        });
+
+        phase2_rx
+            .await
+            .expect("reindex must signal phase 2 start before completing");
+
+        // Phase 1 has already opened the build generation by the time
+        // phase 2 is signaled.
+        let build_id = crate::storage::generation::list_generations(&layout)
+            .unwrap()
+            .into_iter()
+            .map(|(id, _, _, _)| id)
+            .find(|id| *id != current_before)
+            .expect("phase 1 must have opened a new build generation");
+
+        // Cancel before awaiting the task, not by aborting it -- the task
+        // is left to run phase 2 and phase 3 for real so the in-closure
+        // checkpoint is what is exercised, not `spawn_blocking`'s
+        // detach-on-drop behavior (that's the W-1 test above).
+        token.cancel();
+
+        let result = task.await.expect("reindex task must not panic");
+        assert!(
+            matches!(result, Err(IndexError::ReindexCancelled)),
+            "expected Err(ReindexCancelled), got: {result:?}"
+        );
+
+        assert_eq!(
+            layout.read_current().unwrap(),
+            Some(current_before),
+            "a cancelled reindex must never publish; `current` must be unchanged"
+        );
+
+        let summary = crate::storage::generation::gc(&layout, false).unwrap();
+        assert!(
+            summary.removed.contains(&build_id),
+            "gc must reclaim the orphaned build generation left behind by cancellation"
         );
     }
 

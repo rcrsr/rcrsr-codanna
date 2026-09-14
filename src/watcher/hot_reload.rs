@@ -363,7 +363,7 @@ mod tests {
         // Drive a real in-process full reindex through the same seam the
         // MCP server uses (`reindex_locked`), letting it build, publish,
         // and swap the new generation into `facade`.
-        crate::indexing::reindex_locked(&facade, None, true, None, None)
+        crate::indexing::reindex_locked(&facade, None, true, None, None, None)
             .await
             .expect("in-process force reindex must succeed");
 

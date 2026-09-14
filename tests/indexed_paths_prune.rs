@@ -146,6 +146,45 @@ fn prune_drops_ghost_and_stray_entries_but_keeps_configured_out_of_tree_roots() 
 }
 
 #[test]
+fn prune_saves_through_the_current_checked_path_with_no_concurrent_publish() {
+    // End-to-end confirmation that routing the prune save through
+    // `save_facade_current_checked` (instead of a bare `save_facade`) does
+    // not change observable behavior when nothing else publishes
+    // concurrently: the pruned set still lands in `index.meta`. The actual
+    // CAS-refusal race is exercised at the `persistence.rs` unit level,
+    // where a concurrent publish can be injected out of band.
+    let temp = tempfile::tempdir().expect("create temp root");
+
+    let corpus = temp.path().join("corpus");
+    write_py_fixture(&corpus, "valid.py", "valid_symbol");
+    let ghost = temp.path().join("ghost-was-here");
+
+    let settings = Arc::new(settings_for(&temp.path().join("index"), None));
+    let mut facade = IndexFacade::new(Arc::clone(&settings)).expect("create facade");
+    facade.set_indexed_paths(vec![
+        corpus.canonicalize().expect("canonicalize corpus"),
+        ghost.clone(),
+    ]);
+    facade.index_directory(&corpus, false).expect("seed index");
+
+    let persistence = IndexPersistence::new(settings.index_path.clone());
+    persistence
+        .save_facade(&facade)
+        .expect("save seeded facade");
+    drop(facade);
+
+    run_prune_indexed_paths(&settings);
+
+    let after = recorded_indexed_paths(&persistence);
+    assert!(
+        !after.contains(&ghost),
+        "ghost entry must still be pruned via the CAS-guarded save path"
+    );
+    assert!(after.contains(&corpus.canonicalize().expect("canonicalize corpus")));
+    assert_eq!(after.len(), 1);
+}
+
+#[test]
 fn prune_without_workspace_root_drops_only_ghosts() {
     let temp = tempfile::tempdir().expect("create temp root");
 

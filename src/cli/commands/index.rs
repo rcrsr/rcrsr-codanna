@@ -6,6 +6,7 @@ use serde::Serialize;
 
 use crate::cli::commands::directories::{SkipReason, add_paths_to_settings};
 use crate::config::Settings;
+use crate::error::IndexError;
 use crate::indexing::DryRunOutput;
 use crate::indexing::facade::IndexFacade;
 use crate::storage::generation::{self, GenerationId, GenerationState, IndexLayout};
@@ -608,9 +609,19 @@ pub fn run_prune_indexed_paths(config: &Settings) {
 
     facade.set_indexed_paths(retained);
 
-    if let Err(e) = persistence.save_facade(&facade) {
-        eprintln!("Error saving pruned indexed paths: {e}");
-        std::process::exit(1);
+    match persistence.save_facade_current_checked(&facade) {
+        Ok(()) => {}
+        Err(IndexError::GenerationSuperseded { .. }) => {
+            eprintln!(
+                "Error: a reindex published a new generation during prune; re-run \
+                 'codanna index --prune-indexed-paths'"
+            );
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Error saving pruned indexed paths: {e}");
+            std::process::exit(1);
+        }
     }
 
     println!("Pruned {} indexed path(s):", dropped.len());

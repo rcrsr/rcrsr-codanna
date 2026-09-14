@@ -135,6 +135,18 @@ pub enum IndexError {
     )]
     ReindexHasNothingToRebuild,
 
+    /// A reindex's phase-3 checkpoint observed shutdown-driven cancellation
+    /// before publish and orphaned the in-progress build generation instead
+    /// of publishing it. This is a shutdown-driven, non-fault outcome, not a
+    /// bug: nothing was lost, the served generation was never touched, and
+    /// the orphaned build generation will be reclaimed by the next `codanna
+    /// index --gc`.
+    #[error(
+        "Reindex cancelled by shutdown before publishing; nothing was lost, the in-progress \
+         generation was orphaned and will be reclaimed by the next 'codanna index --gc'"
+    )]
+    ReindexCancelled,
+
     /// A requested index generation does not exist
     #[error(
         "Index generation '{id}' not found. Run 'codanna index --status' to list available generations"
@@ -228,6 +240,7 @@ impl IndexError {
             Self::InvalidIgnorePattern { .. } => "INVALID_IGNORE_PATTERN",
             Self::ReindexInProgress => "REINDEX_IN_PROGRESS",
             Self::ReindexHasNothingToRebuild => "REINDEX_HAS_NOTHING_TO_REBUILD",
+            Self::ReindexCancelled => "REINDEX_CANCELLED",
             Self::GenerationNotFound { .. } => "GENERATION_NOT_FOUND",
             Self::GenerationDamaged { .. } => "GENERATION_DAMAGED",
             Self::GenerationSuperseded { .. } => "GENERATION_SUPERSEDED",
@@ -280,6 +293,11 @@ impl IndexError {
                 "Run 'codanna index <path>' to register at least one indexed path",
                 "Check indexing.indexed_paths in .codanna/settings.toml for paths that \
                  were renamed, deleted, or moved since being registered",
+            ],
+            Self::ReindexCancelled => vec![
+                "No action needed; the previously served generation is still active",
+                "Run 'codanna index --gc' to reclaim the orphaned build generation",
+                "Retry the reindex once the server has finished shutting down",
             ],
             Self::GenerationNotFound { .. } => vec![
                 "Run 'codanna index --status' to list available generations",

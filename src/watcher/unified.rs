@@ -685,14 +685,25 @@ impl UnifiedWatcher {
         );
 
         let facade = Arc::clone(&self.facade);
+        let cancellation_token = self.cancellation_token.clone();
         self.catch_up_started_at = Some(Instant::now());
         self.catch_up_task = Some(tokio::spawn(async move {
             // Watcher broadcaster wiring is a later phase; `None` here just
             // means the catch-up reindex doesn't emit an `IndexReloaded`
-            // notification on the watch lane yet.
-            crate::indexing::reindex_locked(&facade, None, true, None, None)
-                .await
-                .map_err(|source| WatchError::CatchUpReindexFailed { source })
+            // notification on the watch lane yet. The cancellation token is
+            // the watcher's own shutdown token, reused (not a new one) so
+            // this catch-up reindex's phase-3 checkpoint observes the same
+            // shutdown signal the watcher itself shuts down on.
+            crate::indexing::reindex_locked(
+                &facade,
+                None,
+                true,
+                None,
+                Some(cancellation_token),
+                None,
+            )
+            .await
+            .map_err(|source| WatchError::CatchUpReindexFailed { source })
         }));
     }
 

@@ -475,6 +475,7 @@ impl CodeIntelligenceServer {
             paths,
             force,
             self.broadcaster.as_deref(),
+            None,
             phase2_started,
         )
         .await
@@ -1296,7 +1297,7 @@ mod tests {
         );
 
         let facade_arc = Arc::new(tokio::sync::RwLock::new(facade));
-        crate::indexing::reindex_locked(&facade_arc, None, true, None, None)
+        crate::indexing::reindex_locked(&facade_arc, None, true, None, None, None)
             .await
             .expect("force reindex_locked on a lite facade");
 
@@ -1360,7 +1361,8 @@ mod tests {
         let pre_generation_id = facade_arc.read().await.generation_id().clone();
 
         crate::indexing::facade::arm_fail_after_walk_for_test(&index_path);
-        let result = crate::indexing::reindex_locked(&facade_arc, None, true, None, None).await;
+        let result =
+            crate::indexing::reindex_locked(&facade_arc, None, true, None, None, None).await;
         assert!(
             result.is_err(),
             "expected reindex_locked to surface the injected post-walk failure as Err"
