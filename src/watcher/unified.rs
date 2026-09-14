@@ -1483,7 +1483,7 @@ impl UnifiedWatcher {
         // outstanding immutable borrow of `self.journal`.
         let entries = std::mem::take(&mut self.journal);
         for entry in entries {
-            if !replay_entry_is_stale(entry.at, generation_started_at) {
+            if !needs_replay(entry.at, generation_started_at) {
                 continue;
             }
             let action = match entry.kind {
@@ -2043,7 +2043,7 @@ enum ReindexActionOutcome {
 /// `started_at` is itself the build's own cut point (a walk that began at
 /// `started_at` is, by definition, not older than an action landing at
 /// that same instant).
-fn replay_entry_is_stale(entry_at: SystemTime, generation_started_at: SystemTime) -> bool {
+fn needs_replay(entry_at: SystemTime, generation_started_at: SystemTime) -> bool {
     entry_at > generation_started_at
 }
 
@@ -2071,29 +2071,29 @@ mod tests {
         );
     }
 
-    // -- replay_entry_is_stale -------------------------------------------
+    // -- needs_replay -------------------------------------------
 
     #[test]
-    fn replay_entry_is_stale_when_entry_postdates_generation_start() {
+    fn needs_replay_when_entry_postdates_generation_start() {
         let start = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
         let entry_at = start + Duration::from_secs(1);
-        assert!(replay_entry_is_stale(entry_at, start));
+        assert!(needs_replay(entry_at, start));
     }
 
     #[test]
-    fn replay_entry_is_stale_false_when_entry_predates_generation_start() {
+    fn needs_replay_false_when_entry_predates_generation_start() {
         let start = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
         let entry_at = start - Duration::from_secs(1);
-        assert!(!replay_entry_is_stale(entry_at, start));
+        assert!(!needs_replay(entry_at, start));
     }
 
     /// An entry recorded at exactly `started_at` is treated as already
     /// covered by that build, not replayed -- the strict `>` boundary
-    /// documented on `replay_entry_is_stale`.
+    /// documented on `needs_replay`.
     #[test]
-    fn replay_entry_is_stale_false_at_exact_boundary() {
+    fn needs_replay_false_at_exact_boundary() {
         let start = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
-        assert!(!replay_entry_is_stale(start, start));
+        assert!(!needs_replay(start, start));
     }
 
     // -- record_replay / REPLAY_JOURNAL_CAP ------------------------------

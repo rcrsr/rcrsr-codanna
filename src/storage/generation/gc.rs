@@ -10,9 +10,10 @@
 //! its fate belongs to whichever work item wires binary-version
 //! negotiation).
 //!
-//! This module has no production caller in this phase -- [`gc`] is meant to
-//! be invoked explicitly (CLI command, MCP tool, etc.) by a later work item,
-//! never wired to a timer or background task here.
+//! [`gc`] runs only at explicit points -- before and after every publish,
+//! once at server startup, and on `codanna index --gc` -- never on a timer
+//! or background task. [`gc_logged`] is the logging wrapper those call
+//! sites share.
 
 use std::fs;
 use std::fs::OpenOptions;

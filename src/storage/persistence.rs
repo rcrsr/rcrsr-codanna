@@ -8,7 +8,7 @@ use crate::indexing::walk_config;
 use crate::storage::generation::layout::{self, free_space_preflight_against};
 use crate::storage::generation::markers::{Building, Complete};
 use crate::storage::generation::{
-    GenerationId, clone_generation, gc, gc_logged, list_generations, migrate_flat_layout,
+    GenerationId, clone_generation, gc_logged, list_generations, migrate_flat_layout,
     resolve_current,
 };
 use crate::storage::{DataSource, IndexLayout, IndexMetadata};
@@ -312,13 +312,7 @@ impl IndexPersistence {
         // (1) Reclaim headroom before allocating a new generation. A run
         // that finds the GC lock already held by a concurrent process is
         // not an error for this build -- `skipped_locked` is simply noted.
-        let gc_summary = gc(&self.layout, true)?;
-        tracing::info!(
-            "[persistence] pre-build gc: removed={} retried_later={} skipped_locked={}",
-            gc_summary.removed.len(),
-            gc_summary.retried_later.len(),
-            gc_summary.skipped_locked
-        );
+        gc_logged(&self.layout, true, "pre-build")?;
 
         // (2) Resolve the parent generation for `mode`. A `CloneCurrent`
         // build over an index with no current generation yet has nothing to

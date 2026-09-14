@@ -9,9 +9,10 @@
 //! [`GenerationState`] and enumerates/validates generation directories, and
 //! [`mod@gc`] reclaims generations that are no longer useful.
 //!
-//! This module has zero production callers as of this phase -- it is
-//! introduced as self-contained plumbing for a later work item to wire
-//! into the indexing and CLI/MCP surfaces.
+//! Callers: `IndexPersistence` (`open_build`/`publish`, migration, load),
+//! `IndexFacade::new` (recovery), the hot-reload watcher (`current` poll),
+//! the unified watcher (replay cut point), and `codanna index
+//! --status/--gc/--rollback`.
 
 pub mod gc;
 pub mod id;
