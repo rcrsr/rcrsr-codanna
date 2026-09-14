@@ -71,10 +71,6 @@ pub fn gc(layout: &IndexLayout, keep_previous: bool) -> IndexResult<GcSummary> {
             source: e,
         })?;
 
-    // See the msrv note in `markers::Building::start` for why `try_lock`
-    // (stabilized Rust 1.89) is used here despite being above this crate's
-    // declared clippy msrv floor.
-    #[allow(clippy::incompatible_msrv)]
     let lock_result = lock_file.try_lock();
     match lock_result {
         Ok(()) => {}
@@ -97,7 +93,6 @@ pub fn gc(layout: &IndexLayout, keep_previous: bool) -> IndexResult<GcSummary> {
     // The lock is released when `lock_file` drops at the end of this
     // function; an explicit unlock here just makes that visible to the
     // reader rather than relying solely on the drop.
-    #[allow(clippy::incompatible_msrv)]
     let _ = lock_file.unlock();
 
     result
@@ -541,7 +536,6 @@ mod tests {
             .write(true)
             .open(&lock_path)
             .expect("open gc lock");
-        #[allow(clippy::incompatible_msrv)]
         holder.try_lock().expect("acquire gc lock in test");
 
         let summary = gc(&layout, true).expect("gc must not error when locked");

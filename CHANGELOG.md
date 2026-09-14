@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Minimum supported Rust version raised to 1.89 (from 1.85), enabling stable `std::fs::File::try_lock`/`unlock`.
 - **Index generations:** Full code reindex now builds into a fresh on-disk generation and publishes it atomically instead of clearing and rebuilding the live Tantivy index in place; concurrent readers never observe an empty or half-populated index during reindex, the `reindex` MCP tool, or watcher catch-up. Includes new `codanna index --status`/`--gc`/`--rollback` commands and fixes for dropped semantics in staged reindex and missing publishes on deletion-only runs. ([#96](https://github.com/rcrsr/rcrsr-codanna/pull/96))
 
 ## [0.16.0+rcrsr.7] - 2026-09-11

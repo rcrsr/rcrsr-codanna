@@ -111,12 +111,9 @@ impl Building {
                 source: e,
             })?;
 
-        // `File::try_lock`/`unlock` stabilized in Rust 1.89, above this
-        // crate's declared `clippy.toml` msrv floor (1.85) but within the
-        // `stable` toolchain CI actually installs; see this module's doc
-        // comment for why the fork-generations design requires flock-based
-        // ownership rather than a `create_new`-only marker file.
-        #[allow(clippy::incompatible_msrv)]
+        // See this module's doc comment for why the fork-generations design
+        // requires flock-based ownership rather than a `create_new`-only
+        // marker file.
         let lock_result = file.try_lock();
         match lock_result {
             Ok(()) => {}
@@ -213,15 +210,12 @@ impl Building {
             Err(_) => return false,
         };
 
-        // See the msrv note in `Building::start`.
-        #[allow(clippy::incompatible_msrv)]
         let lock_result = probe.try_lock();
         let lock_was_free = match lock_result {
             Err(std::fs::TryLockError::WouldBlock) => return true,
             Ok(()) => {
                 // We only opened this handle to probe; release immediately
                 // so we don't mask this instant with our own lock.
-                #[allow(clippy::incompatible_msrv)]
                 let _ = probe.unlock();
                 true
             }

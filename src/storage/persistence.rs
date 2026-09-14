@@ -503,7 +503,6 @@ impl IndexPersistence {
         // a rename or nothing), so waiting out a concurrent publisher is
         // preferable to the skip-on-contention behavior `gc` uses for its
         // much coarser, best-effort pass.
-        #[allow(clippy::incompatible_msrv)]
         lock_file.lock().map_err(|e| IndexError::FileWrite {
             path: lock_path.clone(),
             source: e,
@@ -527,7 +526,6 @@ impl IndexPersistence {
             Ok(())
         };
 
-        #[allow(clippy::incompatible_msrv)]
         let _ = lock_file.unlock();
 
         cas_result?;

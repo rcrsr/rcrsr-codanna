@@ -596,7 +596,6 @@ pub fn run_rollback(config: &Settings, id: Option<String>) {
             std::process::exit(1);
         }
     };
-    #[allow(clippy::incompatible_msrv)]
     if let Err(e) = lock_file.lock() {
         eprintln!(
             "Error: failed to acquire publish lock {}: {e}",
@@ -618,7 +617,6 @@ pub fn run_rollback(config: &Settings, id: Option<String>) {
         std::process::exit(1);
     }
 
-    #[allow(clippy::incompatible_msrv)]
     let _ = lock_file.unlock();
 
     let old_txt = old_current
