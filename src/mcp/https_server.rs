@@ -513,18 +513,33 @@ pub async fn serve_https(config: crate::Settings, watch: bool, bind: String) -> 
     // future's own natural completion). Awaiting these handles here -- not
     // just relying on `ct.cancel()` -- is what lets the unified watcher's
     // `watch()` task finish any `spawn_blocking` closure holding the
-    // facade's write guard, and join any in-flight catch-up reindex task,
-    // before this function returns: `watch()` only observes `ct` between
-    // its own loop iterations (see `UnifiedWatcher::cancellation_token`),
-    // and its cancellation arm blocks on the catch-up task's completion
-    // rather than dropping it, so by the time its `JoinHandle` resolves, no
-    // such closure or task is still running, and it is safe for the caller
-    // to tear the process down right after this function returns.
-    if let Some(handle) = hot_reload_handle {
-        let _ = handle.await;
+    // facade's write guard before this function returns: `watch()` only
+    // observes `ct` between its own loop iterations (see
+    // `UnifiedWatcher::cancellation_token`). Its cancellation arm now
+    // `abort()`s rather than joins any in-flight catch-up reindex task (see
+    // `UnifiedWatcher::watch`), so the join itself should settle quickly;
+    // it is still wrapped in `SHUTDOWN_GRACE` below as a bound against any
+    // unforeseen hang, since the registry/discovery records were already
+    // removed above and it is safe to tear the process down without these
+    // joins completing.
+    const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+    if let Some(handle) = hot_reload_handle
+        && tokio::time::timeout(SHUTDOWN_GRACE, handle).await.is_err()
+    {
+        eprintln!(
+            "hot-reload watcher did not settle within {}s of shutdown; exiting now",
+            SHUTDOWN_GRACE.as_secs()
+        );
+        std::process::exit(0);
     }
-    if let Some(handle) = unified_watcher_handle {
-        let _ = handle.await;
+    if let Some(handle) = unified_watcher_handle
+        && tokio::time::timeout(SHUTDOWN_GRACE, handle).await.is_err()
+    {
+        eprintln!(
+            "unified watcher did not settle within {}s of shutdown; exiting now",
+            SHUTDOWN_GRACE.as_secs()
+        );
+        std::process::exit(0);
     }
 
     if let Some(result) = server_result {

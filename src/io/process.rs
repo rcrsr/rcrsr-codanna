@@ -114,7 +114,7 @@ pub(crate) fn process_looks_like_codanna_serve(process: &sysinfo::Process) -> bo
 ///
 /// Restricted to processes owned by the invoking user's own uid. Without
 /// this, a full-system scan would surface other users' `codanna serve`
-/// processes (pid, port, workspace, cwd) to `codanna ls`'s rogue-row
+/// processes (pid, port, workspace, cwd) to `codanna ls`'s unknown-row
 /// enrichment, breaking the per-user isolation the server registry
 /// (0700/0600 permissions) otherwise guarantees.
 pub fn scan_codanna_serve_pids() -> Vec<u32> {
@@ -145,8 +145,11 @@ pub fn scan_codanna_serve_pids() -> Vec<u32> {
 /// The strict `codanna serve` identity predicate used by
 /// [`scan_codanna_serve_pids`], factored out so it can be exercised directly
 /// against known pids in tests without depending on a nondeterministic
-/// full-system scan.
-fn process_is_codanna_serve(process: &sysinfo::Process) -> bool {
+/// full-system scan, and so `cli::commands::serve` can re-run the same
+/// strict check against a single already-refreshed `Process` handle (e.g.
+/// immediately before signaling an unregistered/unknown `--stop-all
+/// --include-unknown` target) without paying for a second full-system scan.
+pub(crate) fn process_is_codanna_serve(process: &sysinfo::Process) -> bool {
     // On Linux sysinfo lists every thread as its own entry sharing the
     // parent's exe/argv; only the thread-group leader is a real process.
     if process.thread_kind().is_some() {

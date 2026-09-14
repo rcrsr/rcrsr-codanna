@@ -7,10 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`codanna serve --stop --timeout <secs>` / `--no-force`:** `--stop` now escalates to SIGKILL on its own, and reaps the target's registry entry directly, if the target has not exited within `--timeout` seconds (default 5) of the initial SIGTERM; `--no-force` opts out and reports the still-alive state instead, matching the previous behavior.
+- **`codanna serve --stop-all --include-unknown`:** `--stop-all` can now additionally sweep unregistered pids that still independently pass the `codanna serve` process-identity check (re-validated immediately before each is signaled), not just registered targets; these need no registry cleanup and are counted separately from registered targets in the summary line ("stopped N registered, M unknown"). `--include-rogue` is kept as a deprecated alias for one release cycle.
+- **`codanna index --prune-indexed-paths`:** drops tracked `indexed_paths` entries from the current generation's `index.meta` that are ghosts (no longer a directory on disk) or strays (outside `workspace_root` and not listed under `indexing.indexed_paths` in `settings.toml`). Configured out-of-tree roots are kept, since indexing a project from outside its directory is supported upstream. Metadata-only, like `--status`/`--gc`.
+
 ### Changed
 
+- **`codanna ls`:** the SOURCE column value for an unregistered `codanna serve` pid discovered only by the process-table scan is now `unknown` (previously `rogue`).
+- **`codanna serve --stop <pid>` no longer requires registry membership:** a numeric `--stop <pid>` selector now accepts any pid that independently passes the `codanna serve` process-identity check, registered or not -- the previous `--include-rogue` opt-in for `--stop` is gone, since the identity check was always the real safety net, not registry membership. Stopping an unregistered pid this way prints a one-line note. A workspace-root path selector is unaffected: it still only resolves through the registry. `--include-rogue`/`--include-unknown` are now exclusively `--stop-all` flags (see above); using either with `--stop` is rejected at the CLI level.
+- **`codanna serve --kill-all` renamed to `--stop-all`:** matches the SIGTERM-by-default, `--force`-for-SIGKILL semantics of `--stop`, which `--kill-all` never implied. `--kill-all` is kept as a deprecated alias for one release cycle: it still works, but prints a deprecation notice to stderr.
 - Minimum supported Rust version raised to 1.89 (from 1.85), enabling stable `std::fs::File::try_lock`/`unlock`.
 - **Index generations:** Full code reindex now builds into a fresh on-disk generation and publishes it atomically instead of clearing and rebuilding the live Tantivy index in place; concurrent readers never observe an empty or half-populated index during reindex, the `reindex` MCP tool, or watcher catch-up. Includes new `codanna index --status`/`--gc`/`--rollback` commands and fixes for dropped semantics in staged reindex and missing publishes on deletion-only runs. ([#96](https://github.com/rcrsr/rcrsr-codanna/pull/96))
+- **Stale indexed paths warn instead of silently walking nothing:** a startup catch-up or `--force` rebuild now logs one `WARN` per tracked root that no longer exists on disk, pointing at `codanna index --prune-indexed-paths`; the `ReindexHasNothingToRebuild` refusal is reserved for the case where every tracked root is gone.
+- **Bounded, interrupting shutdown:** `--http`/`--https` now bound the post-signal watcher-handle joins to ~3s and exit regardless of whether they settle (registry/discovery cleanup already ran first), and the unified watcher's shutdown path now `abort()`s an in-flight catch-up reindex instead of waiting for it to finish -- safe because of index generations: an aborted build only orphans a half-built generation, reaped by GC on the next start. Stdio mode now also handles SIGTERM (dropping its serve lockfile) instead of relying on the default disposition.
 
 ## [0.16.0+rcrsr.7] - 2026-09-11
 

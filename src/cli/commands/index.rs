@@ -9,6 +9,7 @@ use crate::config::Settings;
 use crate::indexing::DryRunOutput;
 use crate::indexing::facade::IndexFacade;
 use crate::storage::generation::{self, GenerationId, GenerationState, IndexLayout};
+use crate::storage::persistence::IndexPersistence;
 use crate::types::SymbolKind;
 
 /// Arguments for the index command.
@@ -529,6 +530,92 @@ pub fn run_gc(config: &Settings) {
             eprintln!("Error running garbage collection: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+/// Prune the current generation's tracked `indexed_paths` of entries that
+/// no longer exist as a directory on disk (ghosts) or are strays: outside
+/// the configured `workspace_root` *and* not covered by any root listed in
+/// `settings.toml`'s `indexing.indexed_paths`. Out-of-tree roots the user
+/// configured deliberately are kept -- indexing a project from outside its
+/// directory is supported upstream, so `workspace_root` alone is not a
+/// containment boundary. Prints a summary and exits. Distinct from
+/// [`run_gc`], which reclaims stale on-disk index *generations*, not
+/// tracked path entries.
+///
+/// Loads the current generation via [`IndexPersistence::load_facade_lite`]
+/// (no embedding pool needed for a metadata-only edit), recomputes the
+/// retained set, and persists it back with
+/// [`IndexFacade::set_indexed_paths`] through
+/// [`IndexPersistence::save_facade`] -- the same load/mutate/save seam
+/// `codanna index` itself uses, just without opening a new build
+/// generation.
+pub fn run_prune_indexed_paths(config: &Settings) {
+    let persistence = IndexPersistence::new(config.index_path.clone());
+
+    let mut facade = match persistence.load_facade_lite(std::sync::Arc::new(config.clone())) {
+        Ok(facade) => facade,
+        Err(e) => {
+            eprintln!("Error loading index: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let canonical_root = config
+        .workspace_root
+        .as_ref()
+        .map(|root| root.canonicalize().unwrap_or_else(|_| root.clone()));
+    let configured_roots: Vec<PathBuf> = config
+        .indexing
+        .indexed_paths
+        .iter()
+        .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
+        .collect();
+    let existing: Vec<PathBuf> = facade.get_indexed_paths().iter().cloned().collect();
+
+    let mut retained: Vec<PathBuf> = Vec::new();
+    let mut dropped: Vec<(PathBuf, &'static str)> = Vec::new();
+
+    for path in existing {
+        if !path.is_dir() {
+            dropped.push((path, "ghost: no longer exists as a directory on disk"));
+            continue;
+        }
+
+        if let Some(root) = &canonical_root {
+            let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+            let in_root = canonical.starts_with(root);
+            let configured = configured_roots.iter().any(|r| canonical.starts_with(r));
+            if !in_root && !configured {
+                dropped.push((
+                    path,
+                    "stray: outside the workspace root and not listed in settings.toml indexing.indexed_paths",
+                ));
+                continue;
+            }
+        }
+
+        retained.push(path);
+    }
+
+    if dropped.is_empty() {
+        println!("No stale indexed paths to prune.");
+        return;
+    }
+
+    facade.set_indexed_paths(retained);
+
+    if let Err(e) = persistence.save_facade(&facade) {
+        eprintln!("Error saving pruned indexed paths: {e}");
+        std::process::exit(1);
+    }
+
+    println!("Pruned {} indexed path(s):", dropped.len());
+    for (path, reason) in &dropped {
+        println!(
+            "  {} ({reason})",
+            crate::parsing::paths::render_absolute_path(path).display()
+        );
     }
 }
 

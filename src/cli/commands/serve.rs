@@ -23,18 +23,33 @@ pub struct ServeArgs {
     /// Prune stale registry entries instead of starting one.
     pub reap: bool,
     /// Stop every registered server instead of starting one.
+    pub stop_all: bool,
+    /// Deprecated spelling of `stop_all`, merged into it in `run` (with a
+    /// deprecation notice) since clap-derive can't tell which spelling was
+    /// used at the point `stop_all` is read.
     pub kill_all: bool,
-    /// With `kill_all`, also stop registered proxies (not just backing
+    /// With `stop_all`, also stop registered proxies (not just backing
     /// servers).
     pub include_proxies: bool,
-    /// With `stop` or `kill_all`, send SIGKILL instead of the default
+    /// With `stop` or `stop_all`, send SIGKILL instead of the default
     /// SIGTERM.
     pub force: bool,
-    /// With `stop`, also allow a numeric pid selector that is not present in
-    /// the per-user server registry, as long as it still independently
-    /// passes `looks_like_codanna_serve`. Absent, `stop`'s selector
-    /// resolution is registered-pids-only (today's behavior, unchanged).
+    /// With `stop_all`, also stop unregistered pids that still
+    /// independently look like `codanna serve` processes (identity-checked
+    /// via `scan_codanna_serve_pids` immediately before each is signaled). A
+    /// numeric `--stop <pid>` selector no longer needs this flag: it always
+    /// accepts any pid passing the identity check, registered or not.
+    pub include_unknown: bool,
+    /// Deprecated spelling of `include_unknown`, merged into it in `run`
+    /// (with a deprecation notice) since clap-derive can't tell which
+    /// spelling was used at the point `include_unknown` is read.
     pub include_rogue: bool,
+    /// With `stop`, seconds to wait for the delivered signal to take effect
+    /// before escalating to SIGKILL (default: 5).
+    pub timeout: u64,
+    /// With `stop`, opt out of escalating to SIGKILL when the target has
+    /// not exited within `timeout`.
+    pub no_force: bool,
 }
 
 /// Resolve which server transport `codanna serve` should start.
@@ -87,28 +102,54 @@ pub async fn run(
         list,
         stop,
         reap,
+        stop_all,
         kill_all,
         include_proxies,
         force,
+        include_unknown,
         include_rogue,
+        timeout,
+        no_force,
     } = args;
 
-    // Registry lifecycle operations (--list/--stop/--reap/--kill-all) are
+    // `--kill-all` is a deprecated spelling of `--stop-all`, merged here
+    // (rather than in clap) because clap-derive cannot report which
+    // spelling was actually used, and the deprecation notice needs that.
+    let stop_all = stop_all || kill_all;
+    if kill_all {
+        eprintln!(
+            "DEPRECATION: `codanna serve --kill-all` is deprecated in favor of `--stop-all`; it will be removed in a future release."
+        );
+    }
+
+    // `--include-rogue` is a deprecated spelling of `--include-unknown`,
+    // merged here for the same clap-derive-can't-tell-which-spelling reason
+    // as `--kill-all` above.
+    let include_unknown = include_unknown || include_rogue;
+    if include_rogue {
+        eprintln!(
+            "DEPRECATION: `codanna serve --include-rogue` is deprecated in favor of `--include-unknown`; it will be removed in a future release."
+        );
+    }
+
+    // Registry lifecycle operations (--list/--stop/--reap/--stop-all) are
     // never start-a-server operations: handle them here, before any
     // transport mode is resolved, and return without ever reaching the
     // server-startup match below. Clap's `conflicts_with_all` on these flags
     // (see `cli::args::Commands::Serve`) already guarantees `http`/`https`/
     // `proxy`/`bind` are all still at their defaults whenever one of these is
     // set.
-    if list || stop.is_some() || reap || kill_all {
+    if list || stop.is_some() || reap || stop_all {
         run_registry_management(
             list,
             stop,
             reap,
-            kill_all,
+            stop_all,
             include_proxies,
             force,
-            include_rogue,
+            include_unknown,
+            timeout,
+            no_force,
         )
         .await;
         return;
@@ -161,39 +202,41 @@ pub async fn run(
     }
 }
 
-/// Dispatch `codanna serve --list`/`--stop`/`--reap`/`--kill-all`. Runs each
-/// requested operation in turn (reap, then stop, then kill-all, then list) so
+/// Dispatch `codanna serve --list`/`--stop`/`--reap`/`--stop-all`. Runs each
+/// requested operation in turn (reap, then stop, then stop-all, then list) so
 /// `--stop --list` reflects the post-stop state, `--reap --list` reflects the
-/// post-reap state, and `--kill-all --list` reflects the post-kill-all state.
+/// post-reap state, and `--stop-all --list` reflects the post-stop-all state.
 ///
-/// `kill_all_servers` reports its outcome instead of exiting the process
+/// `stop_all_servers` reports its outcome instead of exiting the process
 /// directly, so `--list` still runs (and reflects the post-sweep state) even
-/// when a `--kill-all` target failed to stop; the failure is only turned
+/// when a `--stop-all` target failed to stop; the failure is only turned
 /// into a nonzero exit code after every requested step has run.
 async fn run_registry_management(
     list: bool,
     stop: Option<String>,
     reap: bool,
-    kill_all: bool,
+    stop_all: bool,
     include_proxies: bool,
     force: bool,
-    include_rogue: bool,
+    include_unknown: bool,
+    timeout: u64,
+    no_force: bool,
 ) {
     if reap {
         reap_stale_entries();
     }
     if let Some(selector) = stop {
-        stop_server(&selector, force, include_rogue).await;
+        stop_server(&selector, force, timeout, no_force).await;
     }
-    let kill_all_succeeded = if kill_all {
-        Some(kill_all_servers(force, include_proxies).await)
+    let stop_all_succeeded = if stop_all {
+        Some(stop_all_servers(force, include_proxies, include_unknown).await)
     } else {
         None
     };
     if list {
         print_registry_list();
     }
-    if kill_all_succeeded == Some(false) {
+    if stop_all_succeeded == Some(false) {
         std::process::exit(1);
     }
 }
@@ -240,23 +283,32 @@ fn print_registry_list() {
 /// serve` process -- otherwise `codanna serve --stop <pid>` would
 /// SIGTERM/SIGKILL any process the invoking user can signal, not just a
 /// codanna server, contradicting the "Stop a registered server..." help
-/// text. By default it must additionally be registered (present in the
-/// per-user server registry); `allow_rogue` is an explicit, non-default
-/// opt-in (`--include-rogue`) that waives the registry-membership check but
-/// never an identity check, so this can never become a generic kill-any-pid
-/// primitive.
+/// text -- but it need NOT be present in the per-user server registry: the
+/// identity check (`looks_like_codanna_serve`/`scan_codanna_serve_pids`) is
+/// the sole safety net for a numeric selector, registered or not, so this
+/// can never become a generic kill-any-pid primitive without also becoming a
+/// no-op for stopping an unregistered-but-genuine codanna server (e.g. one
+/// started before the registry existed, or from another user's session this
+/// one can still signal).
+///
+/// A PATH selector, by contrast, stays registry-gated: a workspace-root path
+/// only has meaning by way of a registered entry's `workspace_root` field,
+/// so there is no way to resolve one to a pid without consulting the
+/// registry.
 ///
 /// The identity check itself is stricter for an unregistered pid than a
 /// registered one. A registered pid is already vouched for by the registry
 /// (this process itself wrote that entry), so the lenient
 /// `looks_like_codanna_serve` (`cmd` contains "codanna" as a substring
 /// anywhere) suffices to confirm the same process is still there. An
-/// unregistered pid reached only via `--include-rogue` has no such
-/// vouching, so it is checked against the stricter, basename-anchored
-/// `scan_codanna_serve_pids` predicate instead, to minimize the chance of
-/// signaling an unrelated process that merely mentions "codanna" on its
-/// command line.
-fn resolve_selector_to_pid(selector: &str, allow_rogue: bool) -> Option<u32> {
+/// unregistered pid has no such vouching, so it is checked against the
+/// stricter, basename-anchored `scan_codanna_serve_pids` predicate instead,
+/// to minimize the chance of signaling an unrelated process that merely
+/// mentions "codanna" on its command line.
+///
+/// Returns `(pid, was_registered)` so the caller can print a one-line note
+/// when a numeric selector resolved to a pid outside the registry.
+fn resolve_selector_to_pid(selector: &str) -> Option<(u32, bool)> {
     if let Ok(pid) = selector.parse::<u32>() {
         let is_registered = crate::serve_registry::list_entries()
             .iter()
@@ -271,7 +323,7 @@ fn resolve_selector_to_pid(selector: &str, allow_rogue: bool) -> Option<u32> {
             return None;
         }
 
-        return (allow_rogue || is_registered).then_some(pid);
+        return Some((pid, is_registered));
     }
 
     let path = PathBuf::from(selector);
@@ -282,7 +334,7 @@ fn resolve_selector_to_pid(selector: &str, allow_rogue: bool) -> Option<u32> {
         .find_map(|entry| {
             let matches = entry.workspace_root == path
                 || canonical.as_deref() == Some(entry.workspace_root.as_path());
-            matches.then_some(entry.pid)
+            matches.then_some((entry.pid, true))
         })
 }
 
@@ -299,7 +351,7 @@ enum SignalOutcome {
 
 /// Send `signal` to an already-resolved `process`, classifying the result.
 ///
-/// Shared by `stop_server` and any future kill-all path so both agree on how
+/// Shared by `stop_server` and `stop_all_servers` so both agree on how
 /// `sysinfo`'s `Option<bool>` outcome maps to a typed result (§BASIC.2 DRY).
 fn send_signal(process: &sysinfo::Process, signal: sysinfo::Signal) -> SignalOutcome {
     match process.kill_with(signal) {
@@ -317,7 +369,12 @@ fn send_signal(process: &sysinfo::Process, signal: sysinfo::Signal) -> SignalOut
 /// `crate::serve_registry::pid_is_alive`) so this can be unit-tested without
 /// a real process, mirroring the split-for-testability pattern used
 /// elsewhere (e.g. `serve_registry::find_spawning_for_in`, `ls::render`).
-async fn wait_for_exit(
+///
+/// `pub` (not `pub(crate)`): exposed so `tests/serve_stop_bounded.rs`, an
+/// external integration test, can drive `stop_server`'s escalation sequence
+/// hermetically, mirroring `cli::commands::index::run_prune_indexed_paths`'s
+/// exposure for the same reason.
+pub async fn wait_for_exit(
     pid: u32,
     deadline: std::time::Duration,
     poll_interval: std::time::Duration,
@@ -330,26 +387,52 @@ async fn wait_for_exit(
     !is_alive(pid)
 }
 
+/// The tail of `stop_server`'s SIGTERM -> timeout -> SIGKILL -> reap
+/// escalation: re-poll `is_alive(pid)` for up to `repoll_deadline` after
+/// SIGKILL has already been sent, then reap the target's registry entry via
+/// `reap` unconditionally -- regardless of whether the re-poll observed it
+/// exit. SIGKILL cannot be caught or ignored by a well-behaved process, so
+/// this does not block the CLI's exit code on re-confirming death within a
+/// short bounded window; `reap` runs either way so a killed process's
+/// registry entry (which it can no longer remove itself) never lingers.
+///
+/// `is_alive` and `reap` are injectable (mirroring `wait_for_exit`'s
+/// `is_alive` parameter) so this can be unit-tested with a stub that never
+/// reports the target as dead, without a real process or a real registry
+/// file. `pub` for the same external-test-seam reason as `wait_for_exit`.
+///
+/// Returns whether the re-poll observed the target exit (used only for the
+/// message `stop_server` prints).
+pub async fn repoll_after_sigkill_and_reap(
+    pid: u32,
+    repoll_deadline: std::time::Duration,
+    poll_interval: std::time::Duration,
+    is_alive: impl Fn(u32) -> bool,
+    reap: impl FnOnce(u32),
+) -> bool {
+    let exited = wait_for_exit(pid, repoll_deadline, poll_interval, is_alive).await;
+    reap(pid);
+    exited
+}
+
 /// Stop a registered server: resolve `selector` to a pid, send SIGTERM (or
-/// SIGKILL with `force`), then poll -- bounded, a few seconds -- for the
-/// target to exit. SIGTERM is the default; SIGKILL is only ever sent when
-/// `force` is set explicitly.
-async fn stop_server(selector: &str, force: bool, include_rogue: bool) {
+/// SIGKILL with `force`), then poll -- bounded by `timeout` seconds -- for
+/// the target to exit. SIGTERM is the default; SIGKILL is only ever sent as
+/// the *initial* signal when `force` is set explicitly.
+///
+/// If the initial signal was SIGTERM and the target has not exited within
+/// `timeout`, this escalates to SIGKILL by default (unless `no_force` opts
+/// out), re-polls briefly, and -- since a SIGKILL'd process cannot
+/// self-deregister -- reaps its registry entry directly via `remove_entry`.
+async fn stop_server(selector: &str, force: bool, timeout: u64, no_force: bool) {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System};
 
-    let Some(pid) = resolve_selector_to_pid(selector, include_rogue) else {
+    let Some((pid, was_registered)) = resolve_selector_to_pid(selector) else {
         if let Ok(pid) = selector.parse::<u32>() {
-            // With `--include-rogue`, registry membership is already waived
-            // by `resolve_selector_to_pid`, so reaching here means the pid
-            // failed the identity check instead -- report that distinctly
-            // rather than the registry-membership wording below, which
-            // would be misleading given `--include-rogue` explicitly waived
-            // that requirement.
-            if include_rogue {
-                eprintln!("pid {pid} does not look like a codanna serve process.");
-            } else {
-                eprintln!("No registered server with pid {pid}.");
-            }
+            // A numeric selector's only failure mode now is the identity
+            // check (`resolve_selector_to_pid` no longer gates numeric
+            // selectors on registry membership).
+            eprintln!("pid {pid} does not look like a codanna serve process.");
         } else {
             eprintln!(
                 "No registered server matches '{selector}' (expected a pid or a workspace-root path)."
@@ -357,6 +440,10 @@ async fn stop_server(selector: &str, force: bool, include_rogue: bool) {
         }
         std::process::exit(1);
     };
+
+    if !was_registered {
+        eprintln!("pid {pid} was not registered; stopping anyway.");
+    }
 
     let mut sys = System::new();
     let target = Pid::from_u32(pid);
@@ -373,6 +460,10 @@ async fn stop_server(selector: &str, force: bool, include_rogue: bool) {
         std::process::exit(1);
     };
 
+    // Liveness is determinable here: `sys.process(target)` just resolved to
+    // a live process above, so report that before signaling it.
+    eprintln!("pid {pid} is alive; sending signal.");
+
     let signal = if force { Signal::Kill } else { Signal::Term };
     match send_signal(process, signal) {
         SignalOutcome::Sent => {}
@@ -387,7 +478,7 @@ async fn stop_server(selector: &str, force: bool, include_rogue: bool) {
         }
     }
 
-    let deadline = std::time::Duration::from_secs(5);
+    let deadline = std::time::Duration::from_secs(timeout);
     let poll_interval = std::time::Duration::from_millis(100);
     let exited = wait_for_exit(
         pid,
@@ -398,9 +489,66 @@ async fn stop_server(selector: &str, force: bool, include_rogue: bool) {
     .await;
 
     if !exited {
+        // `--force` already sent SIGKILL as the initial signal, so there is
+        // nothing left to escalate to; `--no-force` explicitly opts out of
+        // escalation. Either way, report the still-alive state and give up.
+        if force || no_force {
+            eprintln!(
+                "Server pid {pid} did not exit within {}s of receiving the signal (still alive).",
+                deadline.as_secs()
+            );
+            std::process::exit(1);
+        }
+
         eprintln!(
-            "Server pid {pid} did not exit within {}s of receiving the signal.",
+            "Server pid {pid} did not exit within {}s of SIGTERM (still alive); escalating to SIGKILL.",
             deadline.as_secs()
+        );
+
+        let mut sys = System::new();
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[target]),
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        // The target may have exited between `wait_for_exit`'s last poll and
+        // this refresh -- nothing to escalate to in that case; fall through
+        // to the re-poll below, which will observe it as no longer alive.
+        if let Some(process) = sys.process(target) {
+            match send_signal(process, Signal::Kill) {
+                SignalOutcome::Sent => {}
+                SignalOutcome::SendFailed => {
+                    eprintln!("Failed to send SIGKILL to pid {pid}.");
+                    std::process::exit(1);
+                }
+                SignalOutcome::UnsupportedPlatform => {
+                    eprintln!("Sending signals is not supported on this platform (pid {pid}).");
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        let repoll_deadline = std::time::Duration::from_secs(2);
+        let exited_after_kill = repoll_after_sigkill_and_reap(
+            pid,
+            repoll_deadline,
+            poll_interval,
+            crate::serve_registry::pid_is_alive,
+            crate::serve_registry::remove_entry,
+        )
+        .await;
+
+        if exited_after_kill {
+            eprintln!(
+                "Killed server pid {pid} (SIGKILL after SIGTERM timeout, now exited); reaped its registry entry."
+            );
+            return;
+        }
+
+        eprintln!(
+            "Sent SIGKILL to pid {pid} after SIGTERM timeout; it had not yet exited by the end \
+             of the re-poll window (still alive), but its registry entry was reaped anyway \
+             since a SIGKILL'd process cannot self-deregister."
         );
         std::process::exit(1);
     }
@@ -416,16 +564,23 @@ async fn stop_server(selector: &str, force: bool, include_rogue: bool) {
 }
 
 /// Stop every registered server (and, with `include_proxies`, every
-/// registered proxy too) instead of starting one.
+/// registered proxy too), and, with `include_unknown`, every unregistered
+/// pid that still independently looks like a `codanna serve` process --
+/// instead of starting one.
 ///
-/// Targets come from `serve_registry::list_entries()` -- the same source
-/// `codanna ls`/`codanna serve --list` read -- filtered to entries that are
-/// not already stale (`entry_is_stale`, mirroring `--reap`'s definition of
-/// "still alive"). By default only `ServerRole::Server` entries are
-/// targeted; `include_proxies` additionally targets `ServerRole::Proxy`
-/// entries. Every target is attempted even if an earlier one fails or times
-/// out (§BASIC.12.1: bounded fail-fast -- report every failure, but never
-/// abort the sweep on the first one).
+/// Registered targets come from `serve_registry::list_entries()` -- the same
+/// source `codanna ls`/`codanna serve --list` read -- filtered to entries
+/// that are not already stale (`entry_is_stale`, mirroring `--reap`'s
+/// definition of "still alive"). By default only `ServerRole::Server`
+/// entries are targeted; `include_proxies` additionally targets
+/// `ServerRole::Proxy` entries. `include_unknown` additionally targets every
+/// pid `io::process::scan_codanna_serve_pids` finds that is NOT already a
+/// registered pid and is not this process's own pid -- these have no
+/// registry entry to filter by role or staleness, since they were never
+/// registered, and need no registry cleanup once stopped. Every target
+/// (registered or unknown) is attempted even if an earlier one fails or
+/// times out (§BASIC.12.1: bounded fail-fast -- report every failure, but
+/// never abort the sweep on the first one).
 ///
 /// Every target is signaled first (re-validating its identity immediately
 /// before its own signal, since an earlier target's signal may have taken
@@ -436,15 +591,29 @@ async fn stop_server(selector: &str, force: bool, include_rogue: bool) {
 /// Returns whether every target stopped (`true`) or at least one did not
 /// (`false`), so the caller can run any remaining requested steps (e.g.
 /// `--list`) before turning a failure into a nonzero exit code.
-async fn kill_all_servers(force: bool, include_proxies: bool) -> bool {
-    let targets: Vec<u32> = crate::serve_registry::list_entries()
-        .into_iter()
+async fn stop_all_servers(force: bool, include_proxies: bool, include_unknown: bool) -> bool {
+    let registered_entries = crate::serve_registry::list_entries();
+
+    let registered_targets: Vec<u32> = registered_entries
+        .iter()
         .filter(|entry| !crate::serve_registry::entry_is_stale(entry))
         .filter(|entry| include_proxies || entry.role == crate::serve_registry::ServerRole::Server)
         .map(|entry| entry.pid)
         .collect();
 
-    if targets.is_empty() {
+    let unknown_targets: Vec<u32> = if include_unknown {
+        let registered_pids: std::collections::HashSet<u32> =
+            registered_entries.iter().map(|entry| entry.pid).collect();
+        let own_pid = std::process::id();
+        crate::io::process::scan_codanna_serve_pids()
+            .into_iter()
+            .filter(|pid| !registered_pids.contains(pid) && *pid != own_pid)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    if registered_targets.is_empty() && unknown_targets.is_empty() {
         let hint = if include_proxies {
             "run `codanna serve --reap` to prune stale entries"
         } else {
@@ -456,25 +625,54 @@ async fn kill_all_servers(force: bool, include_proxies: bool) -> bool {
     }
 
     let mut any_failed = false;
-    let mut signaled = Vec::with_capacity(targets.len());
-    for pid in targets {
-        if kill_one_registered_target(pid, force) {
-            signaled.push(pid);
+
+    let mut signaled_registered = Vec::with_capacity(registered_targets.len());
+    for pid in registered_targets {
+        if stop_one_registered_target(pid, force) {
+            signaled_registered.push(pid);
         } else {
             any_failed = true;
         }
     }
 
-    let mut waits = tokio::task::JoinSet::new();
-    for pid in signaled {
-        waits.spawn(wait_for_registered_target(pid, force));
+    let mut signaled_unknown = Vec::with_capacity(unknown_targets.len());
+    for pid in unknown_targets {
+        if stop_one_unknown_target(pid, force) {
+            signaled_unknown.push(pid);
+        } else {
+            any_failed = true;
+        }
     }
-    while let Some(result) = waits.join_next().await {
+
+    let mut registered_waits = tokio::task::JoinSet::new();
+    for pid in signaled_registered {
+        registered_waits.spawn(wait_for_registered_target(pid, force));
+    }
+    let mut unknown_waits = tokio::task::JoinSet::new();
+    for pid in signaled_unknown {
+        unknown_waits.spawn(wait_for_unknown_target(pid, force));
+    }
+
+    let mut registered_stopped = 0u32;
+    while let Some(result) = registered_waits.join_next().await {
         match result {
-            Ok(exited) => any_failed |= !exited,
+            Ok(true) => registered_stopped += 1,
+            Ok(false) => any_failed = true,
             Err(_) => any_failed = true,
         }
     }
+    let mut unknown_stopped = 0u32;
+    while let Some(result) = unknown_waits.join_next().await {
+        match result {
+            Ok(true) => unknown_stopped += 1,
+            Ok(false) => any_failed = true,
+            Err(_) => any_failed = true,
+        }
+    }
+
+    eprintln!(
+        "Stop-all summary: stopped {registered_stopped} registered, {unknown_stopped} unknown."
+    );
 
     !any_failed
 }
@@ -486,10 +684,10 @@ async fn kill_all_servers(force: bool, include_proxies: bool) -> bool {
 ///
 /// The identity re-check happens immediately before signaling (mirroring
 /// `stop_server`'s tight check-then-use adjacency) because, in
-/// `kill_all_servers`'s sequential signal pass, a pid selected by the
+/// `stop_all_servers`'s sequential signal pass, a pid selected by the
 /// up-front filter may no longer be a live codanna server by the time its
 /// turn comes.
-fn kill_one_registered_target(pid: u32, force: bool) -> bool {
+fn stop_one_registered_target(pid: u32, force: bool) -> bool {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System, UpdateKind};
 
     let mut sys = System::new();
@@ -532,7 +730,7 @@ fn kill_one_registered_target(pid: u32, force: bool) -> bool {
 
 /// Poll one already-signaled registered pid for exit and report the outcome
 /// in the same message shape `stop_server` uses, returning whether this
-/// target ended up stopped -- so `kill_all_servers` can poll every signaled
+/// target ended up stopped -- so `stop_all_servers` can poll every signaled
 /// target concurrently and still learn each one's individual outcome.
 async fn wait_for_registered_target(pid: u32, force: bool) -> bool {
     let deadline = std::time::Duration::from_secs(5);
@@ -561,6 +759,86 @@ async fn wait_for_registered_target(pid: u32, force: bool) -> bool {
         );
     } else {
         eprintln!("Stopped server pid {pid} (SIGTERM).");
+    }
+    true
+}
+
+/// Re-validate one already-selected unregistered pid's identity, then signal
+/// it (SIGTERM, or SIGKILL with `force`) -- the `--stop-all --include-unknown`
+/// counterpart of `stop_one_registered_target`, using the same
+/// single-pid-refresh-then-signal shape but the STRICTER,
+/// `scan_codanna_serve_pids`-style predicate (`process_is_codanna_serve`),
+/// since an unknown target has no registry entry vouching for it.
+///
+/// The identity re-check happens immediately before signaling for the same
+/// reason `stop_one_registered_target`'s does: a pid selected by
+/// `stop_all_servers`'s up-front scan may no longer be a live codanna server
+/// by the time its turn in the sequential signal pass comes.
+fn stop_one_unknown_target(pid: u32, force: bool) -> bool {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System, UpdateKind};
+
+    let mut sys = System::new();
+    let target = Pid::from_u32(pid);
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[target]),
+        true,
+        ProcessRefreshKind::nothing()
+            .with_cmd(UpdateKind::Always)
+            .with_exe(UpdateKind::Always),
+    );
+
+    let Some(process) = sys.process(target) else {
+        eprintln!("No running process with pid {pid} (it may have exited already); skipping.");
+        return false;
+    };
+
+    if !crate::io::process::process_is_codanna_serve(process) {
+        eprintln!("pid {pid} no longer looks like a codanna serve process; skipping.");
+        return false;
+    }
+
+    let signal = if force { Signal::Kill } else { Signal::Term };
+    match send_signal(process, signal) {
+        SignalOutcome::Sent => true,
+        SignalOutcome::SendFailed => {
+            let name = if force { "SIGKILL" } else { "SIGTERM" };
+            eprintln!("Failed to send {name} to pid {pid}.");
+            false
+        }
+        SignalOutcome::UnsupportedPlatform => {
+            eprintln!("Sending signals is not supported on this platform (pid {pid}).");
+            false
+        }
+    }
+}
+
+/// Poll one already-signaled unknown (unregistered) pid for exit, mirroring
+/// `wait_for_registered_target` but without any registry-entry wording,
+/// since an unknown target was never registered and needs no registry
+/// cleanup once stopped.
+async fn wait_for_unknown_target(pid: u32, force: bool) -> bool {
+    let deadline = std::time::Duration::from_secs(5);
+    let poll_interval = std::time::Duration::from_millis(100);
+    let exited = wait_for_exit(
+        pid,
+        deadline,
+        poll_interval,
+        crate::io::process::pid_is_alive,
+    )
+    .await;
+
+    if !exited {
+        eprintln!(
+            "Unregistered pid {pid} did not exit within {}s of receiving the signal.",
+            deadline.as_secs()
+        );
+        return false;
+    }
+
+    if force {
+        eprintln!("Killed unregistered pid {pid} (SIGKILL).");
+    } else {
+        eprintln!("Stopped unregistered pid {pid} (SIGTERM).");
     }
     true
 }
@@ -823,12 +1101,55 @@ async fn run_stdio_server(
         }
     };
 
-    // Wait for server to complete
-    if let Err(e) = service.waiting().await {
-        eprintln!("MCP server error: {e}");
-        drop(serve_lock);
-        std::process::exit(1);
+    // Wait for server to complete, racing it against SIGTERM/Ctrl+C. The
+    // default disposition of SIGTERM is immediate termination, which would
+    // skip destructors entirely and leave `serve_lock`'s lockfile behind
+    // (mirrors the same rationale as `http_server::serve_http`'s
+    // `shutdown_signal`, which additionally deregisters a server-registry
+    // entry -- stdio mode never registers one, so only the lock needs
+    // dropping here).
+    tokio::select! {
+        result = service.waiting() => {
+            if let Err(e) = result {
+                eprintln!("MCP server error: {e}");
+                drop(serve_lock);
+                std::process::exit(1);
+            }
+        }
+        _ = stdio_shutdown_signal() => {
+            eprintln!("Shutting down stdio MCP server...");
+            drop(serve_lock);
+            crate::serve_registry::remove_entry(std::process::id());
+            std::process::exit(0);
+        }
     }
+}
+
+/// Await a shutdown signal (SIGTERM on Unix, in addition to Ctrl+C/SIGINT;
+/// Ctrl+C only elsewhere) so `run_stdio_server` can drop `PidLockGuard`
+/// (removing the serve lockfile) instead of relying on the default
+/// disposition of SIGTERM, which terminates the process immediately and
+/// skips destructors.
+#[cfg(unix)]
+async fn stdio_shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            eprintln!("Received shutdown signal (Ctrl+C)");
+        }
+        _ = sigterm.recv() => {
+            eprintln!("Received shutdown signal (SIGTERM)");
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn stdio_shutdown_signal() {
+    tokio::signal::ctrl_c()
+        .await
+        .expect("failed to listen for ctrl+c");
+    eprintln!("Received shutdown signal (Ctrl+C)");
 }
 
 /// Serve a degraded stdio MCP session for a gate-refused index.

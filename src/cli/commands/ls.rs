@@ -5,9 +5,9 @@
 //! 1. Live, non-stale entries from the per-user server registry
 //!    (`crate::serve_registry::list_entries`), split by `role` into
 //!    `Server`/`Proxy` rows.
-//! 2. "Rogue" `codanna serve` pids -- discovered via a full-process-table
+//! 2. "Unknown" `codanna serve` pids -- discovered via a full-process-table
 //!    scan (`crate::io::process::scan_codanna_serve_pids`) -- that have no
-//!    live registry entry, enriched best-effort via `resolve_rogue`.
+//!    live registry entry, enriched best-effort via `resolve_unknown`.
 //! 3. Each registered `Proxy` entry, attributed to the registered `Server`
 //!    entry sharing its `workspace_root` (via `serve_registry::paths_match`),
 //!    displayed as an attached proxy row under its backing server.
@@ -25,7 +25,7 @@ use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use crate::serve_discovery::{self, ServeScheme};
 use crate::serve_registry::{RegistryEntry, ServerRole, ServerStatus, paths_match};
 
-/// Best-effort enrichment for "rogue" `codanna serve` pids -- processes
+/// Best-effort enrichment for "unknown" `codanna serve` pids -- processes
 /// that look like a codanna server (see
 /// [`crate::io::process::looks_like_codanna_serve`]) but have no
 /// corresponding entry in the per-user server registry
@@ -33,9 +33,9 @@ use crate::serve_registry::{RegistryEntry, ServerRole, ServerStatus, paths_match
 /// registry existed, or their registry entry was pruned/removed out from
 /// under a still-running process.
 ///
-/// Best-effort resolve a rogue pid's workspace root, port, scheme, and
+/// Best-effort resolve an unknown pid's workspace root, port, scheme, and
 /// server/proxy kind, in a single `sysinfo` refresh -- rather than the two
-/// separate per-pid scans `resolve_rogue`/`guess_rogue_kind` used to perform
+/// separate per-pid scans `resolve_unknown`/`guess_unknown_kind` used to perform
 /// independently (each constructing its own `System::new()` and refreshing
 /// the same pid a second time).
 ///
@@ -58,7 +58,7 @@ use crate::serve_registry::{RegistryEntry, ServerRole, ServerStatus, paths_match
 /// exited, its cwd/argv are unreadable (e.g. permission-restricted
 /// `/proc/<pid>` on Linux), or no `--bind` argument is present -- renders as
 /// `None`. This function never returns an error.
-fn resolve_rogue(
+fn resolve_unknown(
     pid: u32,
 ) -> (
     Option<String>,
@@ -81,19 +81,19 @@ fn resolve_rogue(
         return (None, None, None, RowKind::Server, None);
     };
     let kind = kind_from_cmd(process.cmd());
-    let rogue_exe = process.exe().map(Path::to_path_buf);
+    let unknown_exe = process.exe().map(Path::to_path_buf);
 
     let Some(cwd) = process.cwd().map(Path::to_path_buf) else {
-        return (None, None, None, kind, rogue_exe);
+        return (None, None, None, kind, unknown_exe);
     };
     let workspace = cwd.to_string_lossy().into_owned();
 
     if let Some((port, scheme)) = read_record_if_pid_matches(&cwd, pid) {
-        return (Some(workspace), Some(port), Some(scheme), kind, rogue_exe);
+        return (Some(workspace), Some(port), Some(scheme), kind, unknown_exe);
     }
 
     let port = parse_bind_port(process.cmd()).filter(|port| *port != 0);
-    (Some(workspace), port, None, kind, rogue_exe)
+    (Some(workspace), port, None, kind, unknown_exe)
 }
 
 /// Read `<cwd>/.codanna/serve.json` (via the existing
@@ -163,14 +163,14 @@ impl RowKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RowSource {
     Registered,
-    Rogue,
+    Unknown,
 }
 
 impl RowSource {
     fn as_str(self) -> &'static str {
         match self {
             RowSource::Registered => "registered",
-            RowSource::Rogue => "rogue",
+            RowSource::Unknown => "unknown",
         }
     }
 }
@@ -188,12 +188,12 @@ struct Row {
     version: String,
 }
 
-/// Best-effort guess at whether a rogue process is a stdio-facing proxy or a
+/// Best-effort guess at whether an unknown process is a stdio-facing proxy or a
 /// backing server, by checking its argv for a literal `--proxy` token.
 /// Defaults to `Server` when the token is absent, since a backing server is
-/// the common case and every field of a rogue row is already best-effort
-/// display data (see [`resolve_rogue`]). Pure function over an already-
-/// fetched argv so [`resolve_rogue`] can derive kind from the single scan it
+/// the common case and every field of an unknown row is already best-effort
+/// display data (see [`resolve_unknown`]). Pure function over an already-
+/// fetched argv so [`resolve_unknown`] can derive kind from the single scan it
 /// already performs, instead of a second per-pid `sysinfo` refresh.
 fn kind_from_cmd(cmd: &[std::ffi::OsString]) -> RowKind {
     let is_proxy = cmd.iter().any(|arg| arg.to_string_lossy() == "--proxy");
@@ -204,12 +204,12 @@ fn kind_from_cmd(cmd: &[std::ffi::OsString]) -> RowKind {
     }
 }
 
-/// Classify a rogue row's binary against the invoking `codanna ls` process's
-/// own executable. This never exec's or spawns the rogue binary -- it only
-/// compares paths and, when those differ, reads the rogue binary's bytes
+/// Classify an unknown row's binary against the invoking `codanna ls` process's
+/// own executable. This never exec's or spawns the unknown binary -- it only
+/// compares paths and, when those differ, reads the unknown binary's bytes
 /// (never runs it) -- so it is never a `--version` probe.
 ///
-/// - `"deleted"` -- `rogue_exe` is `None` (unreadable, e.g. the process
+/// - `"deleted"` -- `unknown_exe` is `None` (unreadable, e.g. the process
 ///   already exited or `/proc/<pid>/exe` is permission-restricted), or its
 ///   path renders with a trailing `" (deleted)"` marker, the Linux
 ///   in-place-upgrade signature for a still-running process whose backing
@@ -226,34 +226,37 @@ fn kind_from_cmd(cmd: &[std::ffi::OsString]) -> RowKind {
 ///
 /// `current_exe` must already be canonicalized by the caller: `build_rows`
 /// resolves it once (alongside `std::env::current_exe()`) rather than
-/// re-canonicalizing it on every rogue row this function is called for.
+/// re-canonicalizing it on every unknown row this function is called for.
 ///
 /// Split out as a pure function (mirrors `render`/`process_is_codanna_serve`)
 /// so every outcome can be exercised directly against synthetic paths in
 /// tests, without depending on a live process scan.
-fn classify_rogue_version(rogue_exe: Option<&Path>, current_exe: Option<&Path>) -> &'static str {
-    let Some(rogue_exe) = rogue_exe else {
+fn classify_unknown_version(
+    unknown_exe: Option<&Path>,
+    current_exe: Option<&Path>,
+) -> &'static str {
+    let Some(unknown_exe) = unknown_exe else {
         return "deleted";
     };
-    if rogue_exe.to_string_lossy().ends_with("(deleted)") {
+    if unknown_exe.to_string_lossy().ends_with("(deleted)") {
         return "deleted";
     }
     let Some(current_exe) = current_exe else {
         return "-";
     };
-    match rogue_exe.canonicalize() {
-        Ok(rogue) if rogue == current_exe => "same",
+    match unknown_exe.canonicalize() {
+        Ok(unknown) if unknown == current_exe => "same",
         // Canonicalized paths differ -- before concluding "other", fall back
         // to a content comparison, since two different install locations can
         // hold the byte-identical binary (e.g. mise vs `~/.local/bin`).
         Ok(_) => {
-            if binaries_are_byte_identical(rogue_exe, current_exe) {
+            if binaries_are_byte_identical(unknown_exe, current_exe) {
                 "same"
             } else {
                 "other"
             }
         }
-        // The rogue path no longer resolves on disk: the binary was removed
+        // The unknown path no longer resolves on disk: the binary was removed
         // out from under the running process (same situation as the
         // `(deleted)` marker, just without the marker).
         Err(_) => "deleted",
@@ -263,9 +266,9 @@ fn classify_rogue_version(rogue_exe: Option<&Path>, current_exe: Option<&Path>) 
 thread_local! {
     /// Cache of the most recently read `b` path/bytes pair from
     /// `binaries_are_byte_identical`. `build_rows` calls this function once
-    /// per rogue pid with `b` fixed to `current_exe`, so reusing the cached
+    /// per unknown pid with `b` fixed to `current_exe`, so reusing the cached
     /// bytes when `b` matches the cached path avoids re-reading the same
-    /// (typically large) binary from disk on every rogue row. Keyed by path
+    /// (typically large) binary from disk on every unknown row. Keyed by path
     /// equality (not just "populated") so unrelated callers/tests using a
     /// different `b` path still get a correct, freshly-read comparison.
     static BINARY_BYTES_CACHE: std::cell::RefCell<Option<(std::path::PathBuf, std::rc::Rc<Vec<u8>>)>> =
@@ -274,7 +277,7 @@ thread_local! {
 
 /// Best-effort byte-content comparison of two binaries, used only as a
 /// fallback when their canonicalized paths differ (see
-/// `classify_rogue_version`). Never exec's or spawns either binary -- it only
+/// `classify_unknown_version`). Never exec's or spawns either binary -- it only
 /// reads file metadata/bytes. Compares file sizes first as a cheap
 /// short-circuit (a size mismatch is definitely "different", no need to read
 /// either file), then falls back to a full byte comparison. Any I/O error
@@ -284,7 +287,7 @@ thread_local! {
 ///
 /// `b`'s bytes are cached (see `BINARY_BYTES_CACHE`) across calls with the
 /// same `b` path, since the real caller (`build_rows`) calls this once per
-/// rogue pid with `b` fixed to `current_exe`.
+/// unknown pid with `b` fixed to `current_exe`.
 fn binaries_are_byte_identical(a: &Path, b: &Path) -> bool {
     let (Ok(meta_a), Ok(meta_b)) = (std::fs::metadata(a), std::fs::metadata(b)) else {
         return false;
@@ -328,7 +331,7 @@ fn registered_row(entry: &RegistryEntry, kind: RowKind) -> Row {
 /// instead of trusting `entry.status` verbatim. Used for unattached proxy
 /// rows: `entry.status` is stale write-once data recorded by
 /// `src/mcp/proxy.rs` at spawn time and never rewritten, so an unattached
-/// proxy (its backing server is gone, dead, or itself rogue/stale) would
+/// proxy (its backing server is gone, dead, or itself unknown/stale) would
 /// otherwise keep displaying "healthy" long after it stopped being true.
 fn registered_row_with_status_override(
     entry: &RegistryEntry,
@@ -364,10 +367,10 @@ fn registered_row_with_status_override(
 ///    `role = Proxy` whose `workspace_root` matches that server's (via
 ///    `serve_registry::paths_match`) -- an "attached" proxy row.
 /// 3. Any registered proxy left unattached (no live server shares its
-///    workspace, e.g. the backing server is itself rogue or stale).
-/// 4. Rogue pids from a full-process-table scan, minus any pid already
+///    workspace, e.g. the backing server is itself unknown or stale).
+/// 4. Unknown pids from a full-process-table scan, minus any pid already
 ///    covered by step 1/2/3's live registry entries, enriched best-effort
-///    via a single per-pid [`resolve_rogue`] call.
+///    via a single per-pid [`resolve_unknown`] call.
 fn build_rows() -> Vec<Row> {
     let live_entries: Vec<RegistryEntry> = crate::serve_registry::list_entries()
         .into_iter()
@@ -416,24 +419,24 @@ fn build_rows() -> Vec<Row> {
 
     let registered_pids: HashSet<u32> = live_entries.iter().map(|entry| entry.pid).collect();
 
-    let mut rogue_pids: Vec<u32> = crate::io::process::scan_codanna_serve_pids()
+    let mut unknown_pids: Vec<u32> = crate::io::process::scan_codanna_serve_pids()
         .into_iter()
         .filter(|pid| !registered_pids.contains(pid))
         .collect();
-    rogue_pids.sort_unstable();
-    rogue_pids.dedup();
+    unknown_pids.sort_unstable();
+    unknown_pids.dedup();
 
     let current_exe = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.canonicalize().ok());
 
-    for pid in rogue_pids {
-        let (workspace, port, scheme, kind, rogue_exe) = resolve_rogue(pid);
-        let version = classify_rogue_version(rogue_exe.as_deref(), current_exe.as_deref());
+    for pid in unknown_pids {
+        let (workspace, port, scheme, kind, unknown_exe) = resolve_unknown(pid);
+        let version = classify_unknown_version(unknown_exe.as_deref(), current_exe.as_deref());
         rows.push(Row {
             pid,
             kind,
-            source: RowSource::Rogue,
+            source: RowSource::Unknown,
             port,
             scheme,
             status: "running".to_string(),
@@ -523,10 +526,10 @@ mod tests {
         assert_eq!(RowKind::Server.as_str(), "server");
         assert_eq!(RowKind::Proxy.as_str(), "proxy");
         assert_eq!(RowSource::Registered.as_str(), "registered");
-        assert_eq!(RowSource::Rogue.as_str(), "rogue");
+        assert_eq!(RowSource::Unknown.as_str(), "unknown");
     }
 
-    /// (1) An empty result set -- no registered entries and no rogue pids --
+    /// (1) An empty result set -- no registered entries and no unknown pids --
     /// must render the same "no servers" wording `codanna serve --list` uses
     /// for its own empty case, not a bare header with no rows or a different
     /// message. Exercised directly against `render`, independent of the real
@@ -563,7 +566,7 @@ mod tests {
             Row {
                 pid: 333,
                 kind: RowKind::Server,
-                source: RowSource::Rogue,
+                source: RowSource::Unknown,
                 port: None,
                 scheme: None,
                 status: "running".to_string(),
@@ -587,22 +590,22 @@ mod tests {
             "registered row should print its version string: {text}"
         );
         assert!(text.contains("222") && text.contains("proxy") && text.contains("registered"));
-        assert!(text.contains("333") && text.contains("rogue") && text.contains('-'));
+        assert!(text.contains("333") && text.contains("unknown") && text.contains('-'));
         assert!(text.contains("same"));
     }
 
     #[test]
-    fn classify_rogue_version_none_rogue_exe_is_deleted() {
+    fn classify_unknown_version_none_unknown_exe_is_deleted() {
         assert_eq!(
-            classify_rogue_version(None, Some(Path::new("/usr/bin/codanna"))),
+            classify_unknown_version(None, Some(Path::new("/usr/bin/codanna"))),
             "deleted"
         );
     }
 
     #[test]
-    fn classify_rogue_version_deleted_marker_is_deleted() {
+    fn classify_unknown_version_deleted_marker_is_deleted() {
         assert_eq!(
-            classify_rogue_version(
+            classify_unknown_version(
                 Some(Path::new("/usr/bin/codanna (deleted)")),
                 Some(Path::new("/usr/bin/codanna")),
             ),
@@ -611,38 +614,38 @@ mod tests {
     }
 
     #[test]
-    fn classify_rogue_version_equal_canonical_paths_are_same() {
+    fn classify_unknown_version_equal_canonical_paths_are_same() {
         let exe = std::env::current_exe()
             .and_then(|exe| exe.canonicalize())
             .expect("test binary must have a resolvable, canonicalizable exe path");
-        assert_eq!(classify_rogue_version(Some(&exe), Some(&exe)), "same");
+        assert_eq!(classify_unknown_version(Some(&exe), Some(&exe)), "same");
     }
 
     #[test]
-    fn classify_rogue_version_differing_resolvable_paths_are_other() {
+    fn classify_unknown_version_differing_resolvable_paths_are_other() {
         // `current_exe` is expected pre-canonicalized by the caller; mirror
-        // that here rather than relying on `classify_rogue_version` to do it.
+        // that here rather than relying on `classify_unknown_version` to do it.
         let current = std::env::current_exe()
             .and_then(|exe| exe.canonicalize())
             .expect("test binary must have a resolvable, canonicalizable exe path");
         // /bin/sh and /bin exist on essentially every Linux/macOS test host,
         // and neither canonicalizes to the test binary's own exe path.
         assert_eq!(
-            classify_rogue_version(Some(Path::new("/bin")), Some(&current)),
+            classify_unknown_version(Some(Path::new("/bin")), Some(&current)),
             "other"
         );
     }
 
     #[test]
-    fn classify_rogue_version_unresolvable_current_exe_is_dash() {
+    fn classify_unknown_version_unresolvable_current_exe_is_dash() {
         assert_eq!(
-            classify_rogue_version(Some(Path::new("/usr/bin/codanna")), None),
+            classify_unknown_version(Some(Path::new("/usr/bin/codanna")), None),
             "-"
         );
     }
 
     #[test]
-    fn classify_rogue_version_differing_paths_same_bytes_are_same() {
+    fn classify_unknown_version_differing_paths_same_bytes_are_same() {
         let dir = std::env::temp_dir();
         let a = dir.join(format!(
             "codanna-ls-test-identical-a-{}",
@@ -658,7 +661,7 @@ mod tests {
         let current = a.canonicalize().expect("canonicalize temp file a");
         // `b`'s canonicalized path differs from `current` (different file
         // name/location), but its bytes are identical -- must classify "same".
-        let result = classify_rogue_version(Some(&b), Some(&current));
+        let result = classify_unknown_version(Some(&b), Some(&current));
 
         std::fs::remove_file(&a).ok();
         std::fs::remove_file(&b).ok();
@@ -667,7 +670,7 @@ mod tests {
     }
 
     #[test]
-    fn classify_rogue_version_differing_paths_differing_bytes_are_other() {
+    fn classify_unknown_version_differing_paths_differing_bytes_are_other() {
         let dir = std::env::temp_dir();
         let a = dir.join(format!(
             "codanna-ls-test-differing-a-{}",
@@ -681,7 +684,7 @@ mod tests {
         std::fs::write(&b, b"a totally different length of content").expect("write temp file b");
 
         let current = a.canonicalize().expect("canonicalize temp file a");
-        let result = classify_rogue_version(Some(&b), Some(&current));
+        let result = classify_unknown_version(Some(&b), Some(&current));
 
         std::fs::remove_file(&a).ok();
         std::fs::remove_file(&b).ok();

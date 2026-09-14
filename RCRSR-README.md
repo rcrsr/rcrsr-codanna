@@ -327,23 +327,56 @@ prints a notice to stderr and delegates to `ls`.
 codanna ls                                  # list every codanna server process you own
 codanna serve --stop <pid|workspace-path>   # SIGTERM a registered server
 codanna serve --stop <pid> --force          # SIGKILL instead
-codanna serve --stop <pid> --include-rogue  # allow a rogue pid (still must look like `codanna serve`)
+codanna serve --stop <pid> --timeout 10     # wait 10s (default 5) before escalating
+codanna serve --stop <pid> --no-force       # give up instead of escalating to SIGKILL
 codanna serve --reap                        # prune registry entries whose pid is dead
-codanna serve --kill-all                    # SIGTERM every registered backing server
-codanna serve --kill-all --include-proxies  # ...and every registered proxy too
-codanna serve --kill-all --force            # SIGKILL every target
+codanna serve --stop-all                              # SIGTERM every registered backing server
+codanna serve --stop-all --include-proxies            # ...and every registered proxy too
+codanna serve --stop-all --include-unknown            # ...and every unregistered pid that still looks like `codanna serve`
+codanna serve --stop-all --force                      # SIGKILL every target
 ```
+
+`--kill-all` is a **deprecated alias for `--stop-all`**, and `--include-rogue`
+is a **deprecated alias for `--include-unknown`**, both kept for one release
+cycle: they print a deprecation notice to stderr and behave identically to
+their replacements otherwise.
 
 These are lifecycle operations and cannot be combined with
 `--http`/`--https`/`--proxy`/`--bind`.
 
+- A numeric `--stop <pid>` selector accepts any pid that independently passes
+  the `codanna serve` process-identity check, registered or not — no separate
+  opt-in flag needed; stopping an unregistered pid this way prints a one-line
+  note ("pid N was not registered; stopping anyway"). A workspace-root path
+  selector still only resolves through the registry, since the path has no
+  meaning outside a registered entry's `workspace_root`.
 - `--stop` sends SIGTERM by default, so the server runs the same shutdown path
   as Ctrl+C and idle shutdown, removing its `serve.json` and registry entry.
-  A `--force`d (SIGKILL) process cannot clean up, so its registry entry can be
-  left behind; `--reap` prunes those. `ls` skips dead-pid entries but never
-  deletes them, keeping "what does the registry say" and "clean up" separate.
-- `--kill-all` sweeps every live registry entry. Every target is attempted even
-  if an earlier one fails; exit code is `0` only if all stopped.
+  If the target has not exited within `--timeout` seconds (default 5),
+  `--stop` escalates to SIGKILL on its own and reaps the registry entry
+  directly (a SIGKILL'd process cannot self-deregister) — pass `--no-force`
+  to opt out and just report the still-alive state instead. An initial
+  `--force` (SIGKILL immediately, no escalation) still leaves the registry
+  entry for `--reap` to prune, as before. `ls` skips dead-pid entries but
+  never deletes them, keeping "what does the registry say" and "clean up"
+  separate.
+- `--stop-all` sweeps every live registry entry. Every target is attempted even
+  if an earlier one fails; exit code is `0` only if all stopped. With
+  `--include-unknown`, it additionally sweeps every unregistered pid a
+  process-table scan finds that still looks like `codanna serve` (identity
+  re-checked immediately before each is signaled); these need no registry
+  cleanup, and are counted separately from registered targets in the summary
+  line.
+- Shutdown itself (SIGTERM, Ctrl+C, idle timeout, or workspace-gone) is
+  bounded: `--http`/`--https` give any still-running watcher task up to ~3s
+  to settle after cleanup (registry/discovery removal) has already run, then
+  exit regardless rather than hang on it. A catch-up reindex still in flight
+  at shutdown is aborted, not awaited — safe because of [index
+  generations](#index-generations): an aborted build only orphans a
+  half-built generation, reaped by GC on the next start, and never touches
+  the live generation already being served. Stdio mode (`codanna serve`,
+  no `--http`/`--https`) also now handles SIGTERM the same way — dropping its
+  lockfile — instead of relying on the default disposition.
 
 **VERSION column.** Registered rows show the version the server recorded at
 startup (`-` for entries written by a pre-`version` build). Rogue rows have no
@@ -366,7 +399,7 @@ dead, or itself rogue shows `orphaned` instead of the `healthy` it recorded at
 connect time (a proxy's entry is written once and never updated, so it would
 otherwise stay `healthy` forever). An orphaned proxy is still live and will
 revive a backing server on its next delegated call; stop it with
-`--kill-all --include-proxies` if you don't want that.
+`--stop-all --include-proxies` if you don't want that.
 
 ### Hot-reload notifications through the proxy
 
@@ -469,6 +502,25 @@ so a client can tell that a rollback happened. If nothing on disk validates,
 `serve` on a genuinely empty index root bootstraps an empty generation; a root
 with damaged remnants refuses to start rather than build over the evidence —
 run `--status` to see what is there, then `--gc` or remove `.codanna/index`.
+
+### Tracked indexed paths
+
+Each generation's `index.meta` records the directory roots it was built from.
+Entries can go stale — a scratch directory indexed once and later deleted, or
+a root registered by a session whose `settings.toml` was since edited — and
+every startup catch-up or `--force` rebuild then warns once per such entry
+(`Skipping stale indexed path …`) rather than failing on it.
+
+```bash
+codanna index --prune-indexed-paths   # drop ghost and stray roots from the current generation
+```
+
+It drops **ghosts** (no longer a directory on disk) and **strays** (outside
+`workspace_root` *and* not listed under `indexing.indexed_paths` in
+`settings.toml`). Out-of-tree roots you configured deliberately are kept:
+indexing a project from outside its directory is supported upstream, so
+`workspace_root` alone is not a containment boundary. Like `--status`/`--gc`,
+it is a metadata-only edit and never opens a new build generation.
 
 ## Reindexing on demand (`reindex` MCP tool)
 

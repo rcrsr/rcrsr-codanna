@@ -2092,6 +2092,13 @@ impl ReindexHandles {
                             tracing::warn!("Failed to reindex {}: {e}", path.display());
                         }
                     }
+                } else {
+                    tracing::warn!(
+                        "Skipping stale indexed path '{}': no longer exists as a directory \
+                         on disk. Run 'codanna index --prune-indexed-paths' to remove it \
+                         from tracking",
+                        path.display()
+                    );
                 }
             }
             total_reindexed
@@ -2274,17 +2281,26 @@ pub(crate) async fn reindex_locked(
     // this check and the clear is a pre-existing race that no ordering here
     // can close.
     if paths_is_none && force {
-        let has_rebuild_source = {
+        let (has_rebuild_source, ghost_paths) = {
             let indexer = facade.read().await;
-            indexer
-                .pipeline()
-                .settings()
-                .indexing
-                .indexed_paths
+            let indexed_paths = indexer.pipeline().settings().indexing.indexed_paths.clone();
+            let ghost_paths: Vec<std::path::PathBuf> = indexed_paths
                 .iter()
-                .any(|p| p.is_dir())
+                .filter(|p| !p.is_dir())
+                .cloned()
+                .collect();
+            let has_rebuild_source = ghost_paths.len() < indexed_paths.len();
+            (has_rebuild_source, ghost_paths)
         };
         if !has_rebuild_source {
+            for path in &ghost_paths {
+                tracing::warn!(
+                    "Skipping stale indexed path '{}': no longer exists as a directory \
+                     on disk. Run 'codanna index --prune-indexed-paths' to remove it \
+                     from tracking",
+                    path.display()
+                );
+            }
             tracing::error!(
                 "Refusing force reindex: no explicit paths and no configured \
                  indexing.indexed_paths that still exist on disk as a directory \

@@ -2,7 +2,7 @@
 //! (`src/cli/commands/ls.rs`).
 //!
 //! Mirrors the subprocess-driven pattern already established in
-//! `test_serve_registry.rs` (registered/rogue registry state) and
+//! `test_serve_registry.rs` (registered/unknown registry state) and
 //! `test_serve_proxy_discovery.rs` (a real `codanna serve --proxy` delegating
 //! to a real backing `codanna serve --http`): every scenario here drives the
 //! real `codanna` binary, never calling into `codanna::serve_registry`
@@ -232,8 +232,8 @@ impl Drop for Reaper {
 /// nondeterminism: `codanna ls` also does a full host-wide process-table
 /// scan (`io::process::scan_codanna_serve_pids`), so an unrelated, genuinely
 /// running `codanna serve` process elsewhere on the same host (e.g. an
-/// MCP-plugin-backed server for an unrelated tool) legitimately produces a
-/// rogue row here, and this test must not treat that as a failure.
+/// MCP-plugin-backed server for an unrelated tool) legitimately produces an
+/// unknown row here, and this test must not treat that as a failure.
 #[test]
 fn empty_registry_never_reports_a_registered_row() {
     let home = TempDir::new().expect("create isolated test home");
@@ -302,11 +302,11 @@ fn registered_backing_server_appears_as_registered_server_healthy() {
 }
 
 /// (3) A real `codanna serve --http` process registered under a DIFFERENT
-/// per-user registry root ("rogue" from the perspective of the registry
+/// per-user registry root ("unknown" from the perspective of the registry
 /// `codanna ls` consults here) must still show up in the merged table,
-/// marked as a rogue source rather than being silently dropped.
+/// marked as an unknown source rather than being silently dropped.
 #[test]
-fn rogue_server_under_different_home_is_marked_rogue() {
+fn unknown_server_under_different_home_is_marked_unknown() {
     let workspace = prepare_workspace();
     let server_home = workspace.path().join(".home");
     std::fs::create_dir_all(&server_home).expect("create server test home");
@@ -324,7 +324,7 @@ fn rogue_server_under_different_home_is_marked_rogue() {
     // `codanna ls` is run under an entirely different, freshly created
     // registry root: the server's own registry entry is invisible here, but
     // a full-process-table scan (`io::process::scan_codanna_serve_pids`)
-    // still finds the live pid, so it must be reported as a rogue row.
+    // still finds the live pid, so it must be reported as an unknown row.
     let ls_home = TempDir::new().expect("create isolated ls home");
     assert!(
         !registry_file_exists(ls_home.path(), pid),
@@ -340,10 +340,10 @@ fn rogue_server_under_different_home_is_marked_rogue() {
     let row = stdout
         .lines()
         .find(|line| line.contains(&pid.to_string()))
-        .unwrap_or_else(|| panic!("codanna ls output should mention rogue pid {pid}:\n{stdout}"));
+        .unwrap_or_else(|| panic!("codanna ls output should mention unknown pid {pid}:\n{stdout}"));
     assert!(
-        row.to_lowercase().contains("rogue"),
-        "row for the unregistered-here server should be marked source=rogue: {row}"
+        row.to_lowercase().contains("unknown"),
+        "row for the unregistered-here server should be marked source=unknown: {row}"
     );
 
     let _ = server.kill();
