@@ -19,15 +19,14 @@ use crate::indexing::facade::IndexFacade;
 /// `ReindexHandles::run` walk, whether directly or via `run_reindex`/
 /// `run_reindex_for_test`/`reindex_locked`, across module boundaries.
 ///
-/// `indexing::facade::set_fail_after_walk_for_test` arms a bare
-/// process-wide `AtomicBool` with no correlation to which caller armed it
-/// (see that function's doc comment): the very next `run()` call anywhere
-/// in the test binary consumes it, not necessarily the one belonging to the
-/// test that armed it. Reindex-driving tests live in multiple modules
-/// (`mcp::server`, `watcher::hot_reload`, `indexing::facade`) that all run
-/// concurrently under `cargo test`'s default parallelism, so a module-local
-/// lock cannot prevent one module's test from stealing another module's
-/// injected failure (or lack thereof). Every such test, in every module,
+/// `indexing::facade::arm_fail_after_walk_for_test` is keyed by index root,
+/// so an unrelated test's walk can no longer consume (or trip over) another
+/// test's injected failure; this lock now only keeps the tests that arm it,
+/// or that assert on timing across a real walk, from overlapping each
+/// other. Reindex-driving tests live in multiple modules (`mcp::server`,
+/// `watcher::hot_reload`, `indexing::facade`) that all run concurrently
+/// under `cargo test`'s default parallelism, so a module-local lock would
+/// not do. Every such test, in every module,
 /// acquires this single crate-wide lock for its full duration before
 /// touching the reindex machinery. Defined here (rather than in
 /// `indexing::facade`, where the failure-injection flag itself lives)
@@ -1255,6 +1254,71 @@ mod tests {
         );
     }
 
+    /// A staged `force` reindex must carry semantic search into the fresh
+    /// generation whenever settings enable it -- even when the facade
+    /// driving it never loaded an embedding model (the lite facade that
+    /// `codanna mcp reindex` runs on). Keying only on the live facade
+    /// published a generation with no `semantic/` at all, and the serving
+    /// process's next hot-reload of `current` silently lost semantic search.
+    #[tokio::test]
+    async fn reindex_locked_fresh_build_enables_semantic_search_from_settings_on_a_lite_facade() {
+        let _serial_guard = REINDEX_TEST_SERIAL.lock().await;
+        let temp = tempfile::tempdir().expect("create temp root");
+        let source_dir = temp.path().join("src");
+        std::fs::create_dir_all(&source_dir).expect("create source dir");
+        // Embeddings are generated from doc comments only, so the fixture
+        // must carry one.
+        std::fs::write(
+            source_dir.join("documented.py"),
+            "def parse_config(path):\n    \"\"\"Parse the configuration file at path.\"\"\"\n    return path\n",
+        )
+        .expect("write documented fixture");
+
+        let mut settings = Settings {
+            index_path: temp.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.indexing.indexed_paths = vec![source_dir.clone()];
+        settings.semantic_search.enabled = true;
+        let index_path = settings.index_path.clone();
+
+        // Lite facade: semantic search enabled in settings, never enabled on
+        // the facade itself.
+        let mut facade =
+            IndexFacade::new(Arc::new(settings)).expect("create facade over temp index dir");
+        facade
+            .index_directory(&source_dir, false)
+            .expect("seed facade before the force reindex");
+        assert!(
+            !facade.has_semantic_search(),
+            "precondition: the driving facade must be lite (no semantic search loaded)"
+        );
+
+        let facade_arc = Arc::new(tokio::sync::RwLock::new(facade));
+        crate::indexing::reindex_locked(&facade_arc, None, true, None, None)
+            .await
+            .expect("force reindex_locked on a lite facade");
+
+        let published = facade_arc.read().await;
+        assert!(
+            published.has_semantic_search(),
+            "the published generation's facade must carry semantic search"
+        );
+        assert!(
+            published.semantic_search_embedding_count() > 0,
+            "the fresh generation must have embeddings for the walked symbols"
+        );
+        let layout = crate::storage::IndexLayout::new(index_path);
+        assert!(
+            layout
+                .semantic_dir(published.generation_id())
+                .join("metadata.json")
+                .is_file(),
+            "the fresh generation must persist its semantic store on disk"
+        );
+    }
+
     /// Orphan-on-failure regression: when `ReindexHandles::run`'s injected
     /// post-walk failure fires, `reindex_locked` must return `Err` and the
     /// live facade must be genuinely untouched -- not merely "an error was
@@ -1295,7 +1359,7 @@ mod tests {
         let pre_symbol_count = facade_arc.read().await.symbol_count();
         let pre_generation_id = facade_arc.read().await.generation_id().clone();
 
-        crate::indexing::facade::set_fail_after_walk_for_test(true);
+        crate::indexing::facade::arm_fail_after_walk_for_test(&index_path);
         let result = crate::indexing::reindex_locked(&facade_arc, None, true, None, None).await;
         assert!(
             result.is_err(),

@@ -282,7 +282,7 @@ impl IndexPersistence {
 
     /// Allocate and open a fresh generation to build into.
     ///
-    /// Runs a best-effort [`gc()`] pass first to reclaim headroom, resolves
+    /// Runs a best-effort [`gc()`](crate::storage::generation::gc::gc) pass first to reclaim headroom, resolves
     /// `mode`'s parent generation, checks free disk space for a
     /// [`BuildMode::Fresh`] build, then claims ownership of the new
     /// generation via [`Building::start`] before seeding and opening it. See
@@ -412,18 +412,18 @@ impl IndexPersistence {
     /// 2. A [`Complete`] manifest is written for the build's generation,
     ///    recording every file the build actually produced.
     /// 3. A short critical section under [`IndexLayout::publish_lock`] --
-    ///    deliberately never nested inside [`gc()`]'s lock, so the two can
+    ///    deliberately never nested inside [`gc()`](crate::storage::generation::gc::gc)'s lock, so the two can
     ///    never deadlock against each other -- re-reads `current` and
     ///    compares it against the parent this build was seeded from. For an
     ///    incremental build (`parent.is_some()`), if `current` no longer
     ///    matches, this returns [`IndexError::GenerationSuperseded`] and
     ///    leaves the build's `BUILDING` marker in place: the build is
-    ///    orphaned, to be reclaimed by a later [`gc()`] run. A
+    ///    orphaned, to be reclaimed by a later [`gc()`](crate::storage::generation::gc::gc) run. A
     ///    [`BuildMode::Fresh`] build (`parent.is_none()`) always wins the
     ///    race, since it never depended on any particular starting state.
     ///    Otherwise, the [`Building`] guard is finished (removing the
     ///    `BUILDING` marker) and `current` is flipped to the new generation.
-    /// 4. A trailing best-effort [`gc()`] pass reclaims the generation this
+    /// 4. A trailing best-effort [`gc()`](crate::storage::generation::gc::gc) pass reclaims the generation this
     ///    build superseded. Its failure is logged only, never propagated --
     ///    the publish itself already succeeded once `current` was flipped.
     #[must_use = "Publish errors should be handled appropriately"]

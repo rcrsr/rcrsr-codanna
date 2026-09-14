@@ -329,7 +329,9 @@ fn index_single_file(indexer: &mut IndexFacade, path: &PathBuf, force: bool) -> 
     }
 }
 
-/// Index directories as one run. Returns the number of files indexed.
+/// Index directories as one run. Returns the number of files changed --
+/// indexed plus removed by deleted-file cleanup -- so a cleanup-only run
+/// still counts as a change the caller must publish.
 fn index_directories(
     indexer: &mut IndexFacade,
     dirs: &[PathBuf],
@@ -362,7 +364,7 @@ fn index_directories(
         dry_run_output,
     ) {
         Ok(all_stats) => {
-            let mut files_indexed = 0;
+            let mut files_changed = 0;
             for (dir, stats) in dirs.iter().zip(&all_stats) {
                 // Deletions leave the progress trace at zero width; report them
                 // explicitly so a cleanup-only run does not read as a no-op.
@@ -379,9 +381,9 @@ fn index_directories(
                         crate::parsing::paths::render_absolute_path(dir).display()
                     );
                 }
-                files_indexed += stats.files_indexed;
+                files_changed += stats.files_indexed + stats.files_removed;
             }
-            files_indexed
+            files_changed
         }
         Err(e) => {
             eprintln!("Error indexing directories: {e}");

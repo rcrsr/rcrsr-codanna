@@ -2104,9 +2104,9 @@ impl ReindexHandles {
         // `reindex_locked`'s phase 3 publish/swap to never be reached
         // without needing to fabricate a real walk failure. No effect
         // (and no runtime cost beyond the `cfg`-gated check) unless a test
-        // has armed it via `set_fail_after_walk_for_test`.
+        // has armed it for this index root via `arm_fail_after_walk_for_test`.
         #[cfg(test)]
-        if FAIL_AFTER_WALK.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        if take_fail_after_walk_for_test(&semantic_dir) {
             return Err(IndexError::General(
                 "test-injected failure after reindex walk completed".to_string(),
             ));
@@ -2120,19 +2120,42 @@ impl ReindexHandles {
     }
 }
 
-/// Test-only failure-injection flag for [`ReindexHandles::run`]. A plain
-/// `AtomicBool` rather than a thread-local: `run` executes on whatever
-/// `spawn_blocking` worker thread the tokio runtime schedules it onto, which
-/// is not the test's own thread, so a thread-local flag set by the test
-/// would never be observed by `run`.
+/// Test-only failure injection for [`ReindexHandles::run`]: the index root
+/// whose next walk must fail. Process-global rather than thread-local
+/// because `run` executes on whatever `spawn_blocking` worker thread the
+/// runtime picks, never the test's own thread. Keyed by index root (every
+/// test owns a distinct temp root) so a concurrent, unrelated test's walk
+/// can neither consume the injection nor fail on it.
 #[cfg(test)]
-static FAIL_AFTER_WALK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static FAIL_AFTER_WALK_ROOT: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
-/// Arms (or disarms) [`ReindexHandles::run`]'s post-walk failure injection
-/// for the next call. Test-only.
+/// Arms [`ReindexHandles::run`]'s post-walk failure injection for the next
+/// walk over a generation under `index_root`. One-shot: consumed by the
+/// first matching walk. Test-only.
 #[cfg(test)]
-pub(crate) fn set_fail_after_walk_for_test(fail: bool) {
-    FAIL_AFTER_WALK.store(fail, std::sync::atomic::Ordering::SeqCst);
+pub(crate) fn arm_fail_after_walk_for_test(index_root: &Path) {
+    let mut armed = FAIL_AFTER_WALK_ROOT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *armed = Some(index_root.to_path_buf());
+}
+
+/// Consumes the armed injection if `semantic_dir` (a generation directory
+/// under the armed index root) belongs to it.
+#[cfg(test)]
+fn take_fail_after_walk_for_test(semantic_dir: &Path) -> bool {
+    let mut armed = FAIL_AFTER_WALK_ROOT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if armed
+        .as_ref()
+        .is_some_and(|root| semantic_dir.starts_with(root))
+    {
+        *armed = None;
+        true
+    } else {
+        false
+    }
 }
 
 /// Runs the full 3-phase reindex orchestration (brief write lock ->
@@ -2309,10 +2332,19 @@ pub(crate) async fn reindex_locked(
 
                 // `CloneCurrent` already loaded semantic search onto the
                 // build facade if the parent generation had it; `Fresh`
-                // starts with none, so create it empty here when the live
-                // facade has it enabled, or phase 2 would have nothing to
-                // populate.
-                if indexer.has_semantic_search() && !build.has_semantic_search() {
+                // starts with none. Create it here whenever settings ask
+                // for it (or the live facade already carries it), like
+                // `codanna index` does -- keying on the live facade alone
+                // would publish an embedding-less generation from a lite
+                // facade (`codanna mcp reindex`) and every later load,
+                // including the serving process's hot-reload, would lose
+                // semantic search.
+                let semantic_wanted =
+                    indexer.settings().semantic_search.enabled || indexer.has_semantic_search();
+                if semantic_wanted
+                    && !build.has_semantic_search()
+                    && !build.is_semantic_incompatible()
+                {
                     build.enable_semantic_search().inspect_err(|e| {
                         tracing::error!(
                             "Failed to enable semantic search on build generation: {e}"
@@ -6016,14 +6048,12 @@ mod tests {
     // skipped is out of scope here.
     #[tokio::test]
     async fn fail_after_walk_hook_fires_once_after_walk_completes() {
-        // `FAIL_AFTER_WALK` is process-global; serialize against the
-        // `reindex_locked` tests in `mcp::server` that also arm it.
         let _serial_guard = crate::mcp::server::REINDEX_TEST_SERIAL.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let mut facade = test_facade(&dir);
         let handles = facade.snapshot_reindex_handles().unwrap();
 
-        set_fail_after_walk_for_test(true);
+        arm_fail_after_walk_for_test(&dir.path().join("index"));
         let err = handles
             .run(None, false)
             .expect_err("armed hook must fail the run after the walk completes");

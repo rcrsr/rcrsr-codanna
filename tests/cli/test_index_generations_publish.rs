@@ -196,6 +196,59 @@ fn second_run_shares_tantivy_inodes_and_publishes_a_new_generation() {
     );
 }
 
+/// A run whose only change is deleted-file cleanup must still publish:
+/// the removal lands in the cloned build, and dropping that build
+/// unpublished would leave `current` serving the deleted file's symbols
+/// forever (and an orphan generation behind on every run).
+#[test]
+fn cleanup_only_run_publishes_the_removal() {
+    let temp = tempfile::TempDir::new().expect("temp workspace");
+    let workspace = temp.path();
+    write_symbol_file(workspace, "alpha.rs", "cleanup_keep_symbol", 1);
+    write_symbol_file(workspace, "beta.rs", "cleanup_drop_symbol", 2);
+
+    let (exit, stdout, stderr) = run_cli(workspace, &["index", "src", "--no-progress"]);
+    assert_eq!(
+        exit, 0,
+        "first index run must succeed\nstdout:{stdout}\nstderr:{stderr}"
+    );
+    let first_gen = current_id(workspace);
+
+    std::fs::remove_file(workspace.join("src").join("beta.rs")).expect("delete beta.rs");
+    let (exit, stdout, stderr) = run_cli(workspace, &["index", "src", "--no-progress"]);
+    assert_eq!(
+        exit, 0,
+        "cleanup-only run must succeed\nstdout:{stdout}\nstderr:{stderr}"
+    );
+    assert!(
+        stderr.contains("Removed 1 deleted file(s)"),
+        "cleanup-only run must report the removal\nstderr:{stderr}"
+    );
+
+    let second_gen = current_id(workspace);
+    assert_ne!(
+        first_gen, second_gen,
+        "a removal is a change: the run must publish a new generation"
+    );
+
+    let (_, stdout, stderr) = run_cli(workspace, &["retrieve", "symbol", "cleanup_drop_symbol"]);
+    assert!(
+        !stdout.contains("beta.rs"),
+        "the deleted file's symbol must be gone from the published generation\nstdout:{stdout}\nstderr:{stderr}"
+    );
+    let (_, stdout, _) = run_cli(workspace, &["retrieve", "symbol", "cleanup_keep_symbol"]);
+    assert!(
+        stdout.contains("alpha.rs"),
+        "the surviving file's symbol must still resolve\nstdout:{stdout}"
+    );
+
+    let rows = status_rows(workspace);
+    assert!(
+        rows.iter().all(|row| row["state"] != "orphan"),
+        "a cleanup-only run must not leave an orphan generation behind\nrows:{rows:?}"
+    );
+}
+
 /// (2) `codanna index --force` publishes a fresh generation while the
 /// pre-force generation is retained on disk as `Previous`, not deleted.
 #[test]
