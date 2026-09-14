@@ -249,6 +249,54 @@ fn cleanup_only_run_publishes_the_removal() {
     );
 }
 
+/// `codanna mcp <tool> --watch` reindexes before running the tool; a
+/// deletion-only change must publish for the same reason as above.
+#[test]
+fn mcp_watch_publishes_a_deletion_only_change() {
+    let temp = tempfile::TempDir::new().expect("temp workspace");
+    let workspace = temp.path();
+    write_symbol_file(workspace, "alpha.rs", "watch_keep_symbol", 1);
+    write_symbol_file(workspace, "beta.rs", "watch_drop_symbol", 2);
+
+    let (exit, stdout, stderr) = run_cli(workspace, &["index", "src", "--no-progress"]);
+    assert_eq!(
+        exit, 0,
+        "first index run must succeed\nstdout:{stdout}\nstderr:{stderr}"
+    );
+    let first_gen = current_id(workspace);
+
+    std::fs::remove_file(workspace.join("src").join("beta.rs")).expect("delete beta.rs");
+    let (exit, stdout, stderr) = run_cli(
+        workspace,
+        &[
+            "mcp",
+            "search_symbols",
+            "query:watch_keep_symbol",
+            "--watch",
+        ],
+    );
+    assert_eq!(
+        exit, 0,
+        "mcp --watch run must succeed\nstdout:{stdout}\nstderr:{stderr}"
+    );
+
+    assert_ne!(
+        first_gen,
+        current_id(workspace),
+        "mcp --watch must publish the deletion as a new generation"
+    );
+    let (_, stdout, _) = run_cli(workspace, &["retrieve", "symbol", "watch_drop_symbol"]);
+    assert!(
+        !stdout.contains("beta.rs"),
+        "the deleted file's symbol must be gone after mcp --watch\nstdout:{stdout}"
+    );
+    let rows = status_rows(workspace);
+    assert!(
+        rows.iter().all(|row| row["state"] != "orphan"),
+        "no orphan generation may be left behind\nrows:{rows:?}"
+    );
+}
+
 /// (2) `codanna index --force` publishes a fresh generation while the
 /// pre-force generation is retained on disk as `Previous`, not deleted.
 #[test]

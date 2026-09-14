@@ -905,9 +905,7 @@ async fn main() {
         // `dump`, `mcp`) only reads the current generation; auto-indexing a
         // config change here means opening a throwaway `CloneCurrent` build,
         // syncing on it, and publishing it only if it actually changed
-        // anything. A no-op build is simply dropped -- it becomes an orphan
-        // generation reclaimed by a later `gc` pass, never manually cleaned
-        // up at this call site.
+        // anything; a no-op build is discarded on the spot.
         if let Some(metadata) = persistence.current_metadata() {
             let stored_set: std::collections::HashSet<PathBuf> = metadata
                 .indexed_paths
@@ -945,8 +943,9 @@ async fn main() {
                                     tracing::warn!(target: "sync", "failed to publish synced generation: {e}");
                                 }
                             }
+                        } else {
+                            persistence.discard(build);
                         }
-                        // else: no changes; `build` is dropped here.
                     }
                     Err(e) => {
                         tracing::warn!(target: "sync", "failed to open sync build: {e}");
@@ -1162,11 +1161,9 @@ async fn main() {
                         eprintln!("Error: Could not save index: {e}");
                         std::process::exit(1);
                     }
+                } else {
+                    persistence.discard(build);
                 }
-                // else: no changes against an already-existing root; the
-                // build is simply dropped here, becoming an orphan
-                // generation reclaimed by a later `gc` pass -- never
-                // manually cleaned up at this call site.
             }
         }
 
@@ -1233,7 +1230,7 @@ async fn main() {
                 if !paths.is_empty() {
                     match persistence.open_build(settings.clone(), BuildMode::CloneCurrent) {
                         Ok(mut build) => {
-                            let mut total_indexed = 0usize;
+                            let mut total_changed = 0usize;
                             for path in &paths {
                                 if path.is_dir() {
                                     // Run incremental indexing (force=false)
@@ -1245,14 +1242,17 @@ async fn main() {
                                         None,  // no max_files limit
                                         codanna::indexing::DryRunOutput::default(),
                                     ) {
-                                        Ok(stats) => total_indexed += stats.files_indexed,
+                                        Ok(stats) => {
+                                            total_changed +=
+                                                stats.files_indexed + stats.files_removed
+                                        }
                                         Err(e) => {
                                             tracing::warn!(target: "mcp", "watch reindex failed for {}: {e}", codanna::parsing::paths::render_absolute_path(path).display());
                                         }
                                     }
                                 }
                             }
-                            if total_indexed > 0 {
+                            if total_changed > 0 {
                                 match persistence.publish(build) {
                                     Ok(_) => {
                                         indexer = load_current(
@@ -1271,6 +1271,8 @@ async fn main() {
                                         tracing::warn!(target: "mcp", "failed to publish watch reindex: {e}");
                                     }
                                 }
+                            } else {
+                                persistence.discard(build);
                             }
                         }
                         Err(e) => {

@@ -402,6 +402,24 @@ impl IndexPersistence {
         })
     }
 
+    /// Abandon `build` without publishing it and remove its generation
+    /// directory right away, instead of leaving an orphan for the next
+    /// `gc` pass to find. Best-effort: a directory that cannot be removed
+    /// (Windows sharing violation while a mapping is still closing) is left
+    /// as an orphan, which `gc` reclaims later.
+    pub fn discard(&self, build: BuildFacade) {
+        let id = build.generation_id().clone();
+        drop(build);
+        let dir = self.layout.gen_dir(&id);
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => tracing::debug!("[persistence] discarded unpublished build {id}"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::debug!(
+                "[persistence] could not remove discarded build {id} ({e}); left for gc"
+            ),
+        }
+    }
+
     /// Publish a finished build: persist its metadata, write a `COMPLETE`
     /// manifest, and atomically flip `current` to it -- but only if `current`
     /// still names the generation this build was seeded from.
@@ -1006,5 +1024,46 @@ mod tests {
 
         assert_eq!(facade.generation_id(), &id);
         assert_eq!(facade.symbol_count(), expected_symbol_count);
+    }
+
+    #[test]
+    fn discard_removes_the_unpublished_build_directory_and_leaves_current_alone() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = IndexPersistence::new(temp_dir.path().to_path_buf());
+        let settings = settings_for(&temp_dir);
+
+        let current = persistence
+            .publish(
+                persistence
+                    .open_build(Arc::clone(&settings), BuildMode::Fresh)
+                    .expect("open fresh build"),
+            )
+            .expect("publish current");
+
+        let build = persistence
+            .open_build(settings, BuildMode::CloneCurrent)
+            .expect("open clone-current build");
+        let build_id = build.generation_id().clone();
+        let build_dir = persistence.layout.gen_dir(&build_id);
+        assert!(
+            build_dir.is_dir(),
+            "build directory must exist before discard"
+        );
+
+        persistence.discard(build);
+
+        assert!(
+            !build_dir.exists(),
+            "discard must remove the build directory"
+        );
+        assert!(
+            persistence.layout.gen_dir(&current).is_dir(),
+            "discard must not touch the current generation"
+        );
+        assert_eq!(
+            persistence.layout.read_current().expect("read current"),
+            Some(current),
+            "discard must not move the current pointer"
+        );
     }
 }
