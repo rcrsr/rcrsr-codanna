@@ -163,13 +163,39 @@ pub enum Commands {
         /// else, one array per path argument (indexing runs once per
         /// positional path, so multiple path arguments print multiple
         /// concatenated arrays). Never truncates. Takes precedence over
-        /// --list-all
-        #[arg(long, requires = "dry_run")]
+        /// --list-all. Also used by --status to select JSON output instead
+        /// of the human-readable table. Requires --dry-run or --status
+        /// (rejected at runtime otherwise, since clap's `requires` cannot
+        /// express "one of these two"). Not supported with --gc or
+        /// --rollback, which print a plain-text summary and never a JSON
+        /// payload.
+        #[arg(long, conflicts_with_all = ["gc", "rollback"])]
         json: bool,
 
         /// Maximum number of files to index
         #[arg(long)]
         max_files: Option<usize>,
+
+        /// Print current-plus-per-generation index status (id, age, size,
+        /// state, recorded error) and exit. Read-only: never builds or
+        /// writes the index. Combine with --json for machine-readable
+        /// output.
+        #[arg(long)]
+        status: bool,
+
+        /// Run garbage collection over on-disk generations (removes
+        /// orphaned, superseded, and damaged generations no longer
+        /// referenced by `current`) and print a summary, then exit.
+        /// Mutually exclusive with indexing, --status, and --rollback.
+        #[arg(long = "gc", conflicts_with_all = ["status", "rollback", "paths"])]
+        gc: bool,
+
+        /// Roll `current` back to a specific generation id, or (with no
+        /// value given) the newest `Previous`-state generation, then exit.
+        /// Refuses a target generation that fails validation. Mutually
+        /// exclusive with indexing, --status, and --gc.
+        #[arg(long = "rollback", num_args = 0..=1, conflicts_with_all = ["status", "gc", "paths"])]
+        rollback: Option<Option<String>>,
     },
 
     /// Add a directory to the indexed paths list

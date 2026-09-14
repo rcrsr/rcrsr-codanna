@@ -252,6 +252,11 @@ pub async fn serve_http(config: crate::Settings, watch: bool, bind: String) -> a
         crate::log_event!("http", "starting", "no existing index");
         IndexFacade::new(settings.clone())?
     };
+
+    // Startup GC: reclaim stale generations left behind by a prior run, once
+    // per process start, before the watcher (if any) starts below.
+    let _ = crate::storage::generation::gc_logged(facade.index_layout(), true, "startup");
+
     let indexer = Arc::new(RwLock::new(facade));
 
     // Create cancellation token for coordinated shutdown
@@ -332,7 +337,6 @@ pub async fn serve_http(config: crate::Settings, watch: bool, bind: String) -> a
         let mut builder = UnifiedWatcher::builder()
             .broadcaster(broadcaster.clone())
             .indexer(indexer.clone())
-            .index_path(config.index_path.clone())
             .workspace_root(workspace_root.clone())
             .debounce_ms(debounce_ms)
             .refresh_on_overflow(config.file_watch.refresh_on_overflow)
@@ -747,15 +751,15 @@ pub async fn serve_http(config: crate::Settings, watch: bool, bind: String) -> a
             let launch_token = launch_token.clone();
             async move {
                 let mut headers = axum::http::HeaderMap::new();
-                if let Some(dev) = workspace_dev {
-                    if let Ok(value) = axum::http::HeaderValue::from_str(&dev.to_string()) {
-                        headers.insert("x-codanna-workspace-dev", value);
-                    }
+                if let Some(dev) = workspace_dev
+                    && let Ok(value) = axum::http::HeaderValue::from_str(&dev.to_string())
+                {
+                    headers.insert("x-codanna-workspace-dev", value);
                 }
-                if let Some(ino) = workspace_ino {
-                    if let Ok(value) = axum::http::HeaderValue::from_str(&ino.to_string()) {
-                        headers.insert("x-codanna-workspace-ino", value);
-                    }
+                if let Some(ino) = workspace_ino
+                    && let Ok(value) = axum::http::HeaderValue::from_str(&ino.to_string())
+                {
+                    headers.insert("x-codanna-workspace-ino", value);
                 }
                 (headers, launch_token)
             }

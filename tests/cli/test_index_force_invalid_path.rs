@@ -3,7 +3,6 @@
 //! <missing path> --force` destroyed the store and rebuilt nothing.
 //! The pre-clear existence gate refuses before any destruction.
 
-use std::collections::BTreeSet;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -98,19 +97,6 @@ enabled = false
     std::fs::write(codanna_dir.join("settings.toml"), settings).expect("write settings");
 }
 
-fn index_dir_entries(workspace: &Path) -> BTreeSet<String> {
-    std::fs::read_dir(workspace.join(".codanna/index"))
-        .expect("read index dir")
-        .map(|entry| {
-            entry
-                .expect("dir entry")
-                .file_name()
-                .to_string_lossy()
-                .to_string()
-        })
-        .collect()
-}
-
 #[test]
 fn force_with_missing_path_refuses_before_clearing_index() {
     let temp = TempDir::new().expect("temp workspace");
@@ -124,10 +110,10 @@ fn force_with_missing_path_refuses_before_clearing_index() {
         "seed must succeed\nstdout:{stdout}\nstderr:{stderr}"
     );
 
-    let meta = workspace.join(".codanna/index/index.meta");
+    let meta = crate::support::index_meta_path(workspace);
     assert!(meta.exists(), "seed must persist index.meta");
     let meta_before = std::fs::read(&meta).expect("read index.meta");
-    let entries_before = index_dir_entries(workspace);
+    let entries_before = crate::support::index_dir_entries(workspace);
 
     let (exit, stdout, stderr) = run_cli(workspace, &["index", "missing-dir", "--force"]);
     assert_ne!(
@@ -150,7 +136,7 @@ fn force_with_missing_path_refuses_before_clearing_index() {
     );
     assert_eq!(
         entries_before,
-        index_dir_entries(workspace),
+        crate::support::index_dir_entries(workspace),
         "index directory contents must be untouched after the refused run"
     );
 }
@@ -168,10 +154,10 @@ fn force_bare_with_no_existing_roots_refuses_before_clearing_index() {
         "seed must succeed\nstdout:{stdout}\nstderr:{stderr}"
     );
 
-    let meta = workspace.join(".codanna/index/index.meta");
+    let meta = crate::support::index_meta_path(workspace);
     assert!(meta.exists(), "seed must persist index.meta");
     let meta_before = std::fs::read(&meta).expect("read index.meta");
-    let entries_before = index_dir_entries(workspace);
+    let entries_before = crate::support::index_dir_entries(workspace);
 
     std::fs::remove_dir_all(workspace.join("src")).expect("remove registered root");
 
@@ -196,7 +182,7 @@ fn force_bare_with_no_existing_roots_refuses_before_clearing_index() {
     );
     assert_eq!(
         entries_before,
-        index_dir_entries(workspace),
+        crate::support::index_dir_entries(workspace),
         "index directory contents must be untouched after the refused bare-force run"
     );
 }

@@ -130,7 +130,7 @@ fn dump_streams_begin_result_summary_and_exits_zero() {
 #[test]
 fn dump_refuses_stale_index_before_writing_any_line() {
     let workspace = seed_workspace();
-    let meta_path = workspace.path().join(".codanna/index/index.meta");
+    let meta_path = crate::support::index_meta_path(workspace.path());
     let raw = std::fs::read_to_string(&meta_path).expect("read index.meta");
     let mut meta: Value = serde_json::from_str(&raw).expect("parse index.meta");
     meta.as_object_mut()

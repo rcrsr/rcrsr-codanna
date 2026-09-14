@@ -119,7 +119,7 @@ impl Pipeline {
         embedding_pool: Option<Arc<crate::semantic::EmbeddingBackend>>,
     ) -> PipelineResult<SingleFileStats> {
         let start = Instant::now();
-        let semantic_path = self.settings.index_path.join("semantic");
+        let semantic_path = self.semantic_dir.clone();
 
         // Normalize path relative to workspace_root
         let normalized_path = if path.is_absolute() {
@@ -273,36 +273,36 @@ impl Pipeline {
         }
 
         // Generate embeddings for symbols with doc_comments
-        if let (Some(pool), Some(sem)) = (&embedding_pool, &semantic) {
-            if !embed_batch.candidates.is_empty() {
-                tracing::info!(
-                    target: "pipeline",
-                    "Generating {} embeddings for {}",
-                    embed_batch.candidates.len(),
-                    path.display()
-                );
+        if let (Some(pool), Some(sem)) = (&embedding_pool, &semantic)
+            && !embed_batch.candidates.is_empty()
+        {
+            tracing::info!(
+                target: "pipeline",
+                "Generating {} embeddings for {}",
+                embed_batch.candidates.len(),
+                path.display()
+            );
 
-                // Convert to the format expected by embed_parallel
-                let items: Vec<_> = embed_batch
-                    .candidates
-                    .iter()
-                    .map(|(id, doc, lang)| (*id, doc.as_ref(), lang.as_ref()))
-                    .collect();
+            // Convert to the format expected by embed_parallel
+            let items: Vec<_> = embed_batch
+                .candidates
+                .iter()
+                .map(|(id, doc, lang)| (*id, doc.as_ref(), lang.as_ref()))
+                .collect();
 
-                // Generate embeddings
-                let embeddings = pool
-                    .embed_parallel(&items)
-                    .map_err(|e| PipelineError::Parse {
-                        path: path.to_path_buf(),
-                        reason: format!("Embedding generation failed: {e}"),
-                    })?;
+            // Generate embeddings
+            let embeddings = pool
+                .embed_parallel(&items)
+                .map_err(|e| PipelineError::Parse {
+                    path: path.to_path_buf(),
+                    reason: format!("Embedding generation failed: {e}"),
+                })?;
 
-                // store_embeddings warns internally on any dropped embeddings.
-                if !embeddings.is_empty() {
-                    if let Ok(mut guard) = sem.lock() {
-                        guard.store_embeddings(embeddings);
-                    }
-                }
+            // store_embeddings warns internally on any dropped embeddings.
+            if !embeddings.is_empty()
+                && let Ok(mut guard) = sem.lock()
+            {
+                guard.store_embeddings(embeddings);
             }
         }
 
@@ -454,7 +454,7 @@ impl Pipeline {
         };
 
         let start = Instant::now();
-        let semantic_path = self.settings.index_path.join("semantic");
+        let semantic_path = self.semantic_dir.clone();
 
         // Progress bar options shared between phases
         let bar_options = ProgressBarOptions::default()
@@ -766,7 +766,7 @@ impl Pipeline {
         if !pending.ran {
             return Ok(Phase2Stats::default());
         }
-        let semantic_path = self.settings.index_path.join("semantic");
+        let semantic_path = self.semantic_dir.clone();
 
         let symbol_cache = Arc::new(SymbolLookupCache::from_index(&index)?);
         let phase2_stats = self.run_phase2_maybe_bar(
@@ -812,7 +812,7 @@ impl Pipeline {
         progress: Option<Arc<crate::io::status_line::ProgressBar>>,
     ) -> PipelineResult<IncrementalStats> {
         let start = Instant::now();
-        let semantic_path = self.settings.index_path.join("semantic");
+        let semantic_path = self.semantic_dir.clone();
 
         if force {
             // Force mode: index everything (no cleanup needed for fresh index)
@@ -1013,7 +1013,7 @@ impl Pipeline {
         use std::collections::HashSet;
 
         let start = Instant::now();
-        let semantic_path = self.settings.index_path.join("semantic");
+        let semantic_path = self.semantic_dir.clone();
 
         // Canonicalize both path sets for accurate comparison
         let stored_set: HashSet<PathBuf> = stored_paths

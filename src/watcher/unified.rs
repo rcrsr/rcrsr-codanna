@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 use tokio::sync::{RwLock, mpsc};
@@ -17,6 +17,8 @@ use crate::error::IndexError;
 use crate::indexing::ReindexOutcome;
 use crate::indexing::facade::IndexFacade;
 use crate::mcp::notifications::{FileChangeEvent, NotificationBroadcaster};
+use crate::storage::generation::GenerationId;
+use crate::storage::generation::markers::Complete;
 
 use super::debouncer::Debouncer;
 use super::error::WatchError;
@@ -53,8 +55,6 @@ pub struct UnifiedWatcher {
     document_store: Option<Arc<RwLock<DocumentStore>>>,
     /// Chunking config for document re-indexing.
     chunking_config: ChunkingConfig,
-    /// Path for semantic search persistence.
-    index_path: PathBuf,
     /// Workspace root for path resolution.
     workspace_root: PathBuf,
     /// Whether the index is potentially stale due to a backend overflow/rescan
@@ -146,6 +146,28 @@ pub struct UnifiedWatcher {
     /// behavior for existing callers (including tests) that predate this
     /// field.
     cancellation_token: CancellationToken,
+    /// Bounded, per-file record of executed reindex/remove actions,
+    /// replayed against a newly swapped-in generation when its build began
+    /// before the action landed (decision 6b) -- otherwise a hot-reload
+    /// swap that races an in-flight watcher edit would silently drop the
+    /// edit from the generation now being served. Capped at
+    /// [`REPLAY_JOURNAL_CAP`]; see [`Self::record_replay`].
+    journal: Vec<ReplayEntry>,
+    /// The generation this watcher last replayed against / is currently
+    /// serving, used by [`Self::replay_journal_for_new_generation`] to
+    /// detect a redundant re-announcement of the same generation (double-
+    /// fire safety) and to avoid replaying twice against one swap. Set once
+    /// at `watch()` startup to the facade's generation at that time, so
+    /// journal entries recorded before the first swap key against the
+    /// correct baseline.
+    served_generation: Option<GenerationId>,
+    /// Set when a push to `journal` would exceed [`REPLAY_JOURNAL_CAP`]:
+    /// the journal was cleared and full catch-up was armed via
+    /// `mark_stale()` as the fallback for the current episode, since a
+    /// capped-and-cleared journal can no longer support a complete
+    /// selective replay. Consumed (reset to `false`) by the next
+    /// [`Self::replay_journal_for_new_generation`] call.
+    journal_overflowed: bool,
 }
 
 impl UnifiedWatcher {
@@ -172,6 +194,12 @@ impl UnifiedWatcher {
                 );
             }
         }
+
+        // Baseline the replay journal against the generation this watcher
+        // starts out serving, so journal entries recorded before the first
+        // swap-in key against the correct generation in
+        // `replay_journal_for_new_generation`.
+        self.served_generation = Some(self.facade.read().await.generation_id().clone());
 
         // Collect all paths from handlers and register them
         let mut all_paths = Vec::new();
@@ -235,14 +263,18 @@ impl UnifiedWatcher {
                     // `tokio::spawn` in `maybe_start_catch_up`, detached from
                     // this `select!`). Dropping `self` here without joining
                     // it would detach, not abort, the spawned future --
-                    // `reindex_locked` could still be between clearing the
-                    // index and finishing the rebuild walk on its own task
-                    // when this process exits. Join to completion rather
-                    // than aborting: phase 1 of that reindex may already
-                    // have cleared the index by the time an abort would
-                    // land, and aborting mid-clear would leave the on-disk
-                    // index partially rebuilt with no task left to finish
-                    // it.
+                    // `reindex_locked` could still be on its own task,
+                    // partway through building the staged generation, when
+                    // this process exits. Staged builds no longer clear the
+                    // live index in phase 1, so aborting mid-build would only
+                    // orphan the half-built generation (swept up by GC on the
+                    // next start) and would leave the live facade untouched;
+                    // joining here is now a cost-avoidance choice (finish
+                    // work already paid for) rather than a correctness
+                    // requirement. We still join rather than abort for Phase
+                    // 4, since it's cheaper and changes no behavior; switching
+                    // to abort-on-shutdown is a documented follow-up, see
+                    // internal/improvement-notes.md section 2.1.
                     if let Some(handle) = self.catch_up_task.take() {
                         crate::log_event!(
                             "watcher",
@@ -654,7 +686,10 @@ impl UnifiedWatcher {
         let facade = Arc::clone(&self.facade);
         self.catch_up_started_at = Some(Instant::now());
         self.catch_up_task = Some(tokio::spawn(async move {
-            crate::indexing::reindex_locked(&facade, None, true, None)
+            // Watcher broadcaster wiring is a later phase; `None` here just
+            // means the catch-up reindex doesn't emit an `IndexReloaded`
+            // notification on the watch lane yet.
+            crate::indexing::reindex_locked(&facade, None, true, None, None)
                 .await
                 .map_err(|source| WatchError::CatchUpReindexFailed { source })
         }));
@@ -875,10 +910,10 @@ impl UnifiedWatcher {
             };
 
             for dir in dirs {
-                if self.registry.add_watch_dir(dir.clone()) {
-                    if let Err(e) = self.watch_directory(&dir) {
-                        tracing::warn!("[watcher] failed to watch created dir: {e}");
-                    }
+                if self.registry.add_watch_dir(dir.clone())
+                    && let Err(e) = self.watch_directory(&dir)
+                {
+                    tracing::warn!("[watcher] failed to watch created dir: {e}");
                 }
             }
             if !files.is_empty() {
@@ -910,10 +945,10 @@ impl UnifiedWatcher {
             roots.extend(handler_roots);
         }
         for root in &roots {
-            if self.registry.add_watch_dir(root.clone()) {
-                if let Err(e) = self.watch_directory(root) {
-                    tracing::warn!("[watcher] failed to watch root: {e}");
-                }
+            if self.registry.add_watch_dir(root.clone())
+                && let Err(e) = self.watch_directory(root)
+            {
+                tracing::warn!("[watcher] failed to watch root: {e}");
             }
         }
         self.handler_roots = roots;
@@ -921,7 +956,13 @@ impl UnifiedWatcher {
     }
 
     /// Process a debounced file modification.
-    async fn process_modification(&self, path: &Path) {
+    ///
+    /// Iterates handlers by index rather than `for handler in &self.handlers`:
+    /// `execute_action` now needs `&mut self` (to journal replay entries at
+    /// its success points), and holding an iterator borrow of
+    /// `self.handlers` across that call would conflict with it. Indexing
+    /// keeps each handler borrow scoped to a single statement instead.
+    async fn process_modification(&mut self, path: &Path) {
         // Vanished since the drain: the removal lane owns it -- the
         // caller recorded a removal observation, or the Remove event is
         // in flight.
@@ -929,26 +970,27 @@ impl UnifiedWatcher {
             return;
         }
 
-        for handler in &self.handlers {
-            if !handler.matches(path) {
+        for i in 0..self.handlers.len() {
+            if !self.handlers[i].matches(path) {
                 continue;
             }
 
+            let handler_name = self.handlers[i].name().to_string();
             crate::log_event!(
-                handler.name(),
+                handler_name,
                 "modified",
                 "{}",
                 crate::parsing::paths::render_absolute_path(path).display()
             );
 
-            match handler.on_modify(path).await {
+            match self.handlers[i].on_modify(path).await {
                 Ok(action) => {
-                    if let Err(e) = self.execute_action(action, handler.name()).await {
-                        tracing::error!("[{}] action error: {e}", handler.name());
+                    if let Err(e) = self.execute_action(action, &handler_name).await {
+                        tracing::error!("[{handler_name}] action error: {e}");
                     }
                 }
                 Err(e) => {
-                    tracing::error!("[{}] handler error: {e}", handler.name());
+                    tracing::error!("[{handler_name}] handler error: {e}");
                 }
             }
         }
@@ -968,10 +1010,9 @@ impl UnifiedWatcher {
                 .batch_sync_roots
                 .iter()
                 .find(|root| path.starts_with(root))
+                && !roots.contains(root)
             {
-                if !roots.contains(root) {
-                    roots.push(root.clone());
-                }
+                roots.push(root.clone());
             }
         }
 
@@ -1039,6 +1080,26 @@ impl UnifiedWatcher {
         }
 
         if any_ok {
+            // The batch sync drives these paths directly (index_directory_deferred),
+            // never through `execute_action`'s per-file ReindexCode/RemoveCode
+            // arms, so their journal entries must be recorded here -- the
+            // only point that observes the batch outcome for these paths at
+            // all. `created` is unknown for a batch-synced path (discovery
+            // does not distinguish create from modify), so it is recorded
+            // `false`; on replay this only affects which notification kind
+            // (`FileCreated` vs. `FileReindexed`) is re-broadcast, not
+            // whether the symbol data itself is replayed.
+            for path in &removed {
+                if roots.iter().any(|root| path.starts_with(root)) {
+                    self.record_replay(path.clone(), ReplayKind::Remove, false);
+                }
+            }
+            for path in &modified {
+                if roots.iter().any(|root| path.starts_with(root)) {
+                    self.record_replay(path.clone(), ReplayKind::Reindex, false);
+                }
+            }
+
             // Handler caches and subscribers refresh through the same
             // event hot-reload uses; the sync may have relocated paths.
             self.broadcaster.send(FileChangeEvent::IndexReloaded);
@@ -1063,22 +1124,28 @@ impl UnifiedWatcher {
 
     /// Route one wave path through every handler the batch sync did not
     /// subsume.
-    async fn process_wave_residual(&self, path: &Path, batch_covered: bool, is_removal: bool) {
-        for handler in &self.handlers {
-            if !handler.matches(path) {
+    ///
+    /// Iterates handlers by index for the same reason as
+    /// [`Self::process_modification`]: `execute_action` now takes `&mut
+    /// self`, which cannot be called while an iterator over `&self.handlers`
+    /// is still borrowed.
+    async fn process_wave_residual(&mut self, path: &Path, batch_covered: bool, is_removal: bool) {
+        for i in 0..self.handlers.len() {
+            if !self.handlers[i].matches(path) {
                 continue;
             }
-            if batch_covered && handler.covered_by_batch_sync() {
+            if batch_covered && self.handlers[i].covered_by_batch_sync() {
                 continue;
             }
 
+            let handler_name = self.handlers[i].name().to_string();
             let (verb, result) = if is_removal {
-                ("deleted", handler.on_delete(path).await)
+                ("deleted", self.handlers[i].on_delete(path).await)
             } else {
-                ("modified", handler.on_modify(path).await)
+                ("modified", self.handlers[i].on_modify(path).await)
             };
             crate::log_event!(
-                handler.name(),
+                handler_name,
                 verb,
                 "{}",
                 crate::parsing::paths::render_absolute_path(path).display()
@@ -1086,20 +1153,28 @@ impl UnifiedWatcher {
 
             match result {
                 Ok(action) => {
-                    if let Err(e) = self.execute_action(action, handler.name()).await {
-                        tracing::error!("[{}] action error: {e}", handler.name());
+                    if let Err(e) = self.execute_action(action, &handler_name).await {
+                        tracing::error!("[{handler_name}] action error: {e}");
                     }
                 }
                 Err(e) => {
-                    tracing::error!("[{}] handler error: {e}", handler.name());
+                    tracing::error!("[{handler_name}] handler error: {e}");
                 }
             }
         }
     }
 
     /// Execute an action returned by a handler.
+    ///
+    /// Takes `&mut self` (rather than `&self`, as before the replay
+    /// journal): the `ReindexCode`/`RemoveCode` arms record a
+    /// [`ReplayEntry`] into `self.journal` at their success points via
+    /// [`Self::record_replay`], reused as-is for both live dispatch and
+    /// journal replay (see [`Self::replay_journal_for_new_generation`]) so
+    /// the `spawn_blocking` body driving the actual index mutation is never
+    /// duplicated.
     async fn execute_action(
-        &self,
+        &mut self,
         action: WatchAction,
         handler_name: &str,
     ) -> Result<(), WatchError> {
@@ -1110,84 +1185,109 @@ impl UnifiedWatcher {
                 // potentially a long wait. Run it off the tokio worker so a
                 // slow merge cannot stall the whole watch loop (matches the
                 // pattern used for batch sync above).
+                //
+                // The closure returns a `ReindexActionOutcome` rather than
+                // logging/broadcasting/journaling inline: those need
+                // `&mut self` (journaling does), which cannot cross into a
+                // `'static` `spawn_blocking` closure. The match on the
+                // returned outcome below is this arm's single success
+                // point, and is what `record_replay` is called from.
                 let facade = Arc::clone(&self.facade);
-                let index_path = self.index_path.clone();
-                let broadcaster = Arc::clone(&self.broadcaster);
-                let handler_name = handler_name.to_string();
-                tokio::task::spawn_blocking(move || {
+                let outcome = tokio::task::spawn_blocking(move || {
                     let mut indexer = facade.blocking_write();
                     match indexer.index_file(&path) {
                         Ok(result) => {
                             use crate::IndexingResult;
                             match result {
                                 IndexingResult::Indexed(_) => {
-                                    crate::log_event!(handler_name, "reindexed");
-
-                                    // Save semantic search
-                                    if indexer.has_semantic_search() {
-                                        let semantic_path = index_path.join("semantic");
-                                        if let Err(e) =
-                                            indexer.save_semantic_search(&semantic_path)
-                                        {
-                                            tracing::warn!(
-                                                "[{handler_name}] failed to save semantic search: {e}"
-                                            );
-                                        }
-                                    }
-
-                                    // A first-time file grew the resource list;
-                                    // the lanes map FileCreated to list_changed
-                                    // and FileReindexed to a URI-filtered update.
-                                    let event = if created {
-                                        FileChangeEvent::FileCreated { path: path.clone() }
+                                    let semantic_warning = if indexer.has_semantic_search() {
+                                        let semantic_path = indexer.semantic_dir();
+                                        indexer.save_semantic_search(&semantic_path).err()
                                     } else {
-                                        FileChangeEvent::FileReindexed { path: path.clone() }
+                                        None
                                     };
-                                    broadcaster.send(event);
+                                    ReindexActionOutcome::Indexed {
+                                        path,
+                                        semantic_warning,
+                                    }
                                 }
-                                IndexingResult::Cached(_) => {
-                                    crate::debug_event!(handler_name, "unchanged (hash match)");
-                                }
+                                IndexingResult::Cached(_) => ReindexActionOutcome::Cached,
                             }
                         }
-                        Err(e) if is_writer_lock_contention(&e) => {
-                            tracing::info!(
-                                "[{handler_name}] reindex skipped: another serve process holds the index writer; hot-reload converges"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::error!("[{handler_name}] reindex failed: {e}");
-                        }
+                        Err(e) if is_writer_lock_contention(&e) => ReindexActionOutcome::Contention,
+                        Err(e) => ReindexActionOutcome::Failed(e),
                     }
                 })
                 .await
                 .expect("index_file spawn_blocking task must not panic");
+
+                match outcome {
+                    ReindexActionOutcome::Indexed {
+                        path,
+                        semantic_warning,
+                    } => {
+                        crate::log_event!(handler_name, "reindexed");
+                        if let Some(e) = semantic_warning {
+                            tracing::warn!("[{handler_name}] failed to save semantic search: {e}");
+                        }
+
+                        // A first-time file grew the resource list; the
+                        // lanes map FileCreated to list_changed and
+                        // FileReindexed to a URI-filtered update.
+                        let event = if created {
+                            FileChangeEvent::FileCreated { path: path.clone() }
+                        } else {
+                            FileChangeEvent::FileReindexed { path: path.clone() }
+                        };
+                        self.broadcaster.send(event);
+                        self.record_replay(path, ReplayKind::Reindex, created);
+                    }
+                    ReindexActionOutcome::Cached => {
+                        crate::debug_event!(handler_name, "unchanged (hash match)");
+                    }
+                    ReindexActionOutcome::Contention => {
+                        tracing::info!(
+                            "[{handler_name}] reindex skipped: another serve process holds the index writer; hot-reload converges"
+                        );
+                    }
+                    ReindexActionOutcome::Failed(e) => {
+                        tracing::error!("[{handler_name}] reindex failed: {e}");
+                    }
+                }
             }
 
             WatchAction::RemoveCode { path } => {
                 // Same rationale as `ReindexCode`: `remove_file` commits a
                 // batch and can block on merge threads while holding the
-                // exclusive writer lock.
+                // exclusive writer lock. Also same reason for returning the
+                // plain `Result` across the `spawn_blocking` boundary rather
+                // than broadcasting/journaling inline: journaling needs
+                // `&mut self`.
                 let facade = Arc::clone(&self.facade);
-                let broadcaster = Arc::clone(&self.broadcaster);
-                let handler_name = handler_name.to_string();
-                tokio::task::spawn_blocking(move || {
+                let path_for_remove = path.clone();
+                let outcome = tokio::task::spawn_blocking(move || {
                     let mut indexer = facade.blocking_write();
-                    if let Err(e) = indexer.remove_file(&path) {
-                        if is_writer_lock_contention(&e) {
-                            tracing::info!(
-                                "[{handler_name}] remove skipped: another serve process holds the index writer; hot-reload converges"
-                            );
-                        } else {
-                            tracing::error!("[{handler_name}] failed to remove: {e}");
-                        }
-                    } else {
-                        crate::log_event!(handler_name, "removed");
-                        broadcaster.send(FileChangeEvent::FileDeleted { path: path.clone() });
-                    }
+                    indexer.remove_file(&path_for_remove)
                 })
                 .await
                 .expect("remove_file spawn_blocking task must not panic");
+
+                match outcome {
+                    Ok(()) => {
+                        crate::log_event!(handler_name, "removed");
+                        self.broadcaster
+                            .send(FileChangeEvent::FileDeleted { path: path.clone() });
+                        self.record_replay(path, ReplayKind::Remove, false);
+                    }
+                    Err(e) if is_writer_lock_contention(&e) => {
+                        tracing::info!(
+                            "[{handler_name}] remove skipped: another serve process holds the index writer; hot-reload converges"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!("[{handler_name}] failed to remove: {e}");
+                    }
+                }
             }
 
             WatchAction::ReindexDocument { path } => {
@@ -1291,8 +1391,120 @@ impl UnifiedWatcher {
         Ok(())
     }
 
+    /// Record one journaled per-file effect after it has actually landed
+    /// (a `ReindexCode`/`RemoveCode` success), so
+    /// [`Self::replay_journal_for_new_generation`] can re-apply it against
+    /// a newly swapped-in generation if the swap raced ahead of this
+    /// action (decision 6b).
+    ///
+    /// Bounded at [`REPLAY_JOURNAL_CAP`]: a push that would exceed the cap
+    /// does not grow the journal. Instead it clears the journal, sets
+    /// `journal_overflowed`, and calls `mark_stale()` to re-arm full
+    /// catch-up as the fallback -- a capped-and-cleared journal can no
+    /// longer support a complete selective replay, so the entry that would
+    /// have overflowed it is dropped rather than recorded.
+    fn record_replay(&mut self, path: PathBuf, kind: ReplayKind, created: bool) {
+        if self.journal.len() >= REPLAY_JOURNAL_CAP {
+            self.journal.clear();
+            self.journal_overflowed = true;
+            self.mark_stale();
+            return;
+        }
+        self.journal.push(ReplayEntry {
+            path,
+            at: SystemTime::now(),
+            kind,
+            created,
+        });
+    }
+
+    /// Replay journaled per-file actions against the generation this
+    /// watcher's facade now serves, called at the top of
+    /// [`Self::handle_index_reloaded`] before the existing handler-refresh
+    /// body (design D1: replay is watcher-private state driven from here,
+    /// not from `swap_in`).
+    ///
+    /// A hot-reload swap-in can race an in-flight watcher edit: the
+    /// incoming generation's build may have started before that edit's
+    /// `execute_action` call recorded its journal entry, in which case the
+    /// edit is not reflected in the generation now live and must be
+    /// re-applied. Re-dispatches through [`Self::execute_action`] (never
+    /// duplicating its `spawn_blocking` body) for every journal entry whose
+    /// timestamp is strictly after the incoming generation's `COMPLETE`
+    /// `started_at`.
+    async fn replay_journal_for_new_generation(&mut self) {
+        let new_gen = self.facade.read().await.generation_id().clone();
+
+        if Some(&new_gen) == self.served_generation.as_ref() {
+            // Redundant re-announcement of the generation already served
+            // (double-fire safety): nothing raced this swap, and replaying
+            // again here could double-apply already-applied entries.
+            return;
+        }
+
+        if self.journal_overflowed {
+            // The journal was cleared and `mark_stale()` already armed a
+            // full catch-up reindex as the fallback for this episode; a
+            // selective replay against a partial/cleared journal cannot be
+            // complete, so skip it and let catch-up re-converge instead.
+            self.journal_overflowed = false;
+            self.journal.clear();
+            self.served_generation = Some(new_gen);
+            return;
+        }
+
+        let marker_path = {
+            let facade = self.facade.read().await;
+            facade.index_layout().complete_marker(&new_gen)
+        };
+        let started_at_millis = match Complete::read(&marker_path) {
+            Ok(complete) => complete.started_at,
+            Err(e) => {
+                // No reliable cut point to replay against without a
+                // readable COMPLETE marker; skip the selective replay and
+                // fall back to full catch-up so staleness is still
+                // resolved rather than silently dropping the journal.
+                tracing::error!(
+                    "[watcher] failed to read COMPLETE marker for generation {new_gen}: {e}; \
+                     arming full catch-up instead of a selective journal replay"
+                );
+                self.mark_stale();
+                self.served_generation = Some(new_gen);
+                self.journal.clear();
+                return;
+            }
+        };
+        let generation_started_at = UNIX_EPOCH + Duration::from_millis(started_at_millis);
+
+        // Snapshot-and-drain rather than iterating `&self.journal` in place:
+        // `execute_action` needs `&mut self` (it may itself journal a fresh
+        // entry for the replayed action), which would conflict with an
+        // outstanding immutable borrow of `self.journal`.
+        let entries = std::mem::take(&mut self.journal);
+        for entry in entries {
+            if !needs_replay(entry.at, generation_started_at) {
+                continue;
+            }
+            let action = match entry.kind {
+                ReplayKind::Reindex => WatchAction::ReindexCode {
+                    path: entry.path,
+                    created: entry.created,
+                },
+                ReplayKind::Remove => WatchAction::RemoveCode { path: entry.path },
+            };
+            if let Err(e) = self.execute_action(action, "watcher-replay").await {
+                tracing::error!("[watcher] replay action failed: {e}");
+            }
+        }
+
+        self.served_generation = Some(new_gen);
+        self.journal.clear();
+    }
+
     /// Handle IndexReloaded notification - refresh all handlers.
     async fn handle_index_reloaded(&mut self) {
+        self.replay_journal_for_new_generation().await;
+
         crate::log_event!("watcher", "index reloaded, refreshing");
 
         for handler in &self.handlers {
@@ -1580,7 +1792,6 @@ pub struct UnifiedWatcherBuilder {
     facade: Option<Arc<RwLock<IndexFacade>>>,
     document_store: Option<Arc<RwLock<DocumentStore>>>,
     chunking_config: ChunkingConfig,
-    index_path: Option<PathBuf>,
     workspace_root: Option<PathBuf>,
     debounce_ms: u64,
     refresh_on_overflow: bool,
@@ -1597,7 +1808,6 @@ impl UnifiedWatcherBuilder {
             facade: None,
             document_store: None,
             chunking_config: ChunkingConfig::default(),
-            index_path: None,
             workspace_root: None,
             debounce_ms: 500,
             // Mirrors `FileWatchConfig::refresh_on_overflow`'s `default_true()`
@@ -1644,12 +1854,6 @@ impl UnifiedWatcherBuilder {
     /// Set the chunking config for documents.
     pub fn chunking_config(mut self, config: ChunkingConfig) -> Self {
         self.chunking_config = config;
-        self
-    }
-
-    /// Set the index path for semantic search persistence.
-    pub fn index_path(mut self, path: PathBuf) -> Self {
-        self.index_path = Some(path);
         self
     }
 
@@ -1711,10 +1915,6 @@ impl UnifiedWatcherBuilder {
             .workspace_root
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-        let index_path = self
-            .index_path
-            .unwrap_or_else(|| workspace_root.join(".codanna/index"));
-
         // Create channel for events
         let (tx, rx) = mpsc::channel(100);
 
@@ -1734,7 +1934,6 @@ impl UnifiedWatcherBuilder {
             facade,
             document_store: self.document_store,
             chunking_config: self.chunking_config,
-            index_path,
             workspace_root,
             stale: false,
             stale_since: None,
@@ -1753,6 +1952,9 @@ impl UnifiedWatcherBuilder {
             #[cfg(test)]
             walk_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             cancellation_token: self.cancellation_token,
+            journal: Vec::new(),
+            served_generation: None,
+            journal_overflowed: false,
         })
     }
 }
@@ -1770,6 +1972,78 @@ impl Default for UnifiedWatcherBuilder {
 /// the only marker crossing the boxed layers.
 fn is_writer_lock_contention(e: &crate::IndexError) -> bool {
     e.to_string().contains("Failed to acquire Lockfile")
+}
+
+/// One executed per-file watcher action, recorded by
+/// [`UnifiedWatcher::record_replay`] so [`UnifiedWatcher::
+/// replay_journal_for_new_generation`] can re-apply it against a newly
+/// swapped-in generation whose build started before the action landed
+/// (decision 6b).
+#[derive(Debug, Clone)]
+struct ReplayEntry {
+    /// The relative path passed to the original `ReindexCode`/`RemoveCode`
+    /// action, reused verbatim when reconstructing the action for replay.
+    path: PathBuf,
+    /// When this action was recorded (i.e. when it actually landed), used
+    /// to decide whether it postdates the replayed-against generation's
+    /// `COMPLETE.started_at`.
+    at: SystemTime,
+    kind: ReplayKind,
+    /// Preserved from the original `ReindexCode { created, .. }` so replay
+    /// re-emits the correct `FileCreated`/`FileReindexed` notification.
+    /// Unused (always `false`) for `ReplayKind::Remove` entries.
+    created: bool,
+}
+
+/// Which per-file action a [`ReplayEntry`] records.
+#[derive(Debug, Clone)]
+enum ReplayKind {
+    /// Reconstructs to `WatchAction::ReindexCode`.
+    Reindex,
+    /// Reconstructs to `WatchAction::RemoveCode`.
+    Remove,
+}
+
+/// Upper bound on [`UnifiedWatcher`]'s replay journal
+/// (`UnifiedWatcher::journal`). A push that would exceed this clears the
+/// journal and falls back to full catch-up instead of growing it
+/// unboundedly across a very long uninterrupted watch session -- see
+/// [`UnifiedWatcher::record_replay`].
+const REPLAY_JOURNAL_CAP: usize = 10_000;
+
+/// Outcome of the `spawn_blocking` body inside `execute_action`'s
+/// `ReindexCode` arm, returned across the blocking-thread boundary so the
+/// async continuation (which needs `&mut self` to broadcast and to journal
+/// via `record_replay`) can act on it at a single point without duplicating
+/// the `spawn_blocking` body itself.
+enum ReindexActionOutcome {
+    /// `index_file` produced a new/changed index entry.
+    Indexed {
+        path: PathBuf,
+        /// `Some` if saving semantic search data failed; the reindex
+        /// itself still succeeded, so this is reported as a warning rather
+        /// than failing the whole action.
+        semantic_warning: Option<crate::error::IndexError>,
+    },
+    /// `index_file` found the file unchanged (hash match).
+    Cached,
+    /// Another serve process holds the writer lock; hot-reload converges.
+    Contention,
+    /// A genuine indexing failure.
+    Failed(crate::error::IndexError),
+}
+
+/// Pure decision predicate: whether a journal entry recorded at `entry_at`
+/// postdates `generation_started_at` and therefore may not be reflected in
+/// that generation's build, and so must be replayed against it.
+///
+/// Strict `>`: an entry recorded at exactly the generation's `started_at`
+/// is treated as already covered by that build rather than replayed, since
+/// `started_at` is itself the build's own cut point (a walk that began at
+/// `started_at` is, by definition, not older than an action landing at
+/// that same instant).
+fn needs_replay(entry_at: SystemTime, generation_started_at: SystemTime) -> bool {
+    entry_at > generation_started_at
 }
 
 #[cfg(test)]
@@ -1793,6 +2067,84 @@ mod tests {
         assert!(
             event.paths.is_empty(),
             "a rescan/overflow event carries no paths"
+        );
+    }
+
+    // -- needs_replay -------------------------------------------
+
+    #[test]
+    fn needs_replay_when_entry_postdates_generation_start() {
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let entry_at = start + Duration::from_secs(1);
+        assert!(needs_replay(entry_at, start));
+    }
+
+    #[test]
+    fn needs_replay_false_when_entry_predates_generation_start() {
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let entry_at = start - Duration::from_secs(1);
+        assert!(!needs_replay(entry_at, start));
+    }
+
+    /// An entry recorded at exactly `started_at` is treated as already
+    /// covered by that build, not replayed -- the strict `>` boundary
+    /// documented on `needs_replay`.
+    #[test]
+    fn needs_replay_false_at_exact_boundary() {
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        assert!(!needs_replay(start, start));
+    }
+
+    // -- record_replay / REPLAY_JOURNAL_CAP ------------------------------
+
+    #[test]
+    fn record_replay_appends_entries_preserving_created_flag() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut watcher = test_watcher(&tempdir);
+
+        watcher.record_replay(PathBuf::from("a.rs"), ReplayKind::Reindex, true);
+        watcher.record_replay(PathBuf::from("b.rs"), ReplayKind::Remove, false);
+
+        assert_eq!(watcher.journal.len(), 2);
+        assert_eq!(watcher.journal[0].path, PathBuf::from("a.rs"));
+        assert!(watcher.journal[0].created);
+        assert!(matches!(watcher.journal[0].kind, ReplayKind::Reindex));
+        assert_eq!(watcher.journal[1].path, PathBuf::from("b.rs"));
+        assert!(matches!(watcher.journal[1].kind, ReplayKind::Remove));
+        assert!(!watcher.journal_overflowed);
+    }
+
+    /// A push that would exceed `REPLAY_JOURNAL_CAP` must not grow the
+    /// journal: it clears it, sets `journal_overflowed`, and arms full
+    /// catch-up via `mark_stale()` instead.
+    #[test]
+    fn record_replay_at_cap_clears_journal_and_arms_full_catch_up() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut watcher = test_watcher(&tempdir);
+
+        // Fill the journal to exactly the cap via direct field access, so
+        // this test exercises only the boundary push rather than paying
+        // for `REPLAY_JOURNAL_CAP` real `record_replay` calls.
+        watcher.journal = (0..REPLAY_JOURNAL_CAP)
+            .map(|i| ReplayEntry {
+                path: PathBuf::from(format!("f{i}.rs")),
+                at: SystemTime::now(),
+                kind: ReplayKind::Reindex,
+                created: false,
+            })
+            .collect();
+        assert!(!watcher.stale);
+
+        watcher.record_replay(PathBuf::from("overflow.rs"), ReplayKind::Reindex, false);
+
+        assert!(
+            watcher.journal.is_empty(),
+            "an at-cap push must clear the journal rather than grow it"
+        );
+        assert!(watcher.journal_overflowed);
+        assert!(
+            watcher.stale,
+            "an at-cap push must arm full catch-up via mark_stale()"
         );
     }
 
@@ -3489,22 +3841,19 @@ mod tests {
     /// deleted file's) would also make this test pass.
     ///
     /// The poll loop below requires `gone_marker` absent AND `seed_marker`
-    /// present *in the same sample*, then breaks. This is deliberate:
-    /// `reindex_locked`'s phase 1 commits an emptied index before phase 2
-    /// rebuilds it (see the `clear_index()` call gated by
-    /// `paths_is_none && force` in `reindex_locked`, `src/indexing/facade.rs`
-    /// -- deliberately cited without line numbers, which rot), so there is a
-    /// real, observable window where both markers are absent at once. A poll loop that reads
-    /// `gone_marker` in one sample, latches on its absence, and only *then*
-    /// reads `seed_marker` (possibly in the very same sample, but treating
-    /// the two reads as independent) can land inside that transient
-    /// clear-window and record `seed_marker` as absent even though the
-    /// rebuild is still in flight and will restore it moments later --
-    /// producing a flaky false negative on the positive control. Requiring
-    /// both conditions jointly, and continuing to poll otherwise, makes the
-    /// loop wait out that window rather than sampling inside it. Do not
-    /// split this back into two independent reads across different
-    /// samples; that reintroduces the same race in a different shape.
+    /// present *in the same sample*, then breaks. This is deliberate. A
+    /// `paths: None` catch-up is staged (`reindex_locked` builds a fresh
+    /// generation off-lock and atomically swaps it in, see
+    /// `src/indexing/facade.rs` -- cited without line numbers, which rot),
+    /// so the live index never shows an emptied window; but before the
+    /// swap `gone_marker` is still present, and after it both conditions
+    /// hold at once. Reading the two markers as independent samples could
+    /// still latch a stale pre-swap `gone_marker` read against a post-swap
+    /// `seed_marker` read (or vice versa) and misreport the positive
+    /// control. Requiring both conditions jointly in one sample, and
+    /// continuing to poll otherwise, pins the assertion to a single
+    /// consistent facade view. Do not split this back into two independent
+    /// reads across different samples.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn startup_catch_up_drops_symbols_for_files_deleted_while_watcher_was_down() {
         use crate::config::Settings;

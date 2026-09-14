@@ -234,10 +234,9 @@ fn is_member_of(sym: &Symbol, class: &str) -> bool {
     if let Some(crate::symbol::ScopeContext::ClassMember {
         class_name: Some(c),
     }) = &sym.scope_context
+        && (c.as_ref() == class || c.rsplit('.').next() == Some(class))
     {
-        if c.as_ref() == class || c.rsplit('.').next() == Some(class) {
-            return true;
-        }
+        return true;
     }
     matches!(
         sym.kind,
@@ -897,6 +896,18 @@ pub struct SemanticSearchInfo {
     pub updated: Option<String>,
 }
 
+/// Index-generation lifecycle info shown by `get_index_info`.
+#[derive(Debug, Clone, Serialize)]
+pub struct GenerationInfo {
+    pub id: String,
+    pub state: &'static str,
+    /// The generation `current` was rolled back from at startup, when the
+    /// facade's load path had to recover from a damaged or missing/torn
+    /// `current` pointer. `None` on a clean load.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovered_from: Option<String>,
+}
+
 /// The `get_index_info` JSON data payload.
 #[derive(Debug, Clone, Serialize)]
 pub struct IndexInfo {
@@ -927,6 +938,7 @@ pub struct IndexInfo {
     /// reported as `Some(true)` ("changed"). Detect-and-report only: this
     /// does not trigger reindexing or reconciliation (issue #28).
     pub ignore_rules_changed: Option<bool>,
+    pub generation: GenerationInfo,
 }
 
 /// Compares the ignore-rule fingerprint stored at the last index build
@@ -935,7 +947,7 @@ pub struct IndexInfo {
 /// metadata predates this field or the fingerprint cannot be recomputed --
 /// see [`IndexInfo::ignore_rules_changed`].
 pub(crate) fn ignore_rules_changed(facade: &IndexFacade) -> Option<bool> {
-    let metadata = crate::storage::IndexMetadata::load(facade.index_base()).ok()?;
+    let metadata = crate::storage::IndexMetadata::load(&facade.generation_dir()).ok()?;
     let stored_fingerprint = metadata.ignore_fingerprint?;
 
     let settings = facade.settings();
@@ -990,7 +1002,7 @@ pub fn index_info_data(facade: &IndexFacade) -> IndexInfo {
         symbol_count,
         file_count: file_count as usize,
         relationship_count,
-        builder_commit: crate::storage::IndexMetadata::load(facade.index_base())
+        builder_commit: crate::storage::IndexMetadata::load(&facade.generation_dir())
             .ok()
             .and_then(|m| m.builder_commit),
         symbol_kinds: SymbolKindBreakdown {
@@ -1002,6 +1014,15 @@ pub fn index_info_data(facade: &IndexFacade) -> IndexInfo {
         languages,
         semantic_search,
         ignore_rules_changed: ignore_rules_changed(facade),
+        generation: GenerationInfo {
+            id: facade.generation_id().as_str().to_string(),
+            state: crate::storage::generation::classify(
+                facade.index_layout(),
+                facade.generation_id(),
+            )
+            .as_str(),
+            recovered_from: facade.recovered_from().map(|id| id.as_str().to_string()),
+        },
     }
 }
 

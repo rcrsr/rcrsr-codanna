@@ -34,13 +34,23 @@ enabled = true
 "#;
     std::fs::write(&settings_path, settings_content).unwrap();
 
-    // Create semantic metadata to prove it exists
-    let metadata_path = semantic_dir.join("metadata.json");
-    std::fs::write(&metadata_path, "{}").unwrap();
+    // Create semantic metadata to prove it exists. Must be a real,
+    // parseable `SemanticMetadata` -- `validate_generation` loads and
+    // validates it once this fixture is migrated into a generation.
+    codanna::semantic::SemanticMetadata::new("test-model".to_string(), 384, 0)
+        .save(&semantic_dir)
+        .unwrap();
 
     // Create tantivy meta.json to make the index "exist"
     let tantivy_meta_path = tantivy_dir.join("meta.json");
     std::fs::write(&tantivy_meta_path, "{}").unwrap();
+
+    // A real save_facade run always writes index.meta alongside tantivy/;
+    // required for the migrated generation to validate (see
+    // `storage::generation::layout::validate_generation`).
+    codanna::storage::IndexMetadata::new()
+        .save(&index_dir)
+        .unwrap();
 
     // Change to a different directory (simulating --config from outside)
     std::env::set_current_dir(&temp_dir).unwrap();

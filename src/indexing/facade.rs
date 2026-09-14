@@ -24,12 +24,20 @@
 //! ```
 
 use crate::config::Settings;
-use crate::indexing::pipeline::Pipeline;
+use crate::indexing::pipeline::{Pipeline, PipelineConfig};
 use crate::semantic::remote::run_async;
 use crate::semantic::{
     EmbeddingBackend, EmbeddingPool, RemoteEmbedder, SemanticSearchError, SimpleSemanticSearch,
 };
-use crate::storage::{DocumentIndex, SearchResult};
+use crate::storage::generation::layout::unix_millis_now;
+#[cfg(test)]
+use crate::storage::generation::resolve_current;
+use crate::storage::generation::{Complete, migrate_flat_layout, resolve_current_with_recovery};
+use crate::storage::{
+    BuildFacade, BuildMode, DocumentIndex, EMISSION_SEMANTICS_VERSION, GenerationId, IndexLayout,
+    IndexPersistence,
+};
+use crate::storage::{IndexMetadata, SearchResult};
 use crate::symbol::context::{ContextIncludes, SymbolContext, SymbolRelationships};
 use crate::{FileId, IndexError, RelationKind, Relationship, Symbol, SymbolId, SymbolKind};
 use std::collections::{HashMap, HashSet};
@@ -112,8 +120,11 @@ pub struct IndexFacade {
     /// Tracked indexed directories (canonicalized paths)
     indexed_paths: HashSet<PathBuf>,
 
-    /// Base path for index storage
-    index_base: PathBuf,
+    /// Filesystem layout for the index generations this facade's root owns.
+    layout: IndexLayout,
+
+    /// The generation this facade currently reads/writes.
+    generation: GenerationId,
 
     /// Set to true when load_semantic_search fails with DimensionMismatch so
     /// hot-reload and other callers do not retry on every reload cycle.
@@ -135,26 +146,75 @@ pub struct IndexFacade {
     /// in-flight `reindex_locked` permit held against the outgoing facade
     /// silently stops gating callers that read the handle after the swap.
     reindex_gate: Arc<tokio::sync::Semaphore>,
+
+    /// The generation `current` was rolled back from at startup, when
+    /// [`IndexFacade::new`]'s load path had to recover from a damaged or
+    /// missing/torn `current` pointer. `None` on a clean load. Populated
+    /// only by the startup load path in [`Self::new`] -- mid-run
+    /// hot-reloads/`swap_in` leave this field unchanged.
+    recovered_from: Option<GenerationId>,
 }
 
 impl IndexFacade {
-    /// Create a new IndexFacade with the given settings.
-    ///
-    /// Creates or opens the DocumentIndex and initializes the Pipeline.
-    pub fn new(settings: Arc<Settings>) -> FacadeResult<Self> {
-        // Construct the full index path
+    /// Derive the [`IndexLayout`] root from `settings`: `workspace_root`
+    /// joined with `index_path` when a workspace root is configured, else
+    /// `index_path` as-is. Shared by [`Self::new`] and
+    /// [`Self::from_components`]'s callers so this derivation lives in
+    /// exactly one place.
+    fn resolve_layout(settings: &Settings) -> IndexLayout {
         let index_base = if let Some(ref workspace_root) = settings.workspace_root {
             workspace_root.join(&settings.index_path)
         } else {
             settings.index_path.clone()
         };
+        IndexLayout::new(index_base)
+    }
 
-        // Tantivy data goes under index_path/tantivy
-        let tantivy_path = index_base.join("tantivy");
+    /// Build the pipeline for generation `id`, pointing its semantic store
+    /// at `layout.semantic_dir(id)` rather than at a path derived from
+    /// `settings.index_path`.
+    fn pipeline_for(settings: &Arc<Settings>, layout: &IndexLayout, id: &GenerationId) -> Pipeline {
+        Pipeline::with_semantic_dir(
+            settings.clone(),
+            PipelineConfig::from_settings(settings),
+            layout.semantic_dir(id),
+        )
+    }
 
+    /// Create a new IndexFacade with the given settings.
+    ///
+    /// Resolves the index layout from `settings`, migrates a legacy flat
+    /// (pre-generations) layout if one is found, then either opens the
+    /// resolved `current` generation or -- when the root is brand new and no
+    /// generation resolves -- bootstraps a fresh empty one.
+    pub fn new(settings: Arc<Settings>) -> FacadeResult<Self> {
+        let layout = Self::resolve_layout(&settings);
+        migrate_flat_layout(&layout)?;
+
+        match resolve_current_with_recovery(&layout)? {
+            Some(resolved) => {
+                let mut facade = Self::open(settings, layout, resolved.id)?;
+                facade.recovered_from = resolved.recovered_from;
+                Ok(facade)
+            }
+            None => Self::bootstrap_empty_generation(settings, layout),
+        }
+    }
+
+    /// Open an existing generation `id` under `layout`.
+    ///
+    /// Opens `DocumentIndex` at `layout.tantivy_dir(&id)`. The caller is
+    /// responsible for having already resolved `id` (e.g. via
+    /// [`crate::storage::generation::resolve_current`]) -- this does not
+    /// itself validate that `id` is `current`, damaged, or in progress.
+    pub fn open(
+        settings: Arc<Settings>,
+        layout: IndexLayout,
+        id: GenerationId,
+    ) -> FacadeResult<Self> {
+        let tantivy_path = layout.tantivy_dir(&id);
         let document_index = Arc::new(DocumentIndex::new(&tantivy_path, &settings)?);
-
-        let pipeline = Pipeline::with_settings(settings.clone());
+        let pipeline = Self::pipeline_for(&settings, &layout, &id);
 
         Ok(Self {
             document_index,
@@ -163,10 +223,72 @@ impl IndexFacade {
             embedding_pool: None,
             settings,
             indexed_paths: HashSet::new(),
-            index_base,
+            layout,
+            generation: id,
             semantic_incompatible: false,
             semantic_metadata_snapshot: None,
             reindex_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            recovered_from: None,
+        })
+    }
+
+    /// Bootstrap a brand-new, empty generation under `layout` when
+    /// [`Self::new`] finds nothing to open (a fresh index root).
+    ///
+    /// Allocates a fresh [`GenerationId`], opens `DocumentIndex` at its
+    /// `tantivy/` path (which creates the on-disk Tantivy skeleton),
+    /// writes an empty `index.meta` and `COMPLETE` manifest for it, then
+    /// publishes it via [`IndexLayout::write_current`].
+    ///
+    /// Deliberately minimal: no `BUILDING` marker / CAS-publish guard
+    /// against a second concurrent bootstrapper racing the same empty
+    /// root. That build-and-publish machinery is deferred to a later
+    /// phase; this bootstrap only needs to produce a valid, resolvable
+    /// empty generation for the common single-process case.
+    fn bootstrap_empty_generation(
+        settings: Arc<Settings>,
+        layout: IndexLayout,
+    ) -> FacadeResult<Self> {
+        let id = GenerationId::generate();
+        let gen_dir = layout.gen_dir(&id);
+
+        let tantivy_path = layout.tantivy_dir(&id);
+        let document_index = Arc::new(DocumentIndex::new(&tantivy_path, &settings)?);
+
+        let mut meta = IndexMetadata::new();
+        meta.emission_version = Some(EMISSION_SEMANTICS_VERSION);
+        meta.save(&gen_dir)?;
+
+        let now = unix_millis_now();
+        let complete = Complete {
+            id: id.clone(),
+            parent: None,
+            started_at: now,
+            completed_at: now,
+            builder_version: env!("CARGO_PKG_VERSION").to_string(),
+            symbol_count: 0,
+            file_count: 0,
+            files: Vec::new(),
+        };
+        complete.write(&layout)?;
+
+        layout.write_current(&id)?;
+
+        let pipeline = Self::pipeline_for(&settings, &layout, &id);
+
+        Ok(Self {
+            document_index,
+            pipeline,
+            semantic_search: None,
+            embedding_pool: None,
+            settings,
+            indexed_paths: HashSet::new(),
+            layout,
+            generation: id,
+            semantic_incompatible: false,
+            semantic_metadata_snapshot: None,
+            reindex_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            recovered_from: None,
         })
     }
 
@@ -176,13 +298,9 @@ impl IndexFacade {
         pipeline: Pipeline,
         semantic_search: Option<Arc<Mutex<SimpleSemanticSearch>>>,
         settings: Arc<Settings>,
+        layout: IndexLayout,
+        generation: GenerationId,
     ) -> Self {
-        let index_base = if let Some(ref workspace_root) = settings.workspace_root {
-            workspace_root.join(&settings.index_path)
-        } else {
-            settings.index_path.clone()
-        };
-
         Self {
             document_index,
             pipeline,
@@ -190,10 +308,12 @@ impl IndexFacade {
             embedding_pool: None,
             settings,
             indexed_paths: HashSet::new(),
-            index_base,
+            layout,
+            generation,
             semantic_incompatible: false,
             semantic_metadata_snapshot: None,
             reindex_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            recovered_from: None,
         }
     }
 
@@ -212,9 +332,39 @@ impl IndexFacade {
         &self.settings
     }
 
-    /// Get the index base path.
-    pub fn index_base(&self) -> &Path {
-        &self.index_base
+    /// The directory holding this facade's current generation on disk:
+    /// `root/gen/<id>/`.
+    pub fn generation_dir(&self) -> PathBuf {
+        self.layout.gen_dir(&self.generation)
+    }
+
+    /// The semantic-search directory for this facade's current generation:
+    /// `root/gen/<id>/semantic`.
+    pub fn semantic_dir(&self) -> PathBuf {
+        self.layout.semantic_dir(&self.generation)
+    }
+
+    /// The generation this facade currently reads/writes.
+    pub fn generation_id(&self) -> &GenerationId {
+        &self.generation
+    }
+
+    /// The generation `current` was rolled back from at startup, when
+    /// this facade's load path had to recover from a damaged or
+    /// missing/torn `current` pointer. `None` on a clean load, and only
+    /// ever populated by the startup path in [`Self::new`] -- a later
+    /// hot-reload/`swap_in` does not update this field.
+    pub fn recovered_from(&self) -> Option<&GenerationId> {
+        self.recovered_from.as_ref()
+    }
+
+    /// The filesystem layout for the index generations this facade's root
+    /// owns. Used by [`reindex_locked`]'s staged-rebuild branch to derive an
+    /// [`IndexPersistence`](crate::storage::IndexPersistence) rooted at the
+    /// same place this facade lives, rather than re-deriving the root from
+    /// `settings` a second way.
+    pub(crate) fn index_layout(&self) -> &IndexLayout {
+        &self.layout
     }
 
     /// Clone the handle to this facade's reindex gate, used by
@@ -237,13 +387,93 @@ impl IndexFacade {
         self.reindex_gate = gate;
     }
 
+    /// Swap `new` into a shared `Arc<RwLock<IndexFacade>>`, carrying over the
+    /// outgoing facade's reindex gate and re-attaching semantic search if the
+    /// incoming facade didn't already load it.
+    ///
+    /// Callers that replace a facade behind a shared lock (hot-reload,
+    /// force-reindex publish) go through this so the gate-adoption-before-
+    /// assignment ordering documented on [`Self::reindex_gate`] (the field)
+    /// and the post-swap semantic re-attach are done exactly once, in one
+    /// place.
+    pub(crate) async fn swap_in(
+        shared: &Arc<tokio::sync::RwLock<IndexFacade>>,
+        mut new: IndexFacade,
+        broadcaster: Option<&crate::mcp::notifications::NotificationBroadcaster>,
+    ) {
+        // Get write lock and replace the facade. Carry the outgoing
+        // facade's reindex gate into the replacement BEFORE assigning it, so
+        // a permit held by an in-flight `reindex_locked` call is still
+        // respected by callers that read the gate handle after this swap
+        // (see the invariant documented on `IndexFacade::reindex_gate`).
+        let mut guard = shared.write().await;
+        new.adopt_reindex_gate(guard.reindex_gate());
+        *guard = new;
+
+        // Ensure semantic search stays attached after hot reloads
+        let mut restored_semantic = false;
+        if !guard.has_semantic_search() && !guard.is_semantic_incompatible() {
+            let semantic_path = guard.semantic_dir();
+            let metadata_exists = semantic_path.join("metadata.json").exists();
+            if metadata_exists {
+                match guard.load_semantic_search(&semantic_path) {
+                    Ok(true) => {
+                        restored_semantic = true;
+                    }
+                    Ok(false) => {
+                        crate::debug_event!(
+                            "hot-reload",
+                            "semantic metadata present but reload returned false"
+                        );
+                    }
+                    Err(crate::IndexError::SemanticSearch(
+                        crate::semantic::SemanticSearchError::DimensionMismatch {
+                            ref suggestion,
+                            ..
+                        },
+                    )) => {
+                        tracing::warn!(
+                            "Semantic index dimension mismatch after hot-reload: {suggestion}. \
+                             Semantic search disabled until re-indexed with --force."
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to reload semantic search after index update: {e}");
+                    }
+                }
+            } else {
+                crate::debug_event!(
+                    "hot-reload",
+                    "semantic metadata missing",
+                    "{}",
+                    crate::parsing::paths::render_absolute_path(&semantic_path).display()
+                );
+            }
+        }
+
+        let symbol_count = guard.symbol_count();
+        let has_semantic = guard.has_semantic_search();
+        if restored_semantic {
+            let count = guard.semantic_search_embedding_count();
+            crate::debug_event!("hot-reload", "restored semantic", "{count} embeddings");
+        }
+        crate::log_event!("hot-reload", "reloaded", "{symbol_count} symbols");
+        crate::debug_event!("hot-reload", "semantic search", "{has_semantic}");
+
+        // Send notification that index was reloaded
+        if let Some(broadcaster) = broadcaster {
+            broadcaster.send(crate::mcp::notifications::FileChangeEvent::IndexReloaded);
+            crate::debug_event!("hot-reload", "broadcast", "IndexReloaded");
+        }
+    }
+
     // =========================================================================
     // Semantic Search Management
     // =========================================================================
 
     /// Enable semantic search with the configured model.
     pub fn enable_semantic_search(&mut self) -> FacadeResult<()> {
-        let semantic_path = self.index_base.join("semantic");
+        let semantic_path = self.semantic_dir();
         std::fs::create_dir_all(&semantic_path)?;
 
         let backend = build_embedding_backend(&self.settings.semantic_search)?;
@@ -764,18 +994,17 @@ impl IndexFacade {
             }
         }
 
-        if include.contains(ContextIncludes::DEFINITIONS) {
-            if let Ok(rels) = self
+        if include.contains(ContextIncludes::DEFINITIONS)
+            && let Ok(rels) = self
                 .document_index
                 .get_relationships_from(symbol_id, RelationKind::Defines)
-            {
-                let defines: Vec<Symbol> = rels
-                    .iter()
-                    .filter_map(|(_, to_id, _)| self.get_symbol(*to_id))
-                    .collect();
-                if !defines.is_empty() {
-                    relationships.defines = Some(defines);
-                }
+        {
+            let defines: Vec<Symbol> = rels
+                .iter()
+                .filter_map(|(_, to_id, _)| self.get_symbol(*to_id))
+                .collect();
+            if !defines.is_empty() {
+                relationships.defines = Some(defines);
             }
         }
 
@@ -1264,10 +1493,10 @@ impl IndexFacade {
         path: impl AsRef<std::path::Path>,
     ) -> crate::IndexResult<crate::IndexingResult> {
         let path = &Self::canonical_or_raw(path.as_ref());
-        if self.has_semantic_search() {
-            if let Err(e) = self.ensure_embedding_pool() {
-                tracing::warn!("Failed to initialize embedding pool: {e}");
-            }
+        if self.has_semantic_search()
+            && let Err(e) = self.ensure_embedding_pool()
+        {
+            tracing::warn!("Failed to initialize embedding pool: {e}");
         }
         let stats = self.pipeline.index_file_single(
             path,
@@ -1304,7 +1533,7 @@ impl IndexFacade {
     /// Uses the Pipeline's cleanup stage to remove symbols and embeddings.
     pub fn remove_file(&mut self, path: impl AsRef<std::path::Path>) -> crate::IndexResult<()> {
         let path = &Self::canonical_or_raw(path.as_ref());
-        let semantic_path = self.settings.index_path.join("semantic");
+        let semantic_path = self.semantic_dir();
 
         use crate::indexing::pipeline::stages::CleanupStage;
         let cleanup_stage = if let Some(ref sem) = self.semantic_search {
@@ -1318,36 +1547,15 @@ impl IndexFacade {
         Ok(())
     }
 
-    /// Clear all documents from the index.
-    ///
-    /// Reuses the already-open `DocumentIndex`/Tantivy writer handle and the
-    /// in-memory semantic search store rather than removing files on disk or
-    /// constructing new writers. Resets directory tracking so a subsequent
-    /// `index_directory` call re-populates `indexed_paths` from scratch.
-    pub fn clear_index(&mut self) -> FacadeResult<()> {
-        self.document_index.clear()?;
-
-        if let Some(ref semantic) = self.semantic_search {
-            let mut sem = semantic
-                .lock()
-                .map_err(|e| IndexError::LockError(format!("semantic search: {e}")))?;
-            sem.clear();
-        }
-
-        self.indexed_paths.clear();
-
-        Ok(())
-    }
-
     /// Index a directory using the parallel pipeline.
     ///
     /// This is the primary indexing entry point using Pipeline.
     pub fn index_directory(&mut self, path: &Path, force: bool) -> FacadeResult<IndexingStats> {
         let path = &Self::canonical_or_raw(path);
-        if self.has_semantic_search() {
-            if let Err(e) = self.ensure_embedding_pool() {
-                tracing::warn!("Failed to initialize embedding pool: {e}");
-            }
+        if self.has_semantic_search()
+            && let Err(e) = self.ensure_embedding_pool()
+        {
+            tracing::warn!("Failed to initialize embedding pool: {e}");
         }
         let stats = self.pipeline.index_incremental(
             path,
@@ -1388,10 +1596,10 @@ impl IndexFacade {
         pending: &mut crate::indexing::pipeline::PendingResolution,
     ) -> FacadeResult<IndexingStats> {
         let path = &Self::canonical_or_raw(path);
-        if self.has_semantic_search() {
-            if let Err(e) = self.ensure_embedding_pool() {
-                tracing::warn!("Failed to initialize embedding pool: {e}");
-            }
+        if self.has_semantic_search()
+            && let Err(e) = self.ensure_embedding_pool()
+        {
+            tracing::warn!("Failed to initialize embedding pool: {e}");
         }
         let stats = self.pipeline.index_incremental_deferred(
             path,
@@ -1541,10 +1749,10 @@ impl IndexFacade {
             // Auto-force mode for empty indexes (clean index behaves like --force)
             let force = force || self.document_count().unwrap_or(0) == 0;
 
-            if self.has_semantic_search() {
-                if let Err(e) = self.ensure_embedding_pool() {
-                    tracing::warn!("Failed to initialize embedding pool: {e}");
-                }
+            if self.has_semantic_search()
+                && let Err(e) = self.ensure_embedding_pool()
+            {
+                tracing::warn!("Failed to initialize embedding pool: {e}");
             }
 
             // Phase 1 only; resolution is deferred until every root walked
@@ -1618,10 +1826,11 @@ impl IndexFacade {
 
         let mut stats = SyncStats::default();
 
-        if self.has_semantic_search() && !to_add.is_empty() {
-            if let Err(e) = self.ensure_embedding_pool() {
-                tracing::warn!("Failed to initialize embedding pool: {e}");
-            }
+        if self.has_semantic_search()
+            && !to_add.is_empty()
+            && let Err(e) = self.ensure_embedding_pool()
+        {
+            tracing::warn!("Failed to initialize embedding pool: {e}");
         }
 
         // Index new directories with progress if enabled.
@@ -1708,6 +1917,7 @@ impl IndexFacade {
             document_index: Arc::clone(&self.document_index),
             semantic_search: self.semantic_search.clone(),
             embedding_pool: self.embedding_pool.clone(),
+            semantic_dir: self.semantic_dir(),
         })
     }
 }
@@ -1726,6 +1936,10 @@ pub struct ReindexHandles {
     document_index: Arc<DocumentIndex>,
     semantic_search: Option<Arc<Mutex<SimpleSemanticSearch>>>,
     embedding_pool: Option<Arc<EmbeddingBackend>>,
+    /// Generation-aware semantic-embeddings directory, resolved via
+    /// [`IndexFacade::semantic_dir`] at snapshot time so cleanup targets the
+    /// same store `enable_semantic_search` wrote to.
+    semantic_dir: PathBuf,
 }
 
 /// Outcome of an off-lock reindex walk.
@@ -1766,6 +1980,7 @@ impl ReindexHandles {
             document_index,
             semantic_search,
             embedding_pool,
+            semantic_dir,
         } = self;
 
         // A malformed `ignore_patterns` entry is a deterministic misconfig,
@@ -1805,12 +2020,11 @@ impl ReindexHandles {
                         // subsequent call always re-parses, mirroring
                         // `IndexFacade::index_file_with_force`.
                         use crate::indexing::pipeline::stages::CleanupStage;
-                        let semantic_path = pipeline.settings().index_path.join("semantic");
                         let cleanup_stage = if let Some(ref sem) = semantic_search {
-                            CleanupStage::new(Arc::clone(&document_index), &semantic_path)
+                            CleanupStage::new(Arc::clone(&document_index), &semantic_dir)
                                 .with_semantic(Arc::clone(sem))
                         } else {
-                            CleanupStage::new(Arc::clone(&document_index), &semantic_path)
+                            CleanupStage::new(Arc::clone(&document_index), &semantic_dir)
                         };
                         if let Err(e) = cleanup_stage.cleanup_files(&[path.to_path_buf()]) {
                             tracing::warn!(
@@ -1885,11 +2099,62 @@ impl ReindexHandles {
 
         let symbol_count = document_index.count_symbols().unwrap_or(0);
 
+        // Test-only failure injection: fires after the walk above has fully
+        // completed but before `run` returns `Ok`, so tests can force
+        // `reindex_locked`'s phase 3 publish/swap to never be reached
+        // without needing to fabricate a real walk failure. No effect
+        // (and no runtime cost beyond the `cfg`-gated check) unless a test
+        // has armed it for this index root via `arm_fail_after_walk_for_test`.
+        #[cfg(test)]
+        if take_fail_after_walk_for_test(&semantic_dir) {
+            return Err(IndexError::General(
+                "test-injected failure after reindex walk completed".to_string(),
+            ));
+        }
+
         Ok(ReindexOutcome {
             reindexed,
             symbol_count,
             indexed_dirs,
         })
+    }
+}
+
+/// Test-only failure injection for [`ReindexHandles::run`]: the index root
+/// whose next walk must fail. Process-global rather than thread-local
+/// because `run` executes on whatever `spawn_blocking` worker thread the
+/// runtime picks, never the test's own thread. Keyed by index root (every
+/// test owns a distinct temp root) so a concurrent, unrelated test's walk
+/// can neither consume the injection nor fail on it.
+#[cfg(test)]
+static FAIL_AFTER_WALK_ROOT: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Arms [`ReindexHandles::run`]'s post-walk failure injection for the next
+/// walk over a generation under `index_root`. One-shot: consumed by the
+/// first matching walk. Test-only.
+#[cfg(test)]
+pub(crate) fn arm_fail_after_walk_for_test(index_root: &Path) {
+    let mut armed = FAIL_AFTER_WALK_ROOT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *armed = Some(index_root.to_path_buf());
+}
+
+/// Consumes the armed injection if `semantic_dir` (a generation directory
+/// under the armed index root) belongs to it.
+#[cfg(test)]
+fn take_fail_after_walk_for_test(semantic_dir: &Path) -> bool {
+    let mut armed = FAIL_AFTER_WALK_ROOT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if armed
+        .as_ref()
+        .is_some_and(|root| semantic_dir.starts_with(root))
+    {
+        *armed = None;
+        true
+    } else {
+        false
     }
 }
 
@@ -1903,13 +2168,33 @@ impl ReindexHandles {
 /// no lock held, then record indexed directories under lock again) is
 /// guaranteed regardless of caller.
 ///
-/// - Phase 1: acquires a brief write lock. When `paths` is `None` and
-///   `force` is `true`, clears the index first; then snapshots cloneable
-///   reindex handles via [`IndexFacade::snapshot_reindex_handles`].
+/// - Phase 1 branches on `paths`:
+///   - `paths: None` (a full reindex): under the brief write lock, opens a
+///     new generation via [`IndexPersistence::open_build`] -- a
+///     [`BuildMode::Fresh`] generation when `force` is `true`, otherwise a
+///     [`BuildMode::CloneCurrent`] generation hardlinked from the live
+///     generation (cheap, since the live facade is quiescent under the
+///     write lock at clone time) -- then snapshots reindex handles from
+///     that *build* facade rather than the live one. The live facade is
+///     never mutated in this branch.
+///   - `paths: Some(..)` (a scoped reindex): unchanged from before --
+///     snapshots reindex handles directly from the live facade under the
+///     write lock.
 /// - Phase 2: with the write guard already dropped, runs the heavy reindex
-///   walk off-lock via [`ReindexHandles::run`] on a blocking thread.
-/// - Phase 3: acquires a brief write lock again to record any newly
-///   indexed directories via [`IndexFacade::add_indexed_path`].
+///   walk off-lock via [`ReindexHandles::run`] on a blocking thread, against
+///   whichever handles phase 1 snapshotted.
+/// - Phase 3 branches the same way phase 1 did:
+///   - Full reindex: records indexed directories on the build facade, then
+///     [`IndexPersistence::publish_into_facade`]s it and
+///     [`IndexFacade::swap_in`]s the resulting warm facade into `facade`,
+///     broadcasting `IndexReloaded` via `broadcaster` if given. The build
+///     generation's `BUILDING` guard (held inside the build facade for the
+///     whole of phases 1-3) is only released once the publish's
+///     compare-and-swap lands; an error anywhere before that point leaves
+///     the build facade to drop normally, releasing the guard and leaving
+///     an orphan generation for a later `gc()` pass to reclaim.
+///   - Scoped reindex: unchanged -- a brief write lock on the live facade to
+///     record newly indexed directories via [`IndexFacade::add_indexed_path`].
 ///
 /// `phase2_started`, when provided, is signaled the instant phase 1's write
 /// guard has been dropped and before the off-lock walk begins; this exists
@@ -1924,18 +2209,19 @@ impl ReindexHandles {
 /// [`IndexFacade::reindex_gate`]) serializes full reindex runs: only one
 /// `reindex_locked` invocation may be in flight against a given facade at a
 /// time. The permit is acquired strictly before phase 1's write lock and
-/// held across all three phases, including the off-lock phase 2 walk, so a
-/// concurrent caller (e.g. an MCP `reindex(force: true)` racing the
-/// watcher's overflow catch-up reindex) cannot observe phase 1's
-/// `clear_index()` mid-way through another run's phase 2 batch. A caller
-/// that loses the race is rejected immediately with
-/// [`IndexError::ReindexInProgress`] rather than queued, since a queued
-/// duplicate force-reindex would be wasted work that pins the caller open
-/// for the duration of someone else's multi-minute run.
+/// held across all three phases, including the off-lock phase 2 walk and the
+/// phase 3 publish/swap, so a concurrent caller (e.g. an MCP
+/// `reindex(force: true)` racing the watcher's overflow catch-up reindex)
+/// cannot observe a partially published generation. A caller that loses the
+/// race is rejected immediately with [`IndexError::ReindexInProgress`]
+/// rather than queued, since a queued duplicate force-reindex would be
+/// wasted work that pins the caller open for the duration of someone else's
+/// multi-minute run.
 pub(crate) async fn reindex_locked(
     facade: &Arc<tokio::sync::RwLock<IndexFacade>>,
     paths: Option<Vec<String>>,
     force: bool,
+    broadcaster: Option<&crate::mcp::notifications::NotificationBroadcaster>,
     phase2_started: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> FacadeResult<ReindexOutcome> {
     // Take a brief read lock purely to clone the gate handle, then drop it
@@ -1964,8 +2250,9 @@ pub(crate) async fn reindex_locked(
     // .indexed_paths` -- the exact collection `ReindexHandles::run` walks
     // below when `paths` is `None` -- rather than the facade's own
     // `indexed_paths` field, which is a different collection (always empty
-    // on a freshly constructed facade, and wiped by `clear_index()` itself;
-    // see the two-collections trap documented on
+    // on a freshly constructed facade, and discarded wholesale when phase 1
+    // opens a fresh build generation for a full force reindex; see the
+    // two-collections trap documented on
     // `discoverable_dirs_honors_ignore_patterns` above). The predicate
     // mirrors what `ReindexHandles::run`'s `paths: None` branch actually
     // does with this list: it clones it and only rebuilds entries that pass
@@ -1974,7 +2261,7 @@ pub(crate) async fn reindex_locked(
     // list forever, since neither `add_indexed_path` nor
     // `remove_indexed_path` prune against disk -- must not count as "has a
     // rebuild source". Checking `!indexed_paths.is_empty()` alone would let
-    // such stale entries pass, `clear_index()` an emptied index, and phase 2
+    // such stale entries pass, open an empty build generation, and phase 2
     // silently rebuild nothing.
     //
     // Hoisting this ahead of the write guard widens the check-then-act
@@ -2008,39 +2295,79 @@ pub(crate) async fn reindex_locked(
     }
 
     // Phase 1: brief write lock to snapshot cloneable handles for the
-    // off-lock reindex walk, then optionally clear the index. The
-    // has-rebuild-source decision was already made above (before this
-    // guard was acquired), so this closure only needs to snapshot and,
-    // when applicable, clear. `snapshot_reindex_handles` only calls
-    // `ensure_embedding_pool()` and clones `Arc` handles, none of whose
-    // contents `clear_index()` invalidates, so running it ahead of the
-    // clear is behaviorally safe. `clear_index()` performs blocking
-    // Tantivy IO (commit, reader reload), so the owned guard is moved into
-    // `spawn_blocking` rather than doing that work directly on the async
-    // worker while the write lock is held.
+    // off-lock reindex walk. Branches on `paths_is_none`:
+    //
+    // - `paths: None` (staged): opens a new generation (build facade) and
+    //   snapshots handles from *it*, leaving the live facade untouched. The
+    //   build facade rides along as `Some(BuildFacade)` so phase 3 can
+    //   publish it; its `Building` guard keeps the generation's ownership
+    //   lock held for as long as the build facade stays in scope.
+    // - `paths: Some(..)` (scoped, unchanged): snapshots handles directly
+    //   from the live facade, exactly as before.
+    //
+    // Either way, the owned write guard is moved into `spawn_blocking`
+    // since both `snapshot_reindex_handles` (`ensure_embedding_pool`) and
+    // `open_build` (hardlink clone, disk-space preflight) can block.
     let owned_guard = Arc::clone(facade).write_owned().await;
-    let handles = tokio::task::spawn_blocking(move || -> FacadeResult<ReindexHandles> {
-        let mut indexer = owned_guard;
+    let (handles, build) = tokio::task::spawn_blocking(
+        move || -> FacadeResult<(ReindexHandles, Option<BuildFacade>)> {
+            let mut indexer = owned_guard;
 
-        let handles = indexer.snapshot_reindex_handles().inspect_err(|e| {
-            tracing::error!("Failed to snapshot reindex handles: {e}");
-        })?;
+            if paths_is_none {
+                let persistence =
+                    IndexPersistence::new(indexer.index_layout().root().to_path_buf());
+                let mode = if force {
+                    BuildMode::Fresh
+                } else {
+                    BuildMode::CloneCurrent
+                };
+                // Runs while the live write guard is still held, so the
+                // live generation is quiescent for the duration of the
+                // clone (hardlinks only -- fast).
+                let mut build = persistence
+                    .open_build(Arc::clone(indexer.settings()), mode)
+                    .inspect_err(|e| {
+                        tracing::error!("Failed to open build generation for reindex: {e}");
+                    })?;
 
-        if paths_is_none && force {
-            // Log per-phase context for on-call readers, but propagate the
-            // original typed `IndexError` variant (e.g. `LockError`,
-            // `TantivyError`) unchanged rather than flattening it into a
-            // `General(String)`, so `status_code()`/`recovery_suggestions()`
-            // remain available to callers.
-            indexer.clear_index().inspect_err(|e| {
-                tracing::error!("Failed to clear index before force reindex: {e}");
-            })?;
-        }
+                // `CloneCurrent` already loaded semantic search onto the
+                // build facade if the parent generation had it; `Fresh`
+                // starts with none. Create it here whenever settings ask
+                // for it (or the live facade already carries it), like
+                // `codanna index` does -- keying on the live facade alone
+                // would publish an embedding-less generation from a lite
+                // facade (`codanna mcp reindex`) and every later load,
+                // including the serving process's hot-reload, would lose
+                // semantic search.
+                let semantic_wanted =
+                    indexer.settings().semantic_search.enabled || indexer.has_semantic_search();
+                if semantic_wanted
+                    && !build.has_semantic_search()
+                    && !build.is_semantic_incompatible()
+                {
+                    build.enable_semantic_search().inspect_err(|e| {
+                        tracing::error!(
+                            "Failed to enable semantic search on build generation: {e}"
+                        );
+                    })?;
+                }
 
-        Ok(handles)
-        // `indexer` (the owned write guard) is dropped here, releasing the
-        // lock before phase 2's off-lock walk begins.
-    })
+                let handles = build.snapshot_reindex_handles().inspect_err(|e| {
+                    tracing::error!("Failed to snapshot reindex handles for build generation: {e}");
+                })?;
+
+                Ok((handles, Some(build)))
+            } else {
+                let handles = indexer.snapshot_reindex_handles().inspect_err(|e| {
+                    tracing::error!("Failed to snapshot reindex handles: {e}");
+                })?;
+
+                Ok((handles, None))
+            }
+            // `indexer` (the owned write guard) is dropped here, releasing the
+            // lock before phase 2's off-lock walk begins.
+        },
+    )
     .await
     .map_err(map_reindex_join_error)??;
 
@@ -2065,11 +2392,35 @@ pub(crate) async fn reindex_locked(
             .map_err(map_reindex_join_error)??
     };
 
-    // Phase 3: brief write lock to record any newly indexed directories.
-    {
-        let mut indexer = facade.write().await;
-        for dir in &outcome.indexed_dirs {
-            indexer.add_indexed_path(dir);
+    // Phase 3 branches the same way phase 1 did.
+    match build {
+        Some(mut build) => {
+            // Record newly indexed directories on the build facade (not the
+            // live one -- the live facade is never touched in this branch).
+            for dir in &outcome.indexed_dirs {
+                build.add_indexed_path(dir);
+            }
+
+            let persistence = IndexPersistence::new(build.index_layout().root().to_path_buf());
+            // `publish_into_facade` performs blocking Tantivy/filesystem IO
+            // (save, manifest write, CAS rename, trailing gc).
+            let (_, new_facade) =
+                tokio::task::spawn_blocking(move || persistence.publish_into_facade(build))
+                    .await
+                    .map_err(map_reindex_join_error)??;
+
+            // The reindex permit (`_reindex_permit`, still in scope) stays
+            // held through this swap, so no concurrent `reindex_locked` call
+            // can observe the facade mid-swap.
+            IndexFacade::swap_in(facade, new_facade, broadcaster).await;
+        }
+        None => {
+            // Scoped reindex, unchanged: brief write lock on the live
+            // facade to record newly indexed directories.
+            let mut indexer = facade.write().await;
+            for dir in &outcome.indexed_dirs {
+                indexer.add_indexed_path(dir);
+            }
         }
     }
 
@@ -2090,8 +2441,8 @@ fn map_reindex_join_error(e: tokio::task::JoinError) -> IndexError {
 // `.await` would not stop that thread, only detach it while it keeps writing
 // through the `document_index`/`pipeline` handles it snapshotted in phase 1.
 // Releasing the reindex permit early would then let a second reindex acquire
-// the gate and call `clear_index()` concurrently with that still-running
-// thread. So the permit stays held for as long as phase 2 runs — that is
+// the gate and open/publish its own build generation concurrently with that
+// still-running thread. So the permit stays held for as long as phase 2 runs — that is
 // correct — and this watchdog exists solely to make an unusually long phase 2
 // loudly visible in logs instead of silent.
 
@@ -2268,11 +2619,17 @@ pub fn build_embedding_backend(
 mod tests {
     use super::*;
 
-    // Regression: facade construction on a corrupt tantivy dir must return
-    // Err, not panic. The CLI/server fallback paths call this exactly when
-    // the index dir failed to load.
+    // Regression: facade construction over a corrupt legacy flat tantivy dir
+    // must not panic. Before generations, this hard-failed at
+    // `DocumentIndex::new`. Generation-aware `new()` migrates the flat
+    // layout first (moving the corrupt data into its own generation
+    // directory), then `resolve_current` finds that migrated generation
+    // fails validation and self-heals by bootstrapping a fresh, empty
+    // generation instead of propagating the corruption as a hard error --
+    // so construction now succeeds, on a brand-new empty generation, rather
+    // than erroring.
     #[test]
-    fn new_returns_err_on_corrupt_tantivy_dir() {
+    fn new_recovers_from_a_corrupt_flat_tantivy_dir() {
         let dir = tempfile::tempdir().unwrap();
         let tantivy_dir = dir.path().join("tantivy");
         std::fs::create_dir_all(&tantivy_dir).unwrap();
@@ -2284,8 +2641,9 @@ mod tests {
             ..Default::default()
         };
 
-        let result = IndexFacade::new(std::sync::Arc::new(settings));
-        assert!(result.is_err());
+        let facade = IndexFacade::new(std::sync::Arc::new(settings))
+            .expect("must self-heal onto a fresh empty generation rather than error");
+        assert_eq!(facade.symbol_count(), 0);
     }
 
     // Regression: file records key off the walk root's textual form. An
@@ -5468,9 +5826,9 @@ mod tests {
     // `ReindexHandles::run` actually walks for `paths: None`), not the
     // facade's own `indexed_paths: HashSet` field, which is a different
     // collection that starts empty on every freshly constructed facade (see
-    // `IndexFacade::new`) and is wiped by `clear_index()` itself. Reading
-    // the wrong collection would make these tests pass vacuously in one
-    // direction or the other.
+    // `IndexFacade::new`) and never carries over to the fresh build
+    // generation a full force reindex opens. Reading the wrong collection
+    // would make these tests pass vacuously in one direction or the other.
 
     // Facade built via the shared `test_facade` helper has an empty
     // `settings.indexing.indexed_paths` (never populated by
@@ -5498,7 +5856,7 @@ mod tests {
         );
 
         let facade = Arc::new(tokio::sync::RwLock::new(facade));
-        let err = reindex_locked(&facade, None, true, None)
+        let err = reindex_locked(&facade, None, true, None, None)
             .await
             .expect_err("force reindex with no rebuild source must be refused");
         assert!(
@@ -5555,7 +5913,7 @@ mod tests {
         );
 
         let facade = Arc::new(tokio::sync::RwLock::new(facade));
-        reindex_locked(&facade, None, true, None)
+        reindex_locked(&facade, None, true, None, None)
             .await
             .expect("non-empty settings.indexing.indexed_paths must permit the clear");
 
@@ -5577,7 +5935,7 @@ mod tests {
     // Third leg of the falsifiability trio: `settings.indexing.indexed_paths`
     // is non-empty, but every entry is stale (registered, then removed from
     // disk). `!indexed_paths.is_empty()` alone would pass this case and let
-    // `clear_index()` commit an emptied index with phase 2 rebuilding
+    // phase 1 open an empty build generation with phase 2 rebuilding
     // nothing; the guard must instead check that at least one entry still
     // exists on disk as a directory.
     #[tokio::test]
@@ -5621,7 +5979,7 @@ mod tests {
         );
 
         let facade = Arc::new(tokio::sync::RwLock::new(facade));
-        let err = reindex_locked(&facade, None, true, None)
+        let err = reindex_locked(&facade, None, true, None, None)
             .await
             .expect_err("force reindex with only stale indexed_paths must be refused");
         assert!(
@@ -5662,7 +6020,7 @@ mod tests {
 
         let facade = Arc::new(tokio::sync::RwLock::new(facade));
         let explicit_str = explicit.to_string_lossy().into_owned();
-        reindex_locked(&facade, Some(vec![explicit_str]), true, None)
+        reindex_locked(&facade, Some(vec![explicit_str]), true, None, None)
             .await
             .expect("explicit-paths reindex must succeed");
 
@@ -5679,6 +6037,35 @@ mod tests {
                 .is_empty(),
             "explicit path must still be indexed"
         );
+    }
+
+    // Verifies the low-level failure-injection primitive itself: arming it
+    // makes the very next `ReindexHandles::run` fail after the walk has
+    // already completed (so `indexed_dirs`/`symbol_count` were computed,
+    // proving the walk itself ran to completion), and it disarms itself so
+    // it does not leak into a subsequent, unrelated `run` call. Driving this
+    // through the full `reindex_locked` orchestration to prove phase 3 is
+    // skipped is out of scope here.
+    #[tokio::test]
+    async fn fail_after_walk_hook_fires_once_after_walk_completes() {
+        let _serial_guard = crate::mcp::server::REINDEX_TEST_SERIAL.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut facade = test_facade(&dir);
+        let handles = facade.snapshot_reindex_handles().unwrap();
+
+        arm_fail_after_walk_for_test(&dir.path().join("index"));
+        let err = handles
+            .run(None, false)
+            .expect_err("armed hook must fail the run after the walk completes");
+        assert!(
+            matches!(err, IndexError::General(_)),
+            "unexpected error variant: {err:?}"
+        );
+
+        let handles = facade.snapshot_reindex_handles().unwrap();
+        handles
+            .run(None, false)
+            .expect("hook must disarm itself after firing once");
     }
 
     // Error-surface lock for the new variant: both accessors must be wired,
@@ -5930,5 +6317,185 @@ mod tests {
             )
             .unwrap();
         assert_cross_root_edge(&facade, "post-edit");
+    }
+
+    // =========================================================================
+    // Generation-aware construction (open / new bootstrap / flat migration)
+    // =========================================================================
+
+    fn settings_for(root: &Path) -> Arc<Settings> {
+        Arc::new(Settings {
+            index_path: root.to_path_buf(),
+            workspace_root: None,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn open_reads_an_existing_generation_fixture() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = IndexLayout::new(dir.path().to_path_buf());
+        let id = GenerationId::generate();
+        let settings = settings_for(dir.path());
+
+        // Build a minimal real generation fixture the same way
+        // `bootstrap_empty_generation` does: DocumentIndex::new creates the
+        // tantivy skeleton, then index.meta + COMPLETE + current are
+        // written directly.
+        {
+            let _doc_index =
+                DocumentIndex::new(layout.tantivy_dir(&id), &settings).expect("seed tantivy dir");
+        }
+        let mut meta = IndexMetadata::new();
+        meta.emission_version = Some(EMISSION_SEMANTICS_VERSION);
+        meta.save(&layout.gen_dir(&id)).expect("save index.meta");
+        Complete {
+            id: id.clone(),
+            parent: None,
+            started_at: 0,
+            completed_at: 0,
+            builder_version: "0.0.0".to_string(),
+            symbol_count: 0,
+            file_count: 0,
+            files: Vec::new(),
+        }
+        .write(&layout)
+        .expect("write COMPLETE manifest");
+        layout.write_current(&id).expect("write current");
+
+        let facade = IndexFacade::open(settings, layout.clone(), id.clone())
+            .expect("open must succeed over a fixture generation dir");
+
+        assert_eq!(facade.generation_id(), &id);
+        assert_eq!(facade.generation_dir(), layout.gen_dir(&id));
+        assert_eq!(
+            facade.pipeline.semantic_dir(),
+            layout.semantic_dir(&id),
+            "the pipeline must write embeddings into the opened generation"
+        );
+    }
+
+    #[test]
+    fn new_over_an_empty_root_bootstraps_and_publishes_an_empty_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = settings_for(dir.path());
+
+        let facade = IndexFacade::new(settings).expect("new must bootstrap an empty generation");
+
+        assert_eq!(facade.symbol_count(), 0);
+
+        let layout = IndexLayout::new(dir.path().to_path_buf());
+        let current = layout
+            .read_current()
+            .expect("read current")
+            .expect("current must be published");
+        assert_eq!(&current, facade.generation_id());
+
+        assert!(
+            facade
+                .generation_dir()
+                .join("tantivy")
+                .join("meta.json")
+                .is_file(),
+            "bootstrap must create the tantivy skeleton under gen/<id>/tantivy"
+        );
+        assert!(
+            !dir.path().join("tantivy").is_dir(),
+            "artifacts must live under gen/, never directly at the index root"
+        );
+    }
+
+    #[test]
+    fn new_over_a_flat_pre_migration_fixture_migrates_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = settings_for(dir.path());
+
+        // Seed a flat (pre-generations) layout directly, bypassing
+        // IndexFacade::new so the flat shape is never migrated up front.
+        {
+            let _doc_index = DocumentIndex::new(dir.path().join("tantivy"), &settings)
+                .expect("seed flat tantivy dir");
+        }
+        let mut meta = IndexMetadata::new();
+        meta.emission_version = Some(EMISSION_SEMANTICS_VERSION);
+        meta.save(dir.path()).expect("save flat index.meta");
+
+        assert!(dir.path().join("tantivy").join("meta.json").is_file());
+        assert!(!dir.path().join("gen").is_dir());
+
+        let facade = IndexFacade::new(settings).expect("new must migrate the flat layout");
+
+        assert!(
+            dir.path().join("gen").is_dir(),
+            "flat layout must be migrated under gen/"
+        );
+        assert!(
+            !dir.path().join("tantivy").is_dir(),
+            "flat tantivy/ must be moved out of the root, not left in place"
+        );
+
+        let layout = IndexLayout::new(dir.path().to_path_buf());
+        let current = layout
+            .read_current()
+            .expect("read current")
+            .expect("current must be published");
+        assert_eq!(&current, facade.generation_id());
+    }
+
+    // A pre-generations flat layout must migrate on the first facade open,
+    // and a second open of the same root must be a no-op: same generation
+    // id, same `index.meta` bytes.
+    #[test]
+    fn new_migrates_a_flat_layout_and_is_idempotent_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("index");
+        let settings = settings_for(&root);
+
+        {
+            let _doc_index =
+                DocumentIndex::new(root.join("tantivy"), &settings).expect("seed flat tantivy");
+        }
+        std::fs::create_dir_all(root.join("semantic")).unwrap();
+        crate::semantic::SemanticMetadata::new("test-model".to_string(), 384, 0)
+            .save(&root.join("semantic"))
+            .unwrap();
+        IndexMetadata::new().save(&root).unwrap();
+        assert!(!root.join("current").is_file(), "fixture precondition");
+        assert!(!root.join("gen").is_dir(), "fixture precondition");
+
+        let _facade = IndexFacade::new(settings.clone()).unwrap();
+
+        assert!(
+            !root.join("tantivy").exists(),
+            "flat tantivy/ must move under gen/"
+        );
+        assert!(
+            !root.join("semantic").exists(),
+            "flat semantic/ must move under gen/"
+        );
+        assert!(
+            !root.join("index.meta").is_file(),
+            "flat index.meta must move under gen/"
+        );
+
+        let layout = IndexLayout::new(root.clone());
+        let first_id = resolve_current(&layout)
+            .unwrap()
+            .expect("migrated generation resolves");
+        let gen_dir = layout.gen_dir(&first_id);
+        assert!(gen_dir.join("tantivy").join("meta.json").is_file());
+        assert!(gen_dir.join("semantic").join("metadata.json").is_file());
+        let meta_after_first_open = std::fs::read(gen_dir.join("index.meta")).unwrap();
+
+        let _facade_again = IndexFacade::new(settings).unwrap();
+        let second_id = resolve_current(&layout)
+            .unwrap()
+            .expect("current still resolves");
+        assert_eq!(first_id, second_id, "reopen must not mint a new generation");
+        assert_eq!(
+            meta_after_first_open,
+            std::fs::read(gen_dir.join("index.meta")).unwrap(),
+            "reopen must leave index.meta untouched"
+        );
     }
 }

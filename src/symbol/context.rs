@@ -182,207 +182,205 @@ impl SymbolContext {
 
     fn append_relationships(&self, output: &mut String, indent: &str) {
         // Implementations
-        if let Some(impls) = &self.relationships.implements {
-            if !impls.is_empty() {
-                output.push_str(&format!("{indent}Implements:\n"));
-                for symbol in impls {
-                    output.push_str(&format!(
-                        "{}  - {} ({:?}) at {}\n",
-                        indent,
-                        symbol.name,
-                        symbol.kind,
-                        SymbolContext::symbol_location(symbol)
-                    ));
-                }
+        if let Some(impls) = &self.relationships.implements
+            && !impls.is_empty()
+        {
+            output.push_str(&format!("{indent}Implements:\n"));
+            for symbol in impls {
+                output.push_str(&format!(
+                    "{}  - {} ({:?}) at {}\n",
+                    indent,
+                    symbol.name,
+                    symbol.kind,
+                    SymbolContext::symbol_location(symbol)
+                ));
             }
         }
 
         // Implemented by
-        if let Some(impl_by) = &self.relationships.implemented_by {
-            if !impl_by.is_empty() {
+        if let Some(impl_by) = &self.relationships.implemented_by
+            && !impl_by.is_empty()
+        {
+            output.push_str(&format!(
+                "{}Implemented by {} symbol(s):\n",
+                indent,
+                impl_by.len()
+            ));
+            for impl_type in impl_by {
                 output.push_str(&format!(
-                    "{}Implemented by {} symbol(s):\n",
+                    "{}  - {} ({:?}) at {}\n",
                     indent,
-                    impl_by.len()
+                    impl_type.name,
+                    impl_type.kind,
+                    SymbolContext::symbol_location(impl_type)
                 ));
-                for impl_type in impl_by {
-                    output.push_str(&format!(
-                        "{}  - {} ({:?}) at {}\n",
-                        indent,
-                        impl_type.name,
-                        impl_type.kind,
-                        SymbolContext::symbol_location(impl_type)
-                    ));
-                }
             }
         }
 
         // Extends (what base class this extends)
-        if let Some(extends) = &self.relationships.extends {
-            if !extends.is_empty() {
-                output.push_str(&format!("{indent}Extends:\n"));
-                for base_class in extends {
-                    output.push_str(&format!(
-                        "{}  - {} ({:?}) at {}\n",
-                        indent,
-                        base_class.name,
-                        base_class.kind,
-                        SymbolContext::symbol_location(base_class)
-                    ));
-                }
+        if let Some(extends) = &self.relationships.extends
+            && !extends.is_empty()
+        {
+            output.push_str(&format!("{indent}Extends:\n"));
+            for base_class in extends {
+                output.push_str(&format!(
+                    "{}  - {} ({:?}) at {}\n",
+                    indent,
+                    base_class.name,
+                    base_class.kind,
+                    SymbolContext::symbol_location(base_class)
+                ));
             }
         }
 
         // Extended by (what classes extend this base class)
-        if let Some(extended_by) = &self.relationships.extended_by {
-            if !extended_by.is_empty() {
+        if let Some(extended_by) = &self.relationships.extended_by
+            && !extended_by.is_empty()
+        {
+            output.push_str(&format!(
+                "{}Extended by {} class(es):\n",
+                indent,
+                extended_by.len()
+            ));
+            for derived_class in extended_by {
                 output.push_str(&format!(
-                    "{}Extended by {} class(es):\n",
+                    "{}  - {} ({:?}) at {}\n",
                     indent,
-                    extended_by.len()
+                    derived_class.name,
+                    derived_class.kind,
+                    SymbolContext::symbol_location(derived_class)
                 ));
-                for derived_class in extended_by {
-                    output.push_str(&format!(
-                        "{}  - {} ({:?}) at {}\n",
-                        indent,
-                        derived_class.name,
-                        derived_class.kind,
-                        SymbolContext::symbol_location(derived_class)
-                    ));
-                }
             }
         }
 
         // Uses (what types this symbol uses)
-        if let Some(uses) = &self.relationships.uses {
-            if !uses.is_empty() {
-                output.push_str(&format!("{indent}Uses {} type(s):\n", uses.len()));
-                for used_type in uses {
-                    output.push_str(&format!(
-                        "{}  - {} ({:?}) at {}\n",
-                        indent,
-                        used_type.name,
-                        used_type.kind,
-                        SymbolContext::symbol_location(used_type)
-                    ));
-                }
+        if let Some(uses) = &self.relationships.uses
+            && !uses.is_empty()
+        {
+            output.push_str(&format!("{indent}Uses {} type(s):\n", uses.len()));
+            for used_type in uses {
+                output.push_str(&format!(
+                    "{}  - {} ({:?}) at {}\n",
+                    indent,
+                    used_type.name,
+                    used_type.kind,
+                    SymbolContext::symbol_location(used_type)
+                ));
             }
         }
 
         // Used by (what symbols use this type)
-        if let Some(used_by) = &self.relationships.used_by {
-            if !used_by.is_empty() {
-                output.push_str(&format!("{}Used by {} symbol(s):\n", indent, used_by.len()));
-                for using_symbol in used_by {
-                    output.push_str(&format!(
-                        "{}  - {} ({:?}) at {}\n",
-                        indent,
-                        using_symbol.name,
-                        using_symbol.kind,
-                        SymbolContext::symbol_location(using_symbol)
-                    ));
-                }
+        if let Some(used_by) = &self.relationships.used_by
+            && !used_by.is_empty()
+        {
+            output.push_str(&format!("{}Used by {} symbol(s):\n", indent, used_by.len()));
+            for using_symbol in used_by {
+                output.push_str(&format!(
+                    "{}  - {} ({:?}) at {}\n",
+                    indent,
+                    using_symbol.name,
+                    using_symbol.kind,
+                    SymbolContext::symbol_location(using_symbol)
+                ));
             }
         }
 
         // Methods defined
-        if let Some(defines) = &self.relationships.defines {
-            if !defines.is_empty() {
-                output.push_str(&format!("{}Defines {} symbol(s):\n", indent, defines.len()));
-                for defined in defines {
-                    output.push_str(&format!(
-                        "{}  - {} ({:?}) at {}",
-                        indent,
-                        defined.name,
-                        defined.kind,
-                        SymbolContext::symbol_location(defined)
-                    ));
-                    if let Some(sig) = defined.as_signature() {
-                        output.push('\n');
-                        Self::write_multiline(output, sig, indent, 4);
-                    }
+        if let Some(defines) = &self.relationships.defines
+            && !defines.is_empty()
+        {
+            output.push_str(&format!("{}Defines {} symbol(s):\n", indent, defines.len()));
+            for defined in defines {
+                output.push_str(&format!(
+                    "{}  - {} ({:?}) at {}",
+                    indent,
+                    defined.name,
+                    defined.kind,
+                    SymbolContext::symbol_location(defined)
+                ));
+                if let Some(sig) = defined.as_signature() {
                     output.push('\n');
+                    Self::write_multiline(output, sig, indent, 4);
                 }
+                output.push('\n');
             }
         }
 
         // Calls
-        if let Some(calls) = &self.relationships.calls {
-            if !calls.is_empty() {
-                output.push_str(&format!("{}Calls {} function(s):\n", indent, calls.len()));
-                for (called, metadata) in calls {
-                    // A location string names one real place: the callee's
-                    // definition. The call site lives in THIS symbol's file —
-                    // composing it with the callee's path named a nonexistent
-                    // location on every cross-file edge.
+        if let Some(calls) = &self.relationships.calls
+            && !calls.is_empty()
+        {
+            output.push_str(&format!("{}Calls {} function(s):\n", indent, calls.len()));
+            for (called, metadata) in calls {
+                // A location string names one real place: the callee's
+                // definition. The call site lives in THIS symbol's file —
+                // composing it with the callee's path named a nonexistent
+                // location on every cross-file edge.
+                output.push_str(&format!(
+                    "{}  - {} ({:?}) at {} [symbol_id:{}]",
+                    indent,
+                    called.name,
+                    called.kind,
+                    Self::symbol_location(called),
+                    called.id.value()
+                ));
+                if let Some(line) = metadata.as_ref().and_then(|m| m.line) {
                     output.push_str(&format!(
-                        "{}  - {} ({:?}) at {} [symbol_id:{}]",
-                        indent,
-                        called.name,
-                        called.kind,
-                        Self::symbol_location(called),
-                        called.id.value()
+                        " (called at {}:{})",
+                        self.file_path,
+                        line.saturating_add(1)
                     ));
-                    if let Some(line) = metadata.as_ref().and_then(|m| m.line) {
-                        output.push_str(&format!(
-                            " (called at {}:{})",
-                            self.file_path,
-                            line.saturating_add(1)
-                        ));
-                    }
-
-                    // Show receiver info if available
-                    if let Some(meta) = metadata {
-                        if let Some(context) = &meta.context {
-                            if !context.is_empty() {
-                                output.push_str(&format!(" [{context}]"));
-                            }
-                        }
-                    }
-                    output.push('\n');
                 }
+
+                // Show receiver info if available
+                if let Some(meta) = metadata
+                    && let Some(context) = &meta.context
+                    && !context.is_empty()
+                {
+                    output.push_str(&format!(" [{context}]"));
+                }
+                output.push('\n');
             }
         }
 
         // Called by
-        if let Some(callers) = &self.relationships.called_by {
-            if !callers.is_empty() {
-                output.push_str(&format!(
-                    "{}Called by {} function(s):\n",
-                    indent,
-                    callers.len()
-                ));
-                for (caller, metadata) in callers {
-                    // Use call site location from metadata if available, otherwise definition location
-                    let location = if let Some(meta) = metadata {
-                        if let Some(line) = meta.line {
-                            format!("{}:{}", caller.file_path, line.saturating_add(1))
-                        } else {
-                            Self::symbol_location(caller)
-                        }
+        if let Some(callers) = &self.relationships.called_by
+            && !callers.is_empty()
+        {
+            output.push_str(&format!(
+                "{}Called by {} function(s):\n",
+                indent,
+                callers.len()
+            ));
+            for (caller, metadata) in callers {
+                // Use call site location from metadata if available, otherwise definition location
+                let location = if let Some(meta) = metadata {
+                    if let Some(line) = meta.line {
+                        format!("{}:{}", caller.file_path, line.saturating_add(1))
                     } else {
                         Self::symbol_location(caller)
-                    };
-
-                    output.push_str(&format!(
-                        "{}  - {} ({:?}) at {} [symbol_id:{}]",
-                        indent,
-                        caller.name,
-                        caller.kind,
-                        location,
-                        caller.id.value()
-                    ));
-
-                    // Show receiver info if available
-                    if let Some(meta) = metadata {
-                        if let Some(context) = &meta.context {
-                            if !context.is_empty() {
-                                output.push_str(&format!(" [{context}]"));
-                            }
-                        }
                     }
-                    output.push('\n');
+                } else {
+                    Self::symbol_location(caller)
+                };
+
+                output.push_str(&format!(
+                    "{}  - {} ({:?}) at {} [symbol_id:{}]",
+                    indent,
+                    caller.name,
+                    caller.kind,
+                    location,
+                    caller.id.value()
+                ));
+
+                // Show receiver info if available
+                if let Some(meta) = metadata
+                    && let Some(context) = &meta.context
+                    && !context.is_empty()
+                {
+                    output.push_str(&format!(" [{context}]"));
                 }
+                output.push('\n');
             }
         }
     }

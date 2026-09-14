@@ -97,11 +97,11 @@ impl CodeIntelligenceClient {
 
         // Optionally call a specific tool supplied by the user
         if let Some(tool_name) = tool {
-            if let Some(delay) = delay_before_tool_secs {
-                if delay > 0 {
-                    println!("\nWaiting {delay} seconds before calling '{tool_name}'...");
-                    sleep(Duration::from_secs(delay)).await;
-                }
+            if let Some(delay) = delay_before_tool_secs
+                && delay > 0
+            {
+                println!("\nWaiting {delay} seconds before calling '{tool_name}'...");
+                sleep(Duration::from_secs(delay)).await;
             }
 
             println!("\nCalling tool '{tool_name}'...");

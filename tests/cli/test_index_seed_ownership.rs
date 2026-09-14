@@ -132,7 +132,7 @@ fn index_with_path_after_index_deletion_runs_single_pass() {
         "seed must succeed\nstdout:{stdout}\nstderr:{stderr}"
     );
 
-    std::fs::remove_dir_all(workspace.join(".codanna/index")).expect("delete index dir");
+    std::fs::remove_dir_all(crate::support::index_root(workspace)).expect("delete index dir");
 
     let (exit, stdout, stderr) = run_cli(workspace, &["index", "src"]);
     assert_single_command_phase_pass(exit, &stdout, &stderr);
@@ -151,7 +151,7 @@ fn bare_index_after_index_deletion_runs_single_pass() {
         "seed must succeed\nstdout:{stdout}\nstderr:{stderr}"
     );
 
-    std::fs::remove_dir_all(workspace.join(".codanna/index")).expect("delete index dir");
+    std::fs::remove_dir_all(crate::support::index_root(workspace)).expect("delete index dir");
 
     let (exit, stdout, stderr) = run_cli(workspace, &["index"]);
     assert_single_command_phase_pass(exit, &stdout, &stderr);

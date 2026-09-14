@@ -1179,22 +1179,22 @@ impl SwiftParser {
         let class_context = new_class.or(current_class);
 
         // Look for inheritance_specifier nodes (: SuperClass, Protocol)
-        if node.kind() == NODE_INHERITANCE_SPECIFIER {
-            if let Some(derived) = class_context {
-                // Get the type from user_type -> type_identifier
-                if let Some(user_type) = node.child(0) {
-                    if user_type.kind() == NODE_USER_TYPE {
-                        // Find type_identifier inside user_type
-                        let mut cursor = user_type.walk();
-                        for child in user_type.children(&mut cursor) {
-                            if child.kind() == NODE_TYPE_IDENTIFIER {
-                                let base = self.trimmed_text(code, child);
-                                if !base.is_empty() {
-                                    results.push((derived, base, self.node_to_range(node)));
-                                }
-                                break;
-                            }
+        if node.kind() == NODE_INHERITANCE_SPECIFIER
+            && let Some(derived) = class_context
+        {
+            // Get the type from user_type -> type_identifier
+            if let Some(user_type) = node.child(0)
+                && user_type.kind() == NODE_USER_TYPE
+            {
+                // Find type_identifier inside user_type
+                let mut cursor = user_type.walk();
+                for child in user_type.children(&mut cursor) {
+                    if child.kind() == NODE_TYPE_IDENTIFIER {
+                        let base = self.trimmed_text(code, child);
+                        if !base.is_empty() {
+                            results.push((derived, base, self.node_to_range(node)));
                         }
+                        break;
                     }
                 }
             }
@@ -1274,12 +1274,11 @@ impl SwiftParser {
                 // Extract type from type_annotation
                 let mut cursor = node.walk();
                 for child in node.children(&mut cursor) {
-                    if child.kind() == NODE_TYPE_ANNOTATION {
-                        if let Some(type_name) = self.extract_type_name(child, code) {
-                            if !self.is_builtin_type(type_name) {
-                                uses.push((context, type_name, self.node_to_range(child)));
-                            }
-                        }
+                    if child.kind() == NODE_TYPE_ANNOTATION
+                        && let Some(type_name) = self.extract_type_name(child, code)
+                        && !self.is_builtin_type(type_name)
+                    {
+                        uses.push((context, type_name, self.node_to_range(child)));
                     }
                 }
             }
@@ -1313,22 +1312,21 @@ impl SwiftParser {
                 // Extract type from parameter's type annotation
                 let mut cursor = node.walk();
                 for child in node.children(&mut cursor) {
-                    if child.kind() == NODE_USER_TYPE || child.kind() == NODE_TYPE_IDENTIFIER {
-                        if let Some(type_name) = self.extract_type_name(child, code) {
-                            if !self.is_builtin_type(type_name) {
-                                uses.push((ctx, type_name, self.node_to_range(child)));
-                            }
-                        }
+                    if (child.kind() == NODE_USER_TYPE || child.kind() == NODE_TYPE_IDENTIFIER)
+                        && let Some(type_name) = self.extract_type_name(child, code)
+                        && !self.is_builtin_type(type_name)
+                    {
+                        uses.push((ctx, type_name, self.node_to_range(child)));
                     }
                 }
             }
 
             NODE_USER_TYPE | NODE_TYPE_IDENTIFIER => {
                 // This could be a return type
-                if let Some(type_name) = self.extract_type_name(node, code) {
-                    if !self.is_builtin_type(type_name) {
-                        uses.push((ctx, type_name, self.node_to_range(node)));
-                    }
+                if let Some(type_name) = self.extract_type_name(node, code)
+                    && !self.is_builtin_type(type_name)
+                {
+                    uses.push((ctx, type_name, self.node_to_range(node)));
                 }
             }
 

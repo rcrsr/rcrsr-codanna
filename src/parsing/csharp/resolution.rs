@@ -201,12 +201,12 @@ impl ResolutionScope for CSharpResolutionContext {
 
                 // Check using aliases
                 for (namespace, alias) in &self.using_directives {
-                    if let Some(alias_name) = alias {
-                        if alias_name == type_name {
-                            // This is a using alias, resolve in the target namespace
-                            let qualified_name = format!("{namespace}.{member_name}");
-                            return self.resolve(&qualified_name);
-                        }
+                    if let Some(alias_name) = alias
+                        && alias_name == type_name
+                    {
+                        // This is a using alias, resolve in the target namespace
+                        let qualified_name = format!("{namespace}.{member_name}");
+                        return self.resolve(&qualified_name);
                     }
                 }
             }

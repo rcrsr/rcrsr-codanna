@@ -1343,13 +1343,12 @@ impl GoParser {
         let mut end = node.end_byte();
 
         // Find the struct body and exclude it, keeping only the header
-        if let Some(type_node) = node.child_by_field_name("type") {
-            if let Some(body) = type_node
+        if let Some(type_node) = node.child_by_field_name("type")
+            && let Some(body) = type_node
                 .children(&mut type_node.walk())
                 .find(|n| n.kind() == "field_declaration_list")
-            {
-                end = body.start_byte();
-            }
+        {
+            end = body.start_byte();
         }
 
         code[start..end].trim().to_string()
@@ -1388,14 +1387,13 @@ impl GoParser {
         let mut end = node.end_byte();
 
         // Find the interface body and exclude it, keeping only the declaration
-        if let Some(type_node) = node.child_by_field_name("type") {
-            if let Some(body_start) = type_node
+        if let Some(type_node) = node.child_by_field_name("type")
+            && let Some(body_start) = type_node
                 .children(&mut type_node.walk())
                 .find(|n| n.kind() == "method_elem" || n.kind() == "type_elem")
                 .map(|n| n.start_byte())
-            {
-                end = body_start.saturating_sub(2); // Account for the opening brace
-            }
+        {
+            end = body_start.saturating_sub(2); // Account for the opening brace
         }
 
         code[start..end].trim().to_string()
@@ -1547,20 +1545,20 @@ impl GoParser {
         // Check if this is a call expression
         if node.kind() == "call_expression" {
             // Skip if it's a method call (handled by find_method_calls)
-            if let Some(function_node) = node.child_by_field_name("function") {
-                if function_node.kind() != "selector_expression" {
-                    // It's a regular function call
-                    if let Some(fn_name) = Self::extract_function_name(&function_node, code) {
-                        if let Some(context) = function_context {
-                            let range = Range {
-                                start_line: node.start_position().row as u32,
-                                start_column: node.start_position().column as u16,
-                                end_line: node.end_position().row as u32,
-                                end_column: node.end_position().column as u16,
-                            };
-                            calls.push((context, fn_name, range));
-                        }
-                    }
+            if let Some(function_node) = node.child_by_field_name("function")
+                && function_node.kind() != "selector_expression"
+            {
+                // It's a regular function call
+                if let Some(fn_name) = Self::extract_function_name(&function_node, code)
+                    && let Some(context) = function_context
+                {
+                    let range = Range {
+                        start_line: node.start_position().row as u32,
+                        start_column: node.start_position().column as u16,
+                        end_line: node.end_position().row as u32,
+                        end_column: node.end_position().column as u16,
+                    };
+                    calls.push((context, fn_name, range));
                 }
             }
         }
@@ -1884,34 +1882,32 @@ impl GoParser {
         };
 
         // Check for method calls (Go uses selector_expression)
-        if node.kind() == "call_expression" {
-            if let Some(function_node) = node.child_by_field_name("function") {
-                if function_node.kind() == "selector_expression" {
-                    // It's a method call!
-                    if let Some((receiver, method_name, is_static)) =
-                        self.extract_go_method_signature(&function_node, code, package_names)
-                    {
-                        if let Some(context) = function_context {
-                            let range = Range {
-                                start_line: node.start_position().row as u32,
-                                start_column: node.start_position().column as u16,
-                                end_line: node.end_position().row as u32,
-                                end_column: node.end_position().column as u16,
-                            };
+        if node.kind() == "call_expression"
+            && let Some(function_node) = node.child_by_field_name("function")
+            && function_node.kind() == "selector_expression"
+        {
+            // It's a method call!
+            if let Some((receiver, method_name, is_static)) =
+                self.extract_go_method_signature(&function_node, code, package_names)
+                && let Some(context) = function_context
+            {
+                let range = Range {
+                    start_line: node.start_position().row as u32,
+                    start_column: node.start_position().column as u16,
+                    end_line: node.end_position().row as u32,
+                    end_column: node.end_position().column as u16,
+                };
 
-                            let method_call = MethodCall {
-                                caller: context.to_string(),
-                                method_name: method_name.to_string(),
-                                receiver: receiver.map(|r| r.to_string()),
-                                is_static,
-                                range,
-                                caller_range: None, // TODO: track caller definition range
-                            };
+                let method_call = MethodCall {
+                    caller: context.to_string(),
+                    method_name: method_name.to_string(),
+                    receiver: receiver.map(|r| r.to_string()),
+                    is_static,
+                    range,
+                    caller_range: None, // TODO: track caller definition range
+                };
 
-                            calls.push(method_call);
-                        }
-                    }
-                }
+                calls.push(method_call);
             }
         }
 
@@ -2009,21 +2005,21 @@ impl GoParser {
         let mut params = Vec::new();
 
         // Look for generic parameter section like [T any, K comparable, V SomeInterface]
-        if let Some(start) = signature.find('[') {
-            if let Some(end) = signature[start..].find(']') {
-                let generic_section = &signature[start + 1..start + end];
+        if let Some(start) = signature.find('[')
+            && let Some(end) = signature[start..].find(']')
+        {
+            let generic_section = &signature[start + 1..start + end];
 
-                // Parse parameters separated by commas
-                for param in generic_section.split(',') {
-                    let param = param.trim();
-                    if param.is_empty() {
-                        continue;
-                    }
+            // Parse parameters separated by commas
+            for param in generic_section.split(',') {
+                let param = param.trim();
+                if param.is_empty() {
+                    continue;
+                }
 
-                    // Extract just the parameter name (first word)
-                    if let Some(param_name) = param.split_whitespace().next() {
-                        params.push(param_name.to_string());
-                    }
+                // Extract just the parameter name (first word)
+                if let Some(param_name) = param.split_whitespace().next() {
+                    params.push(param_name.to_string());
                 }
             }
         }
@@ -2081,17 +2077,17 @@ impl GoParser {
                 }
             }
             "var_spec" => {
-                if let Some(type_node) = node.child_by_field_name("type") {
-                    if let Some(type_name) = Self::reduce_type_name(type_node, code) {
-                        let mut cursor = node.walk();
-                        for child in node.children(&mut cursor) {
-                            if child.kind() == "identifier" {
-                                bindings.push((
-                                    &code[child.byte_range()],
-                                    type_name,
-                                    Self::range_of(node),
-                                ));
-                            }
+                if let Some(type_node) = node.child_by_field_name("type")
+                    && let Some(type_name) = Self::reduce_type_name(type_node, code)
+                {
+                    let mut cursor = node.walk();
+                    for child in node.children(&mut cursor) {
+                        if child.kind() == "identifier" {
+                            bindings.push((
+                                &code[child.byte_range()],
+                                type_name,
+                                Self::range_of(node),
+                            ));
                         }
                     }
                 }

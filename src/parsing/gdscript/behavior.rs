@@ -165,14 +165,13 @@ impl LanguageBehavior for GdscriptBehavior {
         }
 
         // Adjust module symbol naming to use the last path segment for readability
-        if symbol.kind == SymbolKind::Module {
-            if let Some(path) = module_path {
-                if let Some(name) = path.rsplit('/').next() {
-                    let name = name.trim_end_matches(".gd");
-                    if !name.is_empty() {
-                        symbol.name = compact_string(name);
-                    }
-                }
+        if symbol.kind == SymbolKind::Module
+            && let Some(path) = module_path
+            && let Some(name) = path.rsplit('/').next()
+        {
+            let name = name.trim_end_matches(".gd");
+            if !name.is_empty() {
+                symbol.name = compact_string(name);
             }
         }
     }
@@ -282,25 +281,25 @@ impl LanguageBehavior for GdscriptBehavior {
         }
 
         // 2. Handle relative imports (./file.gd, ../dir/file.gd)
-        if let Some(importing_mod) = importing_module {
-            if import_path.starts_with("./") || import_path.starts_with("../") {
-                let resolved = self.resolve_gdscript_relative_import(import_path, importing_mod);
-                // Compare with normalized symbol path
-                let norm_symbol = symbol_module_path
-                    .strip_prefix("res://")
-                    .unwrap_or(symbol_module_path)
-                    .strip_suffix(".gd")
-                    .unwrap_or(
-                        symbol_module_path
-                            .strip_prefix("res://")
-                            .unwrap_or(symbol_module_path),
-                    );
+        if let Some(importing_mod) = importing_module
+            && (import_path.starts_with("./") || import_path.starts_with("../"))
+        {
+            let resolved = self.resolve_gdscript_relative_import(import_path, importing_mod);
+            // Compare with normalized symbol path
+            let norm_symbol = symbol_module_path
+                .strip_prefix("res://")
+                .unwrap_or(symbol_module_path)
+                .strip_suffix(".gd")
+                .unwrap_or(
+                    symbol_module_path
+                        .strip_prefix("res://")
+                        .unwrap_or(symbol_module_path),
+                );
 
-                let norm_resolved = resolved.strip_prefix("res://").unwrap_or(&resolved);
+            let norm_resolved = resolved.strip_prefix("res://").unwrap_or(&resolved);
 
-                if norm_resolved == norm_symbol {
-                    return true;
-                }
+            if norm_resolved == norm_symbol {
+                return true;
             }
         }
 

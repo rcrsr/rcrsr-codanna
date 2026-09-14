@@ -30,10 +30,10 @@ fn fail_with_rollback(
         }
     }
 
-    if let Some(b) = backup {
-        if let Err(e) = restore_profile(b) {
-            failures.push(format!("backup restore failed: {e}"));
-        }
+    if let Some(b) = backup
+        && let Err(e) = restore_profile(b)
+    {
+        failures.push(format!("backup restore failed: {e}"));
     }
 
     if failures.is_empty() {

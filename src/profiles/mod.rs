@@ -270,10 +270,8 @@ pub fn list_profiles(verbose: bool, json: bool) -> ProfileResult<()> {
         } else {
             for (profile_name, profile_info) in &provider.profiles {
                 print!("  - {profile_name} (v{})", profile_info.version);
-                if verbose {
-                    if let Some(desc) = &profile_info.description {
-                        print!(": {desc}");
-                    }
+                if verbose && let Some(desc) = &profile_info.description {
+                    print!(": {desc}");
                 }
                 println!();
             }
@@ -738,31 +736,27 @@ pub fn update_profile(profile_name: &str, force: bool) -> ProfileResult<()> {
     };
 
     // Check if already up to date
-    if !force {
-        if let Some(ref remote) = remote_commit {
-            if remote == existing_commit {
-                // Verify integrity before declaring up-to-date
-                match verification::verify_profile(&workspace, profile_name, false) {
-                    Ok(()) => {
-                        println!(
-                            "Profile '{profile_name}' already up to date (commit {})",
-                            &existing_commit[..8]
-                        );
-                        return Ok(());
-                    }
-                    Err(_) => {
-                        println!(
-                            "Profile '{profile_name}' integrity check failed, reinstalling..."
-                        );
-                    }
+    if !force && let Some(ref remote) = remote_commit {
+        if remote == existing_commit {
+            // Verify integrity before declaring up-to-date
+            match verification::verify_profile(&workspace, profile_name, false) {
+                Ok(()) => {
+                    println!(
+                        "Profile '{profile_name}' already up to date (commit {})",
+                        &existing_commit[..8]
+                    );
+                    return Ok(());
                 }
-            } else {
-                println!(
-                    "Updating profile '{profile_name}' from {} to {}",
-                    &existing_commit[..8],
-                    &remote[..8]
-                );
+                Err(_) => {
+                    println!("Profile '{profile_name}' integrity check failed, reinstalling...");
+                }
             }
+        } else {
+            println!(
+                "Updating profile '{profile_name}' from {} to {}",
+                &existing_commit[..8],
+                &remote[..8]
+            );
         }
     }
 

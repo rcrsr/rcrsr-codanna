@@ -438,10 +438,10 @@ impl ResolutionScope for GenericResolutionContext {
             ScopeLevel::Package,
             ScopeLevel::Global,
         ] {
-            if let Some(symbols) = self.symbols.get(level) {
-                if let Some(&id) = symbols.get(name) {
-                    return Some(id);
-                }
+            if let Some(symbols) = self.symbols.get(level)
+                && let Some(&id) = symbols.get(name)
+            {
+                return Some(id);
             }
         }
         None
@@ -522,10 +522,10 @@ impl InheritanceResolver for GenericInheritanceResolver {
 
     fn resolve_method(&self, type_name: &str, method: &str) -> Option<String> {
         // First check if the type has the method directly
-        if let Some(methods) = self.type_methods.get(type_name) {
-            if methods.contains(&method.to_string()) {
-                return Some(type_name.to_string());
-            }
+        if let Some(methods) = self.type_methods.get(type_name)
+            && methods.contains(&method.to_string())
+        {
+            return Some(type_name.to_string());
         }
 
         // Then check parent types

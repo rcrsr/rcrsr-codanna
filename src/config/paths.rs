@@ -63,11 +63,19 @@ impl Settings {
         Ok(())
     }
 
-    /// Remove a folder from the list of indexed paths
+    /// Remove a folder from the list of indexed paths.
+    ///
+    /// A path that no longer exists on disk cannot be canonicalized, but it
+    /// may still be recorded (the directory was deleted after `add-dir`);
+    /// it is then matched by the absolute form of `path` as given.
     pub fn remove_indexed_path(&mut self, path: &Path) -> Result<(), String> {
-        let canonical_path = path
-            .canonicalize()
-            .map_err(|e| format!("Invalid path: {e}"))?;
+        let canonical_path = match path.canonicalize() {
+            Ok(canonical) => canonical,
+            Err(_) if !path.exists() => {
+                std::path::absolute(path).map_err(|e| format!("Invalid path: {e}"))?
+            }
+            Err(e) => return Err(format!("Invalid path: {e}")),
+        };
 
         let original_len = self.indexing.indexed_paths.len();
         self.indexing.indexed_paths.retain(|p| p != &canonical_path);
@@ -87,5 +95,37 @@ impl Settings {
     /// Returns empty vector if none are configured (maintains backward compatibility)
     pub fn get_indexed_paths(&self) -> Vec<PathBuf> {
         self.indexing.indexed_paths.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::Settings;
+
+    #[test]
+    fn remove_indexed_path_drops_a_directory_that_no_longer_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let gone = dir.path().join("gone");
+        std::fs::create_dir(&gone).expect("create dir");
+
+        let mut settings = Settings::default();
+        settings.add_indexed_path(gone.clone()).expect("add");
+        std::fs::remove_dir(&gone).expect("delete dir");
+
+        settings
+            .remove_indexed_path(&gone)
+            .expect("remove after delete");
+        assert!(settings.get_indexed_paths().is_empty());
+    }
+
+    #[test]
+    fn remove_indexed_path_still_rejects_an_unknown_missing_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut settings = Settings::default();
+
+        let err = settings
+            .remove_indexed_path(&dir.path().join("never-added"))
+            .expect_err("unknown path must be rejected");
+        assert!(err.contains("not found"), "{err}");
     }
 }

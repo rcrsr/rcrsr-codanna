@@ -26,6 +26,12 @@ how, see the commit history.
     - [Ports](#ports)
     - [Server registry and `codanna ls`](#server-registry-and-codanna-ls)
     - [Hot-reload notifications through the proxy](#hot-reload-notifications-through-the-proxy)
+  - [Index generations](#index-generations)
+    - [Layout](#layout)
+    - [Migration (one-time, forward-only)](#migration-one-time-forward-only)
+    - [Who writes where](#who-writes-where)
+    - [Disk cost and GC](#disk-cost-and-gc)
+    - [Inspecting and recovering](#inspecting-and-recovering)
   - [Reindexing on demand (`reindex` MCP tool)](#reindexing-on-demand-reindex-mcp-tool)
     - [Arguments](#arguments)
     - [Concurrency contract](#concurrency-contract)
@@ -171,7 +177,8 @@ with the fork's caveats:
   expect relationship counts to *drop* on re-index (upstream measured −7.6% to
   −48%, mostly lost wrong answers). Re-baseline any tooling that asserts on
   caller or impact counts. `index.meta` and `get_index_info --json` also gain a
-  descriptive `builder_commit` field.
+  descriptive `builder_commit` field. (In the fork, `index.meta` now lives per
+  generation at `index/gen/<id>/index.meta` — see [Index generations](#index-generations).)
 - **v0.13.0 migrates every transport to the MCP 2026-07-28 spec** (rmcp
   3.1.0), serving the new stateless generation alongside the legacy one through
   its deprecation window. `server/discover` is answered; stateless HTTP requests
@@ -371,6 +378,98 @@ to each stdio client, so a client behind the proxy is as hot-reload-aware as one
 connected directly. If you only run a single client, plain `codanna serve` is
 unchanged.
 
+## Index generations
+
+Every full rebuild of the code index builds into a fresh **generation** and
+publishes it atomically, so readers never see an empty or half-rebuilt index —
+not during `codanna index --force`, not during a `reindex` MCP call, and not
+during the watcher's catch-up after downtime. Upstream rebuilds in place: it
+clears the live index first and repopulates it, and every query issued in
+between sees whatever has been written so far.
+
+### Layout
+
+```
+.codanna/index/
+├── current          # "<id>\n" — the generation being served; rewritten via tmp + rename
+├── gen/
+│   └── <id>/        # one generation: tantivy/, semantic/, index.meta, BUILDING | COMPLETE | DAMAGED markers
+├── gc.lock          # serializes garbage collection across processes
+├── publish.lock     # serializes the compare-and-swap publish
+├── documents/       # document collections — a separate store, never part of a generation
+└── resolvers/       # path-alias config cache, unchanged
+```
+
+`index.meta` lives **per generation** (`gen/<id>/index.meta`), not at the index
+root. Generation ids are 19 lowercase hex characters (a millisecond timestamp
+plus randomness), so they sort chronologically.
+
+### Migration (one-time, forward-only)
+
+The first command that opens an existing flat index (`index/tantivy/meta.json`
+with no `current`) renames it into `gen/<id>/` and writes `current`. Nothing is
+re-parsed. Older binaries will not find the flat layout afterwards — rebuild
+with `codanna index` if you need to go back. `codanna index --status` on an
+unmigrated index says so and is the one command that does *not* migrate (it is
+strictly read-only).
+
+### Who writes where
+
+- **CLI writes always publish a new generation**: `codanna index`,
+  `codanna index --force`, `codanna mcp --watch`, and the pre-dispatch sync that
+  reconciles `add-dir`/`remove-dir` against the config. Incremental runs
+  hardlink-clone the current generation's Tantivy segments first (`cp -al`
+  semantics — milliseconds, near-zero extra disk) and then walk; `--force`
+  builds from scratch.
+- **The serving process mutates `current` in place** only for bounded per-file
+  work: the watcher's per-file edits and batch removal waves, and scoped
+  `reindex paths:[…]` calls. Every `paths`-less in-process reindex (`reindex`,
+  `reindex force:true`, the watcher's catch-up) is staged into a new generation
+  and swapped in under a brief write lock; readers keep querying the old
+  generation until the swap.
+- **Publish is compare-and-swap** under `publish.lock`. An incremental publish
+  whose parent is no longer `current` (another process published in between)
+  fails with `GENERATION_SUPERSEDED` and leaves the index as it was; a
+  `--force` publish always wins. A from-scratch build refuses to start when free
+  disk is below the current generation's size (`INDEX_NO_SPACE_FOR_BUILD`; run
+  `--gc` first).
+- **Hot-reload polls `current`**, not `meta.json`'s mtime, so the server's own
+  writes never trigger a reload and an external `codanna index` is picked up as
+  exactly one swap. Per-file edits that land while a staged build is in flight
+  are journaled and replayed onto the new generation after the swap (bounded at
+  10k entries; past that the watcher falls back to a full catch-up).
+
+### Disk cost and GC
+
+Steady state is `current + previous` — the previous generation is kept as a
+rollback target; during a build it is `+ building`. GC runs after every
+publish, once at server startup, and on `codanna index --gc` — never on a timer.
+It removes orphaned builds (a build whose process died), older superseded
+generations, and damaged generations once a newer one has been served, and it
+logs at `INFO` only when it actually removed something.
+
+### Inspecting and recovering
+
+```bash
+codanna index --status          # one row per generation: id, state, age, size, recorded error
+codanna index --status --json
+codanna index --gc              # reclaim stale generations now
+codanna index --rollback        # point current at the newest previous generation
+codanna index --rollback <id>   # …or at a specific one (refused if it fails validation)
+```
+
+States are `current`, `previous`, `building`, `orphan`, `damaged`, and
+`incompatible` (built by a binary with different emission semantics).
+
+If `current` is missing, torn, or names a generation that fails validation, the
+next open logs a `WARN` naming the failure and the generation it rolled back to,
+marks the bad one `DAMAGED` (kept for forensics until GC), and serves the newest
+valid one. `get_index_info` reports `generation: { id, state, recovered_from }`
+so a client can tell that a rollback happened. If nothing on disk validates,
+`serve` on a genuinely empty index root bootstraps an empty generation; a root
+with damaged remnants refuses to start rather than build over the evidence —
+run `--status` to see what is there, then `--gc` or remove `.codanna/index`.
+
 ## Reindexing on demand (`reindex` MCP tool)
 
 Upstream reindexing is CLI-only. The fork exposes it as a `reindex` MCP tool,
@@ -381,7 +480,7 @@ server. It is also reachable as `codanna mcp reindex`.
 ```jsonc
 { "name": "reindex", "arguments": {} }                                 // incremental; unchanged files skipped
 { "name": "reindex", "arguments": { "paths": ["src/foo.rs", "src/bar/"] } }
-{ "name": "reindex", "arguments": { "force": true } }                  // full clear-and-rebuild
+{ "name": "reindex", "arguments": { "force": true } }                  // full rebuild into a fresh generation
 { "name": "reindex", "arguments": { "documents": true } }              // also refresh document collections
 ```
 
@@ -389,9 +488,11 @@ server. It is also reachable as `codanna mcp reindex`.
 
 - `paths` — files or directories to reindex (default: all configured
   `indexed_paths`). Must resolve inside the workspace root; at most 1024.
-- `force` (default `false`) — for a full reindex, clears the index before
-  rebuilding. For scoped `paths`, re-parses those files even when their content
-  hash is unchanged, without a global clear.
+- `force` (default `false`) — for a full reindex, builds a fresh generation
+  from scratch instead of cloning the current one (see
+  [Index generations](#index-generations)); the old generation keeps serving
+  until the swap. For scoped `paths`, re-parses those files even when their
+  content hash is unchanged, in place.
 - `documents` (default `false`) — additionally reindex every configured
   document collection, discovering markdown files added since the last run
   (which upstream reindexing and the watcher never do). Totals are reported
@@ -406,8 +507,10 @@ structured envelope.
 Read-only MCP tools, including `search_documents`, are safe to call in parallel
 from multiple clients in every serve mode. Reindexing does not block reads: the
 walk-and-parse work runs off the index write lock, which is held only briefly
-before and after it. While the walk is in flight, readers may transiently see a
-repopulating index.
+before and after it. A full (`paths`-less) reindex is staged into a new
+generation, so readers see the previous index unchanged until the swap; a
+scoped `paths` reindex works in place, and readers may transiently see those
+files repopulating.
 
 `search_documents` takes a brief write guard per call to auto-sync collections
 against disk, then searches under a read guard, so concurrent calls make
@@ -465,12 +568,13 @@ without waiting for an overflow. It is **off by default** (`startup_catch_up`)
 and independent of `refresh_on_overflow` — the two keys are two triggers for
 the same machinery, not one gated by both.
 
-Know what you're opting into: this is a full clear-and-rebuild, so expect
-degraded or empty query results until it completes on a large index. The clear
-and rebuild are not atomic — if the process is killed between them (OOM,
-`kill -9`, host crash) the on-disk index is left empty with no signal on next
-start; run `codanna index <path>` to rebuild. That window exists regardless,
-but `startup_catch_up` opens it on every start and every proxy auto-respawn.
+Know what you're opting into: this is a full rebuild — on a large workspace it
+takes as long as `codanna index --force`. It is staged into a new generation
+(see [Index generations](#index-generations)), so queries keep being answered
+from the previous generation until the rebuild is published, and a process
+killed mid-rebuild (OOM, `kill -9`, host crash) leaves only an orphaned build
+directory for GC — the served index is untouched. The cost is CPU and transient
+disk (`current + building`) on every start and every proxy auto-respawn.
 Combined with a short `idle_shutdown_minutes` on a large workspace, every
 respawn pays a full rebuild — size the timeout with that in mind. With no
 `indexed_paths` registered, each episode logs five `ERROR` lines and gives up;

@@ -619,127 +619,119 @@ impl JavaScriptParser {
     ) {
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            if child.kind() == "variable_declarator" {
-                if let Some(name_node) = child.child_by_field_name("name") {
-                    if name_node.kind() == "identifier" {
-                        let name = &code[name_node.byte_range()];
+            if child.kind() == "variable_declarator"
+                && let Some(name_node) = child.child_by_field_name("name")
+                && name_node.kind() == "identifier"
+            {
+                let name = &code[name_node.byte_range()];
 
-                        // Check if this is an arrow function assignment
-                        let is_arrow_function =
-                            if let Some(value_node) = child.child_by_field_name("value") {
-                                value_node.kind() == "arrow_function"
-                            } else {
-                                false
-                            };
+                // Check if this is an arrow function assignment
+                let is_arrow_function = if let Some(value_node) = child.child_by_field_name("value")
+                {
+                    value_node.kind() == "arrow_function"
+                } else {
+                    false
+                };
 
-                        // Determine the kind based on whether it's a function or regular variable
-                        let kind = if is_arrow_function {
-                            SymbolKind::Function
-                        } else if code[node.byte_range()].starts_with("const") {
-                            SymbolKind::Constant
-                        } else {
-                            SymbolKind::Variable
-                        };
+                // Determine the kind based on whether it's a function or regular variable
+                let kind = if is_arrow_function {
+                    SymbolKind::Function
+                } else if code[node.byte_range()].starts_with("const") {
+                    SymbolKind::Constant
+                } else {
+                    SymbolKind::Variable
+                };
 
-                        let visibility = self.determine_visibility(node, code);
+                let visibility = self.determine_visibility(node, code);
 
-                        // Extract JSDoc comment for const declarations
-                        let doc_comment = self.extract_doc_comment(&node, code);
+                // Extract JSDoc comment for const declarations
+                let doc_comment = self.extract_doc_comment(&node, code);
 
-                        let mut symbol = self.create_symbol(
-                            counter.next_id(),
-                            name.to_string(),
-                            kind,
-                            file_id,
-                            Range::new(
-                                child.start_position().row as u32,
-                                child.start_position().column as u16,
-                                child.end_position().row as u32,
-                                child.end_position().column as u16,
-                            ),
-                            None,
-                            doc_comment,
-                            module_path,
-                            visibility,
-                        );
+                let mut symbol = self.create_symbol(
+                    counter.next_id(),
+                    name.to_string(),
+                    kind,
+                    file_id,
+                    Range::new(
+                        child.start_position().row as u32,
+                        child.start_position().column as u16,
+                        child.end_position().row as u32,
+                        child.end_position().column as u16,
+                    ),
+                    None,
+                    doc_comment,
+                    module_path,
+                    visibility,
+                );
 
-                        // Override scope context for arrow functions - they are never hoisted
-                        if is_arrow_function {
-                            // Arrow functions are not hoisted, but keep the parent context that was already set
-                            match symbol.scope_context {
-                                Some(crate::symbol::ScopeContext::Local {
-                                    parent_name,
-                                    parent_kind,
-                                    ..
-                                }) => {
-                                    symbol.scope_context =
-                                        Some(crate::symbol::ScopeContext::Local {
-                                            hoisted: false, // Arrow functions are never hoisted
-                                            parent_name,    // Keep the parent context
-                                            parent_kind,    // Keep the parent kind
-                                        });
-                                }
-                                _ => {
-                                    // If not already Local, make it Local with parent context
-                                    let (parent_name, parent_kind) = if let Some(func_name) =
-                                        self.context.current_function()
-                                    {
-                                        (Some(func_name.into()), Some(crate::SymbolKind::Function))
-                                    } else if let Some(class_name) = self.context.current_class() {
-                                        (Some(class_name.into()), Some(crate::SymbolKind::Class))
-                                    } else {
-                                        (None, None)
-                                    };
-
-                                    symbol.scope_context =
-                                        Some(crate::symbol::ScopeContext::Local {
-                                            hoisted: false,
-                                            parent_name,
-                                            parent_kind,
-                                        });
-                                }
-                            }
+                // Override scope context for arrow functions - they are never hoisted
+                if is_arrow_function {
+                    // Arrow functions are not hoisted, but keep the parent context that was already set
+                    match symbol.scope_context {
+                        Some(crate::symbol::ScopeContext::Local {
+                            parent_name,
+                            parent_kind,
+                            ..
+                        }) => {
+                            symbol.scope_context = Some(crate::symbol::ScopeContext::Local {
+                                hoisted: false, // Arrow functions are never hoisted
+                                parent_name,    // Keep the parent context
+                                parent_kind,    // Keep the parent kind
+                            });
                         }
+                        _ => {
+                            // If not already Local, make it Local with parent context
+                            let (parent_name, parent_kind) =
+                                if let Some(func_name) = self.context.current_function() {
+                                    (Some(func_name.into()), Some(crate::SymbolKind::Function))
+                                } else if let Some(class_name) = self.context.current_class() {
+                                    (Some(class_name.into()), Some(crate::SymbolKind::Class))
+                                } else {
+                                    (None, None)
+                                };
 
-                        symbols.push(symbol);
-
-                        // CRITICAL FIX: Process arrow function body for nested symbols
-                        if is_arrow_function {
-                            if let Some(value_node) = child.child_by_field_name("value") {
-                                if value_node.kind() == "arrow_function" {
-                                    if let Some(body) = value_node.child_by_field_name("body") {
-                                        // Save current context
-                                        let saved_function =
-                                            self.context.current_function().map(|s| s.to_string());
-                                        let saved_class =
-                                            self.context.current_class().map(|s| s.to_string());
-
-                                        // Enter function scope for the arrow function
-                                        self.context.enter_scope(ScopeType::function());
-                                        self.context.set_current_function(Some(name.to_string()));
-
-                                        // Register the body node for audit tracking
-                                        self.register_handled_node(body.kind(), body.kind_id());
-                                        // Process the body using standard extraction
-                                        self.extract_symbols_from_node(
-                                            body,
-                                            code,
-                                            file_id,
-                                            counter,
-                                            symbols,
-                                            module_path,
-                                            depth + 1,
-                                        );
-
-                                        // Exit scope and restore context
-                                        self.context.exit_scope();
-                                        self.context.set_current_function(saved_function);
-                                        self.context.set_current_class(saved_class);
-                                    }
-                                }
-                            }
+                            symbol.scope_context = Some(crate::symbol::ScopeContext::Local {
+                                hoisted: false,
+                                parent_name,
+                                parent_kind,
+                            });
                         }
                     }
+                }
+
+                symbols.push(symbol);
+
+                // CRITICAL FIX: Process arrow function body for nested symbols
+                if is_arrow_function
+                    && let Some(value_node) = child.child_by_field_name("value")
+                    && value_node.kind() == "arrow_function"
+                    && let Some(body) = value_node.child_by_field_name("body")
+                {
+                    // Save current context
+                    let saved_function = self.context.current_function().map(|s| s.to_string());
+                    let saved_class = self.context.current_class().map(|s| s.to_string());
+
+                    // Enter function scope for the arrow function
+                    self.context.enter_scope(ScopeType::function());
+                    self.context.set_current_function(Some(name.to_string()));
+
+                    // Register the body node for audit tracking
+                    self.register_handled_node(body.kind(), body.kind_id());
+                    // Process the body using standard extraction
+                    self.extract_symbols_from_node(
+                        body,
+                        code,
+                        file_id,
+                        counter,
+                        symbols,
+                        module_path,
+                        depth + 1,
+                    );
+
+                    // Exit scope and restore context
+                    self.context.exit_scope();
+                    self.context.set_current_function(saved_function);
+                    self.context.set_current_class(saved_class);
                 }
             }
         }
@@ -870,10 +862,10 @@ impl JavaScriptParser {
         }
 
         // 2) Sibling check (rare, but safe)
-        if let Some(prev) = node.prev_sibling() {
-            if prev.kind() == "export_statement" {
-                return Visibility::Public;
-            }
+        if let Some(prev) = node.prev_sibling()
+            && prev.kind() == "export_statement"
+        {
+            return Visibility::Public;
         }
 
         // 3) Token check: if the source preceding the node contains 'export '
@@ -1330,19 +1322,14 @@ impl JavaScriptParser {
                                             while let Some(oa) = obj_anc {
                                                 if oa.kind() == "object" {
                                                     // Found the object, now find its variable declarator
-                                                    if let Some(obj_parent) = oa.parent() {
-                                                        if obj_parent.kind()
+                                                    if let Some(obj_parent) = oa.parent()
+                                                        && obj_parent.kind()
                                                             == "variable_declarator"
-                                                        {
-                                                            if let Some(name_node) = obj_parent
-                                                                .child_by_field_name("name")
-                                                            {
-                                                                ctx = Some(
-                                                                    &code[name_node.byte_range()],
-                                                                );
-                                                                break;
-                                                            }
-                                                        }
+                                                        && let Some(name_node) =
+                                                            obj_parent.child_by_field_name("name")
+                                                    {
+                                                        ctx = Some(&code[name_node.byte_range()]);
+                                                        break;
                                                     }
                                                 }
                                                 obj_anc = oa.parent();
@@ -1378,37 +1365,29 @@ impl JavaScriptParser {
         // Special handling for fragmented functions
         // If this is an identifier followed by formal_parameters, we need to process
         // the following siblings with this function's context
-        if node.kind() == "identifier" {
-            if let Some(parent) = node.parent() {
-                if parent.kind() == "ERROR" || parent.kind() == "program" {
-                    if let Some(next_sibling) = node.next_sibling() {
-                        if next_sibling.kind() == "formal_parameters" {
-                            // Process subsequent siblings with this function's context
-                            let mut current = next_sibling.next_sibling();
-                            while let Some(sibling) = current {
-                                // Heuristic boundary: stop if we hit another top-level declaration
-                                let k = sibling.kind();
-                                if k == "function_declaration"
-                                    || k == "generator_function_declaration"
-                                    || k == "class_declaration"
-                                    || k == "export_statement"
-                                {
-                                    break;
-                                }
-                                self.extract_calls_recursive(
-                                    &sibling,
-                                    code,
-                                    function_context,
-                                    calls,
-                                );
-                                current = sibling.next_sibling();
-                            }
-                            // Don't process children since we handled siblings
-                            return;
-                        }
-                    }
+        if node.kind() == "identifier"
+            && let Some(parent) = node.parent()
+            && (parent.kind() == "ERROR" || parent.kind() == "program")
+            && let Some(next_sibling) = node.next_sibling()
+            && next_sibling.kind() == "formal_parameters"
+        {
+            // Process subsequent siblings with this function's context
+            let mut current = next_sibling.next_sibling();
+            while let Some(sibling) = current {
+                // Heuristic boundary: stop if we hit another top-level declaration
+                let k = sibling.kind();
+                if k == "function_declaration"
+                    || k == "generator_function_declaration"
+                    || k == "class_declaration"
+                    || k == "export_statement"
+                {
+                    break;
                 }
+                self.extract_calls_recursive(&sibling, code, function_context, calls);
+                current = sibling.next_sibling();
             }
+            // Don't process children since we handled siblings
+            return;
         }
 
         // Recurse to children
@@ -1491,34 +1470,32 @@ impl JavaScriptParser {
         };
 
         // Check for method calls
-        if node.kind() == "call_expression" {
-            if let Some(function_node) = node.child_by_field_name("function") {
-                if function_node.kind() == "member_expression" {
-                    // It's a method call!
-                    if let Some((receiver, method_name, is_static)) =
-                        self.extract_method_signature(&function_node, code)
-                    {
-                        if let Some(context) = function_context {
-                            let range = Range {
-                                start_line: node.start_position().row as u32,
-                                start_column: node.start_position().column as u16,
-                                end_line: node.end_position().row as u32,
-                                end_column: node.end_position().column as u16,
-                            };
+        if node.kind() == "call_expression"
+            && let Some(function_node) = node.child_by_field_name("function")
+            && function_node.kind() == "member_expression"
+        {
+            // It's a method call!
+            if let Some((receiver, method_name, is_static)) =
+                self.extract_method_signature(&function_node, code)
+                && let Some(context) = function_context
+            {
+                let range = Range {
+                    start_line: node.start_position().row as u32,
+                    start_column: node.start_position().column as u16,
+                    end_line: node.end_position().row as u32,
+                    end_column: node.end_position().column as u16,
+                };
 
-                            let method_call = MethodCall {
-                                caller: context.to_string(),
-                                method_name: method_name.to_string(),
-                                receiver: receiver.map(|r| r.to_string()),
-                                is_static,
-                                range,
-                                caller_range: None, // TODO: track caller definition range
-                            };
+                let method_call = MethodCall {
+                    caller: context.to_string(),
+                    method_name: method_name.to_string(),
+                    receiver: receiver.map(|r| r.to_string()),
+                    is_static,
+                    range,
+                    caller_range: None, // TODO: track caller definition range
+                };
 
-                            calls.push(method_call);
-                        }
-                    }
-                }
+                calls.push(method_call);
             }
         }
 
@@ -1672,16 +1649,15 @@ impl JavaScriptParser {
                     .chars()
                     .next()
                     .is_some_and(|c| c.is_uppercase())
+                    && let Some(fn_name) = func_context
                 {
-                    if let Some(fn_name) = func_context {
-                        let range = Range {
-                            start_line: node.start_position().row as u32,
-                            start_column: node.start_position().column as u16,
-                            end_line: node.end_position().row as u32,
-                            end_column: node.end_position().column as u16,
-                        };
-                        uses.push((fn_name, component_name, range));
-                    }
+                    let range = Range {
+                        start_line: node.start_position().row as u32,
+                        start_column: node.start_position().column as u16,
+                        end_line: node.end_position().row as u32,
+                        end_column: node.end_position().column as u16,
+                    };
+                    uses.push((fn_name, component_name, range));
                 }
             }
         }
@@ -1737,23 +1713,23 @@ impl LanguageParser for JavaScriptParser {
             node.prev_sibling()
         };
 
-        if let Some(prev) = comment_node {
-            if prev.kind() == "comment" {
-                let comment = &code[prev.byte_range()];
-                if comment.starts_with("/**") {
-                    // Clean up the comment
-                    let cleaned = comment
-                        .trim_start_matches("/**")
-                        .trim_end_matches("*/")
-                        .lines()
-                        .map(|line| line.trim_start_matches(" * ").trim_start_matches(" *"))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                        .trim()
-                        .to_string();
+        if let Some(prev) = comment_node
+            && prev.kind() == "comment"
+        {
+            let comment = &code[prev.byte_range()];
+            if comment.starts_with("/**") {
+                // Clean up the comment
+                let cleaned = comment
+                    .trim_start_matches("/**")
+                    .trim_end_matches("*/")
+                    .lines()
+                    .map(|line| line.trim_start_matches(" * ").trim_start_matches(" *"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    .trim()
+                    .to_string();
 
-                    return Some(cleaned);
-                }
+                return Some(cleaned);
             }
         }
         None
@@ -1900,36 +1876,36 @@ impl LanguageParser for JavaScriptParser {
                                 }
                             });
                             let init = child.child_by_field_name("value");
-                            if let (Some(var), Some(init_node)) = (name, init) {
-                                if init_node.kind() == "new_expression" {
-                                    // Extract constructor type: new TypeName(...)
-                                    if let Some(constructor) =
-                                        init_node.child_by_field_name("constructor")
-                                    {
-                                        // constructor might be an identifier or qualified name
-                                        // We take the last identifier as the type name
-                                        let type_name = if constructor.kind() == "identifier" {
-                                            Some(&code[constructor.byte_range()])
-                                        } else {
-                                            // Fallback: try to find a trailing identifier
-                                            let mut last_ident: Option<&str> = None;
-                                            let mut c2 = constructor.walk();
-                                            for part in constructor.children(&mut c2) {
-                                                if part.kind() == "identifier" {
-                                                    last_ident = Some(&code[part.byte_range()]);
-                                                }
+                            if let (Some(var), Some(init_node)) = (name, init)
+                                && init_node.kind() == "new_expression"
+                            {
+                                // Extract constructor type: new TypeName(...)
+                                if let Some(constructor) =
+                                    init_node.child_by_field_name("constructor")
+                                {
+                                    // constructor might be an identifier or qualified name
+                                    // We take the last identifier as the type name
+                                    let type_name = if constructor.kind() == "identifier" {
+                                        Some(&code[constructor.byte_range()])
+                                    } else {
+                                        // Fallback: try to find a trailing identifier
+                                        let mut last_ident: Option<&str> = None;
+                                        let mut c2 = constructor.walk();
+                                        for part in constructor.children(&mut c2) {
+                                            if part.kind() == "identifier" {
+                                                last_ident = Some(&code[part.byte_range()]);
                                             }
-                                            last_ident
-                                        };
-                                        if let Some(typ) = type_name {
-                                            let range = Range::new(
-                                                child.start_position().row as u32,
-                                                child.start_position().column as u16,
-                                                child.end_position().row as u32,
-                                                child.end_position().column as u16,
-                                            );
-                                            out.push((var, typ, range));
                                         }
+                                        last_ident
+                                    };
+                                    if let Some(typ) = type_name {
+                                        let range = Range::new(
+                                            child.start_position().row as u32,
+                                            child.start_position().column as u16,
+                                            child.end_position().row as u32,
+                                            child.end_position().column as u16,
+                                        );
+                                        out.push((var, typ, range));
                                     }
                                 }
                             }

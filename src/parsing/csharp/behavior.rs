@@ -196,33 +196,36 @@ impl LanguageBehavior for CSharpBehavior {
         }
 
         // Try cached resolution first
-        let cached_result = RULES_CACHE.with(|cache| {
-            let mut cache_ref = cache.borrow_mut();
+        let cached_result =
+            RULES_CACHE.with(|cache| {
+                let mut cache_ref = cache.borrow_mut();
 
-            // Check if cache needs reload (>1 second old or empty)
-            let needs_reload = cache_ref
-                .as_ref()
-                .map(|(ts, _)| ts.elapsed() >= Duration::from_secs(1))
-                .unwrap_or(true);
+                // Check if cache needs reload (>1 second old or empty)
+                let needs_reload = cache_ref
+                    .as_ref()
+                    .map(|(ts, _)| ts.elapsed() >= Duration::from_secs(1))
+                    .unwrap_or(true);
 
-            // Load from disk if needed
-            if needs_reload {
-                let persistence =
-                    ResolutionPersistence::new(std::path::Path::new(crate::init::local_dir_name()));
-                if let Ok(index) = persistence.load("csharp") {
-                    *cache_ref = Some((Instant::now(), index));
-                } else {
-                    *cache_ref = None;
+                // Load from disk if needed
+                if needs_reload {
+                    let persistence = ResolutionPersistence::new(std::path::Path::new(
+                        crate::init::local_dir_name(),
+                    ));
+                    if let Ok(index) = persistence.load("csharp") {
+                        *cache_ref = Some((Instant::now(), index));
+                    } else {
+                        *cache_ref = None;
+                    }
                 }
-            }
 
-            // Get module path from cached rules
-            if let Some((_, ref index)) = *cache_ref {
-                // Canonicalize file path for matching
-                if let Ok(canon_file) = file_path.canonicalize() {
-                    // Find config that applies to this file
-                    if let Some(config_path) = index.get_config_for_file(&canon_file) {
-                        if let Some(rules) = index.rules.get(config_path) {
+                // Get module path from cached rules
+                if let Some((_, ref index)) = *cache_ref {
+                    // Canonicalize file path for matching
+                    if let Ok(canon_file) = file_path.canonicalize() {
+                        // Find config that applies to this file
+                        if let Some(config_path) = index.get_config_for_file(&canon_file)
+                            && let Some(rules) = index.rules.get(config_path)
+                        {
                             // Get baseUrl (RootNamespace from .csproj)
                             if let Some(ref base_url) = rules.base_url {
                                 // Find matching source root
@@ -251,10 +254,9 @@ impl LanguageBehavior for CSharpBehavior {
                         }
                     }
                 }
-            }
 
-            None
-        });
+                None
+            });
 
         // Return cached result if found
         if cached_result.is_some() {

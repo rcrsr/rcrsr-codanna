@@ -220,7 +220,7 @@ Add codanna to any MCP-compatible client. Project-scoped `.mcp.json` (Claude Cod
 ## Requirements
 
 - ~150MB for embedding model (downloaded on first use)
-- **Build from source:** Rust 1.85+, Linux needs `pkg-config libssl-dev`
+- **Build from source:** Rust 1.89+, Linux needs `pkg-config libssl-dev`
 - Windows support is experimental
 
 ## Contributing

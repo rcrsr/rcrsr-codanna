@@ -66,9 +66,31 @@ SETTINGS
         || { echo "workspace seed failed: $ws" >&2; exit 2; }
 }
 
+# Resolve the current generation's data directory: read the `current`
+# pointer file (a bare generation id) under the index root and join
+# `gen/<id>`. Falls back to the index root itself if there is no `current`
+# pointer (e.g. a legacy flat layout never migrated).
+current_generation_dir() {
+    local ws=$1
+    local root="$ws/.codanna/index"
+    local current_file="$root/current"
+    if [ -f "$current_file" ]; then
+        local id
+        id=$(tr -d '[:space:]' < "$current_file")
+        echo "$root/gen/$id"
+    else
+        echo "$root"
+    fi
+}
+
+index_meta_path() {
+    local ws=$1
+    echo "$(current_generation_dir "$ws")/index.meta"
+}
+
 tamper_stale() {
     local ws=$1
-    python3 - "$ws/.codanna/index/index.meta" <<'PY'
+    python3 - "$(index_meta_path "$ws")" <<'PY'
 import json, sys
 path = sys.argv[1]
 meta = json.load(open(path))

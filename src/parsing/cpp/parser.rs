@@ -89,19 +89,19 @@ impl CppParser {
         file_id: FileId,
         imports: &mut Vec<Import>,
     ) {
-        if node.kind() == "preproc_include" {
-            if let Some(path_node) = node.child_by_field_name("path") {
-                let path_text = &code[path_node.byte_range()];
-                // Remove quotes
-                let clean_path = path_text.trim_matches(|c| c == '"' || c == '<' || c == '>');
-                imports.push(Import {
-                    path: clean_path.to_string(),
-                    alias: None,
-                    file_id,
-                    is_glob: false,
-                    is_type_only: false,
-                });
-            }
+        if node.kind() == "preproc_include"
+            && let Some(path_node) = node.child_by_field_name("path")
+        {
+            let path_text = &code[path_node.byte_range()];
+            // Remove quotes
+            let clean_path = path_text.trim_matches(|c| c == '"' || c == '<' || c == '>');
+            imports.push(Import {
+                path: clean_path.to_string(),
+                alias: None,
+                file_id,
+                is_glob: false,
+                is_type_only: false,
+            });
         }
 
         // Recursively process children
@@ -135,29 +135,29 @@ impl CppParser {
                     let mut method_name = String::new();
 
                     for i in 0..declarator.child_count() {
-                        if let Some(child) = declarator.child(i as u32) {
-                            if child.kind() == "qualified_identifier" {
-                                // This is a method implementation (Class::method)
-                                is_method = true;
-                                // Extract method name from qualified_identifier
-                                for j in 0..child.child_count() {
-                                    if let Some(id_node) = child.child(j as u32) {
-                                        if id_node.kind() == "identifier" {
-                                            method_name = code[id_node.byte_range()].to_string();
-                                            break;
-                                        }
-                                    }
+                        if let Some(child) = declarator.child(i as u32)
+                            && child.kind() == "qualified_identifier"
+                        {
+                            // This is a method implementation (Class::method)
+                            is_method = true;
+                            // Extract method name from qualified_identifier
+                            for j in 0..child.child_count() {
+                                if let Some(id_node) = child.child(j as u32)
+                                    && id_node.kind() == "identifier"
+                                {
+                                    method_name = code[id_node.byte_range()].to_string();
+                                    break;
                                 }
-                                break;
                             }
+                            break;
                         }
                     }
 
                     // Fallback: try to get declarator field
-                    if method_name.is_empty() {
-                        if let Some(name_node) = declarator.child_by_field_name("declarator") {
-                            method_name = code[name_node.byte_range()].to_string();
-                        }
+                    if method_name.is_empty()
+                        && let Some(name_node) = declarator.child_by_field_name("declarator")
+                    {
+                        method_name = code[name_node.byte_range()].to_string();
                     }
 
                     if !method_name.is_empty() {
@@ -316,42 +316,42 @@ impl CppParser {
                 // Check if this is a method declaration (has function_declarator child)
                 if self.context.current_class().is_some() {
                     for i in 0..node.child_count() {
-                        if let Some(child) = node.child(i as u32) {
-                            if child.kind() == "function_declarator" {
-                                // This is a method declaration
-                                // Look for field_identifier child
-                                for j in 0..child.child_count() {
-                                    if let Some(name_node) = child.child(j as u32) {
-                                        if name_node.kind() == "field_identifier" {
-                                            let method_name = &code[name_node.byte_range()];
-                                            let symbol_id = counter.next_id();
-                                            let doc_comment = self.extract_doc_comment(&node, code);
-                                            let range = Range::new(
-                                                node.start_position().row as u32,
-                                                node.start_position().column as u16,
-                                                node.end_position().row as u32,
-                                                node.end_position().column as u16,
-                                            );
+                        if let Some(child) = node.child(i as u32)
+                            && child.kind() == "function_declarator"
+                        {
+                            // This is a method declaration
+                            // Look for field_identifier child
+                            for j in 0..child.child_count() {
+                                if let Some(name_node) = child.child(j as u32)
+                                    && name_node.kind() == "field_identifier"
+                                {
+                                    let method_name = &code[name_node.byte_range()];
+                                    let symbol_id = counter.next_id();
+                                    let doc_comment = self.extract_doc_comment(&node, code);
+                                    let range = Range::new(
+                                        node.start_position().row as u32,
+                                        node.start_position().column as u16,
+                                        node.end_position().row as u32,
+                                        node.end_position().column as u16,
+                                    );
 
-                                            let symbol = self.create_symbol(
-                                                symbol_id,
-                                                method_name.to_string(),
-                                                SymbolKind::Method,
-                                                file_id,
-                                                range,
-                                                None, // signature
-                                                doc_comment,
-                                                "", // module_path
-                                                Visibility::Public,
-                                            );
+                                    let symbol = self.create_symbol(
+                                        symbol_id,
+                                        method_name.to_string(),
+                                        SymbolKind::Method,
+                                        file_id,
+                                        range,
+                                        None, // signature
+                                        doc_comment,
+                                        "", // module_path
+                                        Visibility::Public,
+                                    );
 
-                                            symbols.push(symbol);
-                                            break;
-                                        }
-                                    }
+                                    symbols.push(symbol);
+                                    break;
                                 }
-                                break;
                             }
+                            break;
                         }
                     }
                 }
@@ -423,60 +423,60 @@ impl CppParser {
             in_member_fn
         };
 
-        if node.kind() == "call_expression" {
-            if let Some(function_node) = node.child_by_field_name("function") {
-                let range = Range::new(
-                    node.start_position().row as u32,
-                    node.start_position().column as u16,
-                    node.end_position().row as u32,
-                    node.end_position().column as u16,
-                );
-                let caller = function_context.unwrap_or("");
+        if node.kind() == "call_expression"
+            && let Some(function_node) = node.child_by_field_name("function")
+        {
+            let range = Range::new(
+                node.start_position().row as u32,
+                node.start_position().column as u16,
+                node.end_position().row as u32,
+                node.end_position().column as u16,
+            );
+            let caller = function_context.unwrap_or("");
 
-                match function_node.kind() {
-                    // obj.method() and ptr->method() share the field_expression node kind.
-                    "field_expression" => {
-                        let receiver = function_node
-                            .child_by_field_name("argument")
-                            .map(|n| code[n.byte_range()].trim());
-                        let method_name = function_node
-                            .child_by_field_name("field")
-                            .map(|n| code[n.byte_range()].trim())
-                            .unwrap_or_else(|| code[function_node.byte_range()].trim());
-                        let mut call = MethodCall::new(caller, method_name, range);
-                        if let Some(r) = receiver {
-                            call = call.with_receiver(r);
-                        }
-                        calls.push(call);
+            match function_node.kind() {
+                // obj.method() and ptr->method() share the field_expression node kind.
+                "field_expression" => {
+                    let receiver = function_node
+                        .child_by_field_name("argument")
+                        .map(|n| code[n.byte_range()].trim());
+                    let method_name = function_node
+                        .child_by_field_name("field")
+                        .map(|n| code[n.byte_range()].trim())
+                        .unwrap_or_else(|| code[function_node.byte_range()].trim());
+                    let mut call = MethodCall::new(caller, method_name, range);
+                    if let Some(r) = receiver {
+                        call = call.with_receiver(r);
                     }
-                    // Class::method() — :: token is the syntactic static marker in C++.
-                    "qualified_identifier" => {
-                        let receiver = function_node
-                            .child_by_field_name("scope")
-                            .map(|n| code[n.byte_range()].trim());
-                        let method_name = function_node
-                            .child_by_field_name("name")
-                            .map(|n| code[n.byte_range()].trim())
-                            .unwrap_or_else(|| code[function_node.byte_range()].trim());
-                        let mut call = MethodCall::new(caller, method_name, range);
-                        if let Some(r) = receiver {
-                            call = call.with_receiver(r).static_method();
-                        }
-                        calls.push(call);
+                    calls.push(call);
+                }
+                // Class::method() — :: token is the syntactic static marker in C++.
+                "qualified_identifier" => {
+                    let receiver = function_node
+                        .child_by_field_name("scope")
+                        .map(|n| code[n.byte_range()].trim());
+                    let method_name = function_node
+                        .child_by_field_name("name")
+                        .map(|n| code[n.byte_range()].trim())
+                        .unwrap_or_else(|| code[function_node.byte_range()].trim());
+                    let mut call = MethodCall::new(caller, method_name, range);
+                    if let Some(r) = receiver {
+                        call = call.with_receiver(r).static_method();
                     }
-                    _ => {
-                        let function_name = code[function_node.byte_range()].trim();
-                        let mut call = MethodCall::new(caller, function_name, range);
-                        // Unqualified call inside a member function is
-                        // implicit-this: C++ member lookup shadows free
-                        // functions, and the self-form path resolves through
-                        // the enclosing type. Free-function bodies stay
-                        // receiver-less.
-                        if in_member_fn {
-                            call = call.with_receiver("this");
-                        }
-                        calls.push(call);
+                    calls.push(call);
+                }
+                _ => {
+                    let function_name = code[function_node.byte_range()].trim();
+                    let mut call = MethodCall::new(caller, function_name, range);
+                    // Unqualified call inside a member function is
+                    // implicit-this: C++ member lookup shadows free
+                    // functions, and the self-form path resolves through
+                    // the enclosing type. Free-function bodies stay
+                    // receiver-less.
+                    if in_member_fn {
+                        call = call.with_receiver("this");
                     }
+                    calls.push(call);
                 }
             }
         }
@@ -503,24 +503,24 @@ impl CppParser {
         implementations: &mut Vec<(&'a str, &'a str, Range)>,
     ) {
         // In C++, method implementations often have the form Class::method
-        if node.kind() == "function_definition" {
-            if let Some(declarator) = node.child_by_field_name("declarator") {
-                // Check if this is a method implementation (has :: in the name)
-                let declarator_text = &code[declarator.byte_range()];
-                if declarator_text.contains("::") {
-                    // This is likely a method implementation
-                    // Extract class name and method name
-                    if let Some(separator_pos) = declarator_text.find("::") {
-                        let class_name = &declarator_text[..separator_pos];
-                        let method_name = &declarator_text[separator_pos + 2..];
-                        let range = Range::new(
-                            node.start_position().row as u32,
-                            node.start_position().column as u16,
-                            node.end_position().row as u32,
-                            node.end_position().column as u16,
-                        );
-                        implementations.push((class_name, method_name, range));
-                    }
+        if node.kind() == "function_definition"
+            && let Some(declarator) = node.child_by_field_name("declarator")
+        {
+            // Check if this is a method implementation (has :: in the name)
+            let declarator_text = &code[declarator.byte_range()];
+            if declarator_text.contains("::") {
+                // This is likely a method implementation
+                // Extract class name and method name
+                if let Some(separator_pos) = declarator_text.find("::") {
+                    let class_name = &declarator_text[..separator_pos];
+                    let method_name = &declarator_text[separator_pos + 2..];
+                    let range = Range::new(
+                        node.start_position().row as u32,
+                        node.start_position().column as u16,
+                        node.end_position().row as u32,
+                        node.end_position().column as u16,
+                    );
+                    implementations.push((class_name, method_name, range));
                 }
             }
         }
@@ -540,18 +540,18 @@ impl CppParser {
         extends: &mut Vec<(&'a str, &'a str, Range)>,
     ) {
         // In C++, inheritance is specified with : public BaseClass, : protected BaseClass, etc.
-        if node.kind() == "class_specifier" {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let derived_class = &code[name_node.byte_range()];
+        if node.kind() == "class_specifier"
+            && let Some(name_node) = node.child_by_field_name("name")
+        {
+            let derived_class = &code[name_node.byte_range()];
 
-                // Look for base class specifiers
-                for i in 0..node.child_count() {
-                    if let Some(child) = node.child(i as u32) {
-                        if child.kind() == "base_class_clause" {
-                            // Extract base class names
-                            Self::extract_base_classes_in_node(child, code, derived_class, extends);
-                        }
-                    }
+            // Look for base class specifiers
+            for i in 0..node.child_count() {
+                if let Some(child) = node.child(i as u32)
+                    && child.kind() == "base_class_clause"
+                {
+                    // Extract base class names
+                    Self::extract_base_classes_in_node(child, code, derived_class, extends);
                 }
             }
         }
@@ -648,17 +648,17 @@ impl CppParser {
             }
         }
         // Preprocessor definitions
-        else if node.kind() == "preproc_def" {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let macro_name = &code[name_node.byte_range()];
-                let range = Range::new(
-                    node.start_position().row as u32,
-                    node.start_position().column as u16,
-                    node.end_position().row as u32,
-                    node.end_position().column as u16,
-                );
-                defines.push((macro_name, "macro", range));
-            }
+        else if node.kind() == "preproc_def"
+            && let Some(name_node) = node.child_by_field_name("name")
+        {
+            let macro_name = &code[name_node.byte_range()];
+            let range = Range::new(
+                node.start_position().row as u32,
+                node.start_position().column as u16,
+                node.end_position().row as u32,
+                node.end_position().column as u16,
+            );
+            defines.push((macro_name, "macro", range));
         }
 
         // Process children
@@ -676,25 +676,25 @@ impl CppParser {
         variable_types: &mut Vec<(&'a str, &'a str, Range)>,
     ) {
         // Variable declarations with explicit types
-        if node.kind() == "declaration" {
-            if let Some(type_node) = node.child_by_field_name("type") {
-                let type_name = &code[type_node.byte_range()];
-                if let Some(declarator) = node.child_by_field_name("declarator") {
-                    let declarator_text = &code[declarator.byte_range()];
-                    // Extract variable name (before = if present)
-                    let var_name = if let Some(equals_pos) = declarator_text.find('=') {
-                        declarator_text[..equals_pos].trim()
-                    } else {
-                        declarator_text.trim()
-                    };
-                    let range = Range::new(
-                        node.start_position().row as u32,
-                        node.start_position().column as u16,
-                        node.end_position().row as u32,
-                        node.end_position().column as u16,
-                    );
-                    variable_types.push((var_name, type_name, range));
-                }
+        if node.kind() == "declaration"
+            && let Some(type_node) = node.child_by_field_name("type")
+        {
+            let type_name = &code[type_node.byte_range()];
+            if let Some(declarator) = node.child_by_field_name("declarator") {
+                let declarator_text = &code[declarator.byte_range()];
+                // Extract variable name (before = if present)
+                let var_name = if let Some(equals_pos) = declarator_text.find('=') {
+                    declarator_text[..equals_pos].trim()
+                } else {
+                    declarator_text.trim()
+                };
+                let range = Range::new(
+                    node.start_position().row as u32,
+                    node.start_position().column as u16,
+                    node.end_position().row as u32,
+                    node.end_position().column as u16,
+                );
+                variable_types.push((var_name, type_name, range));
             }
         }
 
@@ -713,22 +713,22 @@ impl CppParser {
         inherent_methods: &mut Vec<(String, String, Range)>,
     ) {
         // Method definitions inside class specifiers
-        if node.kind() == "class_specifier" {
-            if let Some(class_name_node) = node.child_by_field_name("name") {
-                let class_name = &code[class_name_node.byte_range()];
+        if node.kind() == "class_specifier"
+            && let Some(class_name_node) = node.child_by_field_name("name")
+        {
+            let class_name = &code[class_name_node.byte_range()];
 
-                // Look for method definitions inside the class body
-                for i in 0..node.child_count() {
-                    if let Some(child) = node.child(i as u32) {
-                        if child.kind() == "field_declaration_list" {
-                            Self::extract_methods_from_class_body(
-                                child,
-                                code,
-                                class_name,
-                                inherent_methods,
-                            );
-                        }
-                    }
+            // Look for method definitions inside the class body
+            for i in 0..node.child_count() {
+                if let Some(child) = node.child(i as u32)
+                    && child.kind() == "field_declaration_list"
+                {
+                    Self::extract_methods_from_class_body(
+                        child,
+                        code,
+                        class_name,
+                        inherent_methods,
+                    );
                 }
             }
         }
@@ -1008,34 +1008,34 @@ impl CppParser {
         let function_context = Self::function_name_at_def(node, code).or(current_function);
 
         // Check if this is a call expression
-        if node.kind() == "call_expression" {
-            if let Some(function_node) = node.child_by_field_name("function") {
-                // Extract the actual function name from different call patterns
-                let target_name = match function_node.kind() {
-                    // Member function call: obj->method() or obj.method()
-                    "field_expression" => {
-                        // Get the field identifier (the actual method name)
-                        if let Some(field_node) = function_node.child_by_field_name("field") {
-                            &code[field_node.byte_range()]
-                        } else {
-                            &code[function_node.byte_range()]
-                        }
+        if node.kind() == "call_expression"
+            && let Some(function_node) = node.child_by_field_name("function")
+        {
+            // Extract the actual function name from different call patterns
+            let target_name = match function_node.kind() {
+                // Member function call: obj->method() or obj.method()
+                "field_expression" => {
+                    // Get the field identifier (the actual method name)
+                    if let Some(field_node) = function_node.child_by_field_name("field") {
+                        &code[field_node.byte_range()]
+                    } else {
+                        &code[function_node.byte_range()]
                     }
-                    // Simple function call: function()
-                    _ => &code[function_node.byte_range()],
-                };
-
-                let range = Range::new(
-                    node.start_position().row as u32,
-                    node.start_position().column as u16,
-                    node.end_position().row as u32,
-                    node.end_position().column as u16,
-                );
-
-                // Only record call if we have a function context
-                if let Some(context) = function_context {
-                    calls.push((context, target_name, range));
                 }
+                // Simple function call: function()
+                _ => &code[function_node.byte_range()],
+            };
+
+            let range = Range::new(
+                node.start_position().row as u32,
+                node.start_position().column as u16,
+                node.end_position().row as u32,
+                node.end_position().column as u16,
+            );
+
+            // Only record call if we have a function context
+            if let Some(context) = function_context {
+                calls.push((context, target_name, range));
             }
         }
 

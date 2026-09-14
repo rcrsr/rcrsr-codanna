@@ -321,40 +321,40 @@ impl PipelineMetrics {
 
     /// Add stage metrics to the report.
     pub fn add_stage(&self, metrics: StageMetrics) {
-        if self.enabled {
-            if let Ok(mut report) = self.report.lock() {
-                report.add_stage(metrics);
-            }
+        if self.enabled
+            && let Ok(mut report) = self.report.lock()
+        {
+            report.add_stage(metrics);
         }
     }
 
     /// Finalize the report without logging.
     /// Use this when logging needs to be deferred (e.g., until StatusLine is dropped).
     pub fn finalize(&self, total_time: Duration) {
-        if self.enabled {
-            if let Ok(mut report) = self.report.lock() {
-                report.finalize(total_time);
-            }
+        if self.enabled
+            && let Ok(mut report) = self.report.lock()
+        {
+            report.finalize(total_time);
         }
     }
 
     /// Log the finalized report.
     /// Call after StatusLine is dropped to avoid stderr race conditions.
     pub fn log(&self) {
-        if self.enabled {
-            if let Ok(report) = self.report.lock() {
-                report.log();
-            }
+        if self.enabled
+            && let Ok(report) = self.report.lock()
+        {
+            report.log();
         }
     }
 
     /// Finalize and log the report.
     pub fn finalize_and_log(&self, total_time: Duration) {
-        if self.enabled {
-            if let Ok(mut report) = self.report.lock() {
-                report.finalize(total_time);
-                report.log();
-            }
+        if self.enabled
+            && let Ok(mut report) = self.report.lock()
+        {
+            report.finalize(total_time);
+            report.log();
         }
     }
 }

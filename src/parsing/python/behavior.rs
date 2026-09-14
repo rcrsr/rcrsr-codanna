@@ -554,28 +554,28 @@ impl LanguageBehavior for PythonBehavior {
             let mut resolved_symbol: Option<SymbolId> = None;
             let mut suffix_matches: Vec<SymbolId> = Vec::new();
             for id in cache.lookup_candidates(&symbol_name) {
-                if let Some(symbol) = cache.get(id) {
-                    if let Some(ref sym_module) = symbol.module_path {
-                        let sym_mod = sym_module.as_ref();
-                        if sym_mod == target_module || sym_mod == effective_path {
-                            resolved_symbol = Some(id);
-                            break;
-                        }
-                        if !target_module.is_empty()
-                            && crate::indexing::pipeline::types::segment_suffix_match(
-                                sym_mod,
-                                &target_module,
-                            )
-                        {
-                            suffix_matches.push(id);
-                        }
+                if let Some(symbol) = cache.get(id)
+                    && let Some(ref sym_module) = symbol.module_path
+                {
+                    let sym_mod = sym_module.as_ref();
+                    if sym_mod == target_module || sym_mod == effective_path {
+                        resolved_symbol = Some(id);
+                        break;
+                    }
+                    if !target_module.is_empty()
+                        && crate::indexing::pipeline::types::segment_suffix_match(
+                            sym_mod,
+                            &target_module,
+                        )
+                    {
+                        suffix_matches.push(id);
                     }
                 }
             }
-            if resolved_symbol.is_none() {
-                if let [id] = suffix_matches.as_slice() {
-                    resolved_symbol = Some(*id);
-                }
+            if resolved_symbol.is_none()
+                && let [id] = suffix_matches.as_slice()
+            {
+                resolved_symbol = Some(*id);
             }
 
             // 6. Re-exported path: "from pkg import helper" where pkg's
@@ -609,12 +609,12 @@ impl LanguageBehavior for PythonBehavior {
 
         // 9. Add local symbols from this file
         for sym_id in cache.symbols_in_file(file_id) {
-            if let Some(symbol) = cache.get(sym_id) {
-                if self.is_resolvable_symbol(&symbol) {
-                    context.add_symbol(symbol.name.to_string(), symbol.id, ScopeLevel::Module);
-                    if let Some(ref module_path) = symbol.module_path {
-                        context.add_symbol(module_path.to_string(), symbol.id, ScopeLevel::Global);
-                    }
+            if let Some(symbol) = cache.get(sym_id)
+                && self.is_resolvable_symbol(&symbol)
+            {
+                context.add_symbol(symbol.name.to_string(), symbol.id, ScopeLevel::Module);
+                if let Some(ref module_path) = symbol.module_path {
+                    context.add_symbol(module_path.to_string(), symbol.id, ScopeLevel::Global);
                 }
             }
         }
@@ -652,10 +652,10 @@ impl LanguageBehavior for PythonBehavior {
                 // "from .a import helper" resolves to "pkg.a.helper" while
                 // the symbol's module is "pkg.a" - same module+symbol shape
                 // as the absolute arm below.
-                if let Some(remainder) = resolved.strip_prefix(&format!("{symbol_module_path}.")) {
-                    if !remainder.contains('.') {
-                        return true;
-                    }
+                if let Some(remainder) = resolved.strip_prefix(&format!("{symbol_module_path}."))
+                    && !remainder.contains('.')
+                {
+                    return true;
                 }
             }
 

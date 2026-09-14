@@ -188,83 +188,81 @@ pub async fn run(
     };
 
     // Process positional arguments using unified parser
-    if !positional.is_empty() {
-        if let Some(ref mut args_map) = arguments {
-            // Use the unified parser from args.rs
-            let (first_positional, params) = parse_positional_args(&positional);
+    if !positional.is_empty()
+        && let Some(ref mut args_map) = arguments
+    {
+        // Use the unified parser from args.rs
+        let (first_positional, params) = parse_positional_args(&positional);
 
-            // Handle the first positional argument based on tool type
-            if let Some(pos_arg) = first_positional {
-                match tool.as_str() {
-                    "find_symbol" => {
-                        args_map.insert(
-                            "name".to_string(),
-                            serde_json::Value::String(pos_arg.clone()),
-                        );
-                    }
-                    "get_calls" | "find_callers" | "analyze_impact" | "read_symbol" => {
-                        // Canonical key is `name` (old `function_name` /
-                        // `symbol_name` keys are still accepted via serde
-                        // aliases when passed explicitly through --args).
-                        args_map.insert(
-                            "name".to_string(),
-                            serde_json::Value::String(pos_arg.clone()),
-                        );
-                    }
-                    "get_file_outline" => {
-                        args_map.insert(
-                            "path".to_string(),
-                            serde_json::Value::String(pos_arg.clone()),
-                        );
-                    }
-                    "semantic_search_docs"
-                    | "semantic_search_with_context"
-                    | "search_documents" => {
-                        args_map.insert(
-                            "query".to_string(),
-                            serde_json::Value::String(pos_arg.clone()),
-                        );
-                    }
-                    "search_symbols" => {
-                        args_map.insert(
-                            "query".to_string(),
-                            serde_json::Value::String(pos_arg.clone()),
-                        );
-                    }
-                    _ => {
-                        eprintln!("Warning: Unknown tool '{tool}', ignoring positional argument");
-                    }
-                }
-            }
-
-            // Special handling: find_symbol supports symbol_id:XXX as positional
-            // If symbol_id is in params but name wasn't set, use it as the name
-            if tool == "find_symbol" && !args_map.contains_key("name") {
-                if let Some(id) = params.get("symbol_id") {
+        // Handle the first positional argument based on tool type
+        if let Some(pos_arg) = first_positional {
+            match tool.as_str() {
+                "find_symbol" => {
                     args_map.insert(
                         "name".to_string(),
-                        serde_json::Value::String(format!("symbol_id:{id}")),
+                        serde_json::Value::String(pos_arg.clone()),
                     );
                 }
+                "get_calls" | "find_callers" | "analyze_impact" | "read_symbol" => {
+                    // Canonical key is `name` (old `function_name` /
+                    // `symbol_name` keys are still accepted via serde
+                    // aliases when passed explicitly through --args).
+                    args_map.insert(
+                        "name".to_string(),
+                        serde_json::Value::String(pos_arg.clone()),
+                    );
+                }
+                "get_file_outline" => {
+                    args_map.insert(
+                        "path".to_string(),
+                        serde_json::Value::String(pos_arg.clone()),
+                    );
+                }
+                "semantic_search_docs" | "semantic_search_with_context" | "search_documents" => {
+                    args_map.insert(
+                        "query".to_string(),
+                        serde_json::Value::String(pos_arg.clone()),
+                    );
+                }
+                "search_symbols" => {
+                    args_map.insert(
+                        "query".to_string(),
+                        serde_json::Value::String(pos_arg.clone()),
+                    );
+                }
+                _ => {
+                    eprintln!("Warning: Unknown tool '{tool}', ignoring positional argument");
+                }
             }
+        }
 
-            // Add all key:value pairs from params
-            for (key, value) in params {
-                // Try to parse as number first, then boolean, fallback to string
-                let json_value = if let Ok(n) = value.parse::<i64>() {
-                    serde_json::Value::Number(n.into())
-                } else if let Ok(f) = value.parse::<f64>() {
-                    serde_json::Value::Number(
-                        serde_json::Number::from_f64(f)
-                            .unwrap_or_else(|| serde_json::Number::from(0)),
-                    )
-                } else if let Ok(b) = value.parse::<bool>() {
-                    serde_json::Value::Bool(b)
-                } else {
-                    serde_json::Value::String(value)
-                };
-                args_map.insert(key, json_value);
-            }
+        // Special handling: find_symbol supports symbol_id:XXX as positional
+        // If symbol_id is in params but name wasn't set, use it as the name
+        if tool == "find_symbol"
+            && !args_map.contains_key("name")
+            && let Some(id) = params.get("symbol_id")
+        {
+            args_map.insert(
+                "name".to_string(),
+                serde_json::Value::String(format!("symbol_id:{id}")),
+            );
+        }
+
+        // Add all key:value pairs from params
+        for (key, value) in params {
+            // Try to parse as number first, then boolean, fallback to string
+            let json_value = if let Ok(n) = value.parse::<i64>() {
+                serde_json::Value::Number(n.into())
+            } else if let Ok(f) = value.parse::<f64>() {
+                serde_json::Value::Number(
+                    serde_json::Number::from_f64(f).unwrap_or_else(|| serde_json::Number::from(0)),
+                )
+            } else if let Ok(b) = value.parse::<bool>() {
+                serde_json::Value::Bool(b)
+            } else {
+                serde_json::Value::String(value)
+            };
+            args_map.insert(key, json_value);
         }
     }
 
@@ -342,20 +340,19 @@ pub async fn run(
         // `depth:` is a documented alias of `max_depth:` on analyze_impact —
         // the envelope's own meta field is named `depth`, so the surface must
         // accept the key it emits.
-        if tool == "analyze_impact" {
-            if let Some(map) = arguments.as_mut() {
-                if let Some(depth) = map.remove("depth") {
-                    if map.contains_key("max_depth") {
-                        exit_invalid_args(
-                            &tool,
-                            "analyze_impact accepts either 'depth' or 'max_depth', not both",
-                            accepted,
-                            json,
-                        );
-                    }
-                    map.insert("max_depth".to_string(), depth);
-                }
+        if tool == "analyze_impact"
+            && let Some(map) = arguments.as_mut()
+            && let Some(depth) = map.remove("depth")
+        {
+            if map.contains_key("max_depth") {
+                exit_invalid_args(
+                    &tool,
+                    "analyze_impact accepts either 'depth' or 'max_depth', not both",
+                    accepted,
+                    json,
+                );
             }
+            map.insert("max_depth".to_string(), depth);
         }
 
         if let Some(map) = arguments.as_ref() {
@@ -377,19 +374,17 @@ pub async fn run(
         // downstream call site (the JSON pre-collection block and the text
         // dispatch match below) parses it with `.and_then(|v| v.as_f64())`
         // and would otherwise silently drop it as `None`.
-        if tool == "search_documents" {
-            if let Some(map) = arguments.as_ref() {
-                if let Some(v) = map.get("threshold") {
-                    if v.as_f64().is_none() {
-                        exit_invalid_args(
-                            &tool,
-                            "search_documents: 'threshold' must be a number",
-                            accepted,
-                            json,
-                        );
-                    }
-                }
-            }
+        if tool == "search_documents"
+            && let Some(map) = arguments.as_ref()
+            && let Some(v) = map.get("threshold")
+            && v.as_f64().is_none()
+        {
+            exit_invalid_args(
+                &tool,
+                "search_documents: 'threshold' must be a number",
+                accepted,
+                json,
+            );
         }
 
         if !requires_one_of.is_empty() {

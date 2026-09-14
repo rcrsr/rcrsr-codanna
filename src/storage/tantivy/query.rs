@@ -659,12 +659,12 @@ impl DocumentIndex {
     /// Get next file ID
     pub fn get_next_file_id(&self) -> StorageResult<u32> {
         // During batch operations, use and increment the pending counter
-        if let Ok(mut pending_guard) = self.pending_file_counter.lock() {
-            if let Some(ref mut counter) = *pending_guard {
-                let next_id = *counter;
-                *counter += 1;
-                return Ok(next_id);
-            }
+        if let Ok(mut pending_guard) = self.pending_file_counter.lock()
+            && let Some(ref mut counter) = *pending_guard
+        {
+            let next_id = *counter;
+            *counter += 1;
+            return Ok(next_id);
         }
 
         // Otherwise, query the committed metadata
@@ -675,12 +675,12 @@ impl DocumentIndex {
     /// Get next symbol ID
     pub fn get_next_symbol_id(&self) -> StorageResult<u32> {
         // During batch operations, use and increment the pending counter
-        if let Ok(mut pending_guard) = self.pending_symbol_counter.lock() {
-            if let Some(ref mut counter) = *pending_guard {
-                let next_id = *counter;
-                *counter += 1;
-                return Ok(next_id);
-            }
+        if let Ok(mut pending_guard) = self.pending_symbol_counter.lock()
+            && let Some(ref mut counter) = *pending_guard
+        {
+            let next_id = *counter;
+            *counter += 1;
+            return Ok(next_id);
         }
 
         // Otherwise, query the committed metadata
@@ -745,10 +745,10 @@ impl DocumentIndex {
             let doc: Document = searcher.doc(doc_address)?;
 
             // Extract file_path field
-            if let Some(path_value) = doc.get_first(self.schema.file_path) {
-                if let Some(path_str) = path_value.as_str() {
-                    paths.push(PathBuf::from(path_str));
-                }
+            if let Some(path_value) = doc.get_first(self.schema.file_path)
+                && let Some(path_str) = path_value.as_str()
+            {
+                paths.push(PathBuf::from(path_str));
             }
         }
 
@@ -2408,10 +2408,20 @@ mod tests {
         // This test queries the production .codanna/index to verify relationships exist
 
         let index_base = Path::new(".codanna/index");
-        let tantivy_path = index_base.join("tantivy");
+        let layout = crate::storage::IndexLayout::new(index_base.to_path_buf());
+        let Some(id) = crate::storage::generation::resolve_current(&layout)
+            .expect("failed to resolve current generation")
+        else {
+            eprintln!(
+                "Skipping test: no current generation under .codanna/index. Run: ./target/release/codanna index test_monorepos/spring-petclinic"
+            );
+            return;
+        };
+        let tantivy_path = layout.tantivy_dir(&id);
         if !tantivy_path.exists() {
             eprintln!(
-                "Skipping test: .codanna/index/tantivy not found. Run: ./target/release/codanna index test_monorepos/spring-petclinic"
+                "Skipping test: {} not found. Run: ./target/release/codanna index test_monorepos/spring-petclinic",
+                tantivy_path.display()
             );
             return;
         }

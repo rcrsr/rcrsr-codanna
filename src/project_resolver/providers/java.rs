@@ -78,11 +78,11 @@ impl JavaProvider {
         } else {
             // Extract custom source directory
             // This is a simplified parser - production code would use xml-rs
-            if let Some(start) = content.find("<sourceDirectory>") {
-                if let Some(end) = content[start..].find("</sourceDirectory>") {
-                    let src_dir = &content[start + 17..start + end];
-                    source_roots.push(project_dir.join(src_dir.trim()));
-                }
+            if let Some(start) = content.find("<sourceDirectory>")
+                && let Some(end) = content[start..].find("</sourceDirectory>")
+            {
+                let src_dir = &content[start + 17..start + end];
+                source_roots.push(project_dir.join(src_dir.trim()));
             }
         }
 

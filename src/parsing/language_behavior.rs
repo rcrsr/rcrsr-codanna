@@ -638,14 +638,14 @@ pub trait LanguageBehavior: Send + Sync {
 
         // 2. Add file's local symbols (MEDIUM PRIORITY)
         for symbol_id in cache.symbols_in_file(file_id) {
-            if let Some(symbol) = cache.get(symbol_id) {
-                if self.is_resolvable_symbol(&symbol) {
-                    context.add_symbol(symbol.name.to_string(), symbol.id, ScopeLevel::Module);
+            if let Some(symbol) = cache.get(symbol_id)
+                && self.is_resolvable_symbol(&symbol)
+            {
+                context.add_symbol(symbol.name.to_string(), symbol.id, ScopeLevel::Module);
 
-                    // Also add by module_path for fully qualified resolution
-                    if let Some(module_path) = &symbol.module_path {
-                        context.add_symbol(module_path.to_string(), symbol.id, ScopeLevel::Module);
-                    }
+                // Also add by module_path for fully qualified resolution
+                if let Some(module_path) = &symbol.module_path {
+                    context.add_symbol(module_path.to_string(), symbol.id, ScopeLevel::Module);
                 }
             }
         }
@@ -901,10 +901,9 @@ pub trait LanguageBehavior: Send + Sync {
         if let Some(crate::symbol::ScopeContext::ClassMember {
             class_name: Some(class),
         }) = candidate.scope_context.as_ref()
+            && &**class == receiver
         {
-            if &**class == receiver {
-                return true;
-            }
+            return true;
         }
         let sep = self.module_separator();
         let suffix = format!("{sep}{receiver}");

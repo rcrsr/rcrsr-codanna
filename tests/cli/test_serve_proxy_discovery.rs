@@ -1169,7 +1169,7 @@ fn proxy_mode_is_exempt_from_the_emission_gate_that_refuses_plain_serve() {
     // Deliberately write a mismatched `emission_version` into the on-disk
     // `index.meta` the fixture's index build produced -- the mismatch this
     // test's two arms observe is WRITTEN here, not assumed.
-    let index_dir = workspace.path().join(".codanna").join("index");
+    let index_dir = crate::support::current_generation_dir(workspace.path());
     let mut meta = codanna::storage::IndexMetadata::load(&index_dir)
         .expect("load the index.meta written by prepare_workspace's index build");
     assert_eq!(

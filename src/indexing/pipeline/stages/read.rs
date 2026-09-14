@@ -133,10 +133,10 @@ impl ReadStage {
                                 // path, which must still be normalized to
                                 // workspace-relative when workspace_root is set.
                                 _ => read_file(&path).map(|mut content| {
-                                    if let Some(ref root) = *workspace_root {
-                                        if let Ok(relative) = content.path.strip_prefix(root) {
-                                            content.path = relative.to_path_buf();
-                                        }
+                                    if let Some(ref root) = *workspace_root
+                                        && let Ok(relative) = content.path.strip_prefix(root)
+                                    {
+                                        content.path = relative.to_path_buf();
                                     }
                                     content
                                 }),

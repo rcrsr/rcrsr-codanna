@@ -22,6 +22,7 @@ name = "codanna"
 version = "0.16.0+rcrsr.7"
 authors = ["Angel Bartolli <bartolli@gmail.com>"]
 edition = "2024"
+rust-version = "1.89"
 description = "Local code intelligence MCP server and CLI for AI coding agents"
 documentation = "https://docs.codanna.sh"
 homepage = "https://docs.codanna.sh"

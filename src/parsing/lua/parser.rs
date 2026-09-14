@@ -765,48 +765,48 @@ fn extract_method_calls_recursive<'a>(
     // prefix stripped, colon checked first. The twin dedupe in the parse
     // stage keys on this equality.
     let mut enclosing = enclosing;
-    if node.kind() == "function_declaration" {
-        if let Some(name_node) = node.child_by_field_name("name") {
-            let name_text = &code[name_node.byte_range()];
-            let simple_name = if let Some(colon_pos) = name_text.rfind(':') {
-                &name_text[colon_pos + 1..]
-            } else if let Some(dot_pos) = name_text.rfind('.') {
-                &name_text[dot_pos + 1..]
-            } else {
-                name_text
-            };
-            enclosing = Some(simple_name);
-        }
+    if node.kind() == "function_declaration"
+        && let Some(name_node) = node.child_by_field_name("name")
+    {
+        let name_text = &code[name_node.byte_range()];
+        let simple_name = if let Some(colon_pos) = name_text.rfind(':') {
+            &name_text[colon_pos + 1..]
+        } else if let Some(dot_pos) = name_text.rfind('.') {
+            &name_text[dot_pos + 1..]
+        } else {
+            name_text
+        };
+        enclosing = Some(simple_name);
     }
 
-    if node.kind() == "function_call" {
-        if let Some(name_node) = node.child_by_field_name("name") {
-            // Colon form `tbl:method()` and dot form `tbl.fn()` differ in AST kind only;
-            // dot form is ambiguous (could be table-fn or static), spec says treat conservative ⇒ instance.
-            let table_field = match name_node.kind() {
-                "method_index_expression" => "method",
-                "dot_index_expression" => "field",
-                _ => "",
-            };
-            if !table_field.is_empty() {
-                if let Some(method_node) = name_node.child_by_field_name(table_field) {
-                    let method_name = code[method_node.byte_range()].to_string();
-                    let range = range_from_node(node);
+    if node.kind() == "function_call"
+        && let Some(name_node) = node.child_by_field_name("name")
+    {
+        // Colon form `tbl:method()` and dot form `tbl.fn()` differ in AST kind only;
+        // dot form is ambiguous (could be table-fn or static), spec says treat conservative ⇒ instance.
+        let table_field = match name_node.kind() {
+            "method_index_expression" => "method",
+            "dot_index_expression" => "field",
+            _ => "",
+        };
+        if !table_field.is_empty()
+            && let Some(method_node) = name_node.child_by_field_name(table_field)
+        {
+            let method_name = code[method_node.byte_range()].to_string();
+            let range = range_from_node(node);
 
-                    let receiver = name_node
-                        .child_by_field_name("table")
-                        .map(|n| code[n.byte_range()].to_string());
+            let receiver = name_node
+                .child_by_field_name("table")
+                .map(|n| code[n.byte_range()].to_string());
 
-                    calls.push(MethodCall {
-                        caller: enclosing.unwrap_or("<module>").to_string(),
-                        method_name,
-                        receiver,
-                        is_static: false,
-                        range,
-                        caller_range: Some(range),
-                    });
-                }
-            }
+            calls.push(MethodCall {
+                caller: enclosing.unwrap_or("<module>").to_string(),
+                method_name,
+                receiver,
+                is_static: false,
+                range,
+                caller_range: Some(range),
+            });
         }
     }
 
@@ -851,20 +851,21 @@ fn extract_imports_recursive(node: &Node, code: &str, file_id: FileId, imports: 
                 }
             }
 
-            if let Some(call_node) = require_call {
-                if let Some(import) = try_extract_require_call(&call_node, code, file_id, alias) {
-                    imports.push(import);
-                    found_import = true;
-                }
+            if let Some(call_node) = require_call
+                && let Some(import) = try_extract_require_call(&call_node, code, file_id, alias)
+            {
+                imports.push(import);
+                found_import = true;
             }
         }
 
         // Also check for standalone require() calls (without assignment)
-        if !found_import && current_node.kind() == "function_call" {
-            if let Some(import) = try_extract_require_call(&current_node, code, file_id, None) {
-                imports.push(import);
-                found_import = true;
-            }
+        if !found_import
+            && current_node.kind() == "function_call"
+            && let Some(import) = try_extract_require_call(&current_node, code, file_id, None)
+        {
+            imports.push(import);
+            found_import = true;
         }
 
         // Only push children if we didn't find an import (preserve skip behavior)

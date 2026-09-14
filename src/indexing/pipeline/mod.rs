@@ -60,7 +60,7 @@ pub use types::{
 
 use crate::Settings;
 use crate::semantic::SimpleSemanticSearch;
-use crate::storage::DocumentIndex;
+use crate::storage::{DocumentIndex, IndexLayout};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -72,18 +72,70 @@ use std::sync::{Arc, Mutex};
 pub struct Pipeline {
     settings: Arc<Settings>,
     config: PipelineConfig,
+
+    /// Directory the pipeline reads/writes semantic-search (embedding)
+    /// artifacts under. Sourced from the owning [`crate::indexing::IndexFacade`]'s
+    /// generation-scoped `IndexLayout` (`gen/<id>/semantic`) via
+    /// [`Self::with_semantic_dir`]; [`Self::with_settings`] falls back to
+    /// deriving it from `settings.index_path` for callers (mainly tests)
+    /// that construct a `Pipeline` without an `IndexFacade`.
+    semantic_dir: PathBuf,
 }
 
 impl Pipeline {
     /// Create a new pipeline with the given settings and configuration.
+    ///
+    /// The semantic directory is derived from `settings.index_path`; use
+    /// [`Self::with_semantic_dir`] when a generation-scoped path from an
+    /// `IndexFacade`'s `IndexLayout` is available.
     pub fn new(settings: Arc<Settings>, config: PipelineConfig) -> Self {
-        Self { settings, config }
+        let semantic_dir = Self::derive_semantic_dir(&settings);
+        Self {
+            settings,
+            config,
+            semantic_dir,
+        }
     }
 
     /// Create a pipeline with configuration derived from settings.
     pub fn with_settings(settings: Arc<Settings>) -> Self {
         let config = PipelineConfig::from_settings(&settings);
         Self::new(settings, config)
+    }
+
+    /// Create a pipeline with an explicit semantic directory, e.g. sourced
+    /// from an `IndexFacade`'s generation-scoped `IndexLayout` at
+    /// `IndexFacade::open` / bootstrap time.
+    pub fn with_semantic_dir(
+        settings: Arc<Settings>,
+        config: PipelineConfig,
+        semantic_dir: PathBuf,
+    ) -> Self {
+        Self {
+            settings,
+            config,
+            semantic_dir,
+        }
+    }
+
+    /// Derive a semantic directory from `settings.index_path` alone, for
+    /// callers with no generation-scoped `IndexLayout` at hand (mainly
+    /// tests constructing a bare `Pipeline` via [`Self::new`]/
+    /// [`Self::with_settings`]; production code always goes through
+    /// [`Self::with_semantic_dir`] with an `IndexFacade`'s own layout).
+    ///
+    /// When `settings.index_path` already has a `current` generation on
+    /// disk, this resolves to that generation's own `gen/<id>/semantic`
+    /// directory rather than a root-level `.../semantic` that would
+    /// conflict with the generation layout contract. Only falls back to a
+    /// root-level path when there is no `current` pointer to resolve (a
+    /// fresh index directory, as most tests construct).
+    fn derive_semantic_dir(settings: &Settings) -> PathBuf {
+        let layout = IndexLayout::new(settings.index_path.clone());
+        match layout.read_current().ok().flatten() {
+            Some(current) => layout.semantic_dir(&current),
+            None => layout.root().join("semantic"),
+        }
     }
 
     /// Get the pipeline configuration.
@@ -94,6 +146,12 @@ impl Pipeline {
     /// Get the settings.
     pub fn settings(&self) -> &Settings {
         &self.settings
+    }
+
+    /// Get the directory the pipeline reads/writes semantic-search
+    /// artifacts under.
+    pub fn semantic_dir(&self) -> &Path {
+        &self.semantic_dir
     }
 
     // ─────────────────────────────────────────────────────────────────────────────

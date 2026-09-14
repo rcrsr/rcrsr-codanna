@@ -729,33 +729,33 @@ impl CSharpParser {
         };
 
         // Handle invocation expressions with proper caller context
-        if node.kind() == "invocation_expression" {
-            if let Some(expression_node) = node.child(0) {
-                let caller = function_context.unwrap_or("");
-                let callee = match expression_node.kind() {
-                    "member_access_expression" => {
-                        // obj.Method() - extract just method name for resolution
-                        // The receiver info is captured by find_method_calls() for richer context
-                        expression_node
-                            .child_by_field_name("name")
-                            .map(|n| &code[n.byte_range()])
-                            .unwrap_or(&code[expression_node.byte_range()])
-                    }
-                    "identifier" => {
-                        // Simple method call like "DoSomething()"
-                        &code[expression_node.byte_range()]
-                    }
-                    _ => &code[expression_node.byte_range()],
-                };
+        if node.kind() == "invocation_expression"
+            && let Some(expression_node) = node.child(0)
+        {
+            let caller = function_context.unwrap_or("");
+            let callee = match expression_node.kind() {
+                "member_access_expression" => {
+                    // obj.Method() - extract just method name for resolution
+                    // The receiver info is captured by find_method_calls() for richer context
+                    expression_node
+                        .child_by_field_name("name")
+                        .map(|n| &code[n.byte_range()])
+                        .unwrap_or(&code[expression_node.byte_range()])
+                }
+                "identifier" => {
+                    // Simple method call like "DoSomething()"
+                    &code[expression_node.byte_range()]
+                }
+                _ => &code[expression_node.byte_range()],
+            };
 
-                let range = Range::new(
-                    node.start_position().row as u32,
-                    node.start_position().column as u16,
-                    node.end_position().row as u32,
-                    node.end_position().column as u16,
-                );
-                calls.push((caller, callee, range));
-            }
+            let range = Range::new(
+                node.start_position().row as u32,
+                node.start_position().column as u16,
+                node.end_position().row as u32,
+                node.end_position().column as u16,
+            );
+            calls.push((caller, callee, range));
         }
 
         // Recursively process children with inherited or updated context
@@ -846,29 +846,27 @@ impl CSharpParser {
                             // obj.Method() calls
                             if let Some(object_node) =
                                 expression_node.child_by_field_name("expression")
+                                && let Some(name_node) = expression_node.child_by_field_name("name")
                             {
-                                if let Some(name_node) = expression_node.child_by_field_name("name")
-                                {
-                                    let receiver = code[object_node.byte_range()].to_string();
-                                    let method = code[name_node.byte_range()].to_string();
-                                    let range = Range::new(
-                                        node.start_position().row as u32,
-                                        node.start_position().column as u16,
-                                        node.end_position().row as u32,
-                                        node.end_position().column as u16,
-                                    );
-                                    // Syntactic Pascal heuristic; type-inference recovers lowercase classes later.
-                                    let is_static = receiver
-                                        .chars()
-                                        .next()
-                                        .is_some_and(|c| c.is_ascii_uppercase());
-                                    let mut call = MethodCall::new(caller, &method, range)
-                                        .with_receiver(&receiver);
-                                    if is_static {
-                                        call = call.static_method();
-                                    }
-                                    method_calls.push(call);
+                                let receiver = code[object_node.byte_range()].to_string();
+                                let method = code[name_node.byte_range()].to_string();
+                                let range = Range::new(
+                                    node.start_position().row as u32,
+                                    node.start_position().column as u16,
+                                    node.end_position().row as u32,
+                                    node.end_position().column as u16,
+                                );
+                                // Syntactic Pascal heuristic; type-inference recovers lowercase classes later.
+                                let is_static = receiver
+                                    .chars()
+                                    .next()
+                                    .is_some_and(|c| c.is_ascii_uppercase());
+                                let mut call = MethodCall::new(caller, &method, range)
+                                    .with_receiver(&receiver);
+                                if is_static {
+                                    call = call.static_method();
                                 }
+                                method_calls.push(call);
                             }
                         }
                         "identifier" => {
@@ -1451,30 +1449,30 @@ impl CSharpParser {
         if let Some(body_node) = enum_node.child_by_field_name("body") {
             let mut cursor = body_node.walk();
             for child in body_node.children(&mut cursor) {
-                if child.kind() == "enum_member_declaration" {
-                    if let Some(name_node) = child.child_by_field_name("name") {
-                        let name = code[name_node.byte_range()].to_string();
-                        let signature = self.extract_enum_member_signature(child, code);
-                        let doc_comment = self.extract_doc_comment(&child, code);
+                if child.kind() == "enum_member_declaration"
+                    && let Some(name_node) = child.child_by_field_name("name")
+                {
+                    let name = code[name_node.byte_range()].to_string();
+                    let signature = self.extract_enum_member_signature(child, code);
+                    let doc_comment = self.extract_doc_comment(&child, code);
 
-                        let symbol = self.create_symbol(
-                            counter.next_id(),
-                            name,
-                            SymbolKind::Constant, // Enum members are constant values
-                            file_id,
-                            Range::new(
-                                child.start_position().row as u32,
-                                child.start_position().column as u16,
-                                child.end_position().row as u32,
-                                child.end_position().column as u16,
-                            ),
-                            Some(signature),
-                            doc_comment,
-                            module_path,
-                            Visibility::Public, // Enum members are always public
-                        );
-                        symbols.push(symbol);
-                    }
+                    let symbol = self.create_symbol(
+                        counter.next_id(),
+                        name,
+                        SymbolKind::Constant, // Enum members are constant values
+                        file_id,
+                        Range::new(
+                            child.start_position().row as u32,
+                            child.start_position().column as u16,
+                            child.end_position().row as u32,
+                            child.end_position().column as u16,
+                        ),
+                        Some(signature),
+                        doc_comment,
+                        module_path,
+                        Visibility::Public, // Enum members are always public
+                    );
+                    symbols.push(symbol);
                 }
             }
         }
@@ -1605,31 +1603,31 @@ impl CSharpParser {
                 // Extract each variable declarator
                 let mut var_cursor = child.walk();
                 for var_child in child.children(&mut var_cursor) {
-                    if var_child.kind() == "variable_declarator" {
-                        if let Some(name_node) = var_child.child_by_field_name("name") {
-                            let name = code[name_node.byte_range()].to_string();
-                            let signature = self.extract_field_signature(node, code);
-                            let doc_comment = self.extract_doc_comment(&node, code);
-                            let visibility = self.determine_visibility(node, code);
+                    if var_child.kind() == "variable_declarator"
+                        && let Some(name_node) = var_child.child_by_field_name("name")
+                    {
+                        let name = code[name_node.byte_range()].to_string();
+                        let signature = self.extract_field_signature(node, code);
+                        let doc_comment = self.extract_doc_comment(&node, code);
+                        let visibility = self.determine_visibility(node, code);
 
-                            let symbol = self.create_symbol(
-                                counter.next_id(),
-                                name,
-                                SymbolKind::Variable,
-                                file_id,
-                                Range::new(
-                                    var_child.start_position().row as u32,
-                                    var_child.start_position().column as u16,
-                                    var_child.end_position().row as u32,
-                                    var_child.end_position().column as u16,
-                                ),
-                                Some(signature.clone()),
-                                doc_comment.clone(),
-                                module_path,
-                                visibility,
-                            );
-                            symbols.push(symbol);
-                        }
+                        let symbol = self.create_symbol(
+                            counter.next_id(),
+                            name,
+                            SymbolKind::Variable,
+                            file_id,
+                            Range::new(
+                                var_child.start_position().row as u32,
+                                var_child.start_position().column as u16,
+                                var_child.end_position().row as u32,
+                                var_child.end_position().column as u16,
+                            ),
+                            Some(signature.clone()),
+                            doc_comment.clone(),
+                            module_path,
+                            visibility,
+                        );
+                        symbols.push(symbol);
                     }
                 }
             }
@@ -1741,30 +1739,30 @@ impl CSharpParser {
         // Look for variable_declarator nodes within the declaration
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            if child.kind() == "variable_declarator" {
-                if let Some(name_node) = child.child_by_field_name("name") {
-                    let name = code[name_node.byte_range()].to_string();
-                    let signature = self.extract_variable_signature(node, code);
-                    let doc_comment = self.extract_doc_comment(&node, code);
+            if child.kind() == "variable_declarator"
+                && let Some(name_node) = child.child_by_field_name("name")
+            {
+                let name = code[name_node.byte_range()].to_string();
+                let signature = self.extract_variable_signature(node, code);
+                let doc_comment = self.extract_doc_comment(&node, code);
 
-                    let symbol = self.create_symbol(
-                        counter.next_id(),
-                        name,
-                        SymbolKind::Variable,
-                        file_id,
-                        Range::new(
-                            child.start_position().row as u32,
-                            child.start_position().column as u16,
-                            child.end_position().row as u32,
-                            child.end_position().column as u16,
-                        ),
-                        Some(signature.clone()),
-                        doc_comment.clone(),
-                        module_path,
-                        Visibility::Private, // Local variables are private
-                    );
-                    symbols.push(symbol);
-                }
+                let symbol = self.create_symbol(
+                    counter.next_id(),
+                    name,
+                    SymbolKind::Variable,
+                    file_id,
+                    Range::new(
+                        child.start_position().row as u32,
+                        child.start_position().column as u16,
+                        child.end_position().row as u32,
+                        child.end_position().column as u16,
+                    ),
+                    Some(signature.clone()),
+                    doc_comment.clone(),
+                    module_path,
+                    Visibility::Private, // Local variables are private
+                );
+                symbols.push(symbol);
             }
         }
     }

@@ -88,10 +88,10 @@ impl ResolutionScope for GdscriptResolutionContext {
             }
             ScopeLevel::Module => {
                 // If we're inside a class, treat as class member; otherwise module-level
-                if matches!(self.scope_stack.last(), Some(ScopeType::Class)) {
-                    if let Some(scope) = self.current_class_scope_mut() {
-                        scope.insert(name.clone(), symbol_id);
-                    }
+                if matches!(self.scope_stack.last(), Some(ScopeType::Class))
+                    && let Some(scope) = self.current_class_scope_mut()
+                {
+                    scope.insert(name.clone(), symbol_id);
                 }
                 self.module_scope.entry(name).or_insert(symbol_id);
             }
@@ -227,11 +227,11 @@ impl ResolutionScope for GdscriptResolutionContext {
         // import_scope feeds resolve(), whose hits are identity-grade for
         // the receiver anchor and inheritance chain walk. External/Unknown
         // bindings carry name-guessed ids (cache tier 3), not identity.
-        if binding.origin == ImportOrigin::Internal {
-            if let Some(symbol_id) = binding.resolved_symbol {
-                self.import_scope
-                    .insert(binding.exposed_name.clone(), symbol_id);
-            }
+        if binding.origin == ImportOrigin::Internal
+            && let Some(symbol_id) = binding.resolved_symbol
+        {
+            self.import_scope
+                .insert(binding.exposed_name.clone(), symbol_id);
         }
         self.import_bindings
             .insert(binding.exposed_name.clone(), binding);

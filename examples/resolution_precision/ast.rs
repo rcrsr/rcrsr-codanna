@@ -147,10 +147,10 @@ pub fn binding_type(
             .filter(|(row, _)| *row <= call_line)
             .max_by_key(|(row, _)| *row)
             .or_else(|| hits.iter().min_by_key(|(row, _)| *row));
-        if let Some((_, ty)) = best {
-            if let Some(name) = type_name(lang, *ty, &parsed.source) {
-                return Some(name);
-            }
+        if let Some((_, ty)) = best
+            && let Some(name) = type_name(lang, *ty, &parsed.source)
+        {
+            return Some(name);
         }
     }
     None

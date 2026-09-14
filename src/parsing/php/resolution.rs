@@ -385,20 +385,20 @@ impl InheritanceResolver for PhpInheritanceResolver {
         // 4. Interface methods (though these are usually abstract)
 
         // 1. Check own methods
-        if let Some(methods) = self.type_methods.get(type_name) {
-            if methods.iter().any(|m| m == method_name) {
-                return Some(type_name.to_string());
-            }
+        if let Some(methods) = self.type_methods.get(type_name)
+            && methods.iter().any(|m| m == method_name)
+        {
+            return Some(type_name.to_string());
         }
 
         // 2. Check trait methods
         if let Some(traits) = self.class_uses_traits.get(type_name) {
             // In PHP, later traits override earlier ones
             for trait_name in traits.iter().rev() {
-                if let Some(methods) = self.trait_methods.get(trait_name) {
-                    if methods.iter().any(|m| m == method_name) {
-                        return Some(trait_name.clone());
-                    }
+                if let Some(methods) = self.trait_methods.get(trait_name)
+                    && methods.iter().any(|m| m == method_name)
+                {
+                    return Some(trait_name.clone());
                 }
             }
         }
@@ -462,17 +462,17 @@ impl InheritanceResolver for PhpInheritanceResolver {
         }
 
         // Check interfaces
-        if let Some(interfaces) = self.class_implements.get(child) {
-            if interfaces.iter().any(|i| i == parent) {
-                return true;
-            }
+        if let Some(interfaces) = self.class_implements.get(child)
+            && interfaces.iter().any(|i| i == parent)
+        {
+            return true;
         }
 
         // Check traits
-        if let Some(traits) = self.class_uses_traits.get(child) {
-            if traits.iter().any(|t| t == parent) {
-                return true;
-            }
+        if let Some(traits) = self.class_uses_traits.get(child)
+            && traits.iter().any(|t| t == parent)
+        {
+            return true;
         }
 
         false

@@ -117,10 +117,9 @@ impl LanguageBehavior for PhpBehavior {
         if let Some(crate::symbol::ScopeContext::ClassMember {
             class_name: Some(class),
         }) = candidate.scope_context.as_ref()
+            && &**class == resolved
         {
-            if &**class == resolved {
-                return true;
-            }
+            return true;
         }
         let suffix = format!("::{resolved}");
         candidate
@@ -183,89 +182,78 @@ impl LanguageBehavior for PhpBehavior {
         }
 
         // Try to resolve using PSR-4 rules from composer.json
-        let cached_result =
-            RULES_CACHE.with(|cache| {
-                let mut cache_ref = cache.borrow_mut();
+        let cached_result = RULES_CACHE.with(|cache| {
+            let mut cache_ref = cache.borrow_mut();
 
-                // Reload if >1 second old
-                let needs_reload = cache_ref
-                    .as_ref()
-                    .map(|(ts, _)| ts.elapsed() >= Duration::from_secs(1))
-                    .unwrap_or(true);
+            // Reload if >1 second old
+            let needs_reload = cache_ref
+                .as_ref()
+                .map(|(ts, _)| ts.elapsed() >= Duration::from_secs(1))
+                .unwrap_or(true);
 
-                if needs_reload {
-                    let persistence = ResolutionPersistence::new(Path::new(".codanna"));
-                    if let Ok(index) = persistence.load("php") {
-                        *cache_ref = Some((Instant::now(), index));
-                    }
+            if needs_reload {
+                let persistence = ResolutionPersistence::new(Path::new(".codanna"));
+                if let Ok(index) = persistence.load("php") {
+                    *cache_ref = Some((Instant::now(), index));
                 }
+            }
 
-                // Use rules to compute namespace
-                if let Some((_, ref index)) = *cache_ref {
-                    if let Ok(canon_file) = file_path.canonicalize() {
-                        if let Some(config_path) = index.get_config_for_file(&canon_file) {
-                            if let Some(rules) = index.rules.get(config_path) {
-                                // Sort paths by length (longest first) to match most specific path
-                                // This ensures src/Illuminate/Macroable/ matches before src/Illuminate/
-                                let mut sorted_paths: Vec<_> = rules.paths.iter().collect();
-                                sorted_paths.sort_by_key(|p| std::cmp::Reverse(p.0.len()));
+            // Use rules to compute namespace
+            if let Some((_, ref index)) = *cache_ref
+                && let Ok(canon_file) = file_path.canonicalize()
+                && let Some(config_path) = index.get_config_for_file(&canon_file)
+                && let Some(rules) = index.rules.get(config_path)
+            {
+                // Sort paths by length (longest first) to match most specific path
+                // This ensures src/Illuminate/Macroable/ matches before src/Illuminate/
+                let mut sorted_paths: Vec<_> = rules.paths.iter().collect();
+                sorted_paths.sort_by_key(|p| std::cmp::Reverse(p.0.len()));
 
-                                // Try each source root to find the matching namespace prefix
-                                for (source_root_str, namespace_prefixes) in sorted_paths {
-                                    let source_root = Path::new(source_root_str);
-                                    let canon_root = source_root
-                                        .canonicalize()
-                                        .unwrap_or_else(|_| source_root.to_path_buf());
+                // Try each source root to find the matching namespace prefix
+                for (source_root_str, namespace_prefixes) in sorted_paths {
+                    let source_root = Path::new(source_root_str);
+                    let canon_root = source_root
+                        .canonicalize()
+                        .unwrap_or_else(|_| source_root.to_path_buf());
 
-                                    if let Some(mut segments) =
-                                        crate::parsing::paths::relative_segments(
-                                            &canon_file,
-                                            &canon_root,
-                                        )
-                                    {
-                                        // Remove .php extension from the stem,
-                                        // join segments with the namespace separator
-                                        let namespace_suffix = match segments.pop() {
-                                            Some(last) => {
-                                                let stem = last
-                                                    .strip_suffix(".php")
-                                                    .or_else(|| last.strip_suffix(".class.php"))
-                                                    .unwrap_or(&last);
-                                                segments.push(stem.to_string());
-                                                segments.join("\\")
-                                            }
-                                            None => String::new(),
-                                        };
-
-                                        // Get namespace prefix (first element in prefixes array)
-                                        let namespace_prefix = namespace_prefixes
-                                            .first()
-                                            .map(|s| s.as_str())
-                                            .unwrap_or("");
-
-                                        // Combine prefix + suffix
-                                        let prefix_trimmed =
-                                            namespace_prefix.trim_end_matches('\\');
-                                        if namespace_suffix.is_empty() {
-                                            if prefix_trimmed.is_empty() {
-                                                return None;
-                                            }
-                                            return Some(format!("\\{prefix_trimmed}"));
-                                        } else if prefix_trimmed.is_empty() {
-                                            return Some(format!("\\{namespace_suffix}"));
-                                        } else {
-                                            return Some(format!(
-                                                "\\{prefix_trimmed}\\{namespace_suffix}"
-                                            ));
-                                        }
-                                    }
-                                }
+                    if let Some(mut segments) =
+                        crate::parsing::paths::relative_segments(&canon_file, &canon_root)
+                    {
+                        // Remove .php extension from the stem,
+                        // join segments with the namespace separator
+                        let namespace_suffix = match segments.pop() {
+                            Some(last) => {
+                                let stem = last
+                                    .strip_suffix(".php")
+                                    .or_else(|| last.strip_suffix(".class.php"))
+                                    .unwrap_or(&last);
+                                segments.push(stem.to_string());
+                                segments.join("\\")
                             }
+                            None => String::new(),
+                        };
+
+                        // Get namespace prefix (first element in prefixes array)
+                        let namespace_prefix =
+                            namespace_prefixes.first().map(|s| s.as_str()).unwrap_or("");
+
+                        // Combine prefix + suffix
+                        let prefix_trimmed = namespace_prefix.trim_end_matches('\\');
+                        if namespace_suffix.is_empty() {
+                            if prefix_trimmed.is_empty() {
+                                return None;
+                            }
+                            return Some(format!("\\{prefix_trimmed}"));
+                        } else if prefix_trimmed.is_empty() {
+                            return Some(format!("\\{namespace_suffix}"));
+                        } else {
+                            return Some(format!("\\{prefix_trimmed}\\{namespace_suffix}"));
                         }
                     }
                 }
-                None
-            });
+            }
+            None
+        });
 
         if cached_result.is_some() {
             return cached_result;
@@ -368,10 +356,11 @@ impl LanguageBehavior for PhpBehavior {
                 } else {
                     // Single name import - only match in same namespace
                     // e.g., "User" should match "App\Models\User" only when in App\Models
-                    if let Some((symbol_ns, symbol_name)) = symbol_normalized.rsplit_once('\\') {
-                        if symbol_ns == importing_normalized && symbol_name == import_normalized {
-                            return true;
-                        }
+                    if let Some((symbol_ns, symbol_name)) = symbol_normalized.rsplit_once('\\')
+                        && symbol_ns == importing_normalized
+                        && symbol_name == import_normalized
+                    {
+                        return true;
                     }
                 }
             }

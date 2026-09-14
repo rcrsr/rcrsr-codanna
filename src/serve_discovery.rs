@@ -628,13 +628,12 @@ async fn wait_until_healthy(
 ) -> DiscoveryResult<ServeRecord> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Some(record) = read_record(codanna_dir) {
-            if pid_is_alive(record.pid)
-                && pid_looks_like_codanna_serve(&record)
-                && check_health(record.port, record.scheme, record.token.as_deref()).await
-            {
-                return Ok(record);
-            }
+        if let Some(record) = read_record(codanna_dir)
+            && pid_is_alive(record.pid)
+            && pid_looks_like_codanna_serve(&record)
+            && check_health(record.port, record.scheme, record.token.as_deref()).await
+        {
+            return Ok(record);
         }
 
         if let Some(captured) = exit_slot.and_then(|slot| slot.lock().ok()?.clone()) {
@@ -1113,8 +1112,8 @@ pub async fn discover_or_spawn(
     // workspace, wait on THAT pid instead. `find_spawning_for` already
     // filters out a dead pid (a genuine startup failure, not merely slow),
     // so `None` here means it is safe to proceed with a normal spawn.
-    if let Some(spawning) = crate::serve_registry::find_spawning_for(workspace_root) {
-        if let Some(outcome) = wait_on_spawning_pid(
+    if let Some(spawning) = crate::serve_registry::find_spawning_for(workspace_root)
+        && let Some(outcome) = wait_on_spawning_pid(
             &codanna_dir,
             &lock_path,
             spawning.pid,
@@ -1122,13 +1121,12 @@ pub async fn discover_or_spawn(
             poll_interval,
         )
         .await
-        {
-            return outcome;
-        }
-        // `spawning.pid` died before becoming healthy while we were about to
-        // wait on it -- the previous attempt genuinely failed, not merely
-        // slow. Fall through to the normal spawn path below.
+    {
+        return outcome;
     }
+    // `spawning.pid` died before becoming healthy while we were about to
+    // wait on it -- the previous attempt genuinely failed, not merely
+    // slow. Fall through to the normal spawn path below.
 
     match PidLockGuard::acquire(&lock_path) {
         Ok(_guard) => {

@@ -393,10 +393,10 @@ impl InheritanceResolver for PythonInheritanceResolver {
 
         // Search for method in MRO order
         for class in &mro {
-            if let Some(methods) = self.class_methods.get(class) {
-                if methods.iter().any(|m| m == method_name) {
-                    return Some(class.clone());
-                }
+            if let Some(methods) = self.class_methods.get(class)
+                && methods.iter().any(|m| m == method_name)
+            {
+                return Some(class.clone());
             }
         }
 

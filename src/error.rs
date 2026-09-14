@@ -134,6 +134,48 @@ pub enum IndexError {
          'codanna index <path>' to register at least one indexed path, then retry"
     )]
     ReindexHasNothingToRebuild,
+
+    /// A requested index generation does not exist
+    #[error(
+        "Index generation '{id}' not found. Run 'codanna index --status' to list available generations"
+    )]
+    GenerationNotFound { id: String },
+
+    /// A generation's on-disk contents failed validation
+    #[error(
+        "Index generation '{id}' is damaged: {reason}. Run 'codanna index --gc' to remove it, \
+         then 'codanna index --force' to rebuild"
+    )]
+    GenerationDamaged { id: String, reason: String },
+
+    /// The generation pointer moved between read and use
+    #[error(
+        "Index generation was superseded: expected '{expected}' but current generation is \
+         '{actual}'. Retry the operation to pick up the current generation"
+    )]
+    GenerationSuperseded { expected: String, actual: String },
+
+    /// A build for this generation is already running in another process
+    #[error(
+        "Build for index generation '{id}' is already in progress (pid {pid}). Wait for it to \
+         finish, then retry, or run 'codanna index --status' to check progress"
+    )]
+    GenerationBuildInProgress { id: String, pid: u32 },
+
+    /// Insufficient disk space to build a new generation
+    #[error(
+        "Not enough disk space to build a new index generation: needed {needed} bytes, only \
+         {available} bytes available. Free up disk space or run 'codanna index --gc' to remove \
+         old generations, then retry"
+    )]
+    IndexNotSpaceForBuild { needed: u64, available: u64 },
+
+    /// A string failed to parse as a valid generation identifier
+    #[error(
+        "Invalid generation id '{input}': expected 19 lowercase hex characters (13 hex digits \
+         of unix-millis timestamp + 6 hex digits of randomness)"
+    )]
+    InvalidGenerationId { input: String },
 }
 
 impl IndexError {
@@ -186,6 +228,12 @@ impl IndexError {
             Self::InvalidIgnorePattern { .. } => "INVALID_IGNORE_PATTERN",
             Self::ReindexInProgress => "REINDEX_IN_PROGRESS",
             Self::ReindexHasNothingToRebuild => "REINDEX_HAS_NOTHING_TO_REBUILD",
+            Self::GenerationNotFound { .. } => "GENERATION_NOT_FOUND",
+            Self::GenerationDamaged { .. } => "GENERATION_DAMAGED",
+            Self::GenerationSuperseded { .. } => "GENERATION_SUPERSEDED",
+            Self::GenerationBuildInProgress { .. } => "GENERATION_BUILD_IN_PROGRESS",
+            Self::IndexNotSpaceForBuild { .. } => "INDEX_NO_SPACE_FOR_BUILD",
+            Self::InvalidGenerationId { .. } => "INVALID_GENERATION_ID",
         }
         .to_string()
     }
@@ -233,6 +281,29 @@ impl IndexError {
                 "Check indexing.indexed_paths in .codanna/settings.toml for paths that \
                  were renamed, deleted, or moved since being registered",
             ],
+            Self::GenerationNotFound { .. } => vec![
+                "Run 'codanna index --status' to list available generations",
+                "Run 'codanna index --force' to build a fresh generation",
+            ],
+            Self::GenerationDamaged { .. } => vec![
+                "Run 'codanna index --gc' to remove the damaged generation",
+                "Run 'codanna index --force' to rebuild from scratch",
+            ],
+            Self::GenerationSuperseded { .. } => vec![
+                "Retry the operation; it will pick up the current generation",
+                "Run 'codanna index --status' to confirm the current generation id",
+            ],
+            Self::GenerationBuildInProgress { .. } => vec![
+                "Wait for the in-progress build to finish, then retry",
+                "Run 'codanna index --status' to check build progress",
+            ],
+            Self::IndexNotSpaceForBuild { .. } => vec![
+                "Free up disk space and retry",
+                "Run 'codanna index --gc' to remove old generations and reclaim space",
+            ],
+            Self::InvalidGenerationId { .. } => {
+                vec!["Run 'codanna index --status' to list valid generation ids"]
+            }
             _ => vec![],
         }
     }
@@ -386,5 +457,65 @@ where
                 e
             ))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generation_not_found_status_and_recovery() {
+        let err = IndexError::GenerationNotFound {
+            id: "gen-1".to_string(),
+        };
+        assert_eq!(err.status_code(), "GENERATION_NOT_FOUND");
+        assert!(!err.recovery_suggestions().is_empty());
+    }
+
+    #[test]
+    fn generation_damaged_status_and_recovery() {
+        let err = IndexError::GenerationDamaged {
+            id: "gen-2".to_string(),
+            reason: "missing segment file".to_string(),
+        };
+        assert_eq!(err.status_code(), "GENERATION_DAMAGED");
+        assert!(!err.recovery_suggestions().is_empty());
+    }
+
+    #[test]
+    fn generation_superseded_status_and_recovery() {
+        let err = IndexError::GenerationSuperseded {
+            expected: "gen-3".to_string(),
+            actual: "gen-4".to_string(),
+        };
+        assert_eq!(err.status_code(), "GENERATION_SUPERSEDED");
+        assert!(!err.recovery_suggestions().is_empty());
+        let message = err.to_string();
+        assert!(message.contains("gen-3"));
+        assert!(message.contains("gen-4"));
+    }
+
+    #[test]
+    fn generation_build_in_progress_status_and_recovery() {
+        let err = IndexError::GenerationBuildInProgress {
+            id: "gen-5".to_string(),
+            pid: 4242,
+        };
+        assert_eq!(err.status_code(), "GENERATION_BUILD_IN_PROGRESS");
+        assert!(!err.recovery_suggestions().is_empty());
+    }
+
+    #[test]
+    fn index_not_space_for_build_status_and_recovery() {
+        let err = IndexError::IndexNotSpaceForBuild {
+            needed: 1_048_576,
+            available: 512,
+        };
+        assert_eq!(err.status_code(), "INDEX_NO_SPACE_FOR_BUILD");
+        assert!(!err.recovery_suggestions().is_empty());
+        let message = err.to_string();
+        assert!(message.contains("1048576"));
+        assert!(message.contains("512"));
     }
 }

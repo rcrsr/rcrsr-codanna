@@ -126,12 +126,11 @@ fn parse_bind_port(argv: &[std::ffi::OsString]) -> Option<u16> {
             if let Some(port) = parse_addr_port(value) {
                 return Some(port);
             }
-        } else if arg == "--bind" {
-            if let Some(value) = argv.get(i + 1) {
-                if let Some(port) = parse_addr_port(value) {
-                    return Some(port);
-                }
-            }
+        } else if arg == "--bind"
+            && let Some(value) = argv.get(i + 1)
+            && let Some(port) = parse_addr_port(value)
+        {
+            return Some(port);
         }
     }
     None
@@ -298,10 +297,10 @@ fn binaries_are_byte_identical(a: &Path, b: &Path) -> bool {
     };
     let bytes_b = BINARY_BYTES_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        if let Some((cached_path, cached_bytes)) = cache.as_ref() {
-            if cached_path == b {
-                return Some(cached_bytes.clone());
-            }
+        if let Some((cached_path, cached_bytes)) = cache.as_ref()
+            && cached_path == b
+        {
+            return Some(cached_bytes.clone());
         }
         let bytes = std::fs::read(b).ok()?;
         let bytes = std::rc::Rc::new(bytes);

@@ -50,6 +50,11 @@ pub async fn serve_https(config: crate::Settings, watch: bool, bind: String) -> 
         crate::log_event!("https", "starting", "no existing index");
         IndexFacade::new(settings.clone())?
     };
+
+    // Startup GC: reclaim stale generations left behind by a prior run, once
+    // per process start, before the watcher (if any) starts below.
+    let _ = crate::storage::generation::gc_logged(facade.index_layout(), true, "startup");
+
     let indexer = Arc::new(RwLock::new(facade));
 
     // Create cancellation token for graceful shutdown
@@ -87,7 +92,6 @@ pub async fn serve_https(config: crate::Settings, watch: bool, bind: String) -> 
         let mut builder = UnifiedWatcher::builder()
             .broadcaster(broadcaster.clone())
             .indexer(indexer.clone())
-            .index_path(config.index_path.clone())
             .workspace_root(workspace_root.clone())
             .debounce_ms(debounce_ms)
             .refresh_on_overflow(config.file_watch.refresh_on_overflow)
@@ -773,11 +777,11 @@ async fn get_or_create_certificate(bind: &str) -> anyhow::Result<(Vec<u8>, Vec<u
     ];
 
     // If binding to 0.0.0.0, include local network IP
-    if bind.starts_with("0.0.0.0") {
-        if let Ok(local_ip) = local_ip_address::local_ip() {
-            eprintln!("Including local network IP in certificate: {local_ip}");
-            subject_alt_names.push(local_ip.to_string());
-        }
+    if bind.starts_with("0.0.0.0")
+        && let Ok(local_ip) = local_ip_address::local_ip()
+    {
+        eprintln!("Including local network IP in certificate: {local_ip}");
+        subject_alt_names.push(local_ip.to_string());
     }
 
     // Generate certificate using the simpler API but with better parameters

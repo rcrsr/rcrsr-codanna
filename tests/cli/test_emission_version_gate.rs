@@ -101,15 +101,11 @@ enabled = false
     std::fs::write(codanna_dir.join("settings.toml"), settings).expect("write settings");
 }
 
-fn meta_path(workspace: &Path) -> PathBuf {
-    workspace.join(".codanna/index/index.meta")
-}
-
 /// Rewrite index.meta to look like an index built by a binary with
 /// different emission semantics. `version` None simulates a pre-gate
 /// binary (no field at all).
 fn tamper_emission_version(workspace: &Path, version: Option<u64>) {
-    let path = meta_path(workspace);
+    let path = crate::support::index_meta_path(workspace);
     let raw = std::fs::read_to_string(&path).expect("read index.meta");
     let mut meta: Value = serde_json::from_str(&raw).expect("parse index.meta");
     let obj = meta.as_object_mut().expect("index.meta is an object");
@@ -129,7 +125,8 @@ fn tamper_emission_version(workspace: &Path, version: Option<u64>) {
 }
 
 fn stored_emission_version(workspace: &Path) -> Option<u64> {
-    let raw = std::fs::read_to_string(meta_path(workspace)).expect("read index.meta");
+    let raw = std::fs::read_to_string(crate::support::index_meta_path(workspace))
+        .expect("read index.meta");
     let meta: Value = serde_json::from_str(&raw).expect("parse index.meta");
     meta.get("emission_version").and_then(Value::as_u64)
 }
@@ -456,9 +453,10 @@ fn serve_session(workspace: &Path) -> (String, usize, std::process::ExitStatus) 
 }
 
 /// Fresh-workspace skeleton is empty, not stale: with no registered
-/// indexed paths, serve's startup manufactures a bare tantivy
-/// directory and never writes `index.meta`. A second serve must list
-/// all tools rather than gate-refuse the skeleton it created itself.
+/// indexed paths, serve's startup manufactures a published generation
+/// (a `current` pointer naming a `gen/<id>/` directory with a bare
+/// tantivy index and a fresh-empty `index.meta`). A second serve must
+/// list all tools rather than gate-refuse the skeleton it created itself.
 #[test]
 fn serve_twice_in_fresh_workspace_serves_all_tools() {
     let workspace = TempDir::new().expect("temp dir");
@@ -480,15 +478,22 @@ fn serve_twice_in_fresh_workspace_serves_all_tools() {
     assert_eq!(tool_count, 13, "first serve lists all tools");
     assert!(status.success(), "first serve exits clean, got {status:?}");
 
-    // Reproducer precondition: the skeleton exists with no stored
-    // emission semantics.
+    // Reproducer precondition: a published, empty generation exists.
     assert!(
-        workspace.path().join(".codanna/index/tantivy").exists(),
+        crate::support::tantivy_dir(workspace.path()).exists(),
         "first serve manufactures the index skeleton"
     );
+    let meta_path = crate::support::index_meta_path(workspace.path());
     assert!(
-        !meta_path(workspace.path()).exists(),
-        "the skeleton has no index.meta -- it is empty, not stale"
+        meta_path.exists(),
+        "first serve publishes a generation, whose bootstrap stamps a fresh index.meta"
+    );
+    let meta: Value = serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap())
+        .expect("parse index.meta");
+    assert_eq!(
+        meta["emission_version"].as_u64(),
+        Some(u64::from(codanna::storage::EMISSION_SEMANTICS_VERSION)),
+        "the bootstrap stamps the current emission version -- the skeleton is empty, not stale"
     );
 
     let (instructions, tool_count, status) = serve_session(workspace.path());

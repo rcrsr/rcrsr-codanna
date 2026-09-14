@@ -688,6 +688,12 @@ async fn run_stdio_server(
         facade.symbol_count(),
         facade.has_semantic_search()
     );
+
+    // Startup GC: reclaim stale generations left behind by a prior run, once
+    // per process start, independent of whether the watcher below ends up
+    // starting.
+    let _ = crate::storage::generation::gc_logged(facade.index_layout(), true, "startup");
+
     let broadcaster = Arc::new(crate::mcp::notifications::NotificationBroadcaster::new(100));
     let server =
         crate::mcp::CodeIntelligenceServer::new(facade).with_broadcaster(broadcaster.clone());
@@ -711,7 +717,8 @@ async fn run_stdio_server(
             facade_arc,
             settings.clone(),
             Duration::from_secs(actual_watch_interval),
-        );
+        )
+        .with_broadcaster(broadcaster.clone());
 
         // Spawn watcher in background
         tokio::spawn(async move {
@@ -739,11 +746,11 @@ async fn run_stdio_server(
         let mut builder = UnifiedWatcher::builder()
             .broadcaster(broadcaster.clone())
             .indexer(facade_arc.clone())
-            .index_path(index_path.clone())
             .workspace_root(workspace_root.clone())
             .debounce_ms(debounce_ms)
             .refresh_on_overflow(config.file_watch.refresh_on_overflow)
-            .startup_catch_up(config.file_watch.startup_catch_up);
+            .startup_catch_up(config.file_watch.startup_catch_up)
+            .cancellation_token(tokio_util::sync::CancellationToken::new());
 
         // Add code file handler
         builder = builder.handler(CodeFileHandler::new(

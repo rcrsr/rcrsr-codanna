@@ -3,13 +3,18 @@
 //! edge-set diffing between index runs. Not part of the product surface;
 //! reads through the same `DocumentIndex` scan as `codanna dump`.
 //!
-//! Usage: dump_edges <path-to-.codanna/index/tantivy> [--symbols|--dups]
+//! Usage: dump_edges <path-to-.codanna/index> [--symbols|--dups]
+//!
+//! Takes the index root, not a `tantivy/` directory: the current
+//! generation's `tantivy/` is resolved through the same layout module the
+//! product uses.
 
 use std::collections::HashMap;
 
 use codanna::Symbol;
 use codanna::config::Settings;
-use codanna::storage::{DocumentIndex, StorageError};
+use codanna::storage::generation::resolve_current;
+use codanna::storage::{DocumentIndex, IndexLayout, StorageError};
 
 /// (name, file_path, line, kind, module_path) -- stored line (0-indexed).
 type SymbolIdentity = (String, String, u64, String, String);
@@ -30,15 +35,17 @@ fn identity(symbol: &Symbol) -> SymbolIdentity {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
-    let index_dir = args
+    let index_root = args
         .next()
-        .expect("usage: dump_edges <tantivy-dir> [--symbols|--dups]");
+        .expect("usage: dump_edges <index-root> [--symbols|--dups]");
     let mode = args.next();
     let dump_symbols = mode.as_deref() == Some("--symbols");
     let dump_dups = mode.as_deref() == Some("--dups");
 
+    let layout = IndexLayout::new(std::path::PathBuf::from(&index_root));
+    let id = resolve_current(&layout)?.ok_or("no current generation under the index root")?;
     let settings = Settings::default();
-    let index = DocumentIndex::new(&index_dir, &settings)?;
+    let index = DocumentIndex::new(layout.tantivy_dir(&id), &settings)?;
 
     // Pass 1: symbol_id -> identity
     let mut symbols: HashMap<u64, SymbolIdentity> = HashMap::new();

@@ -111,17 +111,17 @@ pub fn supply_pairs(source: &str, mut emit: impl FnMut(String, String)) {
             let after = rest[pos + 6..].trim_start();
             let child: String = after.chars().take_while(|&c| is_ident(c)).collect();
             let tail = after[child.len()..].trim_start();
-            if !child.is_empty() {
-                if let Some(parent_expr) = tail.strip_prefix("extends ") {
-                    let chain: String = parent_expr
-                        .trim_start()
-                        .chars()
-                        .take_while(|&c| is_ident(c) || c == '.')
-                        .collect();
-                    let parent = chain.rsplit('.').next().unwrap_or(&chain);
-                    if !parent.is_empty() {
-                        emit(child, parent.to_string());
-                    }
+            if !child.is_empty()
+                && let Some(parent_expr) = tail.strip_prefix("extends ")
+            {
+                let chain: String = parent_expr
+                    .trim_start()
+                    .chars()
+                    .take_while(|&c| is_ident(c) || c == '.')
+                    .collect();
+                let parent = chain.rsplit('.').next().unwrap_or(&chain);
+                if !parent.is_empty() {
+                    emit(child, parent.to_string());
                 }
             }
             rest = &rest[pos + 6..];

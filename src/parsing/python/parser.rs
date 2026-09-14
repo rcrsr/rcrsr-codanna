@@ -490,10 +490,10 @@ impl PythonParser {
         // function_definition with first child being "async" token
 
         // Method 1: Check if the first child is "async" token
-        if let Some(first_child) = node.child(0) {
-            if first_child.kind() == "async" {
-                return true;
-            }
+        if let Some(first_child) = node.child(0)
+            && first_child.kind() == "async"
+        {
+            return true;
         }
 
         // Method 2: For safety, also check if any child before "def" is "async"
@@ -1189,10 +1189,10 @@ impl PythonParser {
                 }
                 "subscript" => {
                     // Generic base: class Model(Base[T])
-                    if let Some(value) = child.child_by_field_name("value") {
-                        if matches!(value.kind(), "identifier" | "attribute") {
-                            base_classes.push(&code[value.byte_range()]);
-                        }
+                    if let Some(value) = child.child_by_field_name("value")
+                        && matches!(value.kind(), "identifier" | "attribute")
+                    {
+                        base_classes.push(&code[value.byte_range()]);
                     }
                 }
                 _ => {}
@@ -1239,12 +1239,12 @@ impl PythonParser {
     ) {
         if let Some(type_node) = node.child_by_field_name("type") {
             // Extract variable name from the left side
-            if let Some(target_node) = node.child_by_field_name("left") {
-                if let Some(var_name) = self.extract_variable_name(target_node, code) {
-                    let type_annotation = &code[type_node.byte_range()];
-                    let range = self.node_to_range(node);
-                    variable_types.push((var_name, type_annotation, range));
-                }
+            if let Some(target_node) = node.child_by_field_name("left")
+                && let Some(var_name) = self.extract_variable_name(target_node, code)
+            {
+                let type_annotation = &code[type_node.byte_range()];
+                let range = self.node_to_range(node);
+                variable_types.push((var_name, type_annotation, range));
             }
             return;
         }
@@ -1339,17 +1339,17 @@ impl PythonParser {
                     // Find all methods defined in this class
                     if let Some(body) = node.child_by_field_name("body") {
                         for child in body.children(&mut body.walk()) {
-                            if child.kind() == "function_definition" {
-                                if let Some(method_name_node) = child.child_by_field_name("name") {
-                                    let method_name = &code[method_name_node.byte_range()];
-                                    let range = Range::new(
-                                        child.start_position().row as u32,
-                                        child.start_position().column as u16,
-                                        child.end_position().row as u32,
-                                        child.end_position().column as u16,
-                                    );
-                                    defines.push((class_name, method_name, range));
-                                }
+                            if child.kind() == "function_definition"
+                                && let Some(method_name_node) = child.child_by_field_name("name")
+                            {
+                                let method_name = &code[method_name_node.byte_range()];
+                                let range = Range::new(
+                                    child.start_position().row as u32,
+                                    child.start_position().column as u16,
+                                    child.end_position().row as u32,
+                                    child.end_position().column as u16,
+                                );
+                                defines.push((class_name, method_name, range));
                             }
                         }
                     }

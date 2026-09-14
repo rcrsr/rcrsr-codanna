@@ -807,7 +807,7 @@ async fn get_index_info_text_staleness_warning_matches_fingerprint_mismatch() {
         let mut metadata = codanna::storage::IndexMetadata::new();
         metadata.update_ignore_fingerprint(current);
         metadata
-            .save(facade.index_base())
+            .save(&facade.generation_dir())
             .expect("save matching-fingerprint metadata");
 
         let server = CodeIntelligenceServer::new(facade);
@@ -830,7 +830,7 @@ async fn get_index_info_text_staleness_warning_matches_fingerprint_mismatch() {
         let mut metadata = codanna::storage::IndexMetadata::new();
         metadata.update_ignore_fingerprint("deliberately-mismatched-fingerprint".to_string());
         metadata
-            .save(facade.index_base())
+            .save(&facade.generation_dir())
             .expect("save mismatched-fingerprint metadata");
 
         let server = CodeIntelligenceServer::new(facade);

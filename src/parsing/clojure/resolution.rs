@@ -137,10 +137,10 @@ impl ResolutionScope for ClojureResolutionContext {
     }
 
     fn exit_scope(&mut self) {
-        if let Some(scope) = self.scope_stack.pop() {
-            if matches!(scope, ScopeType::Function { .. }) {
-                self.clear_local_scope();
-            }
+        if let Some(scope) = self.scope_stack.pop()
+            && matches!(scope, ScopeType::Function { .. })
+        {
+            self.clear_local_scope();
         }
     }
 

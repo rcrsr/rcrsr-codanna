@@ -593,10 +593,10 @@ fn run_add_collection(
             std::process::exit(1);
         }
         collection.paths.push(canonical_path.clone());
-        if let Some(pat) = pattern {
-            if !collection.patterns.contains(&pat) {
-                collection.patterns.push(pat);
-            }
+        if let Some(pat) = pattern
+            && !collection.patterns.contains(&pat)
+        {
+            collection.patterns.push(pat);
         }
         println!(
             "Added path to existing collection '{name}': {}",

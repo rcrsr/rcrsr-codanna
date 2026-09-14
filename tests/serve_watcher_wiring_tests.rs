@@ -33,6 +33,24 @@ const WATCHER_BUILDER_SITES: [&str; 3] = [
     "src/mcp/https_server.rs",
 ];
 
+/// Substrings every serve site must contain, matched loosely because the
+/// exact call arguments differ per site (e.g. HTTP wires the hot-reload
+/// watcher with `.with_broadcaster(index_watcher_broadcaster)` while stdio
+/// uses `.with_broadcaster(broadcaster.clone())`, and each site constructs
+/// its own `CancellationToken` binding). Unlike `REQUIRED_CALLS`, these are
+/// checked with `contains` rather than an exact literal match.
+///
+/// The third entry guards a second hand-maintained touch point: every site
+/// must call `gc_logged(..., "startup")` once after its first successful
+/// facade load (independent of whether the watcher below ends up starting),
+/// or that serve mode silently never reclaims stale generations left behind
+/// by a prior run at process start.
+const REQUIRED_SUBSTRINGS: [&str; 3] = [
+    ".with_broadcaster(",
+    ".cancellation_token(",
+    "gc_logged(facade.index_layout(), true, \"startup\")",
+];
+
 #[test]
 fn all_serve_builder_sites_wire_startup_catch_up_and_refresh_on_overflow() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -60,5 +78,37 @@ fn all_serve_builder_sites_wire_startup_catch_up_and_refresh_on_overflow() {
          set of touch points is: {WATCHER_BUILDER_SITES:?}.",
         REQUIRED_CALLS[0],
         REQUIRED_CALLS[1]
+    );
+}
+
+#[test]
+fn all_serve_builder_sites_wire_broadcaster_cancellation_token_and_startup_gc() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    let missing: Vec<(&str, &str)> = WATCHER_BUILDER_SITES
+        .iter()
+        .flat_map(|relative_path| {
+            let path = manifest_dir.join(relative_path);
+            let contents = fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("must be able to read {relative_path}: {e}"));
+            REQUIRED_SUBSTRINGS
+                .iter()
+                .filter(move |substring| !contents.contains(*substring))
+                .map(move |substring| (*relative_path, *substring))
+        })
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "§CDNA.7: every hand-maintained serve site must wire \
+         `{}`, `{}`, and `{}` (checked as substrings since call arguments \
+         differ per site), or that serve mode silently never broadcasts \
+         hot-reload notifications / never cancels its unified watcher on \
+         shutdown / never runs its once-per-startup GC pass, with no \
+         compile-time signal. Missing (file, substring): {missing:?}. \
+         The complete set of touch points is: {WATCHER_BUILDER_SITES:?}.",
+        REQUIRED_SUBSTRINGS[0],
+        REQUIRED_SUBSTRINGS[1],
+        REQUIRED_SUBSTRINGS[2]
     );
 }
