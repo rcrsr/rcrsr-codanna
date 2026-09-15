@@ -497,16 +497,68 @@ pub fn run_status(config: &Settings, json: bool) {
         }
         return;
     }
-    for row in &rows {
-        print!(
-            "{}  state={}  age={}s  size={}B",
-            row.id, row.state, row.age_seconds, row.size_bytes
-        );
-        if let Some(error) = &row.error {
-            print!("  error={error}");
-        }
-        println!();
+    print!("{}", render_status(&rows));
+}
+
+/// Render the human-readable `--status` table. Same shape as `codanna ls`:
+/// a fixed-width header, one row per generation, the free-width column
+/// (ERROR) last so a long recorded reason never misaligns the others.
+fn render_status(rows: &[GenerationStatus]) -> String {
+    let mut out = format!(
+        "{:<20} {:<13} {:<9} {:<10} ERROR\n",
+        "ID", "STATE", "AGE", "SIZE"
+    );
+    for row in rows {
+        out.push_str(&format!(
+            "{:<20} {:<13} {:<9} {:<10} {}\n",
+            row.id,
+            row.state,
+            format_age(row.age_seconds),
+            format_size(row.size_bytes),
+            row.error.as_deref().unwrap_or("-")
+        ));
     }
+    out
+}
+
+/// Two most significant units, zero sub-unit dropped: `42s`, `5m 3s`,
+/// `23h 19m`, `3d 12h`.
+fn format_age(secs: u64) -> String {
+    const MIN: u64 = 60;
+    const HOUR: u64 = 60 * MIN;
+    const DAY: u64 = 24 * HOUR;
+    let (major, major_unit, minor, minor_unit) = if secs >= DAY {
+        (secs / DAY, "d", (secs % DAY) / HOUR, "h")
+    } else if secs >= HOUR {
+        (secs / HOUR, "h", (secs % HOUR) / MIN, "m")
+    } else if secs >= MIN {
+        (secs / MIN, "m", secs % MIN, "s")
+    } else {
+        return format!("{secs}s");
+    };
+    if minor == 0 {
+        format!("{major}{major_unit}")
+    } else {
+        format!("{major}{major_unit} {minor}{minor_unit}")
+    }
+}
+
+/// Binary units with one decimal above bytes: `512 B`, `1.5 KiB`, `27.6 MiB`.
+fn format_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["KiB", "MiB", "GiB", "TiB", "PiB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64 / 1024.0;
+    let mut unit = UNITS[0];
+    for next in &UNITS[1..] {
+        if value < 1024.0 {
+            break;
+        }
+        value /= 1024.0;
+        unit = next;
+    }
+    format!("{value:.1} {unit}")
 }
 
 /// Run garbage collection over on-disk generations and print a summary,
@@ -725,4 +777,73 @@ pub fn run_rollback(config: &Settings, id: Option<String>) {
         .map(GenerationId::to_string)
         .unwrap_or_else(|| "none".to_string());
     println!("Rolled back current generation: {old_txt} -> {target}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(
+        id: &str,
+        state: &'static str,
+        age: u64,
+        size: u64,
+        error: Option<&str>,
+    ) -> GenerationStatus {
+        GenerationStatus {
+            id: id.to_string(),
+            state,
+            age_seconds: age,
+            size_bytes: size,
+            error: error.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn format_age_uses_two_units_and_drops_zero_minor() {
+        assert_eq!(format_age(0), "0s");
+        assert_eq!(format_age(42), "42s");
+        assert_eq!(format_age(303), "5m 3s");
+        assert_eq!(format_age(300), "5m");
+        assert_eq!(format_age(83_970), "23h 19m");
+        assert_eq!(format_age(3 * 86_400 + 12 * 3_600 + 59), "3d 12h");
+    }
+
+    #[test]
+    fn format_size_uses_binary_units() {
+        assert_eq!(format_size(0), "0 B");
+        assert_eq!(format_size(512), "512 B");
+        assert_eq!(format_size(1_536), "1.5 KiB");
+        assert_eq!(format_size(28_969_725), "27.6 MiB");
+        assert_eq!(format_size(3 * 1024 * 1024 * 1024), "3.0 GiB");
+    }
+
+    #[test]
+    fn render_status_prints_header_and_aligned_rows() {
+        let rows = [
+            row("001a0a07ff10d446d20", "previous", 84_000, 21_505_546, None),
+            row(
+                "001a0a0806652634ed6",
+                "damaged",
+                60,
+                1_024,
+                Some("torn current"),
+            ),
+        ];
+        let text = render_status(&rows);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "header plus one line per row: {text}");
+        assert_eq!(
+            lines[0],
+            "ID                   STATE         AGE       SIZE       ERROR"
+        );
+        assert_eq!(
+            lines[1],
+            "001a0a07ff10d446d20  previous      23h 20m   20.5 MiB   -"
+        );
+        assert_eq!(
+            lines[2],
+            "001a0a0806652634ed6  damaged       1m        1.0 KiB    torn current"
+        );
+    }
 }

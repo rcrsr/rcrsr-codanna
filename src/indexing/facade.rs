@@ -60,6 +60,17 @@ pub struct IndexingStats {
     pub symbols_removed: usize,
 }
 
+/// Which persisted semantic-search state [`IndexFacade::attach_persisted_state`]
+/// should restore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SemanticRestore {
+    /// Load the full pre-computed embeddings via [`IndexFacade::load_semantic_search`].
+    Embeddings,
+    /// Only load the lightweight metadata snapshot (lite/no-semantic mode)
+    /// via [`IndexFacade::load_semantic_metadata_snapshot`], without loading embeddings.
+    MetadataSnapshotOnly,
+}
+
 /// Output verbosity for `index --dry-run`.
 ///
 /// A dedicated enum instead of two more bool parameters on
@@ -153,6 +164,23 @@ pub struct IndexFacade {
     /// only by the startup load path in [`Self::new`] -- mid-run
     /// hot-reloads/`swap_in` leave this field unchanged.
     recovered_from: Option<GenerationId>,
+}
+
+/// Pure decision logic for [`IndexFacade::wants_semantic_search`], kept
+/// free of `IndexFacade` so it can be unit tested without constructing one.
+///
+/// Semantic search should be enabled when either the operation needs it
+/// and config allows it, or the source build already has it (carry
+/// forward) -- and only when the target doesn't already have it and isn't
+/// marked incompatible.
+fn semantic_enable_decision(
+    config_enabled: bool,
+    needs: bool,
+    source_has: bool,
+    target_has: bool,
+    target_incompatible: bool,
+) -> bool {
+    ((needs && config_enabled) || source_has) && !target_has && !target_incompatible
 }
 
 impl IndexFacade {
@@ -410,46 +438,10 @@ impl IndexFacade {
         new.adopt_reindex_gate(guard.reindex_gate());
         *guard = new;
 
-        // Ensure semantic search stays attached after hot reloads
-        let mut restored_semantic = false;
-        if !guard.has_semantic_search() && !guard.is_semantic_incompatible() {
-            let semantic_path = guard.semantic_dir();
-            let metadata_exists = semantic_path.join("metadata.json").exists();
-            if metadata_exists {
-                match guard.load_semantic_search(&semantic_path) {
-                    Ok(true) => {
-                        restored_semantic = true;
-                    }
-                    Ok(false) => {
-                        crate::debug_event!(
-                            "hot-reload",
-                            "semantic metadata present but reload returned false"
-                        );
-                    }
-                    Err(crate::IndexError::SemanticSearch(
-                        crate::semantic::SemanticSearchError::DimensionMismatch {
-                            ref suggestion,
-                            ..
-                        },
-                    )) => {
-                        tracing::warn!(
-                            "Semantic index dimension mismatch after hot-reload: {suggestion}. \
-                             Semantic search disabled until re-indexed with --force."
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to reload semantic search after index update: {e}");
-                    }
-                }
-            } else {
-                crate::debug_event!(
-                    "hot-reload",
-                    "semantic metadata missing",
-                    "{}",
-                    crate::parsing::paths::render_absolute_path(&semantic_path).display()
-                );
-            }
-        }
+        // Ensure semantic search stays attached after hot reloads. The
+        // incoming facade already carries its own indexed_paths, so no
+        // metadata is passed here for a second restore.
+        let restored_semantic = guard.attach_persisted_state(SemanticRestore::Embeddings, None);
 
         let symbol_count = guard.symbol_count();
         let has_semantic = guard.has_semantic_search();
@@ -465,6 +457,96 @@ impl IndexFacade {
             broadcaster.send(crate::mcp::notifications::FileChangeEvent::IndexReloaded);
             crate::debug_event!("hot-reload", "broadcast", "IndexReloaded");
         }
+    }
+
+    /// Re-attach persisted semantic-search state after opening or reloading
+    /// a facade's generation, and optionally restore `indexed_paths` from
+    /// `metadata`.
+    ///
+    /// A semantic-load failure is logged and swallowed rather than
+    /// propagated: the text index must stay valid even when semantic search
+    /// cannot be restored. Callers pass `metadata: None` when the incoming
+    /// facade already carries its own `indexed_paths` (e.g. [`Self::swap_in`]),
+    /// to avoid a redundant restore.
+    ///
+    /// Returns whether embeddings were newly attached in this call, for
+    /// callers that log an embedding count.
+    pub(crate) fn attach_persisted_state(
+        &mut self,
+        mode: SemanticRestore,
+        metadata: Option<&IndexMetadata>,
+    ) -> bool {
+        let mut attached = false;
+
+        match mode {
+            SemanticRestore::Embeddings => {
+                if !self.has_semantic_search() && !self.is_semantic_incompatible() {
+                    let semantic_dir = self.semantic_dir();
+                    match self.load_semantic_search(&semantic_dir) {
+                        Ok(true) => {
+                            attached = true;
+                            tracing::debug!(
+                                target: "semantic",
+                                "loaded semantic search embeddings"
+                            );
+                        }
+                        Ok(false) => {
+                            tracing::debug!(
+                                target: "semantic",
+                                "no semantic data found (optional)"
+                            );
+                        }
+                        Err(IndexError::SemanticSearch(
+                            SemanticSearchError::DimensionMismatch { ref suggestion, .. },
+                        )) => {
+                            tracing::error!(
+                                target: "semantic",
+                                "semantic search disabled — index incompatible: {suggestion}"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "semantic",
+                                "failed to load semantic search: {e}"
+                            );
+                        }
+                    }
+                }
+            }
+            SemanticRestore::MetadataSnapshotOnly => {
+                let semantic_dir = self.semantic_dir();
+                if semantic_dir.join("metadata.json").exists() {
+                    match self.load_semantic_metadata_snapshot(&semantic_dir) {
+                        Ok(true) => {
+                            tracing::debug!(
+                                target: "semantic",
+                                "loaded semantic metadata snapshot"
+                            );
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "semantic",
+                                "failed to load semantic metadata snapshot: {e}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(meta) = metadata
+            && let Some(ref stored_paths) = meta.indexed_paths
+        {
+            self.set_indexed_paths(stored_paths.clone());
+            tracing::debug!(
+                target: "semantic",
+                "restored {} indexed paths from metadata",
+                stored_paths.len()
+            );
+        }
+
+        attached
     }
 
     // =========================================================================
@@ -509,6 +591,22 @@ impl IndexFacade {
     /// DimensionMismatch, meaning retrying would always fail until re-indexed.
     pub fn is_semantic_incompatible(&self) -> bool {
         self.semantic_incompatible
+    }
+
+    /// Decide whether semantic search should be enabled on this facade.
+    ///
+    /// `needs` is true when the current operation requires semantic search
+    /// (e.g. a semantic MCP tool was invoked); `carry_forward_from_source`
+    /// is true when a source build already has semantic search enabled and
+    /// that state should be preserved on this (target) build.
+    pub fn wants_semantic_search(&self, needs: bool, carry_forward_from_source: bool) -> bool {
+        semantic_enable_decision(
+            self.settings().semantic_search.enabled,
+            needs,
+            carry_forward_from_source,
+            self.has_semantic_search(),
+            self.is_semantic_incompatible(),
+        )
     }
 
     /// Save semantic search data to disk.
@@ -2327,6 +2425,27 @@ fn wait_at_mid_walk_barrier_for_test(semantic_dir: &Path) {
 /// rather than queued, since a queued duplicate force-reindex would be
 /// wasted work that pins the caller open for the duration of someone else's
 /// multi-minute run.
+/// Whether the live facade's generation carries a previously-indexed root
+/// (recorded via [`IndexFacade::get_indexed_paths`], itself restored from
+/// [`IndexMetadata::indexed_paths`] at load time) that the live
+/// `indexing.indexed_paths` config no longer accounts for -- either the root
+/// was removed from config, or its directory no longer exists on disk.
+///
+/// Used by [`reindex_locked`] to decide whether an incremental catch-up must
+/// fall back to [`BuildMode::Fresh`] instead of [`BuildMode::CloneCurrent`]:
+/// `CloneCurrent` carries every row from the parent generation forward
+/// unconditionally, so a root dropped from config would otherwise never be
+/// reconciled by the incremental walk (which only visits configured roots).
+fn generation_roots_are_stale(indexer: &IndexFacade) -> bool {
+    let current_paths = &indexer.pipeline().settings().indexing.indexed_paths;
+    indexer.get_indexed_paths().iter().any(|recorded_root| {
+        !recorded_root.is_dir()
+            || !current_paths
+                .iter()
+                .any(|p| p.canonicalize().is_ok_and(|c| c == *recorded_root))
+    })
+}
+
 pub(crate) async fn reindex_locked(
     facade: &Arc<tokio::sync::RwLock<IndexFacade>>,
     paths: Option<Vec<String>>,
@@ -2353,23 +2472,25 @@ pub(crate) async fn reindex_locked(
     // needed by phase 2's `handles.run(paths, force)` call.
     let paths_is_none = paths.is_none();
 
-    // Refuse-before-cost: when this is a force reindex with no explicit
-    // paths, check whether there is anything to rebuild from BEFORE paying
-    // for `snapshot_reindex_handles()` -> `ensure_embedding_pool()`, which
-    // can load a ~150MB fastembed model under the exclusive write guard.
-    // This brief read lock reads `indexer.pipeline().settings().indexing
-    // .indexed_paths` -- the exact collection `ReindexHandles::run` walks
-    // below when `paths` is `None` -- rather than the facade's own
-    // `indexed_paths` field, which is a different collection (always empty
-    // on a freshly constructed facade, and discarded wholesale when phase 1
-    // opens a fresh build generation for a full force reindex; see the
-    // two-collections trap documented on
-    // `discoverable_dirs_honors_ignore_patterns` above). The predicate
-    // mirrors what `ReindexHandles::run`'s `paths: None` branch actually
-    // does with this list: it clones it and only rebuilds entries that pass
-    // `path.is_dir()`, so a registered directory that was later renamed,
-    // deleted, or replaced by a broken symlink -- and thus stays in the
-    // list forever, since neither `add_indexed_path` nor
+    // Refuse-before-cost: when there are no explicit paths, check whether
+    // there is anything to rebuild from BEFORE paying for
+    // `snapshot_reindex_handles()` -> `ensure_embedding_pool()` (can load a
+    // ~150MB fastembed model) and, for the non-force/incremental catch-up
+    // path, before `open_build(BuildMode::CloneCurrent)`'s byte-copy of the
+    // semantic store and index.meta plus a full semantic mmap reload -- all
+    // of it done under the exclusive write guard taken below. This brief
+    // read lock reads `indexer.pipeline().settings().indexing.indexed_paths`
+    // -- the exact collection `ReindexHandles::run` walks below when `paths`
+    // is `None` -- rather than the facade's own `indexed_paths` field, which
+    // is a different collection (always empty on a freshly constructed
+    // facade, and discarded wholesale when phase 1 opens a fresh build
+    // generation for a full force reindex; see the two-collections trap
+    // documented on `discoverable_dirs_honors_ignore_patterns` above). The
+    // predicate mirrors what `ReindexHandles::run`'s `paths: None` branch
+    // actually does with this list: it clones it and only rebuilds entries
+    // that pass `path.is_dir()`, so a registered directory that was later
+    // renamed, deleted, or replaced by a broken symlink -- and thus stays in
+    // the list forever, since neither `add_indexed_path` nor
     // `remove_indexed_path` prune against disk -- must not count as "has a
     // rebuild source". Checking `!indexed_paths.is_empty()` alone would let
     // such stale entries pass, open an empty build generation, and phase 2
@@ -2380,16 +2501,16 @@ pub(crate) async fn reindex_locked(
     // lock), but does not reopen the bug: the only in-process writer to
     // `indexing.indexed_paths` while a server is running is the watcher's
     // created-directory handler (`src/watcher/handlers/code.rs`), which is
-    // add-only, so a concurrent mutation can only turn a refusal into a
+    // add-only, so a concurrent mutation can only turn a refusal/skip into a
     // valid run, never the reverse. A directory vanishing from disk between
     // this check and the clear is a pre-existing race that no ordering here
     // can close.
-    if paths_is_none && force {
-        let (has_rebuild_source, indexed_paths) = {
+    if paths_is_none {
+        let (has_rebuild_source, indexed_paths, symbol_count) = {
             let indexer = facade.read().await;
             let indexed_paths = indexer.pipeline().settings().indexing.indexed_paths.clone();
             let has_rebuild_source = indexed_paths.iter().any(|p| p.is_dir());
-            (has_rebuild_source, indexed_paths)
+            (has_rebuild_source, indexed_paths, indexer.symbol_count())
         };
         if !has_rebuild_source {
             let ghost_paths: Vec<&std::path::PathBuf> =
@@ -2403,12 +2524,28 @@ pub(crate) async fn reindex_locked(
                     path.display()
                 );
             }
-            tracing::error!(
-                "Refusing force reindex: no explicit paths and no configured \
+            if force {
+                tracing::error!(
+                    "Refusing force reindex: no explicit paths and no configured \
+                     indexing.indexed_paths that still exist on disk as a directory \
+                     to rebuild from"
+                );
+                return Err(IndexError::ReindexHasNothingToRebuild);
+            }
+            // Incremental catch-up (force: false): nothing to rebuild from,
+            // so converge quietly rather than paying for a `CloneCurrent`
+            // build (byte-copy of the semantic store + a full mmap reload)
+            // that would only republish an unchanged generation.
+            tracing::debug!(
+                "Skipping incremental catch-up: no explicit paths and no configured \
                  indexing.indexed_paths that still exist on disk as a directory \
                  to rebuild from"
             );
-            return Err(IndexError::ReindexHasNothingToRebuild);
+            return Ok(ReindexOutcome {
+                reindexed: 0,
+                symbol_count,
+                indexed_dirs: Vec::new(),
+            });
         }
     }
 
@@ -2436,12 +2573,36 @@ pub(crate) async fn reindex_locked(
                     IndexPersistence::new(indexer.index_layout().root().to_path_buf());
                 let mode = if force {
                     BuildMode::Fresh
+                } else if generation_roots_are_stale(&indexer) {
+                    // The parent generation's own indexed_paths (recorded at
+                    // build time in `IndexMetadata::indexed_paths` and
+                    // restored onto the live facade by
+                    // `attach_persisted_state`) name a root that is no
+                    // longer in the live `indexing.indexed_paths` config, or
+                    // whose directory has vanished from disk.
+                    // `CloneCurrent` starts from a full copy of the parent
+                    // generation's rows (see `clone_generation` in
+                    // `src/storage/generation/layout.rs`), and
+                    // `ReindexHandles::run` only walks directories still in
+                    // the live config, so that removed root's rows would
+                    // never be reconciled by this incremental catch-up. Fall
+                    // back to a fresh build instead -- mirroring
+                    // `open_build`'s own `CloneCurrent`-over-no-index
+                    // fallback to `Fresh` (see
+                    // `open_build_clone_current_over_no_index_falls_back_to_fresh`
+                    // in `src/storage/persistence.rs`) -- so the removed
+                    // root's symbols don't linger indefinitely in the
+                    // served index.
+                    BuildMode::Fresh
                 } else {
                     BuildMode::CloneCurrent
                 };
                 // Runs while the live write guard is still held, so the
                 // live generation is quiescent for the duration of the
-                // clone (hardlinks only -- fast).
+                // clone. Only Tantivy segment files are hardlinked; the
+                // semantic store and `index.meta` are always byte-copied
+                // (see `clone_generation` in
+                // `src/storage/generation/layout.rs`).
                 let mut build = persistence
                     .open_build(Arc::clone(indexer.settings()), mode)
                     .inspect_err(|e| {
@@ -2457,12 +2618,7 @@ pub(crate) async fn reindex_locked(
                 // facade (`codanna mcp reindex`) and every later load,
                 // including the serving process's hot-reload, would lose
                 // semantic search.
-                let semantic_wanted =
-                    indexer.settings().semantic_search.enabled || indexer.has_semantic_search();
-                if semantic_wanted
-                    && !build.has_semantic_search()
-                    && !build.is_semantic_incompatible()
-                {
+                if build.wants_semantic_search(true, indexer.has_semantic_search()) {
                     build.enable_semantic_search().inspect_err(|e| {
                         tracing::error!(
                             "Failed to enable semantic search on build generation: {e}"
@@ -2790,6 +2946,31 @@ pub fn build_embedding_backend(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn semantic_enable_decision_carries_forward_from_source_when_config_disabled() {
+        assert!(semantic_enable_decision(false, false, true, false, false));
+    }
+
+    #[test]
+    fn semantic_enable_decision_enables_when_needed_and_config_allows() {
+        assert!(semantic_enable_decision(true, true, false, false, false));
+    }
+
+    #[test]
+    fn semantic_enable_decision_stays_disabled_when_not_needed_and_no_carry_forward() {
+        assert!(!semantic_enable_decision(true, false, false, false, false));
+    }
+
+    #[test]
+    fn semantic_enable_decision_never_enables_when_target_already_has_it() {
+        assert!(!semantic_enable_decision(true, true, true, true, false));
+    }
+
+    #[test]
+    fn semantic_enable_decision_never_enables_when_target_is_incompatible() {
+        assert!(!semantic_enable_decision(true, true, true, false, true));
+    }
 
     // Regression: facade construction over a corrupt legacy flat tantivy dir
     // must not panic. Before generations, this hard-failed at
@@ -3783,6 +3964,24 @@ mod tests {
             workspace_root: None,
             ..Default::default()
         };
+        IndexFacade::new(std::sync::Arc::new(settings)).unwrap()
+    }
+
+    /// Like [`test_facade`], but registers a valid, on-disk
+    /// `indexing.indexed_paths` entry, so a `paths: None` reindex (force or
+    /// not) has a rebuild source and does not trip the refuse-before-cost /
+    /// skip-quietly guards in [`reindex_locked`].
+    fn test_facade_with_indexed_path(dir: &tempfile::TempDir) -> IndexFacade {
+        let registered = dir.path().join("registered");
+        std::fs::create_dir_all(&registered).unwrap();
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings
+            .add_indexed_path(registered)
+            .expect("register indexed path");
         IndexFacade::new(std::sync::Arc::new(settings)).unwrap()
     }
 
@@ -6167,6 +6366,127 @@ mod tests {
         );
     }
 
+    // Incremental catch-up (`force: false`) counterpart to the refuse-before-
+    // cost trio above: with nothing to rebuild from, it must converge
+    // quietly (`Ok` with an empty outcome) rather than erroring, and -- the
+    // point of the guard -- without ever opening a `CloneCurrent` build
+    // (which would byte-copy the semantic store and reload it for no
+    // reason).
+    #[tokio::test]
+    async fn reindex_incremental_with_no_indexed_paths_skips_build_quietly() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("seed.rs");
+        std::fs::write(&source, "pub fn seeded_symbol() {}\n").unwrap();
+
+        let mut facade = test_facade(&dir);
+        facade.index_file(&source).unwrap();
+        let before = facade.document_index().count_symbols().unwrap();
+        assert!(before > 0, "fixture must seed at least one symbol");
+        assert!(
+            facade
+                .pipeline()
+                .settings()
+                .indexing
+                .indexed_paths
+                .is_empty(),
+            "fixture must not register any indexed_paths"
+        );
+
+        let facade = Arc::new(tokio::sync::RwLock::new(facade));
+        let outcome = reindex_locked(&facade, None, false, None, None, None)
+            .await
+            .expect("incremental catch-up with no rebuild source must converge quietly");
+        assert_eq!(outcome.reindexed, 0);
+        assert!(outcome.indexed_dirs.is_empty());
+
+        let indexer = facade.read().await;
+        let after = indexer.document_index().count_symbols().unwrap();
+        assert_eq!(
+            before, after,
+            "skipped incremental catch-up must leave the populated index untouched"
+        );
+    }
+
+    // ── generation_roots_are_stale ──────────────────────────────────────────
+    //
+    // Direct unit coverage for the fresh-fallback predicate, independent of
+    // the full `reindex_locked` orchestration: a generation's own recorded
+    // roots (`IndexFacade::get_indexed_paths`) must be checked against the
+    // live `indexing.indexed_paths` config and against disk, matching what
+    // `generation_roots_are_stale` claims in its doc comment.
+
+    #[test]
+    fn generation_roots_are_stale_when_root_removed_from_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let registered = dir.path().join("registered");
+        std::fs::create_dir_all(&registered).unwrap();
+
+        // Live config no longer names `registered` (simulates it having
+        // been removed from `settings.toml` since the generation carrying
+        // it was built).
+        let settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+        facade.add_indexed_path(&registered);
+
+        assert!(
+            generation_roots_are_stale(&facade),
+            "a recorded root absent from the live config must be reported stale"
+        );
+    }
+
+    #[test]
+    fn generation_roots_are_stale_when_root_directory_vanished() {
+        let dir = tempfile::tempdir().unwrap();
+        let registered = dir.path().join("registered");
+        std::fs::create_dir_all(&registered).unwrap();
+
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings
+            .add_indexed_path(registered.clone())
+            .expect("register indexed path");
+
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+        facade.add_indexed_path(&registered);
+        std::fs::remove_dir_all(&registered).unwrap();
+
+        assert!(
+            generation_roots_are_stale(&facade),
+            "a recorded root whose directory vanished from disk must be reported stale"
+        );
+    }
+
+    #[test]
+    fn generation_roots_are_not_stale_when_root_still_configured_and_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let registered = dir.path().join("registered");
+        std::fs::create_dir_all(&registered).unwrap();
+
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings
+            .add_indexed_path(registered.clone())
+            .expect("register indexed path");
+
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+        facade.add_indexed_path(&registered);
+
+        assert!(
+            !generation_roots_are_stale(&facade),
+            "a recorded root that is still configured and present on disk must not be stale"
+        );
+    }
+
     // Regression lock: an explicit `paths: Some(..)` reindex must never
     // clear the whole index, force or not, and must leave symbols outside
     // the explicit paths untouched.
@@ -6257,7 +6577,7 @@ mod tests {
         let _serial_guard = crate::mcp::server::REINDEX_TEST_SERIAL.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let index_root = dir.path().join("index");
-        let facade = test_facade(&dir);
+        let facade = test_facade_with_indexed_path(&dir);
         let layout = IndexLayout::new(index_root.clone());
 
         let current_before = layout
@@ -6392,7 +6712,7 @@ mod tests {
         let _serial_guard = crate::mcp::server::REINDEX_TEST_SERIAL.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let index_root = dir.path().join("index");
-        let facade = test_facade(&dir);
+        let facade = test_facade_with_indexed_path(&dir);
         let layout = IndexLayout::new(index_root.clone());
 
         let current_before = layout
@@ -6408,10 +6728,10 @@ mod tests {
         let token_for_task = token.clone();
         let task = tokio::spawn(async move {
             // `force: false` (staged clone-current), matching the W-1 abort
-            // test above: `force: true` with `paths: None` would trip the
-            // "nothing to rebuild from" refuse-before-cost guard on this
-            // fixture, since `test_facade` registers no
-            // `indexing.indexed_paths`, and never reach phase 2 at all.
+            // test above. The fixture registers a valid
+            // `indexing.indexed_paths` entry (`test_facade_with_indexed_path`)
+            // so this has a rebuild source and actually reaches phase 2
+            // instead of tripping either refuse-before-cost guard.
             reindex_locked(
                 &facade_for_task,
                 None,

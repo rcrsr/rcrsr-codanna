@@ -263,9 +263,22 @@ pub struct FileWatchConfig {
     /// Opt-in: arm exactly one catch-up reindex at watcher startup, to
     /// re-converge with any changes made while the watcher was not running.
     /// Independent of `refresh_on_overflow` (which governs overflow of the
-    /// live watch queue, not startup). A catch-up reindex is a full
-    /// clear-and-rebuild.
-    /// (default: false, opt-in)
+    /// live watch queue, not startup). A catch-up reindex is incremental: it
+    /// clones the current generation (Tantivy segments are hardlinked; the
+    /// semantic store and `index.meta` are byte-copied) and walks the
+    /// registered indexed paths, re-parsing and re-embedding only files
+    /// whose content hash changed and cleaning up symbols for files that
+    /// vanished from disk while the watcher was down; unchanged files cost
+    /// nothing. If a previously-indexed root was removed from
+    /// `indexing.indexed_paths`, or its directory no longer exists, and at
+    /// least one other configured root is still valid, the catch-up
+    /// automatically falls back to a one-time fresh rebuild so that root's
+    /// symbols don't linger; if *no* configured root remains valid, the
+    /// catch-up skips entirely and stale symbols are left untouched --
+    /// `codanna index --force` will also refuse in that case (no paths
+    /// exist to rebuild from), so deregister the stale path with `codanna
+    /// remove-dir <path>` or register a valid one with `codanna index
+    /// <new-path>`. (default: false, opt-in)
     #[serde(default)]
     pub startup_catch_up: bool,
 

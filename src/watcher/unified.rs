@@ -441,8 +441,10 @@ impl UnifiedWatcher {
     /// two keys each name a different condition ("watcher just started" vs.
     /// "backend reported overflow/rescan") that can arm the same underlying
     /// machinery, not one trigger gated by both flags conjunctively. Startup
-    /// catch-up is opt-in because arming it means a full clear-and-rebuild
-    /// of the index on every process start, not just on detected staleness.
+    /// catch-up is opt-in because arming it means an incremental catch-up
+    /// reindex (hardlink-clone of the current generation, then a hash-skip
+    /// walk that only re-parses/re-embeds changed or vanished files) on
+    /// every process start, not just on detected staleness.
     fn arm_startup_catch_up(&mut self) {
         if self.startup_catch_up {
             crate::log_event!(
@@ -688,16 +690,20 @@ impl UnifiedWatcher {
         let cancellation_token = self.cancellation_token.clone();
         self.catch_up_started_at = Some(Instant::now());
         self.catch_up_task = Some(tokio::spawn(async move {
-            // Watcher broadcaster wiring is a later phase; `None` here just
-            // means the catch-up reindex doesn't emit an `IndexReloaded`
-            // notification on the watch lane yet. The cancellation token is
-            // the watcher's own shutdown token, reused (not a new one) so
-            // this catch-up reindex's phase-3 checkpoint observes the same
-            // shutdown signal the watcher itself shuts down on.
+            // `None` is passed deliberately here, not because broadcaster
+            // wiring is missing: `handle_catch_up_success` already emits the
+            // `IndexReloaded` notification and owns the stale/attempts
+            // bookkeeping as one unit once this task completes. Threading
+            // `self.broadcaster` into `reindex_locked` too would broadcast
+            // twice for the same completion, for no user-visible benefit.
+            // The cancellation token is the watcher's own shutdown token,
+            // reused (not a new one) so this catch-up reindex's phase-3
+            // checkpoint observes the same shutdown signal the watcher
+            // itself shuts down on.
             crate::indexing::reindex_locked(
                 &facade,
                 None,
-                true,
+                false,
                 None,
                 Some(cancellation_token),
                 None,
@@ -3849,9 +3855,11 @@ mod tests {
     ///
     /// `gone_marker` is indexed, then its file is deleted from disk before
     /// `watch()` is ever called -- no notify event exists for the
-    /// deletion either. Only a force/clear+rebuild reindex removes symbols
-    /// for a vanished file; a relocated or "cheaper" incremental walk would
-    /// leave them behind. `seed_marker` is the positive control proving a
+    /// deletion either. The incremental `CloneCurrent` walk (`force: false`)
+    /// also removes symbols for a vanished file, via the walk's
+    /// deleted-file cleanup stage, as long as the root that contained it is
+    /// still registered in `indexing.indexed_paths` and thus gets re-walked.
+    /// `seed_marker` is the positive control proving a
     /// rebuild actually ran rather than the index simply having been wiped
     /// wholesale: without it, a bug that dropped ALL symbols (not just the
     /// deleted file's) would also make this test pass.
@@ -3958,33 +3966,30 @@ mod tests {
         );
     }
 
-    /// Regression guard for a specific forward-looking risk in
-    /// `CatchUpFailure::is_contention()`: today it matches only
-    /// `IndexError::ReindexInProgress`, so `IndexError::
-    /// ReindexHasNothingToRebuild` (added alongside the force-reindex clear
-    /// guard) is classified as a genuine failure. That is deterministic and
-    /// retry-unfixable -- no amount of waiting makes an unregistered/stale
-    /// `indexing.indexed_paths` register itself -- so it must consume
-    /// `catch_up_attempts` and give up after `MAX_CATCH_UP_ATTEMPTS` rather
-    /// than looping forever. A future widening of `is_contention()` to also
-    /// match this variant would silently turn this bounded give-up into an
-    /// unbounded retry loop; this test pins the current (correct) behavior.
+    /// Regression guard for catch-up's `force: false` call to
+    /// `reindex_locked` (see `maybe_start_catch_up`): with no
+    /// `indexing.indexed_paths` registered, the `paths_is_none && force`
+    /// refuse-before-cost guard in `reindex_locked` never fires here (it
+    /// only fires when `force` is `true`), so this is not a failure path at
+    /// all. `reindex_locked`'s `CloneCurrent` strategy hardlink-clones the
+    /// already-seeded generation, phase 2 walks the (empty) indexed-paths
+    /// list and finds nothing to rebuild, and the episode converges
+    /// quietly: the pre-existing index is left untouched, `stale` clears,
+    /// and `catch_up_attempts` never leaves zero.
     ///
     /// Drives the exact private methods `watch()`'s event loop calls
     /// (`maybe_start_catch_up` / `poll_catch_up_task`) directly against a
-    /// real facade with no `indexing.indexed_paths` registered, so every
-    /// attempt's real `reindex_locked(&facade, None, true, None)` call
-    /// refuses with `ReindexHasNothingToRebuild`. This keeps the watcher
-    /// owned by the test (rather than moved into `tokio::spawn(watcher.watch())`
-    /// as the two e2e tests above do), which is what makes the give-up
-    /// path (`catch_up_attempts`/`stale`, both private) directly observable
-    /// without needing a cross-thread log capture.
+    /// real facade with no `indexing.indexed_paths` registered. This keeps
+    /// the watcher owned by the test (rather than moved into
+    /// `tokio::spawn(watcher.watch())` as the two e2e tests above do), which
+    /// is what makes the convergence path (`catch_up_attempts`/`stale`,
+    /// both private) directly observable without needing a cross-thread log
+    /// capture.
     ///
-    /// Polls with a deadline rather than sleeping a fixed span: bounded by
-    /// `MAX_CATCH_UP_ATTEMPTS * CATCH_UP_COOLDOWN` (5 * 5s = 25s) plus
-    /// slack, not a long fixed sleep.
+    /// Polls with a deadline rather than sleeping a fixed span, bounded well
+    /// above one `CATCH_UP_COOLDOWN`-free single-attempt convergence.
     #[tokio::test]
-    async fn startup_catch_up_gives_up_when_nothing_to_rebuild_from() {
+    async fn startup_catch_up_with_no_indexed_paths_succeeds_quietly() {
         use crate::config::Settings;
         use crate::indexing::facade::IndexFacade;
 
@@ -4001,8 +4006,8 @@ mod tests {
             index_path: index_dir.path().to_path_buf(),
             workspace_root: Some(root.clone()),
             // Deliberately no `add_indexed_path` call: `indexing.indexed_paths`
-            // stays empty, so a force reindex with no explicit paths has
-            // nothing to rebuild from on every attempt.
+            // stays empty, so the incremental walk has nothing registered to
+            // re-walk on every attempt.
             ..Default::default()
         };
 
@@ -4027,18 +4032,14 @@ mod tests {
             "arming startup catch-up must mark the watcher stale"
         );
 
-        let deadline = Instant::now() + Duration::from_secs(60);
-        let mut attempted = false;
-        let mut gave_up = false;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut converged = false;
         while Instant::now() < deadline {
             watcher.maybe_start_catch_up();
             watcher.poll_catch_up_task().await;
 
-            if watcher.catch_up_attempts > 0 {
-                attempted = true;
-            }
-            if attempted && watcher.catch_up_attempts == 0 && !watcher.stale {
-                gave_up = true;
+            if !watcher.stale && watcher.catch_up_task.is_none() {
+                converged = true;
                 break;
             }
 
@@ -4046,18 +4047,24 @@ mod tests {
         }
 
         assert!(
-            gave_up,
-            "expected the catch-up episode to reach the give-up path within \
-             the deadline (catch_up_attempts back to 0 and stale cleared \
-             after at least one genuine, non-contention failure)"
+            converged,
+            "expected the catch-up episode to converge quietly within the \
+             deadline (stale cleared, no task left in flight) rather than \
+             wedge or churn forever"
+        );
+        assert_eq!(
+            watcher.catch_up_attempts, 0,
+            "an episode with nothing to rebuild should never register a \
+             genuine (non-contention) failure, so catch_up_attempts must \
+             stay at zero rather than climbing toward MAX_CATCH_UP_ATTEMPTS"
         );
 
         let indexer = facade.read().await;
         let after = indexer.document_index().count_symbols().unwrap();
         assert_eq!(
             before, after,
-            "a catch-up episode with nothing to rebuild from must never touch \
-             the pre-existing index, including after giving up"
+            "a catch-up episode with no indexed paths to walk must leave \
+             the pre-existing index's symbol count unchanged"
         );
     }
 

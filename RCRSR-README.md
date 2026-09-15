@@ -395,9 +395,9 @@ the paths differ, so the same build installed at two locations (a mise dir vs
 
 **STATUS column.** Registered servers show their self-reported `spawning` or
 `healthy`; unknown rows show `running`. A proxy whose backing server is gone,
-dead, or itself unknown shows `orphaned` instead of the `healthy` it recorded at
+dead, or itself unknown shows `detached` instead of the `healthy` it recorded at
 connect time (a proxy's entry is written once and never updated, so it would
-otherwise stay `healthy` forever). An orphaned proxy is still live and will
+otherwise stay `healthy` forever). A detached proxy is still live and will
 revive a backing server on its next delegated call; stop it with
 `--stop-all --include-proxies` if you don't want that.
 
@@ -626,17 +626,29 @@ without waiting for an overflow. It is **off by default** (`startup_catch_up`)
 and independent of `refresh_on_overflow` — the two keys are two triggers for
 the same machinery, not one gated by both.
 
-Know what you're opting into: this is a full rebuild — on a large workspace it
-takes as long as `codanna index --force`. It is staged into a new generation
-(see [Index generations](#index-generations)), so queries keep being answered
-from the previous generation until the rebuild is published, and a process
-killed mid-rebuild (OOM, `kill -9`, host crash) leaves only an orphaned build
+Know what you're opting into: this is incremental, not a wholesale rebuild.
+It clones the current generation (Tantivy segments hardlinked; the semantic
+store and `index.meta` byte-copied) and walks the registered `indexed_paths`,
+skipping any file whose content hash is unchanged; only files that were
+actually added, modified, or deleted while the watcher was down cost real
+CPU/embedding time — an idle workspace's catch-up is cheap regardless of
+workspace size. It is staged into a new generation (see
+[Index generations](#index-generations)), so queries keep being answered from
+the previous generation until the rebuild is published, and a process killed
+mid-rebuild (OOM, `kill -9`, host crash) leaves only an orphaned build
 directory for GC — the served index is untouched. The cost is CPU and transient
-disk (`current + building`) on every start and every proxy auto-respawn.
-Combined with a short `idle_shutdown_minutes` on a large workspace, every
-respawn pays a full rebuild — size the timeout with that in mind. With no
-`indexed_paths` registered, each episode logs five `ERROR` lines and gives up;
-that is expected, not a wedge.
+disk (`current + building`) on every start and every proxy auto-respawn,
+proportional to how much actually changed since the last convergence. With no
+`indexed_paths` still valid on disk, an episode has nothing to walk and skips
+the clone entirely, converging quietly — no `ERROR` lines, no give-up. This
+only reconciles files inside roots still registered in `indexed_paths`: if a
+previously-indexed root is removed from config or its directory disappears,
+and at least one other registered root is still valid, the next catch-up
+automatically falls back to a one-time fresh rebuild so that root's symbols
+don't linger; if every registered root has gone stale, `codanna index --force`
+will also refuse (no paths exist to rebuild from) — run `codanna remove-dir
+<stale-path>` to deregister it, or `codanna index <new-path>` to register a
+valid one.
 
 ### Configuration
 
