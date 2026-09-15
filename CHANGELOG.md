@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0+rcrsr.8] - 2026-09-15
+
 ### Added
 
 - **`codanna serve --stop --timeout <secs>` / `--no-force`:** `--stop` now escalates to SIGKILL on its own, and reaps the target's registry entry directly, if the target has not exited within `--timeout` seconds (default 5) of the initial SIGTERM; `--no-force` opts out and reports the still-alive state instead, matching the previous behavior. ([#97](https://github.com/rcrsr/rcrsr-codanna/pull/97))
