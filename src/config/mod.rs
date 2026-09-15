@@ -263,8 +263,11 @@ pub struct FileWatchConfig {
     /// Opt-in: arm exactly one catch-up reindex at watcher startup, to
     /// re-converge with any changes made while the watcher was not running.
     /// Independent of `refresh_on_overflow` (which governs overflow of the
-    /// live watch queue, not startup). A catch-up reindex is a full
-    /// clear-and-rebuild.
+    /// live watch queue, not startup). A catch-up reindex is incremental:
+    /// it hardlink-clones the current generation and walks the registered
+    /// indexed paths, re-parsing and re-embedding only files whose content
+    /// hash changed and cleaning up symbols for files that vanished from
+    /// disk while the watcher was down; unchanged files cost nothing.
     /// (default: false, opt-in)
     #[serde(default)]
     pub startup_catch_up: bool,

@@ -703,11 +703,7 @@ async fn main() {
     if let Some(ref mut h) = handle {
         let idx = h.facade_mut();
         // Only enable semantic search for commands that need it
-        if needs_semantic_search
-            && config.semantic_search.enabled
-            && !idx.has_semantic_search()
-            && !idx.is_semantic_incompatible()
-        {
+        if idx.wants_semantic_search(needs_semantic_search, false) {
             if let Err(e) = idx.enable_semantic_search() {
                 eprintln!("Warning: Failed to enable semantic search: {e}");
             } else {

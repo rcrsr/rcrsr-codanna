@@ -3,7 +3,7 @@
 //! This module manages metadata and ensures Tantivy index exists.
 //! All actual data is stored in Tantivy.
 
-use crate::indexing::facade::IndexFacade;
+use crate::indexing::facade::{IndexFacade, SemanticRestore};
 use crate::indexing::walk_config;
 use crate::storage::generation::layout::{self, free_space_preflight_against};
 use crate::storage::generation::markers::{Building, Complete};
@@ -203,66 +203,15 @@ impl IndexPersistence {
             );
         }
 
-        // Load semantic search if available and requested
-        let semantic_dir = self.layout.semantic_dir(&id);
-        if load_semantic {
-            tracing::debug!(
-                "[persistence] semantic path computed as: {}",
-                crate::parsing::paths::render_absolute_path(&semantic_dir).display()
-            );
-            match facade.load_semantic_search(&semantic_dir) {
-                Ok(true) => {
-                    tracing::debug!("[persistence] loaded semantic search for facade");
-                }
-                Ok(false) => {
-                    tracing::debug!("[persistence] no semantic data found (this is optional)");
-                }
-                Err(IndexError::SemanticSearch(
-                    crate::semantic::SemanticSearchError::DimensionMismatch {
-                        ref suggestion, ..
-                    },
-                )) => {
-                    // Semantic index is structurally incompatible with the current backend.
-                    // Log at error level so it is visible, but continue without semantic
-                    // search rather than failing the whole facade load and discarding the
-                    // valid text index.
-                    tracing::error!(
-                        "[persistence] semantic search disabled — index incompatible: {suggestion}"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!("[persistence] failed to load semantic search: {e}");
-                }
-            }
+        // Re-attach persisted semantic-search state (full embeddings if
+        // requested, otherwise just the lightweight metadata snapshot) and
+        // restore indexed_paths from metadata.
+        let restore_mode = if load_semantic {
+            SemanticRestore::Embeddings
         } else {
-            tracing::debug!("[persistence] skipping semantic search (lite mode)");
-            if semantic_dir.join("metadata.json").exists() {
-                match facade.load_semantic_metadata_snapshot(&semantic_dir) {
-                    Ok(true) => {
-                        tracing::debug!(
-                            "[persistence] loaded semantic metadata snapshot for lite facade"
-                        );
-                    }
-                    Ok(false) => {}
-                    Err(e) => {
-                        tracing::warn!(
-                            "[persistence] failed to load semantic metadata snapshot: {e}"
-                        );
-                    }
-                }
-            }
-        }
-
-        // Restore indexed_paths from metadata
-        if let Some(ref meta) = metadata
-            && let Some(ref stored_paths) = meta.indexed_paths
-        {
-            facade.set_indexed_paths(stored_paths.clone());
-            tracing::debug!(
-                "[persistence] restored {} indexed paths from metadata",
-                stored_paths.len()
-            );
-        }
+            SemanticRestore::MetadataSnapshotOnly
+        };
+        facade.attach_persisted_state(restore_mode, metadata.as_ref());
 
         Ok(facade)
     }
@@ -360,38 +309,10 @@ impl IndexPersistence {
         // produce -- a semantic load failure never fails the build, it just
         // continues without semantic search.
         if seeded_from_parent {
-            let semantic_dir = self.layout.semantic_dir(&id);
-            match facade.load_semantic_search(&semantic_dir) {
-                Ok(true) => {
-                    tracing::debug!("[persistence] loaded semantic search for build facade");
-                }
-                Ok(false) => {
-                    tracing::debug!("[persistence] no semantic data found for build (optional)");
-                }
-                Err(IndexError::SemanticSearch(
-                    crate::semantic::SemanticSearchError::DimensionMismatch {
-                        ref suggestion, ..
-                    },
-                )) => {
-                    tracing::error!(
-                        "[persistence] semantic search disabled for build — index incompatible: {suggestion}"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!("[persistence] failed to load semantic search for build: {e}");
-                }
-            }
-
-            let metadata = IndexMetadata::load(&self.layout.gen_dir(&id)).ok();
-            if let Some(ref meta) = metadata
-                && let Some(ref stored_paths) = meta.indexed_paths
-            {
-                facade.set_indexed_paths(stored_paths.clone());
-                tracing::debug!(
-                    "[persistence] restored {} indexed paths for build facade",
-                    stored_paths.len()
-                );
-            }
+            facade.attach_persisted_state(
+                SemanticRestore::Embeddings,
+                IndexMetadata::load(&self.layout.gen_dir(&id)).ok().as_ref(),
+            );
         }
 
         // (9)

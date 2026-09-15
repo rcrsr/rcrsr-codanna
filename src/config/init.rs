@@ -252,12 +252,15 @@ impl Settings {
                 result
                     .push_str("\n# Opt-in: arm exactly one catch-up reindex at watcher startup\n");
                 result.push_str(
-                    "# This is a full clear-and-rebuild that runs on every server start\n",
+                    "# This is incremental: it hardlink-clones the current generation and\n",
                 );
                 result.push_str(
-                    "# when enabled. Independent of refresh_on_overflow (which governs\n",
+                    "# walks the registered indexed paths, re-parsing/re-embedding only\n",
                 );
-                result.push_str("# overflow of the live watch queue, not startup).\n");
+                result.push_str("# changed files and cleaning up vanished ones. Independent of\n");
+                result
+                    .push_str("# refresh_on_overflow (which governs overflow of the live watch\n");
+                result.push_str("# queue, not startup).\n");
                 result.push_str("# Default: false\n");
             } else if line.starts_with("churn_threshold = ") {
                 result.push_str("\n# Reserved for future use: churn-based refresh threshold\n");

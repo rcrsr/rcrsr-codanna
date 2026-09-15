@@ -626,17 +626,20 @@ without waiting for an overflow. It is **off by default** (`startup_catch_up`)
 and independent of `refresh_on_overflow` — the two keys are two triggers for
 the same machinery, not one gated by both.
 
-Know what you're opting into: this is a full rebuild — on a large workspace it
-takes as long as `codanna index --force`. It is staged into a new generation
-(see [Index generations](#index-generations)), so queries keep being answered
-from the previous generation until the rebuild is published, and a process
-killed mid-rebuild (OOM, `kill -9`, host crash) leaves only an orphaned build
+Know what you're opting into: this is incremental, not a wholesale rebuild.
+It hardlink-clones the current generation and walks the
+registered `indexed_paths`, skipping any file whose content hash is unchanged;
+only files that were actually added, modified, or deleted while the watcher
+was down cost real CPU/embedding time — an idle workspace's catch-up is cheap
+regardless of workspace size. It is staged into a new generation (see
+[Index generations](#index-generations)), so queries keep being answered from
+the previous generation until the rebuild is published, and a process killed
+mid-rebuild (OOM, `kill -9`, host crash) leaves only an orphaned build
 directory for GC — the served index is untouched. The cost is CPU and transient
-disk (`current + building`) on every start and every proxy auto-respawn.
-Combined with a short `idle_shutdown_minutes` on a large workspace, every
-respawn pays a full rebuild — size the timeout with that in mind. With no
-`indexed_paths` registered, each episode logs five `ERROR` lines and gives up;
-that is expected, not a wedge.
+disk (`current + building`) on every start and every proxy auto-respawn,
+proportional to how much actually changed since the last convergence. With no
+`indexed_paths` registered, an episode has nothing to walk and converges
+quietly — no `ERROR` lines, no give-up.
 
 ### Configuration
 

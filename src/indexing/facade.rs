@@ -60,6 +60,17 @@ pub struct IndexingStats {
     pub symbols_removed: usize,
 }
 
+/// Which persisted semantic-search state [`IndexFacade::attach_persisted_state`]
+/// should restore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SemanticRestore {
+    /// Load the full pre-computed embeddings via [`IndexFacade::load_semantic_search`].
+    Embeddings,
+    /// Only load the lightweight metadata snapshot (lite/no-semantic mode)
+    /// via [`IndexFacade::load_semantic_metadata_snapshot`], without loading embeddings.
+    MetadataSnapshotOnly,
+}
+
 /// Output verbosity for `index --dry-run`.
 ///
 /// A dedicated enum instead of two more bool parameters on
@@ -153,6 +164,23 @@ pub struct IndexFacade {
     /// only by the startup load path in [`Self::new`] -- mid-run
     /// hot-reloads/`swap_in` leave this field unchanged.
     recovered_from: Option<GenerationId>,
+}
+
+/// Pure decision logic for [`IndexFacade::wants_semantic_search`], kept
+/// free of `IndexFacade` so it can be unit tested without constructing one.
+///
+/// Semantic search should be enabled when either the operation needs it
+/// and config allows it, or the source build already has it (carry
+/// forward) -- and only when the target doesn't already have it and isn't
+/// marked incompatible.
+fn semantic_enable_decision(
+    config_enabled: bool,
+    needs: bool,
+    source_has: bool,
+    target_has: bool,
+    target_incompatible: bool,
+) -> bool {
+    ((needs && config_enabled) || source_has) && !target_has && !target_incompatible
 }
 
 impl IndexFacade {
@@ -410,46 +438,10 @@ impl IndexFacade {
         new.adopt_reindex_gate(guard.reindex_gate());
         *guard = new;
 
-        // Ensure semantic search stays attached after hot reloads
-        let mut restored_semantic = false;
-        if !guard.has_semantic_search() && !guard.is_semantic_incompatible() {
-            let semantic_path = guard.semantic_dir();
-            let metadata_exists = semantic_path.join("metadata.json").exists();
-            if metadata_exists {
-                match guard.load_semantic_search(&semantic_path) {
-                    Ok(true) => {
-                        restored_semantic = true;
-                    }
-                    Ok(false) => {
-                        crate::debug_event!(
-                            "hot-reload",
-                            "semantic metadata present but reload returned false"
-                        );
-                    }
-                    Err(crate::IndexError::SemanticSearch(
-                        crate::semantic::SemanticSearchError::DimensionMismatch {
-                            ref suggestion,
-                            ..
-                        },
-                    )) => {
-                        tracing::warn!(
-                            "Semantic index dimension mismatch after hot-reload: {suggestion}. \
-                             Semantic search disabled until re-indexed with --force."
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to reload semantic search after index update: {e}");
-                    }
-                }
-            } else {
-                crate::debug_event!(
-                    "hot-reload",
-                    "semantic metadata missing",
-                    "{}",
-                    crate::parsing::paths::render_absolute_path(&semantic_path).display()
-                );
-            }
-        }
+        // Ensure semantic search stays attached after hot reloads. The
+        // incoming facade already carries its own indexed_paths, so no
+        // metadata is passed here for a second restore.
+        let restored_semantic = guard.attach_persisted_state(SemanticRestore::Embeddings, None);
 
         let symbol_count = guard.symbol_count();
         let has_semantic = guard.has_semantic_search();
@@ -465,6 +457,96 @@ impl IndexFacade {
             broadcaster.send(crate::mcp::notifications::FileChangeEvent::IndexReloaded);
             crate::debug_event!("hot-reload", "broadcast", "IndexReloaded");
         }
+    }
+
+    /// Re-attach persisted semantic-search state after opening or reloading
+    /// a facade's generation, and optionally restore `indexed_paths` from
+    /// `metadata`.
+    ///
+    /// A semantic-load failure is logged and swallowed rather than
+    /// propagated: the text index must stay valid even when semantic search
+    /// cannot be restored. Callers pass `metadata: None` when the incoming
+    /// facade already carries its own `indexed_paths` (e.g. [`Self::swap_in`]),
+    /// to avoid a redundant restore.
+    ///
+    /// Returns whether embeddings were newly attached in this call, for
+    /// callers that log an embedding count.
+    pub(crate) fn attach_persisted_state(
+        &mut self,
+        mode: SemanticRestore,
+        metadata: Option<&IndexMetadata>,
+    ) -> bool {
+        let mut attached = false;
+
+        match mode {
+            SemanticRestore::Embeddings => {
+                if !self.has_semantic_search() && !self.is_semantic_incompatible() {
+                    let semantic_dir = self.semantic_dir();
+                    match self.load_semantic_search(&semantic_dir) {
+                        Ok(true) => {
+                            attached = true;
+                            tracing::debug!(
+                                target: "semantic",
+                                "loaded semantic search embeddings"
+                            );
+                        }
+                        Ok(false) => {
+                            tracing::debug!(
+                                target: "semantic",
+                                "no semantic data found (optional)"
+                            );
+                        }
+                        Err(IndexError::SemanticSearch(
+                            SemanticSearchError::DimensionMismatch { ref suggestion, .. },
+                        )) => {
+                            tracing::error!(
+                                target: "semantic",
+                                "semantic search disabled — index incompatible: {suggestion}"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "semantic",
+                                "failed to load semantic search: {e}"
+                            );
+                        }
+                    }
+                }
+            }
+            SemanticRestore::MetadataSnapshotOnly => {
+                let semantic_dir = self.semantic_dir();
+                if semantic_dir.join("metadata.json").exists() {
+                    match self.load_semantic_metadata_snapshot(&semantic_dir) {
+                        Ok(true) => {
+                            tracing::debug!(
+                                target: "semantic",
+                                "loaded semantic metadata snapshot"
+                            );
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "semantic",
+                                "failed to load semantic metadata snapshot: {e}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(meta) = metadata
+            && let Some(ref stored_paths) = meta.indexed_paths
+        {
+            self.set_indexed_paths(stored_paths.clone());
+            tracing::debug!(
+                target: "semantic",
+                "restored {} indexed paths from metadata",
+                stored_paths.len()
+            );
+        }
+
+        attached
     }
 
     // =========================================================================
@@ -509,6 +591,22 @@ impl IndexFacade {
     /// DimensionMismatch, meaning retrying would always fail until re-indexed.
     pub fn is_semantic_incompatible(&self) -> bool {
         self.semantic_incompatible
+    }
+
+    /// Decide whether semantic search should be enabled on this facade.
+    ///
+    /// `needs` is true when the current operation requires semantic search
+    /// (e.g. a semantic MCP tool was invoked); `carry_forward_from_source`
+    /// is true when a source build already has semantic search enabled and
+    /// that state should be preserved on this (target) build.
+    pub fn wants_semantic_search(&self, needs: bool, carry_forward_from_source: bool) -> bool {
+        semantic_enable_decision(
+            self.settings().semantic_search.enabled,
+            needs,
+            carry_forward_from_source,
+            self.has_semantic_search(),
+            self.is_semantic_incompatible(),
+        )
     }
 
     /// Save semantic search data to disk.
@@ -2457,12 +2555,7 @@ pub(crate) async fn reindex_locked(
                 // facade (`codanna mcp reindex`) and every later load,
                 // including the serving process's hot-reload, would lose
                 // semantic search.
-                let semantic_wanted =
-                    indexer.settings().semantic_search.enabled || indexer.has_semantic_search();
-                if semantic_wanted
-                    && !build.has_semantic_search()
-                    && !build.is_semantic_incompatible()
-                {
+                if build.wants_semantic_search(true, indexer.has_semantic_search()) {
                     build.enable_semantic_search().inspect_err(|e| {
                         tracing::error!(
                             "Failed to enable semantic search on build generation: {e}"
@@ -2790,6 +2883,31 @@ pub fn build_embedding_backend(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn semantic_enable_decision_carries_forward_from_source_when_config_disabled() {
+        assert!(semantic_enable_decision(false, false, true, false, false));
+    }
+
+    #[test]
+    fn semantic_enable_decision_enables_when_needed_and_config_allows() {
+        assert!(semantic_enable_decision(true, true, false, false, false));
+    }
+
+    #[test]
+    fn semantic_enable_decision_stays_disabled_when_not_needed_and_no_carry_forward() {
+        assert!(!semantic_enable_decision(true, false, false, false, false));
+    }
+
+    #[test]
+    fn semantic_enable_decision_never_enables_when_target_already_has_it() {
+        assert!(!semantic_enable_decision(true, true, true, true, false));
+    }
+
+    #[test]
+    fn semantic_enable_decision_never_enables_when_target_is_incompatible() {
+        assert!(!semantic_enable_decision(true, true, true, false, true));
+    }
 
     // Regression: facade construction over a corrupt legacy flat tantivy dir
     // must not panic. Before generations, this hard-failed at
