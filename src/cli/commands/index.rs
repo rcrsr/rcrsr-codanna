@@ -570,7 +570,7 @@ fn format_size(bytes: u64) -> String {
 pub fn run_gc(config: &Settings) {
     let layout = IndexLayout::new(config.index_path.clone());
 
-    match generation::gc(&layout, true) {
+    match generation::gc(&layout, config.indexing.previous_generation_max_age()) {
         Ok(summary) => {
             println!(
                 "gc: removed={} retried_later={} skipped_locked={}",

@@ -477,9 +477,18 @@ strictly read-only).
 Steady state is `current + previous` — the previous generation is kept as a
 rollback target; during a build it is `+ building`. GC runs after every
 publish, once at server startup, and on `codanna index --gc` — never on a timer.
-It removes orphaned builds (a build whose process died), older superseded
-generations, and damaged generations once a newer one has been served, and it
-logs at `INFO` only when it actually removed something.
+It removes orphaned builds (a build whose process died), damaged generations
+once a newer one has been served, and it logs at `INFO` only when it actually
+removed something.
+
+The `previous` generation is not kept indefinitely: its value as a rollback
+target decays with the age of the source tree, not with generation count. GC
+deletes a `previous` generation once it is older than
+`indexing.previous_generation_max_age_hours` (default `24`, i.e. one day),
+regardless of how many `previous` generations have accumulated. Set it to `0`
+to delete every `previous` generation on the next GC pass instead of waiting
+— unlike `idle_shutdown_minutes`, `0` here means immediate deletion, not
+"disabled".
 
 ### Inspecting and recovering
 

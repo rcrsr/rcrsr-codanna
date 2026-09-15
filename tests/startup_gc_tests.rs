@@ -2,16 +2,16 @@
 //! entry points (stdio in `src/cli/commands/serve.rs`, HTTP in
 //! `src/mcp/http_server.rs`, HTTPS in `src/mcp/https_server.rs`): once per
 //! process start, immediately after the first successful facade load, each
-//! site calls `gc_logged(&layout, true, "startup")` to reclaim stale
-//! generations left behind by a prior run.
+//! site calls `gc_logged(&layout, previous_generation_max_age, "startup")` to
+//! reclaim stale generations left behind by a prior run.
 //!
 //! This test does not exercise a specific serve entry point directly (they
 //! are CLI/network-bound and covered by the mechanical drift guard in
 //! `tests/serve_watcher_wiring_tests.rs` instead). It drives the same
 //! sequence those sites drive -- load a facade via `IndexFacade::new`, then
-//! call `gc_logged(&layout, true, "startup")` -- over a real on-disk index
-//! root seeded with an orphan generation, and asserts GC actually reclaims
-//! it.
+//! call `gc_logged(&layout, previous_generation_max_age, "startup")` -- over
+//! a real on-disk index root seeded with an orphan generation, and asserts
+//! GC actually reclaims it.
 //!
 //! Uses a real `IndexFacade`/`IndexLayout` backed by a Tantivy index on disk
 //! in a temporary directory -- no mocks.
@@ -68,8 +68,12 @@ fn startup_gc_reclaims_an_orphan_generation_present_at_process_start() {
     // pass immediately after the facade load, exactly as
     // `src/cli/commands/serve.rs`, `src/mcp/http_server.rs`, and
     // `src/mcp/https_server.rs` do.
-    let summary =
-        gc_logged(&layout, true, "startup").expect("startup gc_logged run must not error");
+    let summary = gc_logged(
+        &layout,
+        facade.settings().indexing.previous_generation_max_age(),
+        "startup",
+    )
+    .expect("startup gc_logged run must not error");
 
     assert!(
         summary.removed.contains(&orphan),

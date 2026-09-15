@@ -1,8 +1,9 @@
 //! `codanna index --force` builds a fresh generation and publishes it
 //! alongside the pre-force generation, rather than clearing the existing
 //! generation in place. The pre-force generation must survive as
-//! `Previous`, not be deleted -- it is only reclaimed later by `--gc`
-//! (subject to `keep_previous`), giving `--rollback` something to restore.
+//! `Previous`, not be deleted -- it is only reclaimed later by `--gc`, once
+//! its age exceeds the configured `previous_generation_max_age` cutoff,
+//! giving `--rollback` something to restore in the meantime.
 
 use std::path::Path;
 

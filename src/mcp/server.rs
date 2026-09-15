@@ -1406,8 +1406,9 @@ mod tests {
              the process to die: {generations:?}"
         );
 
-        let gc_summary = crate::storage::generation::gc(&layout, true)
-            .expect("gc must succeed after the injected failure");
+        let gc_summary =
+            crate::storage::generation::gc(&layout, std::time::Duration::from_secs(3600))
+                .expect("gc must succeed after the injected failure");
         assert_eq!(
             gc_summary.removed.len(),
             1,

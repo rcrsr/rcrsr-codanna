@@ -2,13 +2,13 @@
 //!
 //! [`gc`] deletes generation directories that are no longer useful: dead
 //! builds ([`GenerationState::Orphan`]), superseded valid builds
-//! ([`GenerationState::Previous`], subject to `keep_previous`), and damaged
-//! builds ([`GenerationState::Damaged`]) once the current generation has
-//! demonstrably been served since the damage occurred. [`GenerationState::Current`]
-//! and [`GenerationState::Building`] are never deleted;
-//! [`GenerationState::Incompatible`] is left alone in this phase (deciding
-//! its fate belongs to whichever work item wires binary-version
-//! negotiation).
+//! ([`GenerationState::Previous`], once older than a caller-supplied age
+//! cutoff), and damaged builds ([`GenerationState::Damaged`]) once the
+//! current generation has demonstrably been served since the damage
+//! occurred. [`GenerationState::Current`] and [`GenerationState::Building`]
+//! are never deleted; [`GenerationState::Incompatible`] is left alone in
+//! this phase (deciding its fate belongs to whichever work item wires
+//! binary-version negotiation).
 //!
 //! [`gc`] runs only at explicit points -- before and after every publish,
 //! once at server startup, and on `codanna index --gc` -- never on a timer
@@ -51,10 +51,14 @@ pub struct GcSummary {
 /// `GcSummary { skipped_locked: true, .. }` -- that is not an error, just a
 /// no-op this time.
 ///
-/// `keep_previous` controls how many [`GenerationState::Previous`]
-/// generations survive: the single newest one when `true`, none when
-/// `false`.
-pub fn gc(layout: &IndexLayout, keep_previous: bool) -> IndexResult<GcSummary> {
+/// `previous_max_age` controls which [`GenerationState::Previous`]
+/// generations survive: each one is judged independently by its own age
+/// (derived from the Unix-millis timestamp embedded in its
+/// [`GenerationId`]), and is deleted once that age exceeds
+/// `previous_max_age`. There is no count-based cap and no sorting --
+/// `Duration::ZERO` deletes every `Previous` generation regardless of age,
+/// while a large cutoff keeps all of them.
+pub fn gc(layout: &IndexLayout, previous_max_age: Duration) -> IndexResult<GcSummary> {
     fs::create_dir_all(layout.root()).map_err(|e| IndexError::FileWrite {
         path: layout.root().to_path_buf(),
         source: e,
@@ -88,7 +92,7 @@ pub fn gc(layout: &IndexLayout, keep_previous: bool) -> IndexResult<GcSummary> {
         }
     }
 
-    let result = run(layout, keep_previous);
+    let result = run(layout, previous_max_age);
 
     // The lock is released when `lock_file` drops at the end of this
     // function; an explicit unlock here just makes that visible to the
@@ -111,10 +115,10 @@ pub fn gc(layout: &IndexLayout, keep_previous: bool) -> IndexResult<GcSummary> {
 /// as a hard error to either caller.
 pub fn gc_logged(
     layout: &IndexLayout,
-    keep_previous: bool,
+    previous_max_age: Duration,
     context: &str,
 ) -> IndexResult<GcSummary> {
-    let result = gc(layout, keep_previous);
+    let result = gc(layout, previous_max_age);
     match &result {
         Ok(summary) if !summary.removed.is_empty() => tracing::info!(
             "[gc:{context}] removed={} retried_later={} skipped_locked={}",
@@ -129,7 +133,7 @@ pub fn gc_logged(
 }
 
 /// The actual collection pass, run while the GC lock is held.
-fn run(layout: &IndexLayout, keep_previous: bool) -> IndexResult<GcSummary> {
+fn run(layout: &IndexLayout, previous_max_age: Duration) -> IndexResult<GcSummary> {
     let mut summary = GcSummary::default();
 
     let current_completed_at = current_completed_at_millis(layout);
@@ -148,25 +152,10 @@ fn run(layout: &IndexLayout, keep_previous: bool) -> IndexResult<GcSummary> {
         .filter_map(|(id, _, _)| Building::live_parent(&layout.building_marker(id)))
         .collect();
 
-    let mut previous_ids: Vec<&GenerationId> = generations
-        .iter()
-        .filter(|(_, state, _)| *state == GenerationState::Previous)
-        .map(|(id, _, _)| id)
-        .collect();
-    // `GenerationId` sorts ascending by construction time; newest last.
-    previous_ids.sort();
-    let keep_count = if keep_previous { 1 } else { 0 };
-    let previous_len = previous_ids.len();
-    let previous_to_delete: Vec<GenerationId> = previous_ids
-        .into_iter()
-        .take(previous_len.saturating_sub(keep_count))
-        .cloned()
-        .collect();
-
-    for (id, state, _age) in &generations {
+    for (id, state, age) in &generations {
         let should_delete = match state {
             GenerationState::Orphan => true,
-            GenerationState::Previous => previous_to_delete.contains(id),
+            GenerationState::Previous => *age > previous_max_age,
             GenerationState::Damaged => {
                 is_damaged_stale_enough_to_delete(layout, id, current_completed_at)
             }
@@ -279,6 +268,17 @@ mod tests {
         IndexLayout::new(dir.path().to_path_buf())
     }
 
+    /// Current Unix-millis wall-clock time, used to synthesize a
+    /// [`GenerationId`] whose embedded timestamp is a known offset in the
+    /// past, so a test can make a generation look aged without sleeping.
+    fn unix_millis_now() -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
     /// Build a structurally valid generation under `layout`'s `gen/<id>/`
     /// (mirrors `layout::tests::write_valid_generation`, private to that
     /// module) with an explicit `completed_at`, so GC's damaged-staleness
@@ -350,7 +350,7 @@ mod tests {
         layout.write_current(&current).expect("write current");
         let orphan = write_orphan(&layout);
 
-        let summary = gc(&layout, true).expect("gc run");
+        let summary = gc(&layout, Duration::from_secs(3600)).expect("gc run");
 
         assert!(summary.removed.contains(&orphan));
         assert!(!layout.gen_dir(&orphan).exists());
@@ -368,7 +368,7 @@ mod tests {
         let building_id = GenerationId::generate();
         let guard = Building::start(&layout, &building_id, None).expect("start building");
 
-        let summary = gc(&layout, true).expect("gc run");
+        let summary = gc(&layout, Duration::from_secs(3600)).expect("gc run");
 
         assert!(!summary.removed.contains(&building_id));
         assert!(layout.gen_dir(&building_id).is_dir());
@@ -376,41 +376,45 @@ mod tests {
     }
 
     #[test]
-    fn gc_keeps_only_the_newest_previous_generation_when_keep_previous() {
+    fn gc_judges_each_previous_generation_by_its_own_age_against_the_cutoff() {
         let dir = tempfile::tempdir().expect("tempdir");
         let layout = layout_in(&dir);
 
-        let mut previous_ids = Vec::new();
-        for _ in 0..3 {
-            let id = GenerationId::generate();
-            write_valid_generation(&layout, &id, 0);
-            previous_ids.push(id);
-            sleep(std::time::Duration::from_millis(5));
-        }
+        // A fresh `Previous` generation (age ~0) survives a generous cutoff.
+        let fresh_previous = GenerationId::generate();
+        write_valid_generation(&layout, &fresh_previous, 0);
+
+        // A `Previous` generation synthetically aged well past a 24h cutoff,
+        // constructed with an id whose embedded timestamp is far in the
+        // past -- `generation_age` derives age purely from that timestamp,
+        // so no sleep is needed to make this one look old.
+        let cutoff = Duration::from_secs(24 * 3600);
+        let old_millis = unix_millis_now().saturating_sub(cutoff.as_millis() as u64 + 3_600_000);
+        let aged_previous =
+            GenerationId::new(&format!("{old_millis:013x}000000")).expect("valid synthetic id");
+        write_valid_generation(&layout, &aged_previous, 0);
+
         let current = GenerationId::generate();
         write_valid_generation(&layout, &current, 0);
         layout.write_current(&current).expect("write current");
 
-        let newest_previous = previous_ids.last().cloned().expect("at least one previous");
+        let summary = gc(&layout, cutoff).expect("gc run");
 
-        let summary = gc(&layout, true).expect("gc run");
-
-        for id in &previous_ids[..previous_ids.len() - 1] {
-            assert!(
-                summary.removed.contains(id),
-                "older previous generation must be removed"
-            );
-            assert!(!layout.gen_dir(id).exists());
-        }
         assert!(
-            !summary.removed.contains(&newest_previous),
-            "newest previous generation must survive"
+            !summary.removed.contains(&fresh_previous),
+            "a fresh previous generation must survive a generous cutoff"
         );
-        assert!(layout.gen_dir(&newest_previous).is_dir());
+        assert!(layout.gen_dir(&fresh_previous).is_dir());
+
+        assert!(
+            summary.removed.contains(&aged_previous),
+            "a previous generation older than the cutoff must be removed"
+        );
+        assert!(!layout.gen_dir(&aged_previous).exists());
     }
 
     #[test]
-    fn gc_deletes_all_previous_generations_when_keep_previous_is_false() {
+    fn gc_with_zero_cutoff_deletes_all_previous_generations() {
         let dir = tempfile::tempdir().expect("tempdir");
         let layout = layout_in(&dir);
 
@@ -425,7 +429,7 @@ mod tests {
         write_valid_generation(&layout, &current, 0);
         layout.write_current(&current).expect("write current");
 
-        let summary = gc(&layout, false).expect("gc run");
+        let summary = gc(&layout, Duration::ZERO).expect("gc run");
 
         for id in &previous_ids {
             assert!(summary.removed.contains(id));
@@ -450,7 +454,7 @@ mod tests {
         fs::write(layout.gen_dir(&damaged).join("index.meta"), b"{ not json")
             .expect("corrupt index.meta to force Damaged classification");
 
-        let summary = gc(&layout, true).expect("gc run");
+        let summary = gc(&layout, Duration::from_secs(3600)).expect("gc run");
 
         assert!(!summary.removed.contains(&damaged));
         assert!(layout.gen_dir(&damaged).is_dir());
@@ -475,7 +479,7 @@ mod tests {
         write_valid_generation(&layout, &current, far_future_millis);
         layout.write_current(&current).expect("write current");
 
-        let summary = gc(&layout, true).expect("gc run");
+        let summary = gc(&layout, Duration::from_secs(3600)).expect("gc run");
 
         assert!(summary.removed.contains(&damaged));
         assert!(!layout.gen_dir(&damaged).exists());
@@ -513,7 +517,8 @@ mod tests {
 
         // And a full `gc` run over a tree with no generation dirs left at
         // all must still complete cleanly.
-        let summary = gc(&layout, true).expect("gc must tolerate an already-empty gen/ dir");
+        let summary = gc(&layout, Duration::from_secs(3600))
+            .expect("gc must tolerate an already-empty gen/ dir");
         assert!(summary.removed.is_empty());
         assert!(summary.retried_later.is_empty());
         assert!(!summary.skipped_locked);
@@ -538,7 +543,8 @@ mod tests {
             .expect("open gc lock");
         holder.try_lock().expect("acquire gc lock in test");
 
-        let summary = gc(&layout, true).expect("gc must not error when locked");
+        let summary =
+            gc(&layout, Duration::from_secs(3600)).expect("gc must not error when locked");
 
         assert!(summary.skipped_locked);
         assert!(summary.removed.is_empty());
@@ -601,7 +607,9 @@ mod tests {
 
         let mut summary = None;
         let output = capture_tracing_output(|| {
-            summary = Some(gc_logged(&layout, true, "startup").expect("gc_logged run"));
+            summary = Some(
+                gc_logged(&layout, Duration::from_secs(3600), "startup").expect("gc_logged run"),
+            );
         });
 
         let summary = summary.expect("gc_logged must have run");
@@ -624,7 +632,9 @@ mod tests {
 
         let mut summary = None;
         let output = capture_tracing_output(|| {
-            summary = Some(gc_logged(&layout, true, "startup").expect("gc_logged run"));
+            summary = Some(
+                gc_logged(&layout, Duration::from_secs(3600), "startup").expect("gc_logged run"),
+            );
         });
 
         let summary = summary.expect("gc_logged must have run");

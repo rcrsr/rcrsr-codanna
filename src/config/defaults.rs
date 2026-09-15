@@ -88,6 +88,16 @@ pub(super) fn default_health_poll_ms() -> u64 {
 pub(super) fn default_idle_shutdown_minutes() -> u64 {
     240
 }
+/// Maximum age (in hours) a previous (non-current) generation may reach
+/// before the next GC pass deletes it.
+///
+/// Defaults to 24 hours (one day) so stale previous generations don't
+/// accumulate disk usage indefinitely. Unlike `idle_shutdown_minutes`,
+/// `0` here means DELETE EVERY previous generation on the next GC (i.e.
+/// immediate deletion), not "disabled".
+pub(super) fn default_previous_generation_max_age_hours() -> u64 {
+    24
+}
 pub(super) fn default_test_path_patterns() -> Vec<String> {
     vec![
         "tests/".to_string(),
@@ -264,5 +274,10 @@ mod tests {
     #[test]
     fn default_idle_shutdown_minutes_is_four_hours() {
         assert_eq!(default_idle_shutdown_minutes(), 240);
+    }
+
+    #[test]
+    fn default_previous_generation_max_age_hours_is_one_day() {
+        assert_eq!(default_previous_generation_max_age_hours(), 24);
     }
 }
