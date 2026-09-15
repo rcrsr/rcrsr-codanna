@@ -609,6 +609,57 @@ impl IndexPersistence {
         Ok(())
     }
 
+    /// Save `facade`'s metadata into its bound generation only if that
+    /// generation is still `current`.
+    ///
+    /// Mirrors the compare-and-swap [`Self::publish_into_facade`] already
+    /// performs around `current`: `facade` was bound to a generation by an
+    /// earlier `load_facade`/`load_facade_lite` call, and a save that
+    /// blindly writes into that generation's directory races a concurrent
+    /// publish that has since moved `current` elsewhere (the write would
+    /// silently land in a stale, possibly soon-to-be-GC'd generation while
+    /// reporting success). This holds the same `publish_lock` around a
+    /// `read_current`/compare/save sequence so a save either lands in the
+    /// generation that is still current, or is refused with
+    /// [`IndexError::GenerationSuperseded`].
+    pub(crate) fn save_facade_current_checked(&self, facade: &IndexFacade) -> IndexResult<()> {
+        std::fs::create_dir_all(self.layout.root()).map_err(|e| IndexError::FileWrite {
+            path: self.layout.root().to_path_buf(),
+            source: e,
+        })?;
+        let lock_path = self.layout.publish_lock();
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| IndexError::FileWrite {
+                path: lock_path.clone(),
+                source: e,
+            })?;
+        lock_file.lock().map_err(|e| IndexError::FileWrite {
+            path: lock_path.clone(),
+            source: e,
+        })?;
+
+        let observed = self.layout.read_current()?;
+        let result = if observed.as_ref() == Some(facade.generation_id()) {
+            self.save_facade(facade)
+        } else {
+            Err(IndexError::GenerationSuperseded {
+                expected: facade.generation_id().to_string(),
+                actual: observed
+                    .as_ref()
+                    .map(GenerationId::to_string)
+                    .unwrap_or_else(|| "none".to_string()),
+            })
+        };
+
+        let _ = lock_file.unlock();
+
+        result
+    }
+
     /// Check if an index exists: whether `current` resolves to a valid
     /// generation under this persistence's [`IndexLayout`] (after migrating
     /// a legacy flat layout).
@@ -971,6 +1022,94 @@ mod tests {
             .publish(fresh)
             .expect("a Fresh build (no parent) must win regardless of current");
         assert_eq!(published, fresh_id);
+    }
+
+    #[test]
+    fn save_facade_current_checked_refuses_when_current_moved_off_bound_generation() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = IndexPersistence::new(temp_dir.path().to_path_buf());
+        let settings = settings_for(&temp_dir);
+
+        // Publish G1, current == G1.
+        let base = persistence
+            .open_build(settings.clone(), BuildMode::Fresh)
+            .expect("open fresh base build");
+        let g1 = persistence.publish(base).expect("publish base");
+
+        // Bind a facade to G1 (mirrors `load_facade_lite` in
+        // `run_prune_indexed_paths`).
+        let mut facade = persistence
+            .load_facade_lite(settings.clone())
+            .expect("load facade bound to G1");
+        assert_eq!(facade.generation_id(), &g1);
+
+        let g1_meta_path = persistence.layout.gen_dir(&g1).join("index.meta");
+        let g1_meta_before =
+            std::fs::read(&g1_meta_path).expect("G1 index.meta must exist before the race");
+
+        // Out-of-band: a concurrent full reindex publishes G2, moving
+        // `current` off G1 from under the bound facade.
+        let other = persistence
+            .open_build(settings.clone(), BuildMode::Fresh)
+            .expect("open fresh other build");
+        persistence.publish(other).expect("publish other as G2");
+        assert_ne!(
+            persistence.layout.read_current().unwrap().unwrap(),
+            g1,
+            "current must have moved off G1"
+        );
+
+        facade.set_indexed_paths(vec![temp_dir.path().to_path_buf()]);
+
+        let err = persistence
+            .save_facade_current_checked(&facade)
+            .expect_err("save must be refused once current moved off the bound generation");
+        match err {
+            IndexError::GenerationSuperseded { expected, actual } => {
+                assert_eq!(expected, g1.to_string());
+                assert_ne!(actual, g1.to_string());
+            }
+            other => panic!("expected GenerationSuperseded, got {other:?}"),
+        }
+
+        // The discriminating assertion: a plain `save_facade` would have
+        // written into G1 despite it no longer being current. Confirm no
+        // stale write landed.
+        let g1_meta_after =
+            std::fs::read(&g1_meta_path).expect("G1 index.meta must still exist after the race");
+        assert_eq!(
+            g1_meta_before, g1_meta_after,
+            "G1's index.meta must be byte-unchanged: no stale write must land after current moved on"
+        );
+    }
+
+    #[test]
+    fn save_facade_current_checked_saves_when_current_is_unchanged() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = IndexPersistence::new(temp_dir.path().to_path_buf());
+        let settings = settings_for(&temp_dir);
+
+        let build = persistence
+            .open_build(settings.clone(), BuildMode::Fresh)
+            .expect("open fresh build");
+        persistence.publish(build).expect("publish");
+
+        let mut facade = persistence
+            .load_facade_lite(settings.clone())
+            .expect("load facade bound to current");
+
+        let new_paths = vec![temp_dir.path().to_path_buf()];
+        facade.set_indexed_paths(new_paths.clone());
+
+        persistence
+            .save_facade_current_checked(&facade)
+            .expect("save must succeed when current has not moved");
+
+        let reloaded = persistence
+            .load_facade_lite(settings)
+            .expect("reload facade");
+        let reloaded_paths: Vec<PathBuf> = reloaded.get_indexed_paths().iter().cloned().collect();
+        assert_eq!(reloaded_paths, new_paths);
     }
 
     #[test]

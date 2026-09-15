@@ -122,7 +122,7 @@ fn run_serve_management(home: &Path, args: &[&str]) -> (i32, String, String) {
 
 /// Run `codanna ls` to completion, with the same `home` registry root as
 /// `start_http_server`/`run_serve_management`, so it observes the same
-/// registered/rogue state.
+/// registered/unknown state.
 fn run_ls(home: &Path) -> (i32, String, String) {
     let output = Command::new(codanna_binary())
         .arg("ls")
@@ -190,7 +190,7 @@ fn kill_pid_externally(pid: u32) {
 /// keeps looking like a `codanna serve` process, so `entry_is_stale` still
 /// reports it as live/not-stale) but stops responding to `SIGTERM` until
 /// resumed, letting a test force a genuine in-loop signal-then-wait timeout
-/// in `kill_all_servers` without pre-filtering the target out via
+/// in `stop_all_servers` without pre-filtering the target out via
 /// `entry_is_stale`. `SIGKILL` (used by `Reaper`'s teardown) still terminates
 /// a stopped process immediately, since `SIGKILL` cannot be blocked or
 /// ignored even while stopped.
@@ -416,109 +416,78 @@ fn reap_prunes_stale_entry_that_list_already_skipped() {
 }
 
 /// A real, running `codanna serve` process whose registry entry lives under
-/// a *different* per-user registry root ("rogue" from the perspective of the
+/// a *different* per-user registry root ("unknown" from the perspective of the
 /// `home` used for the `--stop` invocation below): the pid genuinely
 /// `looks_like_codanna_serve`, but no entry for it exists in the registry
 /// `--stop` is about to consult.
-struct RogueServer {
+struct UnknownServer {
     _workspace: TempDir,
     _home: TempDir,
     server: Child,
 }
 
-fn start_rogue_server() -> RogueServer {
+fn start_unknown_server() -> UnknownServer {
     let workspace = prepare_workspace();
-    let home_dir = TempDir::new().expect("create rogue registry home");
+    let home_dir = TempDir::new().expect("create unknown-server registry home");
     let server = start_http_server(workspace.path(), home_dir.path());
-    RogueServer {
+    UnknownServer {
         _workspace: workspace,
         _home: home_dir,
         server,
     }
 }
 
-/// Regression guard: `codanna serve --stop <pid>` without `--include-rogue`
-/// must refuse a pid that looks like `codanna serve` but has no entry in the
-/// registry being consulted -- today's registered-only contract, unchanged.
+/// `codanna serve --stop <pid>` no longer gates a numeric selector on
+/// registry membership: a pid that is not registered under the consulted
+/// registry root still stops, as long as it independently looks like a
+/// `codanna serve` process, and the CLI prints a one-line note that it was
+/// unregistered.
 #[test]
-fn stop_without_include_rogue_refuses_unregistered_codanna_pid() {
+fn stop_of_unregistered_codanna_pid_succeeds_with_note() {
     let home = TempDir::new().expect("create test home");
 
-    let mut rogue = start_rogue_server();
-    let pid = rogue.server.id();
+    let mut unknown = start_unknown_server();
+    let pid = unknown.server.id();
     let _reaper = Reaper(pid);
 
     wait_until(
         || pid_alive(pid),
         FAST_DEADLINE,
-        "rogue server to be running",
+        "unregistered server to be running",
     );
     assert!(
         !registry_file_exists(home.path(), pid),
-        "rogue server's registry entry must not be visible under the --stop registry root"
+        "unregistered server's registry entry must not be visible under the --stop registry root"
     );
 
     let (code, stdout, stderr) = run_serve_management(home.path(), &["--stop", &pid.to_string()]);
     assert_eq!(
-        code, 1,
-        "serve --stop without --include-rogue must refuse an unregistered pid\nstdout:\n{stdout}\nstderr:\n{stderr}"
-    );
-    assert!(
-        pid_alive(pid),
-        "a refused --stop must never signal the target process"
-    );
-
-    let _ = rogue.server.kill();
-    let _ = rogue.server.wait();
-}
-
-/// `codanna serve --stop <pid> --include-rogue` accepts a pid that is not
-/// registered under the consulted registry root, as long as it still
-/// independently looks like a `codanna serve` process.
-#[test]
-fn stop_with_include_rogue_accepts_unregistered_codanna_pid() {
-    let home = TempDir::new().expect("create test home");
-
-    let mut rogue = start_rogue_server();
-    let pid = rogue.server.id();
-    let _reaper = Reaper(pid);
-
-    wait_until(
-        || pid_alive(pid),
-        FAST_DEADLINE,
-        "rogue server to be running",
-    );
-    assert!(
-        !registry_file_exists(home.path(), pid),
-        "rogue server's registry entry must not be visible under the --stop registry root"
-    );
-
-    let (code, stdout, stderr) = run_serve_management(
-        home.path(),
-        &["--stop", &pid.to_string(), "--include-rogue"],
-    );
-    assert_eq!(
         code, 0,
-        "serve --stop --include-rogue should accept a rogue codanna-serve pid\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "serve --stop should accept an unregistered codanna-serve pid\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("was not registered; stopping anyway")
+            || stderr.contains("was not registered; stopping anyway"),
+        "serve --stop should note that the resolved pid was unregistered\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 
-    // `rogue.server` is this test's own child handle: the OS keeps a
+    // `unknown.server` is this test's own child handle: the OS keeps a
     // terminated child as a zombie -- which `pid_alive` deliberately still
     // treats as "alive" -- until its parent reaps it via `wait`/`try_wait`,
     // so exit must be observed through the owning `Child`, exactly like
     // `stop_sends_sigterm_and_server_self_deregisters` above.
     wait_until(
-        || matches!(rogue.server.try_wait(), Ok(Some(_))),
+        || matches!(unknown.server.try_wait(), Ok(Some(_))),
         FAST_DEADLINE,
-        "rogue server to exit after --stop --include-rogue",
+        "unregistered server to exit after --stop",
     );
 }
 
-/// `--include-rogue` waives only registry membership, never the
-/// `looks_like_codanna_serve` identity check: a pid that is not a codanna
-/// process at all must still be refused even with the flag set.
+/// The identity check remains the sole safety net for a numeric `--stop`
+/// selector: a pid that is not a codanna process at all must still be
+/// refused, registered or not.
 #[test]
-fn stop_with_include_rogue_still_refuses_non_codanna_pid() {
+fn stop_still_refuses_non_codanna_pid() {
     let home = TempDir::new().expect("create test home");
 
     let mut non_codanna = Command::new("sleep")
@@ -537,13 +506,10 @@ fn stop_with_include_rogue_still_refuses_non_codanna_pid() {
         "non-codanna process to be running",
     );
 
-    let (code, stdout, stderr) = run_serve_management(
-        home.path(),
-        &["--stop", &pid.to_string(), "--include-rogue"],
-    );
+    let (code, stdout, stderr) = run_serve_management(home.path(), &["--stop", &pid.to_string()]);
     assert_eq!(
         code, 1,
-        "serve --stop --include-rogue must still refuse a non-codanna pid\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "serve --stop must still refuse a non-codanna pid\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
         pid_alive(pid),
@@ -608,9 +574,9 @@ fn list_prints_deprecation_notice_and_delegates_to_ls() {
         );
     }
     // Compare only the registered rows (source == "registered"), not the
-    // full output: rogue rows come from a live, machine-wide process-table
+    // full output: unknown rows come from a live, machine-wide process-table
     // scan taken independently by each invocation, so on a host with other
-    // rogue `codanna serve` processes running concurrently that set can
+    // unknown `codanna serve` processes running concurrently that set can
     // legitimately differ between the two separate subprocess calls above.
     // The registered rows, backed by this test's own isolated registry
     // root, must match exactly regardless.
@@ -695,10 +661,10 @@ fn await_upstream(child: &mut Child) -> (u32, u16) {
         .expect("proxy should report the backing HTTP server within the deadline")
 }
 
-/// `codanna serve --kill-all` must stop every registered server, attempting
+/// `codanna serve --stop-all` must stop every registered server, attempting
 /// (and reporting on) every target rather than stopping after the first.
 #[test]
-fn kill_all_stops_all_registered_servers() {
+fn stop_all_stops_all_registered_servers() {
     let workspace = prepare_workspace();
     let home = workspace.path().join(".home");
     std::fs::create_dir_all(&home).expect("create test home");
@@ -717,43 +683,84 @@ fn kill_all_stops_all_registered_servers() {
         "both backing servers to publish their registry entries",
     );
 
-    let (code, stdout, stderr) = run_serve_management(&home, &["--kill-all"]);
+    let (code, stdout, stderr) = run_serve_management(&home, &["--stop-all"]);
     assert_eq!(
         code, 0,
-        "serve --kill-all should report success when every target stopped\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "serve --stop-all should report success when every target stopped\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     for pid in [pid_a, pid_b] {
         assert!(
             stdout.contains(&pid.to_string()) || stderr.contains(&pid.to_string()),
-            "serve --kill-all output should mention pid {pid}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            "serve --stop-all output should mention pid {pid}\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
     }
 
     wait_until(
         || matches!(server_a.try_wait(), Ok(Some(_))),
         FAST_DEADLINE,
-        "server A to self-exit after --kill-all",
+        "server A to self-exit after --stop-all",
     );
     wait_until(
         || matches!(server_b.try_wait(), Ok(Some(_))),
         FAST_DEADLINE,
-        "server B to self-exit after --kill-all",
+        "server B to self-exit after --stop-all",
     );
     assert!(
         !registry_file_exists(&home, pid_a),
-        "server A should self-deregister once stopped by --kill-all"
+        "server A should self-deregister once stopped by --stop-all"
     );
     assert!(
         !registry_file_exists(&home, pid_b),
-        "server B should self-deregister once stopped by --kill-all"
+        "server B should self-deregister once stopped by --stop-all"
     );
 }
 
-/// A bare `codanna serve --kill-all` targets only `ServerRole::Server`
-/// entries: a registered proxy must survive it. `--kill-all
+/// The deprecated `--kill-all` spelling must produce identical stop
+/// behavior to `--stop-all` (it is merged into `stop_all` in
+/// `cli::commands::serve::run`), and must also emit a one-line deprecation
+/// notice.
+#[test]
+fn kill_all_alias_stops_registered_servers_and_warns() {
+    let workspace = prepare_workspace();
+    let home = workspace.path().join(".home");
+    std::fs::create_dir_all(&home).expect("create test home");
+
+    let mut server = start_http_server(workspace.path(), &home);
+    let pid = server.id();
+    let _reaper = Reaper(pid);
+
+    wait_until(
+        || registry_file_exists(&home, pid),
+        FAST_DEADLINE,
+        "backing server to publish its registry entry",
+    );
+
+    let (code, stdout, stderr) = run_serve_management(&home, &["--kill-all"]);
+    assert_eq!(
+        code, 0,
+        "serve --kill-all should report success when the target stopped\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("DEPRECATION") && stderr.contains("--stop-all"),
+        "serve --kill-all should emit a deprecation notice pointing at --stop-all\nstderr:\n{stderr}"
+    );
+
+    wait_until(
+        || matches!(server.try_wait(), Ok(Some(_))),
+        FAST_DEADLINE,
+        "server to self-exit after --kill-all",
+    );
+    assert!(
+        !registry_file_exists(&home, pid),
+        "server should self-deregister once stopped by --kill-all, just like --stop-all"
+    );
+}
+
+/// A bare `codanna serve --stop-all` targets only `ServerRole::Server`
+/// entries: a registered proxy must survive it. `--stop-all
 /// --include-proxies` must additionally stop the proxy.
 #[test]
-fn kill_all_excludes_proxies_by_default_and_includes_with_flag() {
+fn stop_all_excludes_proxies_by_default_and_includes_with_flag() {
     let workspace = prepare_workspace();
     let home = workspace.path().join(".home");
     std::fs::create_dir_all(&home).expect("create test home");
@@ -770,30 +777,30 @@ fn kill_all_excludes_proxies_by_default_and_includes_with_flag() {
         "both the proxy and its backing server to publish registry entries",
     );
 
-    let (code, stdout, stderr) = run_serve_management(&home, &["--kill-all"]);
+    let (code, stdout, stderr) = run_serve_management(&home, &["--stop-all"]);
     assert_eq!(
         code, 0,
-        "bare serve --kill-all should report success\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "bare serve --stop-all should report success\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 
     wait_until(
         || !pid_alive(backing_pid),
         FAST_DEADLINE,
-        "backing server to be stopped by a bare --kill-all",
+        "backing server to be stopped by a bare --stop-all",
     );
     assert!(
         pid_alive(proxy_pid),
-        "a bare --kill-all must never stop a registered proxy"
+        "a bare --stop-all must never stop a registered proxy"
     );
     assert!(
         registry_file_exists(&home, proxy_pid),
-        "a bare --kill-all must not touch the proxy's registry entry"
+        "a bare --stop-all must not touch the proxy's registry entry"
     );
 
-    let (code, stdout, stderr) = run_serve_management(&home, &["--kill-all", "--include-proxies"]);
+    let (code, stdout, stderr) = run_serve_management(&home, &["--stop-all", "--include-proxies"]);
     assert_eq!(
         code, 0,
-        "serve --kill-all --include-proxies should report success\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "serve --stop-all --include-proxies should report success\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 
     // `proxy` is this test's own child handle: like
@@ -809,10 +816,10 @@ fn kill_all_excludes_proxies_by_default_and_includes_with_flag() {
 }
 
 /// A stale registry entry (process already dead, unable to self-deregister)
-/// must not stop `--kill-all` from attempting and reporting on the other,
+/// must not stop `--stop-all` from attempting and reporting on the other,
 /// still-live registered target.
 #[test]
-fn kill_all_continues_past_a_dead_target() {
+fn stop_all_continues_past_a_dead_target() {
     let workspace = prepare_workspace();
     let home = workspace.path().join(".home");
     std::fs::create_dir_all(&home).expect("create test home");
@@ -856,35 +863,35 @@ fn kill_all_continues_past_a_dead_target() {
         "live server to publish its registry entry",
     );
 
-    let (code, stdout, stderr) = run_serve_management(&home, &["--kill-all"]);
+    let (code, stdout, stderr) = run_serve_management(&home, &["--stop-all"]);
     assert_eq!(
         code, 0,
-        "serve --kill-all should still report success for the live target despite a stale \
+        "serve --stop-all should still report success for the live target despite a stale \
          registered entry\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
         stdout.contains(&live_pid.to_string()) || stderr.contains(&live_pid.to_string()),
-        "serve --kill-all output should mention the live target pid {live_pid}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "serve --stop-all output should mention the live target pid {live_pid}\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 
     wait_until(
         || matches!(live.try_wait(), Ok(Some(_))),
         FAST_DEADLINE,
-        "live server to self-exit after --kill-all",
+        "live server to self-exit after --stop-all",
     );
 }
 
-/// Unlike `kill_all_continues_past_a_dead_target` (which pre-filters a dead
-/// target out via `entry_is_stale` before `kill_all_servers`'s per-target
+/// Unlike `stop_all_continues_past_a_dead_target` (which pre-filters a dead
+/// target out via `entry_is_stale` before `stop_all_servers`'s per-target
 /// loop ever runs), this exercises a genuine in-loop failure: a target that
-/// is live and not stale (so it reaches `kill_one_registered_target`) but
+/// is live and not stale (so it reaches `stop_one_registered_target`) but
 /// never actually exits within the signal-then-wait deadline, alongside a
-/// second target that does stop cleanly. `--kill-all` must still attempt and
+/// second target that does stop cleanly. `--stop-all` must still attempt and
 /// report on the second target rather than aborting the sweep on the first
 /// target's failure.
 #[cfg(unix)]
 #[test]
-fn kill_all_continues_past_an_unresponsive_live_target() {
+fn stop_all_continues_past_an_unresponsive_live_target() {
     let workspace = prepare_workspace();
     let home = workspace.path().join(".home");
     std::fs::create_dir_all(&home).expect("create test home");
@@ -904,7 +911,7 @@ fn kill_all_continues_past_an_unresponsive_live_target() {
 
     // Suspend `stuck` so it stays alive (and still looks like `codanna
     // serve`, so `entry_is_stale` does not filter it out) but cannot act on
-    // the SIGTERM `kill_all_servers` sends it, forcing a genuine in-loop
+    // the SIGTERM `stop_all_servers` sends it, forcing a genuine in-loop
     // wait-for-exit timeout rather than a pre-loop filter exclusion.
     stop_pid_externally(stuck_pid);
     // `Reaper` normally handles teardown via SIGKILL, but it is only
@@ -912,21 +919,21 @@ fn kill_all_continues_past_an_unresponsive_live_target() {
     // test since its pid is also asserted on mid-test.
     let _cleanup_stuck = Reaper(stuck_pid);
 
-    let (code, stdout, stderr) = run_serve_management(&home, &["--kill-all"]);
+    let (code, stdout, stderr) = run_serve_management(&home, &["--stop-all"]);
     assert_eq!(
         code, 1,
-        "serve --kill-all should report failure when a live target never exits\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "serve --stop-all should report failure when a live target never exits\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
         stdout.contains(&live_pid.to_string()) || stderr.contains(&live_pid.to_string()),
-        "serve --kill-all must still attempt and report the second, healthy target \
+        "serve --stop-all must still attempt and report the second, healthy target \
          {live_pid} despite the first target's failure\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 
     wait_until(
         || matches!(live.try_wait(), Ok(Some(_))),
         FAST_DEADLINE,
-        "live server to self-exit after --kill-all despite the stuck target's failure",
+        "live server to self-exit after --stop-all despite the stuck target's failure",
     );
     assert!(
         registry_file_exists(&home, stuck_pid),
@@ -944,27 +951,116 @@ fn kill_all_continues_past_an_unresponsive_live_target() {
     );
 }
 
-/// clap must reject `--stop` and `--kill-all` together: they are mutually
+/// `codanna serve --stop-all --include-unknown` additionally sweeps an
+/// unregistered `codanna serve` pid that a process-table scan finds, not just
+/// registered targets, and reports the two counts separately in its summary
+/// line.
+#[test]
+#[ignore = "machine-wide sweep: --stop-all --include-unknown signals EVERY same-user `codanna serve` process on this host, including real ones and those spawned by parallel tests; run explicitly with `cargo test --test cli_tests -- --ignored --test-threads=1 stop_all_include`"]
+fn stop_all_include_unknown_includes_unregistered_target_and_reports_separately() {
+    let workspace = prepare_workspace();
+    let home = workspace.path().join(".home");
+    std::fs::create_dir_all(&home).expect("create test home");
+
+    let mut registered = start_http_server(workspace.path(), &home);
+    let registered_pid = registered.id();
+    let _reaper_registered = Reaper(registered_pid);
+
+    let mut unknown = start_unknown_server();
+    let unknown_pid = unknown.server.id();
+    let _reaper_rogue = Reaper(unknown_pid);
+
+    wait_until(
+        || registry_file_exists(&home, registered_pid) && pid_alive(unknown_pid),
+        FAST_DEADLINE,
+        "registered server's registry entry to publish and the unregistered server to be running",
+    );
+    assert!(
+        !registry_file_exists(&home, unknown_pid),
+        "unregistered server must not be registered under this test's registry root"
+    );
+
+    let (code, stdout, stderr) = run_serve_management(&home, &["--stop-all", "--include-unknown"]);
+    assert_eq!(
+        code, 0,
+        "serve --stop-all --include-unknown should report success\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let combined = format!("{stdout}\n{stderr}").to_lowercase();
+    assert!(
+        combined.contains("registered") && combined.contains("unknown"),
+        "summary line should report registered and unknown counts separately\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    wait_until(
+        || matches!(registered.try_wait(), Ok(Some(_))),
+        FAST_DEADLINE,
+        "registered server to self-exit after --stop-all --include-unknown",
+    );
+    wait_until(
+        || matches!(unknown.server.try_wait(), Ok(Some(_))),
+        FAST_DEADLINE,
+        "unregistered server to exit after --stop-all --include-unknown",
+    );
+}
+
+/// The deprecated `--include-rogue` spelling must still work as
+/// `--stop-all`'s unregistered-target opt-in (merged into `include_unknown`
+/// in `cli::commands::serve::run`), and must emit a one-line deprecation
+/// notice pointing at `--include-unknown`.
+#[test]
+#[ignore = "machine-wide sweep: --stop-all --include-unknown signals EVERY same-user `codanna serve` process on this host, including real ones and those spawned by parallel tests; run explicitly with `cargo test --test cli_tests -- --ignored --test-threads=1 stop_all_include`"]
+fn stop_all_include_rogue_alias_still_works_and_warns() {
+    let home = TempDir::new().expect("create test home");
+
+    let mut unknown = start_unknown_server();
+    let unknown_pid = unknown.server.id();
+    let _reaper_rogue = Reaper(unknown_pid);
+
+    wait_until(
+        || pid_alive(unknown_pid),
+        FAST_DEADLINE,
+        "unregistered server to be running",
+    );
+
+    let (code, stdout, stderr) =
+        run_serve_management(home.path(), &["--stop-all", "--include-rogue"]);
+    assert_eq!(
+        code, 0,
+        "serve --stop-all --include-rogue should report success\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("DEPRECATION") && stderr.contains("--include-unknown"),
+        "serve --stop-all --include-rogue should emit a deprecation notice pointing at --include-unknown\nstderr:\n{stderr}"
+    );
+
+    wait_until(
+        || matches!(unknown.server.try_wait(), Ok(Some(_))),
+        FAST_DEADLINE,
+        "unregistered server to exit after --stop-all --include-rogue",
+    );
+}
+
+/// clap must reject `--stop` and `--stop-all` together: they are mutually
 /// exclusive registry-lifecycle operations.
 #[test]
-fn stop_and_kill_all_together_is_rejected_by_clap() {
+fn stop_and_stop_all_together_is_rejected_by_clap() {
     let home = TempDir::new().expect("create test home");
 
     let (code, stdout, stderr) =
-        run_serve_management(home.path(), &["--stop", "12345", "--kill-all"]);
+        run_serve_management(home.path(), &["--stop", "12345", "--stop-all"]);
     assert_ne!(
         code, 0,
-        "clap should reject --stop and --kill-all together\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "clap should reject --stop and --stop-all together\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
         stderr.contains("cannot be used with"),
-        "clap's conflict error should explain --stop/--kill-all cannot be combined:\n{stderr}"
+        "clap's conflict error should explain --stop/--stop-all cannot be combined:\n{stderr}"
     );
 }
 
 /// clap must reject `--stop` and `--include-proxies` together even though
-/// `--include-proxies` only declares `requires = "kill_all"`: when `--stop`
-/// is present, clap treats `kill_all` as blocked by its own `conflicts_with
+/// `--include-proxies` only declares `requires = "stop_all"`: when `--stop`
+/// is present, clap treats `stop_all` as blocked by its own `conflicts_with
 /// = "stop"` and silently skips validating `requires` against it, which
 /// would otherwise let `--include-proxies` parse as a silent no-op under
 /// `--stop` instead of being rejected.

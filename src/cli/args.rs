@@ -62,7 +62,7 @@ fn create_custom_help() -> String {
     help.push_str("  list-dirs     List all directories that are being indexed\n");
     help.push_str("  retrieve      Query symbols, relationships, and dependencies\n");
     help.push_str("  serve         Start MCP server\n");
-    help.push_str("  ls            List registered and rogue codanna servers/proxies\n");
+    help.push_str("  ls            List registered and unknown codanna servers/proxies\n");
     help.push_str("  config        Display active settings\n");
     help.push_str("  mcp-test      Test MCP connection\n");
     help.push_str("  mcp           Execute MCP tools directly\n");
@@ -196,6 +196,25 @@ pub enum Commands {
         /// exclusive with indexing, --status, and --gc.
         #[arg(long = "rollback", num_args = 0..=1, conflicts_with_all = ["status", "gc", "paths"])]
         rollback: Option<Option<String>>,
+
+        /// Prune tracked indexed paths that no longer exist on disk, or that
+        /// are outside the workspace root and not listed in settings.toml,
+        /// then print a summary and exit. This prunes the generation's
+        /// tracked `index.meta` paths only -- it does not touch
+        /// settings.toml's indexed-paths list (use `codanna remove-dir` for
+        /// that). Distinct from `--gc`, which removes stale on-disk index
+        /// *generations*, not tracked path entries. Mutually exclusive with
+        /// indexing and every indexing-only option, --status, --gc, and
+        /// --rollback.
+        #[arg(
+            long = "prune-indexed-paths",
+            conflicts_with_all = [
+                "status", "gc", "rollback", "paths",
+                "force", "dry_run", "json", "threads", "max_files",
+                "no_progress", "list_all",
+            ]
+        )]
+        prune_indexed_paths: bool,
     },
 
     /// Add a directory to the indexed paths list
@@ -313,7 +332,7 @@ pub enum Commands {
         #[arg(
             long,
             conflicts_with_all = ["http", "https", "proxy", "bind"],
-            help = "[DEPRECATED: use `codanna ls`] List codanna serve processes, registered and rogue (pid, port, scheme, workspace, status)"
+            help = "[DEPRECATED: use `codanna ls`] List codanna serve processes, registered and unknown (pid, port, scheme, workspace, status)"
         )]
         list: bool,
 
@@ -343,52 +362,132 @@ pub enum Commands {
             group = "stop_or_kill_all",
             help = "Stop every registered server (SIGTERM unless --force); pass --include-proxies to also stop registered proxies"
         )]
+        stop_all: bool,
+
+        /// Deprecated spelling of `--stop-all`.
+        ///
+        /// Kept for one release cycle so existing scripts calling
+        /// `--kill-all` keep working; `run` merges this into `stop_all` and
+        /// prints a deprecation notice. A separate hidden field (not a
+        /// clap `alias`) because clap-derive cannot report which spelling
+        /// was actually used on the command line, and the deprecation
+        /// notice needs that.
+        // TODO(remove-after: v0.17.0): drop this flag once the deprecation
+        // has spanned one full release cycle -- see .github/release-sop.md
+        // "Deprecated-for-one-release-cycle flags".
+        #[arg(
+            long = "kill-all",
+            hide = true,
+            conflicts_with = "stop",
+            group = "stop_or_kill_all",
+            help = "[DEPRECATED: use --stop-all]"
+        )]
         kill_all: bool,
 
-        /// With --kill-all, also stop registered proxies (not just backing servers)
+        /// With --stop-all, also stop registered proxies (not just backing servers)
         #[arg(
             long,
-            requires = "kill_all",
-            // Belt-and-suspenders: `kill_all` itself has `conflicts_with =
-            // "stop"`, and when `--stop` is present clap treats `kill_all`
+            // `requires` targets the `stop_or_kill_all` group (not the bare
+            // `stop_all` field) so the deprecated `--kill-all` alias also
+            // satisfies it -- clap's `requires` only checks the literal id
+            // named, and `--kill-all` never sets `stop_all` itself (`run`
+            // merges them post-parse), so `requires = "stop_all"` would
+            // reject `--kill-all --include-proxies` before that merge ever
+            // runs.
+            requires = "stop_or_kill_all",
+            // Belt-and-suspenders: `stop_all` itself has `conflicts_with =
+            // "stop"`, and when `--stop` is present clap treats `stop_all`
             // as blocked and silently skips validating `requires` against
             // it -- so without this explicit conflict, `--stop
             // --include-proxies` would parse successfully with
-            // `include_proxies == true` but `kill_all == false`, making
+            // `include_proxies == true` but `stop_all == false`, making
             // `--include-proxies` a silent no-op under `--stop` instead of
             // a rejected combination.
             conflicts_with = "stop",
-            help = "With --kill-all, also stop registered proxies, not just backing servers"
+            help = "With --stop-all, also stop registered proxies, not just backing servers"
         )]
         include_proxies: bool,
 
-        /// Send SIGKILL instead of SIGTERM when used with --stop or --kill-all
+        /// Send SIGKILL instead of SIGTERM when used with --stop or --stop-all
         #[arg(
             long,
             requires = "stop_or_kill_all",
-            help = "With --stop or --kill-all, send SIGKILL instead of the default SIGTERM"
+            help = "With --stop or --stop-all, send SIGKILL instead of the default SIGTERM"
         )]
         force: bool,
 
-        /// Allow --stop to target a pid that looks like codanna serve but is
-        /// not present in the per-user server registry (e.g. started before
-        /// the registry existed, or from another user's session this one
-        /// can still signal). Never permits stopping an arbitrary pid: the
-        /// target must still independently pass the process-identity check.
+        /// Allow --stop-all to additionally target unregistered pids that
+        /// still independently look like `codanna serve` processes (e.g.
+        /// started before the registry existed, or from another user's
+        /// session this one can still signal). Never permits stopping an
+        /// arbitrary pid: every such target must still independently pass
+        /// the strict process-identity check
+        /// (`io::process::scan_codanna_serve_pids`'s predicate) immediately
+        /// before it is signaled.
+        ///
+        /// A numeric `--stop <pid>` selector no longer needs this flag: it
+        /// has always accepted any pid passing the identity check,
+        /// registered or not (see `resolve_selector_to_pid`). This flag now
+        /// only widens `--stop-all`'s target set, hence `requires =
+        /// "stop_all"` (mirroring `--include-proxies`) rather than `--stop`.
+        #[arg(
+            long,
+            // See `include_proxies`'s comment: `requires` targets the
+            // `stop_or_kill_all` group so the deprecated `--kill-all` alias
+            // also satisfies it.
+            requires = "stop_or_kill_all",
+            conflicts_with = "stop",
+            help = "With --stop-all, also stop unregistered pids that still look like codanna serve"
+        )]
+        include_unknown: bool,
+
+        /// Deprecated spelling of `--include-unknown`.
+        ///
+        /// Kept for one release cycle so existing scripts calling
+        /// `--include-rogue` keep working; `run` merges this into
+        /// `include_unknown` and prints a deprecation notice. A separate
+        /// hidden field (not a clap `alias`), mirroring `--kill-all`'s
+        /// treatment of `--stop-all`, so the deprecation notice can report
+        /// which spelling was actually used.
+        // TODO(remove-after: v0.17.0): drop this flag once the deprecation
+        // has spanned one full release cycle -- see .github/release-sop.md
+        // "Deprecated-for-one-release-cycle flags".
+        #[arg(
+            long = "include-rogue",
+            hide = true,
+            requires = "stop_or_kill_all",
+            conflicts_with = "stop",
+            help = "[DEPRECATED: use --include-unknown]"
+        )]
+        include_rogue: bool,
+
+        /// With --stop, seconds to wait for the target to exit before
+        /// escalating (default: 5)
+        #[arg(
+            long,
+            default_value = "5",
+            requires = "stop",
+            help = "With --stop, seconds to wait for the signal to take effect before escalating to SIGKILL"
+        )]
+        timeout: u64,
+
+        /// With --stop, do not escalate to SIGKILL if the target has not
+        /// exited within --timeout
         #[arg(
             long,
             requires = "stop",
-            help = "With --stop, also allow an unregistered pid that still looks like codanna serve"
+            conflicts_with = "force",
+            help = "With --stop, do not escalate to SIGKILL if the target has not exited within --timeout"
         )]
-        include_rogue: bool,
+        no_force: bool,
     },
 
     /// List every `codanna serve` process visible to the invoking user
     #[command(
-        about = "List registered and rogue codanna servers/proxies",
+        about = "List registered and unknown codanna servers/proxies",
         long_about = "Merge the per-user server registry with a process-table scan into one \
 read-only table: registered servers, registered proxies attributed to their backing server, and \
-any rogue codanna serve process with no live registry entry. Never loads the code index."
+any unknown codanna serve process with no live registry entry. Never loads the code index."
     )]
     Ls,
 
@@ -847,4 +946,47 @@ pub enum RetrieveQuery {
         #[arg(long, value_delimiter = ',')]
         fields: Option<Vec<String>>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `--include-proxies`/`--include-unknown` `requires` the
+    /// `stop_or_kill_all` group, not the bare `stop_all` field, so the
+    /// deprecated `--kill-all` alias (merged into `stop_all` post-parse by
+    /// `cli::commands::serve::run`) must also satisfy it at parse time.
+    #[test]
+    fn test_kill_all_with_include_proxies_parses() {
+        let cli =
+            Cli::try_parse_from(["codanna", "serve", "--kill-all", "--include-proxies"]).unwrap();
+        match cli.command {
+            Commands::Serve {
+                kill_all,
+                include_proxies,
+                ..
+            } => {
+                assert!(kill_all);
+                assert!(include_proxies);
+            }
+            _ => panic!("expected Commands::Serve"),
+        }
+    }
+
+    #[test]
+    fn test_kill_all_with_include_unknown_parses() {
+        let cli =
+            Cli::try_parse_from(["codanna", "serve", "--kill-all", "--include-unknown"]).unwrap();
+        match cli.command {
+            Commands::Serve {
+                kill_all,
+                include_unknown,
+                ..
+            } => {
+                assert!(kill_all);
+                assert!(include_unknown);
+            }
+            _ => panic!("expected Commands::Serve"),
+        }
+    }
 }

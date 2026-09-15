@@ -638,6 +638,14 @@ pub async fn serve_http(config: crate::Settings, watch: bool, bind: String) -> a
         axum::response::Html(html)
     }
 
+    // Bound on how long the post-signal watcher-handle joins (below) are
+    // allowed to take before this process gives up waiting and exits
+    // anyway. Registry/discovery records are already removed in every
+    // `shutdown_signal()`-reachable arm before those joins run, so exiting
+    // without them completing leaves no stale bookkeeping behind -- only a
+    // watcher task that failed to settle promptly.
+    const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+
     // Helper function for shutdown signal with cancellation token
     // Also listens for SIGTERM on Unix (in addition to Ctrl+C/SIGINT) so
     // `codanna serve --stop <pid>` -- which sends SIGTERM by default, only
@@ -937,18 +945,32 @@ pub async fn serve_http(config: crate::Settings, watch: bool, bind: String) -> a
     // future's own natural completion). Awaiting these handles here -- not
     // just relying on `ct.cancel()` -- is what lets the unified watcher's
     // `watch()` task finish any `spawn_blocking` closure holding the
-    // facade's write guard, and join any in-flight catch-up reindex task,
-    // before this function returns: `watch()` only observes `ct` between
-    // its own loop iterations (see `UnifiedWatcher::cancellation_token`),
-    // and its cancellation arm blocks on the catch-up task's completion
-    // rather than dropping it, so by the time its `JoinHandle` resolves, no
-    // such closure or task is still running, and it is safe for the caller
-    // to tear the process down right after this function returns.
-    if let Some(handle) = hot_reload_handle {
-        let _ = handle.await;
+    // facade's write guard before this function returns: `watch()` only
+    // observes `ct` between its own loop iterations (see
+    // `UnifiedWatcher::cancellation_token`). Its cancellation arm now
+    // `abort()`s rather than joins any in-flight catch-up reindex task (see
+    // `UnifiedWatcher::watch`), so the join itself should settle quickly;
+    // it is still wrapped in `SHUTDOWN_GRACE` below as a bound against any
+    // unforeseen hang, since the registry/discovery records were already
+    // removed above and it is safe to tear the process down without these
+    // joins completing.
+    if let Some(handle) = hot_reload_handle
+        && tokio::time::timeout(SHUTDOWN_GRACE, handle).await.is_err()
+    {
+        eprintln!(
+            "hot-reload watcher did not settle within {}s of shutdown; exiting now",
+            SHUTDOWN_GRACE.as_secs()
+        );
+        std::process::exit(crate::mcp::forced_exit_code(&server_result));
     }
-    if let Some(handle) = unified_watcher_handle {
-        let _ = handle.await;
+    if let Some(handle) = unified_watcher_handle
+        && tokio::time::timeout(SHUTDOWN_GRACE, handle).await.is_err()
+    {
+        eprintln!(
+            "unified watcher did not settle within {}s of shutdown; exiting now",
+            SHUTDOWN_GRACE.as_secs()
+        );
+        std::process::exit(crate::mcp::forced_exit_code(&server_result));
     }
 
     if let Some(result) = server_result {

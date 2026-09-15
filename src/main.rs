@@ -225,7 +225,7 @@ fn is_proxy_serve(command: &Commands, config: &Settings) -> bool {
 }
 
 /// Resolve whether a `Commands::Serve` invocation is a registry lifecycle
-/// operation (`--list`/`--stop`/`--reap`/`--kill-all`) rather than a request
+/// operation (`--list`/`--stop`/`--reap`/`--stop-all`) rather than a request
 /// to start a server.
 ///
 /// These operations only ever read/write the per-user server registry
@@ -233,13 +233,43 @@ fn is_proxy_serve(command: &Commands, config: &Settings) -> bool {
 /// proxy mode (`is_proxy_serve`). Every pre-dispatch resource predicate that
 /// excludes proxy mode must also exclude these, or `serve --list` would
 /// needlessly load a full index before printing a table.
+///
+/// `kill_all: true` is included too since it's the deprecated alias for
+/// `stop_all` merged in `cli::commands::serve::run`, not a distinct
+/// operation.
 fn is_serve_management_op(command: &Commands) -> bool {
     matches!(
         command,
         Commands::Serve { list: true, .. }
             | Commands::Serve { stop: Some(_), .. }
             | Commands::Serve { reap: true, .. }
+            | Commands::Serve { stop_all: true, .. }
             | Commands::Serve { kill_all: true, .. }
+    )
+}
+
+/// Resolve whether a `Commands::Index` invocation is a read-only or
+/// metadata-only generation operation (`--status`, `--gc`, `--rollback`,
+/// `--prune-indexed-paths`) rather than a request to build or rebuild the
+/// index. None of these must trigger `IndexFacade::new`'s bootstrap-on-open,
+/// provider initialization, trait-resolver setup, or semantic-model loading
+/// -- every pre-dispatch resource predicate (`needs_indexer`,
+/// `needs_providers`, `needs_trait_resolver`, `needs_semantic_search`) must
+/// exclude these the same way `is_proxy_serve`/`is_serve_management_op`
+/// exclude serve's non-serving modes.
+fn is_metadata_only_index(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::Index { status: true, .. }
+            | Commands::Index { gc: true, .. }
+            | Commands::Index {
+                rollback: Some(_),
+                ..
+            }
+            | Commands::Index {
+                prune_indexed_paths: true,
+                ..
+            }
     )
 }
 
@@ -433,7 +463,8 @@ async fn main() {
     let needs_providers = !matches!(
         &cli.command,
         Commands::Parse { .. } | Commands::McpTest { .. } | Commands::Benchmark { .. }
-    ) && !is_serve_management_op(&cli.command);
+    ) && !is_serve_management_op(&cli.command)
+        && !is_metadata_only_index(&cli.command);
 
     let needs_indexer = !matches!(
         &cli.command,
@@ -449,19 +480,15 @@ async fn main() {
             | Commands::Documents { .. }
             | Commands::Profile { .. }
             | Commands::Ls
-            // `--status`, `--gc`, and `--rollback` are read-only/generation-
-            // level inspection or maintenance operations (see `run_status`,
-            // `run_gc`, `run_rollback`); none of them must trigger
-            // `IndexFacade::new`'s bootstrap-on-open, which writes a fresh
-            // `current` generation to disk when nothing resolves.
-            | Commands::Index { status: true, .. }
-            | Commands::Index { gc: true, .. }
-            | Commands::Index {
-                rollback: Some(_),
-                ..
-            }
     ) && !is_proxy_serve(&cli.command, &config)
-        && !is_serve_management_op(&cli.command);
+        && !is_serve_management_op(&cli.command)
+        // `--status`, `--gc`, `--rollback`, and `--prune-indexed-paths` are
+        // read-only/generation-level inspection or maintenance operations
+        // (see `run_status`, `run_gc`, `run_rollback`,
+        // `run_prune_indexed_paths`); none of them must trigger
+        // `IndexFacade::new`'s bootstrap-on-open, which writes a fresh
+        // `current` generation to disk when nothing resolves.
+        && !is_metadata_only_index(&cli.command);
 
     // Initialize project resolution providers (only if needed)
     // This ensures caches are built before indexing starts
@@ -513,7 +540,8 @@ async fn main() {
         } | Commands::Index { .. }
             | Commands::Serve { .. }
     ) && !is_proxy_serve(&cli.command, &config)
-        && !is_serve_management_op(&cli.command);
+        && !is_serve_management_op(&cli.command)
+        && !is_metadata_only_index(&cli.command);
 
     // Determine if we need semantic search (ML model loading)
     // Retrieve commands use Tantivy text search only - no ML model needed
@@ -524,6 +552,7 @@ async fn main() {
         }
         Commands::Serve { .. } if is_proxy_serve(&cli.command, &config) => false,
         Commands::Serve { .. } if is_serve_management_op(&cli.command) => false,
+        Commands::Index { .. } if is_metadata_only_index(&cli.command) => false,
         Commands::Index { .. } | Commands::Serve { .. } => true,
         _ => false,
     };
@@ -1016,10 +1045,14 @@ async fn main() {
             list,
             stop,
             reap,
+            stop_all,
             kill_all,
             include_proxies,
             force,
+            include_unknown,
             include_rogue,
+            timeout,
+            no_force,
         } => {
             use codanna::cli::commands::serve::{ServeArgs, run as run_serve};
             // Proxy mode and registry-management ops (--list/--stop/--reap)
@@ -1047,10 +1080,14 @@ async fn main() {
                     list,
                     stop,
                     reap,
+                    stop_all,
                     kill_all,
                     include_proxies,
                     force,
+                    include_unknown,
                     include_rogue,
+                    timeout,
+                    no_force,
                 },
                 config,
                 settings,
@@ -1073,9 +1110,11 @@ async fn main() {
             status,
             gc,
             rollback,
+            prune_indexed_paths,
         } => {
             use codanna::cli::commands::index::{
-                IndexArgs, run as run_index, run_gc, run_rollback, run_status,
+                IndexArgs, run as run_index, run_gc, run_prune_indexed_paths, run_rollback,
+                run_status,
             };
             use codanna::indexing::DryRunOutput;
 
@@ -1091,6 +1130,12 @@ async fn main() {
                 // Generation-level maintenance: no facade involved, same as
                 // `--status`.
                 run_rollback(&config, rollback_id);
+            } else if prune_indexed_paths {
+                // Metadata-only edit on the current generation: loads and
+                // saves via the same persistence seam as `codanna index`,
+                // but never opens a new build generation, same as
+                // `--status`/`--gc`/`--rollback`.
+                run_prune_indexed_paths(&config);
             } else {
                 // Progress enabled by default from settings, --no-progress overrides
                 let progress = config.indexing.show_progress && !no_progress;
@@ -1407,10 +1452,14 @@ mod is_proxy_serve_tests {
             list: false,
             stop: None,
             reap: false,
+            stop_all: false,
             kill_all: false,
             include_proxies: false,
             force: false,
+            include_unknown: false,
             include_rogue: false,
+            timeout: 5,
+            no_force: false,
         }
     }
 

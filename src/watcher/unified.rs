@@ -256,34 +256,35 @@ impl UnifiedWatcher {
                 // guard (those calls run to completion, sequentially, in the
                 // arm bodies below, outside this `select!`). This is what
                 // lets a caller `.await` the `watch()` task's `JoinHandle`
-                // after cancelling the token and be sure no such closure, and
-                // no catch-up reindex task (joined below), is still running.
+                // after cancelling the token and be sure no such closure is
+                // still running; any in-flight catch-up reindex task is
+                // aborted (not joined) below instead.
                 _ = self.cancellation_token.cancelled() => {
                     // A catch-up reindex may be mid-flight (spawned via
                     // `tokio::spawn` in `maybe_start_catch_up`, detached from
-                    // this `select!`). Dropping `self` here without joining
-                    // it would detach, not abort, the spawned future --
-                    // `reindex_locked` could still be on its own task,
-                    // partway through building the staged generation, when
-                    // this process exits. Staged builds no longer clear the
-                    // live index in phase 1, so aborting mid-build would only
-                    // orphan the half-built generation (swept up by GC on the
-                    // next start) and would leave the live facade untouched;
-                    // joining here is now a cost-avoidance choice (finish
-                    // work already paid for) rather than a correctness
-                    // requirement. We still join rather than abort for Phase
-                    // 4, since it's cheaper and changes no behavior; switching
-                    // to abort-on-shutdown is a documented follow-up, see
-                    // internal/improvement-notes.md section 2.1.
+                    // this `select!`). This arm used to await
+                    // `join_catch_up_task` here so shutdown never returned
+                    // while a catch-up build was still running. It now
+                    // `abort()`s the task instead, and does not await the
+                    // aborted handle, so shutdown latency is no longer
+                    // hostage to however long the in-flight reindex takes.
+                    // This is safe because of staged generations (already
+                    // shipped, see `src/storage/generation/`): a full
+                    // reindex builds into its own `gen/<id>/` directory and
+                    // only becomes the served generation via
+                    // `IndexPersistence::publish`/`IndexFacade::swap_in`.
+                    // Aborting mid-build only orphans a half-built
+                    // generation -- reaped by GC on the next start -- and
+                    // never touches the live, already-published generation
+                    // this process is currently serving.
                     if let Some(handle) = self.catch_up_task.take() {
                         crate::log_event!(
                             "watcher",
                             "stopping",
-                            "waiting for in-flight catch-up reindex to finish before exiting"
+                            "aborting in-flight catch-up reindex on shutdown"
                         );
-                        let started_at =
-                            self.catch_up_started_at.take().unwrap_or_else(Instant::now);
-                        self.join_catch_up_task(handle, started_at).await;
+                        handle.abort();
+                        self.catch_up_started_at.take();
                     }
                     crate::log_event!("watcher", "stopped", "cancellation requested");
                     return Ok(());
@@ -684,14 +685,25 @@ impl UnifiedWatcher {
         );
 
         let facade = Arc::clone(&self.facade);
+        let cancellation_token = self.cancellation_token.clone();
         self.catch_up_started_at = Some(Instant::now());
         self.catch_up_task = Some(tokio::spawn(async move {
             // Watcher broadcaster wiring is a later phase; `None` here just
             // means the catch-up reindex doesn't emit an `IndexReloaded`
-            // notification on the watch lane yet.
-            crate::indexing::reindex_locked(&facade, None, true, None, None)
-                .await
-                .map_err(|source| WatchError::CatchUpReindexFailed { source })
+            // notification on the watch lane yet. The cancellation token is
+            // the watcher's own shutdown token, reused (not a new one) so
+            // this catch-up reindex's phase-3 checkpoint observes the same
+            // shutdown signal the watcher itself shuts down on.
+            crate::indexing::reindex_locked(
+                &facade,
+                None,
+                true,
+                None,
+                Some(cancellation_token),
+                None,
+            )
+            .await
+            .map_err(|source| WatchError::CatchUpReindexFailed { source })
         }));
     }
 
@@ -1888,14 +1900,18 @@ impl UnifiedWatcherBuilder {
     /// mid-handler) once this token is cancelled. The token is polled only
     /// inside `watch()`'s own `select!`, strictly between loop iterations,
     /// never while a previous iteration's handler call is still awaiting a
-    /// `spawn_blocking` closure that may hold the facade's write guard (or,
-    /// once armed, a catch-up reindex task, which is joined to completion
-    /// before `watch()` returns). This is what lets a caller `.await` the
-    /// `watch()` task's `JoinHandle` after cancelling the token and be sure
-    /// no such closure or task is still running -- unlike wrapping `watch()`
-    /// in an *external* `select!` against cancellation, which can drop
-    /// `watch()` (and abandon a nested `spawn_blocking` mid-write on its own
-    /// OS thread) at an arbitrary await point deep inside a handler.
+    /// `spawn_blocking` closure that may hold the facade's write guard. Any
+    /// in-flight catch-up reindex task is `abort()`ed (not joined) on
+    /// cancellation, so `watch()` returns promptly without waiting on it --
+    /// safe because staged generations mean an aborted build only orphans a
+    /// half-built generation, reaped by GC on the next start, while the live
+    /// served generation is untouched. This is what lets a caller `.await`
+    /// the `watch()` task's `JoinHandle` after cancelling the token and be
+    /// sure no `spawn_blocking` write-guard closure is still running --
+    /// unlike wrapping `watch()` in an *external* `select!` against
+    /// cancellation, which can drop `watch()` (and abandon a nested
+    /// `spawn_blocking` mid-write on its own OS thread) at an arbitrary await
+    /// point deep inside a handler.
     pub fn cancellation_token(mut self, token: CancellationToken) -> Self {
         self.cancellation_token = token;
         self
@@ -4045,25 +4061,28 @@ mod tests {
         );
     }
 
-    /// Regression guard for the cancellation-shutdown path joining an
-    /// in-flight catch-up reindex task rather than dropping it.
+    /// Regression guard for the cancellation-shutdown path aborting (not
+    /// joining, and not merely dropping/detaching) an in-flight catch-up
+    /// reindex task.
     ///
-    /// `watch()`'s cancellation arm must not return while `catch_up_task`
-    /// is still running: dropping its `JoinHandle` detaches (but does not
-    /// abort) the spawned `reindex_locked` future, which could still be
-    /// mid-walk -- between clearing the index and finishing the rebuild --
-    /// when the caller, believing `watch()` has stopped, tears the process
-    /// down.
+    /// `watch()`'s cancellation arm must return promptly once cancelled,
+    /// without waiting for `catch_up_task` to finish on its own -- staged
+    /// generations (see `src/storage/generation/`) make an abort here safe:
+    /// an aborted mid-build reindex only orphans a half-built generation,
+    /// reaped by GC on the next start, and never touches the live served
+    /// generation. It must also be a genuine `abort()`, not a bare `drop`:
+    /// `AbortHandle::is_finished()` on the still-held handle must report
+    /// the task as settled (cancelled) shortly after `watch()` returns, not
+    /// left silently running in the background.
     ///
-    /// Manufactures the in-flight state directly (rather than waiting for
-    /// a real `maybe_start_catch_up` to fire) by assigning a task that
-    /// flips a shared flag only after a short, deterministic delay to the
-    /// private `catch_up_task` field, then cancels the token before
-    /// spawning `watch()`. If `watch()` returned without joining the task,
-    /// the flag would still be `false` the instant `watch()`'s
-    /// `JoinHandle` resolves.
+    /// Manufactures the in-flight state directly (rather than waiting for a
+    /// real `maybe_start_catch_up` to fire) by assigning a task that only
+    /// flips a shared flag after a long, deterministic delay to the private
+    /// `catch_up_task` field, then cancels the token before spawning
+    /// `watch()`. If `watch()` waited on (rather than aborted) the task,
+    /// the outer `tokio::time::timeout` below would itself time out.
     #[tokio::test]
-    async fn cancellation_waits_for_in_flight_catch_up_task() {
+    async fn cancellation_aborts_in_flight_catch_up_task_without_waiting_for_it() {
         use crate::config::Settings;
         use crate::indexing::facade::IndexFacade;
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -4094,18 +4113,27 @@ mod tests {
             .build()
             .expect("builder has all required fields");
 
+        // A catch-up task that would only finish well past this test's
+        // bound if it were ever awaited -- proving `watch()` returns
+        // without waiting for it.
         let catch_up_finished = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&catch_up_finished);
         watcher.catch_up_started_at = Some(Instant::now());
-        watcher.catch_up_task = Some(tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(300)).await;
+        let catch_up_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
             flag.store(true, Ordering::SeqCst);
             Ok(ReindexOutcome {
                 reindexed: 0,
                 symbol_count: 0,
                 indexed_dirs: Vec::new(),
             })
-        }));
+        });
+        // Kept separately (not consumed) so this test can observe the
+        // task's post-abort state without re-owning the same `JoinHandle`
+        // `watch()`'s cancellation arm already took ownership of and
+        // aborted.
+        let catch_up_abort_handle = catch_up_task.abort_handle();
+        watcher.catch_up_task = Some(catch_up_task);
 
         // Cancel before spawning `watch()` so its very first `select!`
         // iteration takes the cancellation arm instead of any other branch.
@@ -4114,14 +4142,24 @@ mod tests {
 
         let result = tokio::time::timeout(Duration::from_secs(5), watch_task)
             .await
-            .expect("watch() must return once the in-flight catch-up task completes")
+            .expect("watch() must return promptly on cancellation, not wait on the catch-up task")
             .expect("watch() task must not panic");
         result.expect("watch() must return Ok on cooperative cancellation");
 
+        // The catch-up task itself must have been aborted (not merely
+        // detached): its `AbortHandle` reports finished+cancelled promptly,
+        // rather than only after the 60s sleep would otherwise complete.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !catch_up_abort_handle.is_finished() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert!(
-            catch_up_finished.load(Ordering::SeqCst),
-            "watch() returned before the in-flight catch-up reindex task \
-             finished; the cancellation arm must join it, not drop it"
+            catch_up_abort_handle.is_finished(),
+            "the catch-up task must resolve (as aborted) promptly, not keep running"
+        );
+        assert!(
+            !catch_up_finished.load(Ordering::SeqCst),
+            "the aborted catch-up task must never reach its completion flag"
         );
     }
 }
