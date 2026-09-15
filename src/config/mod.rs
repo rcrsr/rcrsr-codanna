@@ -160,7 +160,29 @@ impl IndexingConfig {
     /// generation age; all callers should use this accessor rather than
     /// computing `Duration::from_secs(hours * 3600)` inline.
     pub fn previous_generation_max_age(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.previous_generation_max_age_hours * 3600)
+        std::time::Duration::from_secs(self.previous_generation_max_age_hours.saturating_mul(3600))
+    }
+}
+
+#[cfg(test)]
+mod indexing_config_tests {
+    use super::*;
+
+    #[test]
+    fn previous_generation_max_age_saturates_instead_of_overflowing() {
+        let config = IndexingConfig {
+            previous_generation_max_age_hours: u64::MAX,
+            ..IndexingConfig::default()
+        };
+
+        // `u64::MAX * 3600` would overflow; saturating multiplication caps at
+        // `u64::MAX` seconds, an effectively-infinite cutoff -- the safe
+        // direction, since it never deletes rather than wrapping to a small
+        // cutoff that would delete everything.
+        assert_eq!(
+            config.previous_generation_max_age(),
+            std::time::Duration::from_secs(u64::MAX)
+        );
     }
 }
 

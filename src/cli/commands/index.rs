@@ -724,6 +724,39 @@ pub fn run_rollback(config: &Settings, id: Option<String>) {
         }
     };
 
+    // Also hold `gc.lock` for this whole selection/validate/publish window:
+    // `gc()` only ever deletes a `Previous` generation once its age exceeds
+    // the configured cutoff (`GenerationState::Previous => *age >
+    // previous_max_age` in `storage::generation::gc::run`), and it already
+    // no-ops (`skipped_locked`) rather than blocking when the lock is held
+    // elsewhere -- so blocking-acquiring it here, before `target` is even
+    // validated, closes the window where a concurrent `codanna index --gc`
+    // could delete the exact generation rollback just selected before
+    // `write_current` below finishes pointing `current` at it.
+    let gc_lock_path = layout.gc_lock();
+    let gc_lock_file = match std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&gc_lock_path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!(
+                "Error: failed to open gc lock {}: {e}",
+                gc_lock_path.display()
+            );
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = gc_lock_file.lock() {
+        eprintln!(
+            "Error: failed to acquire gc lock {}: {e}",
+            gc_lock_path.display()
+        );
+        std::process::exit(1);
+    }
+
     if let Err(e) = generation::validate_generation(&layout, &target) {
         eprintln!("Error: refusing to roll back to a damaged generation: {e}");
         std::process::exit(1);
@@ -771,6 +804,7 @@ pub fn run_rollback(config: &Settings, id: Option<String>) {
     }
 
     let _ = lock_file.unlock();
+    let _ = gc_lock_file.unlock();
 
     let old_txt = old_current
         .as_ref()
