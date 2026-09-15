@@ -395,9 +395,9 @@ the paths differ, so the same build installed at two locations (a mise dir vs
 
 **STATUS column.** Registered servers show their self-reported `spawning` or
 `healthy`; unknown rows show `running`. A proxy whose backing server is gone,
-dead, or itself unknown shows `orphaned` instead of the `healthy` it recorded at
+dead, or itself unknown shows `detached` instead of the `healthy` it recorded at
 connect time (a proxy's entry is written once and never updated, so it would
-otherwise stay `healthy` forever). An orphaned proxy is still live and will
+otherwise stay `healthy` forever). A detached proxy is still live and will
 revive a backing server on its next delegated call; stop it with
 `--stop-all --include-proxies` if you don't want that.
 

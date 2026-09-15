@@ -406,13 +406,13 @@ fn build_rows() -> Vec<Row> {
     // An unattached proxy's `entry.status` is stale write-once data from
     // spawn time (`src/mcp/proxy.rs` never rewrites it), so displaying it
     // verbatim as "healthy" would be misleading once its backing server is
-    // gone -- override the displayed status to "orphaned" instead.
+    // gone -- override the displayed status to "detached" instead.
     for proxy in &proxies {
         if !attached.contains(&proxy.pid) {
             rows.push(registered_row_with_status_override(
                 proxy,
                 RowKind::Proxy,
-                Some("orphaned"),
+                Some("detached"),
             ));
         }
     }
@@ -713,13 +713,13 @@ mod tests {
     }
 
     #[test]
-    fn unattached_proxy_status_is_overridden_to_orphaned() {
+    fn unattached_proxy_status_is_overridden_to_detached() {
         // Mirrors the `build_rows` unattached-proxy loop: `entry.status` is
         // stale write-once "healthy" data from spawn time, but since no live
         // server shares its workspace, the displayed status must not repeat
         // that stale claim.
         let entry = synthetic_registry_entry(2, ServerRole::Proxy, ServerStatus::Healthy);
-        let row = registered_row_with_status_override(&entry, RowKind::Proxy, Some("orphaned"));
-        assert_eq!(row.status, "orphaned");
+        let row = registered_row_with_status_override(&entry, RowKind::Proxy, Some("detached"));
+        assert_eq!(row.status, "detached");
     }
 }
