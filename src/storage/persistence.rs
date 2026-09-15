@@ -261,7 +261,11 @@ impl IndexPersistence {
         // (1) Reclaim headroom before allocating a new generation. A run
         // that finds the GC lock already held by a concurrent process is
         // not an error for this build -- `skipped_locked` is simply noted.
-        gc_logged(&self.layout, true, "pre-build")?;
+        gc_logged(
+            &self.layout,
+            settings.indexing.previous_generation_max_age(),
+            "pre-build",
+        )?;
 
         // (2) Resolve the parent generation for `mode`. A `CloneCurrent`
         // build over an index with no current generation yet has nothing to
@@ -455,7 +459,11 @@ impl IndexPersistence {
         // landed. `gc_logged` owns the conditional-log gating (INFO only
         // when something was actually removed); this call site never
         // duplicates that logic.
-        let _ = gc_logged(&self.layout, true, "post-publish");
+        let _ = gc_logged(
+            &self.layout,
+            facade.settings().indexing.previous_generation_max_age(),
+            "post-publish",
+        );
 
         Ok((id, facade))
     }

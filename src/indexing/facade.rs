@@ -6672,7 +6672,7 @@ mod tests {
             "an aborted reindex must never publish; `current` must be unchanged"
         );
 
-        let summary = crate::storage::generation::gc(&layout, false).unwrap();
+        let summary = crate::storage::generation::gc(&layout, std::time::Duration::ZERO).unwrap();
         assert!(
             summary.removed.contains(&build_id),
             "gc must reclaim the orphaned build generation left behind by the aborted reindex"
@@ -6774,7 +6774,7 @@ mod tests {
             "a cancelled reindex must never publish; `current` must be unchanged"
         );
 
-        let summary = crate::storage::generation::gc(&layout, false).unwrap();
+        let summary = crate::storage::generation::gc(&layout, std::time::Duration::ZERO).unwrap();
         assert!(
             summary.removed.contains(&build_id),
             "gc must reclaim the orphaned build generation left behind by cancellation"

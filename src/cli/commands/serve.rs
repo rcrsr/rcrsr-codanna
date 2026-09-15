@@ -1008,7 +1008,11 @@ async fn run_stdio_server(
     // Startup GC: reclaim stale generations left behind by a prior run, once
     // per process start, independent of whether the watcher below ends up
     // starting.
-    let _ = crate::storage::generation::gc_logged(facade.index_layout(), true, "startup");
+    let _ = crate::storage::generation::gc_logged(
+        facade.index_layout(),
+        facade.settings().indexing.previous_generation_max_age(),
+        "startup",
+    );
 
     let broadcaster = Arc::new(crate::mcp::notifications::NotificationBroadcaster::new(100));
     let server =

@@ -107,6 +107,16 @@ pub struct IndexingConfig {
     #[serde(default = "default_max_retry_attempts")]
     pub max_retry_attempts: u32,
 
+    /// Maximum age (in hours) a previous (non-current) generation may reach
+    /// before the next GC pass deletes it.
+    ///
+    /// `0` means DELETE EVERY previous generation on the next GC — i.e. `0`
+    /// is *immediate deletion*, not "disabled". This is the opposite
+    /// convention from `idle_shutdown_minutes`, where `0` means the timeout
+    /// is disabled; do not assume the same meaning here.
+    #[serde(default = "default_previous_generation_max_age_hours")]
+    pub previous_generation_max_age_hours: u64,
+
     /// Patterns to ignore during indexing
     #[serde(default)]
     pub ignore_patterns: Vec<String>,
@@ -140,6 +150,40 @@ pub struct IndexingConfig {
     /// never silent.
     #[serde(default = "default_false")]
     pub follow_links: bool,
+}
+
+impl IndexingConfig {
+    /// Convert [`Self::previous_generation_max_age_hours`] into a
+    /// [`std::time::Duration`].
+    ///
+    /// This is the single hours-to-duration conversion point for previous
+    /// generation age; all callers should use this accessor rather than
+    /// computing `Duration::from_secs(hours * 3600)` inline.
+    pub fn previous_generation_max_age(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.previous_generation_max_age_hours.saturating_mul(3600))
+    }
+}
+
+#[cfg(test)]
+mod indexing_config_tests {
+    use super::*;
+
+    #[test]
+    fn previous_generation_max_age_saturates_instead_of_overflowing() {
+        let config = IndexingConfig {
+            previous_generation_max_age_hours: u64::MAX,
+            ..IndexingConfig::default()
+        };
+
+        // `u64::MAX * 3600` would overflow; saturating multiplication caps at
+        // `u64::MAX` seconds, an effectively-infinite cutoff -- the safe
+        // direction, since it never deletes rather than wrapping to a small
+        // cutoff that would delete everything.
+        assert_eq!(
+            config.previous_generation_max_age(),
+            std::time::Duration::from_secs(u64::MAX)
+        );
+    }
 }
 
 /// Source layout for project resolution
@@ -429,6 +473,7 @@ impl Default for IndexingConfig {
             parallelism: default_parallelism(),
             tantivy_heap_mb: default_tantivy_heap_mb(),
             max_retry_attempts: default_max_retry_attempts(),
+            previous_generation_max_age_hours: default_previous_generation_max_age_hours(),
             // No default patterns: `target/**`, `node_modules/**`, `.git/**`,
             // and `*.generated.*` are already excluded by the default
             // `.codannaignore` shipped by `codanna init`, so duplicating

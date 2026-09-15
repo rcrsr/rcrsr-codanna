@@ -48,7 +48,7 @@ const WATCHER_BUILDER_SITES: [&str; 3] = [
 const REQUIRED_SUBSTRINGS: [&str; 3] = [
     ".with_broadcaster(",
     ".cancellation_token(",
-    "gc_logged(facade.index_layout(), true, \"startup\")",
+    "gc_logged(\n        facade.index_layout(),\n        facade.settings().indexing.previous_generation_max_age(),\n        \"startup\",\n    )",
 ];
 
 #[test]

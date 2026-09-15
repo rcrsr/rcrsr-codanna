@@ -255,7 +255,11 @@ pub async fn serve_http(config: crate::Settings, watch: bool, bind: String) -> a
 
     // Startup GC: reclaim stale generations left behind by a prior run, once
     // per process start, before the watcher (if any) starts below.
-    let _ = crate::storage::generation::gc_logged(facade.index_layout(), true, "startup");
+    let _ = crate::storage::generation::gc_logged(
+        facade.index_layout(),
+        facade.settings().indexing.previous_generation_max_age(),
+        "startup",
+    );
 
     let indexer = Arc::new(RwLock::new(facade));
 
