@@ -348,6 +348,16 @@ impl Default for CallerClassificationConfig {
     }
 }
 
+/// Upper bound, in milliseconds, clamped onto `ServerConfig::spawn_timeout_ms`
+/// and `ServerConfig::spawn_max_wait_ms` at load time (see
+/// `Settings::normalize_loaded`). Both values feed `Duration::from_millis`
+/// and `Instant::now() + duration` in `serve_discovery`'s wait loops, and
+/// `Instant` addition panics on overflow; an unreasonably large configured
+/// value (e.g. a typo adding extra zeros) is clamped here rather than left to
+/// panic deep in a wait loop. One hour comfortably exceeds any legitimate
+/// cold-start wait.
+const MAX_SPAWN_WAIT_MS: u64 = 3_600_000;
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ServerConfig {
     /// Default server mode: "stdio" or "http"
@@ -369,6 +379,11 @@ pub struct ServerConfig {
     /// Timeout for spawning the backing server, in milliseconds
     #[serde(default = "default_spawn_timeout_ms")]
     pub spawn_timeout_ms: u64,
+
+    /// Hard ceiling on waiting for a spawn that is still alive past
+    /// `spawn_timeout_ms` (a slow cold start), in milliseconds
+    #[serde(default = "default_spawn_max_wait_ms")]
+    pub spawn_max_wait_ms: u64,
 
     /// Poll interval while waiting for the backing server to become healthy, in milliseconds
     #[serde(default = "default_health_poll_ms")]
@@ -533,6 +548,7 @@ impl Default for ServerConfig {
             watch_interval: default_watch_interval(),
             auto_spawn: default_auto_spawn(),
             spawn_timeout_ms: default_spawn_timeout_ms(),
+            spawn_max_wait_ms: default_spawn_max_wait_ms(),
             health_poll_ms: default_health_poll_ms(),
             idle_shutdown_minutes: default_idle_shutdown_minutes(),
         }
@@ -619,6 +635,8 @@ impl Settings {
         if let Some(root) = self.workspace_root.take() {
             self.workspace_root = Some(root.canonicalize().unwrap_or(root));
         }
+        self.server.spawn_timeout_ms = self.server.spawn_timeout_ms.min(MAX_SPAWN_WAIT_MS);
+        self.server.spawn_max_wait_ms = self.server.spawn_max_wait_ms.min(MAX_SPAWN_WAIT_MS);
         self.sync_indexed_path_cache();
         self
     }
@@ -793,6 +811,30 @@ enabled = false
         assert!(!settings.languages["rust"].enabled);
     }
 
+    /// Both fields feed `Duration::from_millis` and `Instant::now() + dur` in
+    /// `serve_discovery`'s wait loops; `Instant` addition panics on overflow,
+    /// so a configured value larger than [`MAX_SPAWN_WAIT_MS`] must be
+    /// clamped at load time rather than left to panic in a wait loop.
+    #[test]
+    fn load_from_clamps_oversized_spawn_wait_fields() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("settings.toml");
+
+        fs::write(
+            &config_path,
+            format!(
+                "[server]\nspawn_timeout_ms = {}\nspawn_max_wait_ms = {}\n",
+                i64::MAX,
+                MAX_SPAWN_WAIT_MS + 1
+            ),
+        )
+        .unwrap();
+
+        let settings = Settings::load_from(&config_path).unwrap();
+        assert_eq!(settings.server.spawn_timeout_ms, MAX_SPAWN_WAIT_MS);
+        assert_eq!(settings.server.spawn_max_wait_ms, MAX_SPAWN_WAIT_MS);
+    }
+
     #[cfg(unix)]
     #[test]
     fn load_from_canonicalizes_symlinked_workspace_root() {
@@ -881,6 +923,7 @@ mode = "stdio"
         assert_eq!(server.watch_interval, default_watch_interval());
         assert!(server.auto_spawn);
         assert_eq!(server.spawn_timeout_ms, 8000);
+        assert_eq!(server.spawn_max_wait_ms, 120_000);
         assert_eq!(server.health_poll_ms, 100);
         assert_eq!(
             server.idle_shutdown_minutes,
@@ -911,6 +954,7 @@ mode = "proxy"
         assert_eq!(round_tripped.mode, "proxy");
         assert_eq!(round_tripped.auto_spawn, server.auto_spawn);
         assert_eq!(round_tripped.spawn_timeout_ms, server.spawn_timeout_ms);
+        assert_eq!(round_tripped.spawn_max_wait_ms, server.spawn_max_wait_ms);
         assert_eq!(round_tripped.health_poll_ms, server.health_poll_ms);
     }
 

@@ -288,6 +288,8 @@ optional and shown at their defaults:
 auto_spawn = true           # let the proxy start a backing server when none is found;
                             # false = you start `codanna serve --http --watch` yourself
 spawn_timeout_ms = 8000     # how long to wait for a spawned server to become ready
+spawn_max_wait_ms = 120000  # keep waiting up to this long while that spawn is still
+                            # alive (slow cold start) instead of failing the proxy
 health_poll_ms = 100        # readiness poll interval while waiting
 idle_shutdown_minutes = 240 # exit the backing server after N idle minutes (0 = never)
 ```

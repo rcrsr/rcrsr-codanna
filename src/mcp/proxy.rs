@@ -42,7 +42,7 @@ use rmcp::model::{
     GetPromptResponse, Implementation, InitializeRequestParams, InitializeResult,
     ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
     LoggingMessageNotificationParam, PaginatedRequestParams, ProgressNotificationParam,
-    ReadResourceRequestParams, ReadResourceResponse, ResourceUpdatedNotificationParam,
+    ReadResourceRequestParams, ReadResourceResponse, ResourceUpdatedNotificationParam, ResultType,
     ServerCapabilities, ServerInfo, ServerNotification, ServerResult, SetLevelRequestParams,
     SubscribeRequestParams, UnsubscribeRequestParams,
 };
@@ -700,6 +700,72 @@ impl DelegatingProxyHandler {
     }
 }
 
+/// Fills an absent `resultType` with `"complete"` on a forwarded result.
+///
+/// The upstream leg negotiates a pre-2026-07-28 session, so the backing
+/// server strips `resultType` (`strip_result_type_for_legacy_peer`). A
+/// downstream that negotiated 2026-07-28 MUST receive it, and absent means
+/// complete per the spec's back-compat rule. rmcp strips it again for
+/// legacy downstreams, so their wire shape is unchanged.
+trait MarkComplete {
+    fn mark_complete(self) -> Self;
+}
+
+macro_rules! impl_mark_complete {
+    ($($ty:ty),*) => {$(
+        impl MarkComplete for $ty {
+            fn mark_complete(mut self) -> Self {
+                self.result_type.get_or_insert(ResultType::COMPLETE);
+                self
+            }
+        }
+    )*};
+}
+
+impl_mark_complete!(
+    ListToolsResult,
+    ListResourcesResult,
+    ListResourceTemplatesResult,
+    ListPromptsResult,
+    CompleteResult
+);
+
+impl MarkComplete for CallToolResponse {
+    fn mark_complete(self) -> Self {
+        match self {
+            Self::Complete(mut r) => {
+                r.result_type.get_or_insert(ResultType::COMPLETE);
+                Self::Complete(r)
+            }
+            other => other,
+        }
+    }
+}
+
+impl MarkComplete for ReadResourceResponse {
+    fn mark_complete(self) -> Self {
+        match self {
+            Self::Complete(mut r) => {
+                r.result_type.get_or_insert(ResultType::COMPLETE);
+                Self::Complete(r)
+            }
+            other => other,
+        }
+    }
+}
+
+impl MarkComplete for GetPromptResponse {
+    fn mark_complete(self) -> Self {
+        match self {
+            Self::Complete(mut r) => {
+                r.result_type.get_or_insert(ResultType::COMPLETE);
+                Self::Complete(r)
+            }
+            other => other,
+        }
+    }
+}
+
 impl ServerHandler for DelegatingProxyHandler {
     fn get_info(&self) -> ServerInfo {
         // Reflect the upstream server's negotiated capabilities/info when
@@ -786,6 +852,7 @@ impl ServerHandler for DelegatingProxyHandler {
             async move { up.list_tools(request).await }
         })
         .await
+        .map(MarkComplete::mark_complete)
     }
 
     async fn call_tool(
@@ -798,6 +865,7 @@ impl ServerHandler for DelegatingProxyHandler {
             async move { up.call_tool_once(request).await }
         })
         .await
+        .map(MarkComplete::mark_complete)
     }
 
     async fn list_resources(
@@ -810,6 +878,7 @@ impl ServerHandler for DelegatingProxyHandler {
             async move { up.list_resources(request).await }
         })
         .await
+        .map(MarkComplete::mark_complete)
     }
 
     async fn list_resource_templates(
@@ -822,6 +891,7 @@ impl ServerHandler for DelegatingProxyHandler {
             async move { up.list_resource_templates(request).await }
         })
         .await
+        .map(MarkComplete::mark_complete)
     }
 
     async fn read_resource(
@@ -834,6 +904,7 @@ impl ServerHandler for DelegatingProxyHandler {
             async move { up.read_resource_once(request).await }
         })
         .await
+        .map(MarkComplete::mark_complete)
     }
 
     async fn list_prompts(
@@ -846,6 +917,7 @@ impl ServerHandler for DelegatingProxyHandler {
             async move { up.list_prompts(request).await }
         })
         .await
+        .map(MarkComplete::mark_complete)
     }
 
     async fn get_prompt(
@@ -858,6 +930,7 @@ impl ServerHandler for DelegatingProxyHandler {
             async move { up.get_prompt_once(request).await }
         })
         .await
+        .map(MarkComplete::mark_complete)
     }
 
     async fn complete(
@@ -870,6 +943,7 @@ impl ServerHandler for DelegatingProxyHandler {
             async move { up.complete(request).await }
         })
         .await
+        .map(MarkComplete::mark_complete)
     }
 
     async fn set_level(
@@ -1062,6 +1136,85 @@ pub async fn serve_proxy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mark_complete_fills_absent_result_type() {
+        let legacy: ListToolsResult = serde_json::from_str(r#"{"tools":[]}"#).unwrap();
+        assert!(legacy.result_type.is_none(), "fixture omits resultType");
+        let marked = legacy.mark_complete();
+        assert_eq!(marked.result_type, Some(ResultType::COMPLETE));
+
+        let call: rmcp::model::CallToolResult = serde_json::from_str(r#"{"content":[]}"#).unwrap();
+        match CallToolResponse::Complete(call).mark_complete() {
+            CallToolResponse::Complete(r) => assert_eq!(r.result_type, Some(ResultType::COMPLETE)),
+            other => panic!("variant changed: {other:?}"),
+        }
+
+        // The remaining four `impl_mark_complete!` types plus the other two
+        // Complete-variant response enums are macro/match-generated
+        // identically to the two above; covered here so a future refactor
+        // that renames one enum's `Complete`-variant field is caught rather
+        // than only breaking at runtime. `..T::with_all_items(..)`/`..T::new(..)`
+        // struct-update syntax builds a base instance (each type is
+        // `#[non_exhaustive]`, so it can't be built as a full literal outside
+        // the defining crate) with `result_type` overridden to `None`.
+        let resources = ListResourcesResult {
+            result_type: None,
+            ..ListResourcesResult::with_all_items(Vec::new())
+        };
+        assert_eq!(
+            resources.mark_complete().result_type,
+            Some(ResultType::COMPLETE)
+        );
+
+        let templates = ListResourceTemplatesResult {
+            result_type: None,
+            ..ListResourceTemplatesResult::with_all_items(Vec::new())
+        };
+        assert_eq!(
+            templates.mark_complete().result_type,
+            Some(ResultType::COMPLETE)
+        );
+
+        let prompts = ListPromptsResult {
+            result_type: None,
+            ..ListPromptsResult::with_all_items(Vec::new())
+        };
+        assert_eq!(
+            prompts.mark_complete().result_type,
+            Some(ResultType::COMPLETE)
+        );
+
+        // `CompleteResult`/`ReadResourceResult`/`GetPromptResult` are
+        // `#[non_exhaustive]`, which (unlike the `ListXResult` types above)
+        // also blocks `..base` struct-update syntax outside the defining
+        // crate -- build via their constructor, then clear `result_type` by
+        // field assignment on the existing instance instead.
+        let mut complete = CompleteResult::default();
+        complete.result_type = None;
+        assert_eq!(
+            complete.mark_complete().result_type,
+            Some(ResultType::COMPLETE)
+        );
+
+        let mut read = rmcp::model::ReadResourceResult::new(Vec::new());
+        read.result_type = None;
+        match ReadResourceResponse::Complete(read).mark_complete() {
+            ReadResourceResponse::Complete(r) => {
+                assert_eq!(r.result_type, Some(ResultType::COMPLETE))
+            }
+            other => panic!("variant changed: {other:?}"),
+        }
+
+        let mut prompt = rmcp::model::GetPromptResult::new(Vec::new());
+        prompt.result_type = None;
+        match GetPromptResponse::Complete(prompt).mark_complete() {
+            GetPromptResponse::Complete(r) => {
+                assert_eq!(r.result_type, Some(ResultType::COMPLETE))
+            }
+            other => panic!("variant changed: {other:?}"),
+        }
+    }
 
     fn notification(method: &str) -> CustomNotification {
         CustomNotification::new(method.to_string(), None)
