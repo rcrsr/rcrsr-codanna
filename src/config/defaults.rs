@@ -77,6 +77,15 @@ pub(super) fn default_auto_spawn() -> bool {
 pub(super) fn default_spawn_timeout_ms() -> u64 {
     8000
 }
+/// Ceiling for a spawn that is still alive when `spawn_timeout_ms` runs out.
+///
+/// A cold start (index load, embedding-model download) can legitimately
+/// outlive `spawn_timeout_ms`; giving up while the child is alive only hands
+/// the workspace to a caller that spawns a duplicate. Bounded so a hung
+/// child still fails eventually.
+pub(super) fn default_spawn_max_wait_ms() -> u64 {
+    120_000
+}
 pub(super) fn default_health_poll_ms() -> u64 {
     100
 }

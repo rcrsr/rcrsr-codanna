@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **`serve --proxy` omitted `resultType` for 2026-07-28 clients:** the proxy's upstream leg negotiates a legacy session, so the backing server stripped `resultType: "complete"` and the proxy forwarded results without it; Claude Code rejected `tools/list` with "missing required resultType". Forwarded results now carry `resultType: "complete"` when absent (still stripped for legacy downstream clients).
+- **`serve --proxy` gave up on a slow-starting backing server:** when a spawned server outlived `spawn_timeout_ms` (cold index load, first embedding-model download), the proxy exited with `SpawnTimeout` while the server kept starting. The conduct launcher then fell back to its own bridge, which could not see the not-yet-listening server and spawned a second, unregistered one on the same index (`codanna ls` showed a `spawning` row plus an `unknown` one). The proxy now keeps waiting while that spawn is alive, up to the new `[server] spawn_max_wait_ms` (default `120000`); a spawn that dies still fails immediately.
 
 ### Changed
 

@@ -619,14 +619,23 @@ async fn discover_live(codanna_dir: &Path) -> Option<ServeRecord> {
 /// loser passes `None`: it never holds a `Child` handle for someone else's
 /// spawn (see `wait_on_spawning_pid`), so it has no exit slot to check and
 /// simply falls back to polling until `timeout`.
+///
+/// Past `timeout`, the wait continues up to `max_wait` for as long as
+/// `in_flight()` reports the spawn still alive: a slow cold start is not a
+/// failure, and giving up on it frees the workspace for a caller that spawns
+/// a duplicate server against the same index.
 async fn wait_until_healthy(
     codanna_dir: &Path,
     lock_path: &Path,
     timeout: Duration,
+    max_wait: Duration,
     poll_interval: Duration,
     exit_slot: Option<&SpawnExitSlot>,
+    in_flight: impl Fn() -> bool,
 ) -> DiscoveryResult<ServeRecord> {
-    let deadline = Instant::now() + timeout;
+    let start = Instant::now();
+    let soft_deadline = start + timeout;
+    let hard_deadline = start + timeout.max(max_wait);
     loop {
         if let Some(record) = read_record(codanna_dir)
             && pid_is_alive(record.pid)
@@ -643,15 +652,16 @@ async fn wait_until_healthy(
             });
         }
 
-        if Instant::now() >= deadline {
+        let now = Instant::now();
+        if now >= hard_deadline || (now >= soft_deadline && !in_flight()) {
             return Err(DiscoveryError::SpawnTimeout {
-                timeout_ms: timeout.as_millis() as u64,
+                timeout_ms: now.duration_since(start).as_millis() as u64,
                 lock_path: lock_path.to_path_buf(),
                 record_path: record_path(codanna_dir),
             });
         }
 
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let remaining = hard_deadline.saturating_duration_since(now);
         tokio::time::sleep(poll_interval.min(remaining).max(Duration::from_millis(1))).await;
     }
 }
@@ -677,7 +687,9 @@ fn unix_now_secs() -> u64 {
 /// - `Some(Ok(record))` once the workspace's discovery record converges to
 ///   healthy within `timeout`.
 /// - `Some(Err(DiscoveryError::SpawnTimeout))` if `spawning_pid` is still
-///   alive but the wait ran out.
+///   alive after `max(timeout, max_wait)`. The loop already returns `None`
+///   the moment the pid dies, so waiting past `timeout` only ever happens
+///   while the spawn is alive.
 /// - `None` if `spawning_pid` died before becoming healthy -- the caller
 ///   falls through to the normal spawn path in that case, since a dead pid
 ///   means the previous attempt genuinely failed rather than merely being
@@ -687,9 +699,11 @@ async fn wait_on_spawning_pid(
     lock_path: &Path,
     spawning_pid: u32,
     timeout: Duration,
+    max_wait: Duration,
     poll_interval: Duration,
 ) -> Option<DiscoveryResult<ServeRecord>> {
-    let deadline = Instant::now() + timeout;
+    let start = Instant::now();
+    let deadline = start + timeout.max(max_wait);
     loop {
         if !pid_is_alive(spawning_pid) {
             return None;
@@ -700,7 +714,7 @@ async fn wait_on_spawning_pid(
 
         if Instant::now() >= deadline {
             return Some(Err(DiscoveryError::SpawnTimeout {
-                timeout_ms: timeout.as_millis() as u64,
+                timeout_ms: start.elapsed().as_millis() as u64,
                 lock_path: lock_path.to_path_buf(),
                 record_path: record_path(codanna_dir),
             }));
@@ -1030,6 +1044,7 @@ pub async fn discover_or_spawn(
     let codanna_dir = discovery_dir(workspace_root);
     let lock_path = codanna_dir.join("http.lock");
     let timeout = Duration::from_millis(settings.server.spawn_timeout_ms);
+    let max_wait = Duration::from_millis(settings.server.spawn_max_wait_ms);
     let poll_interval = Duration::from_millis(settings.server.health_poll_ms);
 
     // Fast path: an already-live server, no lock needed.
@@ -1118,6 +1133,7 @@ pub async fn discover_or_spawn(
             &lock_path,
             spawning.pid,
             timeout,
+            max_wait,
             poll_interval,
         )
         .await
@@ -1173,12 +1189,16 @@ pub async fn discover_or_spawn(
                 );
             }
 
+            // The reaper fills `exit_slot` when the child exits, so an empty
+            // slot means our spawn is still alive.
             wait_until_healthy(
                 &codanna_dir,
                 &lock_path,
                 timeout,
+                max_wait,
                 poll_interval,
                 Some(&exit_slot),
+                || exit_slot.lock().is_ok_and(|slot| slot.is_none()),
             )
             .await
             // `_guard` drops here, releasing the lock once the winner's
@@ -1200,7 +1220,18 @@ pub async fn discover_or_spawn(
         Err(PidLockError::Held { lock_path, .. }) => {
             // LOSER. Someone else is spawning (or just finished); wait on
             // their record instead of racing a second spawn.
-            wait_until_healthy(&codanna_dir, &lock_path, timeout, poll_interval, None).await
+            // No `Child` handle here; the winner's `Spawning` registry
+            // entry is the liveness signal for its spawn.
+            wait_until_healthy(
+                &codanna_dir,
+                &lock_path,
+                timeout,
+                max_wait,
+                poll_interval,
+                None,
+                || crate::serve_registry::find_spawning_for(workspace_root).is_some(),
+            )
+            .await
         }
         Err(PidLockError::Io(source)) => Err(DiscoveryError::LockIo {
             path: lock_path,
@@ -1464,8 +1495,10 @@ mod tests {
             &codanna_dir,
             &lock_path,
             Duration::from_secs(5),
+            Duration::from_secs(5),
             Duration::from_millis(10),
             Some(&slot),
+            || true,
         )
         .await;
         let elapsed = start.elapsed();
@@ -1484,6 +1517,69 @@ mod tests {
             elapsed < Duration::from_millis(500),
             "wait_until_healthy should return as soon as the exit slot is populated, \
              not wait out the 5s timeout; elapsed = {elapsed:?}"
+        );
+    }
+
+    /// A spawn still in flight at `timeout` keeps the wait going up to
+    /// `max_wait` rather than failing: giving up on a slow cold start frees
+    /// the workspace for a caller that spawns a duplicate server.
+    #[tokio::test]
+    async fn wait_until_healthy_extends_past_timeout_while_spawn_in_flight() {
+        let workspace = TempDir::new().unwrap();
+        let codanna_dir = workspace.path().join(crate::init::local_dir_name());
+        let lock_path = codanna_dir.join("http.lock");
+
+        let start = Instant::now();
+        let result = wait_until_healthy(
+            &codanna_dir,
+            &lock_path,
+            Duration::from_millis(50),
+            Duration::from_millis(400),
+            Duration::from_millis(10),
+            None,
+            || true,
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(result, Err(DiscoveryError::SpawnTimeout { .. })),
+            "a spawn that never becomes healthy still times out at max_wait, got: {result:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(400),
+            "an in-flight spawn must be waited on until max_wait, not timeout; elapsed = {elapsed:?}"
+        );
+    }
+
+    /// With no spawn in flight, `timeout` still applies: `max_wait` only
+    /// extends a wait on a live spawn.
+    #[tokio::test]
+    async fn wait_until_healthy_stops_at_timeout_when_nothing_in_flight() {
+        let workspace = TempDir::new().unwrap();
+        let codanna_dir = workspace.path().join(crate::init::local_dir_name());
+        let lock_path = codanna_dir.join("http.lock");
+
+        let start = Instant::now();
+        let result = wait_until_healthy(
+            &codanna_dir,
+            &lock_path,
+            Duration::from_millis(50),
+            Duration::from_secs(5),
+            Duration::from_millis(10),
+            None,
+            || false,
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(result, Err(DiscoveryError::SpawnTimeout { .. })),
+            "expected SpawnTimeout, got: {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "no in-flight spawn means the wait ends at timeout, not max_wait; elapsed = {elapsed:?}"
         );
     }
 

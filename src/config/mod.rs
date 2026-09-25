@@ -370,6 +370,11 @@ pub struct ServerConfig {
     #[serde(default = "default_spawn_timeout_ms")]
     pub spawn_timeout_ms: u64,
 
+    /// Hard ceiling on waiting for a spawn that is still alive past
+    /// `spawn_timeout_ms` (a slow cold start), in milliseconds
+    #[serde(default = "default_spawn_max_wait_ms")]
+    pub spawn_max_wait_ms: u64,
+
     /// Poll interval while waiting for the backing server to become healthy, in milliseconds
     #[serde(default = "default_health_poll_ms")]
     pub health_poll_ms: u64,
@@ -533,6 +538,7 @@ impl Default for ServerConfig {
             watch_interval: default_watch_interval(),
             auto_spawn: default_auto_spawn(),
             spawn_timeout_ms: default_spawn_timeout_ms(),
+            spawn_max_wait_ms: default_spawn_max_wait_ms(),
             health_poll_ms: default_health_poll_ms(),
             idle_shutdown_minutes: default_idle_shutdown_minutes(),
         }
@@ -881,6 +887,7 @@ mode = "stdio"
         assert_eq!(server.watch_interval, default_watch_interval());
         assert!(server.auto_spawn);
         assert_eq!(server.spawn_timeout_ms, 8000);
+        assert_eq!(server.spawn_max_wait_ms, 120_000);
         assert_eq!(server.health_poll_ms, 100);
         assert_eq!(
             server.idle_shutdown_minutes,
@@ -911,6 +918,7 @@ mode = "proxy"
         assert_eq!(round_tripped.mode, "proxy");
         assert_eq!(round_tripped.auto_spawn, server.auto_spawn);
         assert_eq!(round_tripped.spawn_timeout_ms, server.spawn_timeout_ms);
+        assert_eq!(round_tripped.spawn_max_wait_ms, server.spawn_max_wait_ms);
         assert_eq!(round_tripped.health_poll_ms, server.health_poll_ms);
     }
 

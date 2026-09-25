@@ -131,8 +131,17 @@ enabled = false
 /// `[server] spawn_timeout_ms`, for proxy #1 to load via `--config`. Kept
 /// separate from the workspace's own `settings.toml` so proxy #2 (started
 /// without `--config`) uses the generous default instead.
-fn write_short_timeout_config(ws: &Path) -> PathBuf {
+///
+/// `extend_while_alive = false` also caps `spawn_max_wait_ms` at the same
+/// tiny value, so the proxy gives up even though its spawn is still alive;
+/// `true` leaves the default ceiling, so the proxy keeps waiting on it.
+fn write_short_timeout_config(ws: &Path, extend_while_alive: bool) -> PathBuf {
     let path = ws.join("short-timeout-config.toml");
+    let max_wait = if extend_while_alive {
+        String::new()
+    } else {
+        format!("spawn_max_wait_ms = {SHORT_SPAWN_TIMEOUT_MS}\n")
+    };
     std::fs::write(
         &path,
         format!(
@@ -144,7 +153,7 @@ enabled = false
 
 [server]
 spawn_timeout_ms = {SHORT_SPAWN_TIMEOUT_MS}
-"#
+{max_wait}"#
         ),
     )
     .expect("write short-timeout config");
@@ -325,7 +334,7 @@ fn second_proxy_waits_on_spawning_entry_instead_of_duplicating() {
     let workspace = prepare_workspace();
     let home = workspace.path().join(".home");
     std::fs::create_dir_all(&home).expect("create test home");
-    let short_config = write_short_timeout_config(workspace.path());
+    let short_config = write_short_timeout_config(workspace.path(), false);
 
     let _reaper = Reaper {
         home: home.clone(),
@@ -452,4 +461,50 @@ fn second_proxy_waits_on_spawning_entry_instead_of_duplicating() {
         !codanna_dir.join("http.lock").exists(),
         "http.lock should not exist once both proxy calls have settled"
     );
+}
+
+/// A spawn still alive when `spawn_timeout_ms` runs out is waited on (up to
+/// `spawn_max_wait_ms`) instead of failing the proxy. Failing there let the
+/// conduct launcher fall back to its own bridge, which could not see the
+/// still-binding server and spawned a second, unregistered one.
+#[test]
+fn proxy_keeps_waiting_on_live_spawn_past_spawn_timeout() {
+    let workspace = prepare_workspace();
+    let home = workspace.path().join(".home");
+    std::fs::create_dir_all(&home).expect("create test home");
+    let short_config = write_short_timeout_config(workspace.path(), true);
+
+    let _reaper = Reaper {
+        home: home.clone(),
+        ws: workspace.path().to_path_buf(),
+    };
+
+    let mut proxy = start_proxy(
+        workspace.path(),
+        &home,
+        Some(&short_config),
+        Some(SPAWN_DELAY_MS),
+    );
+    let status = wait_for_exit_status(&mut proxy, DEADLINE);
+    let (_stdout, stderr) = drain_output(&mut proxy);
+
+    assert!(
+        !stderr.contains("did not become healthy"),
+        "the proxy must not time out while its spawn is alive; stderr:\n{stderr}"
+    );
+    assert!(
+        status.success() || stderr.contains("delegating to backing MCP server"),
+        "the proxy should attach to the slow-starting server it spawned; stderr:\n{stderr}"
+    );
+
+    let servers: Vec<RegistryEntry> = registry_entries_for_workspace(&home, workspace.path())
+        .into_iter()
+        .filter(|e| e.role == ServerRole::Server)
+        .collect();
+    assert_eq!(
+        servers.len(),
+        1,
+        "exactly one backing server should exist; got: {servers:?}"
+    );
+    assert_eq!(servers[0].status, ServerStatus::Healthy);
 }
