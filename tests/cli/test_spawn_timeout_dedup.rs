@@ -69,6 +69,17 @@ const SHORT_SPAWN_TIMEOUT_MS: u64 = 100;
 /// default `spawn_timeout_ms` (8000ms) and this file's [`DEADLINE`].
 const SPAWN_DELAY_MS: u64 = 1500;
 
+/// Generous `spawn_timeout_ms`, deliberately larger than [`SHORT_MAX_WAIT_MS`],
+/// used by `write_timeout_exceeds_max_wait_config` to reproduce the inverted
+/// case (`spawn_timeout_ms > spawn_max_wait_ms`) that the `deadline = start +
+/// timeout.max(max_wait)` regression mishandled.
+const LONG_SPAWN_TIMEOUT_MS: u64 = 5_000;
+
+/// Deliberately smaller than both [`LONG_SPAWN_TIMEOUT_MS`] and
+/// [`SPAWN_DELAY_MS`]: `spawn_max_wait_ms` is documented as the hard ceiling
+/// on the wait, so it must win even though `spawn_timeout_ms` is larger.
+const SHORT_MAX_WAIT_MS: u64 = 300;
+
 /// Build a workspace with a unique fixture symbol, semantic search disabled,
 /// and an already-built index, ready for `codanna serve --proxy` to
 /// discover/spawn against. Mirrors `test_serve_proxy_discovery.rs::prepare_workspace`.
@@ -157,6 +168,33 @@ spawn_timeout_ms = {SHORT_SPAWN_TIMEOUT_MS}
         ),
     )
     .expect("write short-timeout config");
+    path
+}
+
+/// Write a config with `spawn_timeout_ms` (generous, [`LONG_SPAWN_TIMEOUT_MS`])
+/// LARGER than `spawn_max_wait_ms` ([`SHORT_MAX_WAIT_MS`]) -- the inverted
+/// configuration from [`write_short_timeout_config`], which always kept
+/// `spawn_max_wait_ms >= spawn_timeout_ms`. `spawn_max_wait_ms` is documented
+/// as a hard ceiling regardless of `spawn_timeout_ms`, so the wait here must
+/// stop at `SHORT_MAX_WAIT_MS`, not `LONG_SPAWN_TIMEOUT_MS`.
+fn write_timeout_exceeds_max_wait_config(ws: &Path) -> PathBuf {
+    let path = ws.join("timeout-exceeds-max-wait-config.toml");
+    std::fs::write(
+        &path,
+        format!(
+            r#"
+index_path = ".codanna/index"
+
+[semantic_search]
+enabled = false
+
+[server]
+spawn_timeout_ms = {LONG_SPAWN_TIMEOUT_MS}
+spawn_max_wait_ms = {SHORT_MAX_WAIT_MS}
+"#
+        ),
+    )
+    .expect("write timeout-exceeds-max-wait config");
     path
 }
 
@@ -507,4 +545,47 @@ fn proxy_keeps_waiting_on_live_spawn_past_spawn_timeout() {
         "exactly one backing server should exist; got: {servers:?}"
     );
     assert_eq!(servers[0].status, ServerStatus::Healthy);
+}
+
+/// `spawn_max_wait_ms` is documented as the hard ceiling on this wait
+/// regardless of `spawn_timeout_ms` -- reproduces the regression where
+/// `deadline = start + timeout.max(max_wait)` let a larger `spawn_timeout_ms`
+/// silently override a smaller, explicitly configured `spawn_max_wait_ms`.
+/// The backing server's cold start ([`SPAWN_DELAY_MS`]) is deliberately
+/// longer than `spawn_max_wait_ms` but shorter than `spawn_timeout_ms`: the
+/// fixed proxy must time out at `spawn_max_wait_ms`, not wait long enough to
+/// observe the backing server become healthy.
+#[test]
+fn proxy_wait_is_capped_by_max_wait_even_when_timeout_is_larger() {
+    let workspace = prepare_workspace();
+    let home = workspace.path().join(".home");
+    std::fs::create_dir_all(&home).expect("create test home");
+    let config = write_timeout_exceeds_max_wait_config(workspace.path());
+
+    let _reaper = Reaper {
+        home: home.clone(),
+        ws: workspace.path().to_path_buf(),
+    };
+
+    let start = Instant::now();
+    let mut proxy = start_proxy(workspace.path(), &home, Some(&config), Some(SPAWN_DELAY_MS));
+    let status = wait_for_exit_status(&mut proxy, DEADLINE);
+    let elapsed = start.elapsed();
+    let (_stdout, stderr) = drain_output(&mut proxy);
+
+    assert!(
+        !status.success(),
+        "the proxy should time out once spawn_max_wait_ms elapses, even though \
+         spawn_timeout_ms is larger and the spawn is still alive; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("did not become healthy"),
+        "the proxy should report a SpawnTimeout error, got stderr:\n{stderr}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(SPAWN_DELAY_MS),
+        "the wait must be capped by spawn_max_wait_ms ({SHORT_MAX_WAIT_MS}ms), not \
+         spawn_timeout_ms ({LONG_SPAWN_TIMEOUT_MS}ms) or the backing server's cold-start \
+         delay ({SPAWN_DELAY_MS}ms); took {elapsed:?}"
+    );
 }

@@ -591,10 +591,16 @@ async fn check_health(port: u16, scheme: ServeScheme, expected_token: Option<&st
 /// path -- never an error -- matching `check_health`'s
 /// reject-tokenless-means-self-heal rationale.
 async fn discover_live(codanna_dir: &Path) -> Option<ServeRecord> {
-    let record = read_record(codanna_dir)?;
-    if decide(Some(&record)) != Decision::Discover {
-        return None;
-    }
+    // `read_record` and `decide` (which calls `pid_is_alive`/
+    // `pid_looks_like_codanna_serve`, themselves procfs reads) are blocking
+    // filesystem calls; run them via `block_in_place` for the same reason as
+    // `wait_until_healthy`'s and `wait_on_spawning_pid`'s equivalent calls --
+    // this function is polled in a loop by both, so a long wait must not
+    // repeatedly block this tokio worker thread from servicing other tasks.
+    let record = tokio::task::block_in_place(|| {
+        let record = read_record(codanna_dir)?;
+        (decide(Some(&record)) == Decision::Discover).then_some(record)
+    })?;
     if record.scheme == ServeScheme::Http
         && !check_health(record.port, record.scheme, record.token.as_deref()).await
     {
@@ -635,11 +641,17 @@ async fn wait_until_healthy(
 ) -> DiscoveryResult<ServeRecord> {
     let start = Instant::now();
     let soft_deadline = start + timeout;
-    let hard_deadline = start + timeout.max(max_wait);
+    let hard_deadline = start + max_wait;
     loop {
-        if let Some(record) = read_record(codanna_dir)
-            && pid_is_alive(record.pid)
-            && pid_looks_like_codanna_serve(&record)
+        // `read_record`/`pid_is_alive` are blocking filesystem/procfs calls;
+        // run them via `block_in_place` so a long wait (up to `max_wait`,
+        // e.g. 120s of ~100ms polling) doesn't repeatedly block this tokio
+        // worker thread from servicing other tasks.
+        let live_record = tokio::task::block_in_place(|| {
+            read_record(codanna_dir)
+                .filter(|record| pid_is_alive(record.pid) && pid_looks_like_codanna_serve(record))
+        });
+        if let Some(record) = live_record
             && check_health(record.port, record.scheme, record.token.as_deref()).await
         {
             return Ok(record);
@@ -687,9 +699,9 @@ fn unix_now_secs() -> u64 {
 /// - `Some(Ok(record))` once the workspace's discovery record converges to
 ///   healthy within `timeout`.
 /// - `Some(Err(DiscoveryError::SpawnTimeout))` if `spawning_pid` is still
-///   alive after `max(timeout, max_wait)`. The loop already returns `None`
-///   the moment the pid dies, so waiting past `timeout` only ever happens
-///   while the spawn is alive.
+///   alive after `max_wait`, the hard ceiling on this wait regardless of
+///   `timeout`. The loop already returns `None` the moment the pid dies, so
+///   waiting past `timeout` only ever happens while the spawn is alive.
 /// - `None` if `spawning_pid` died before becoming healthy -- the caller
 ///   falls through to the normal spawn path in that case, since a dead pid
 ///   means the previous attempt genuinely failed rather than merely being
@@ -698,14 +710,15 @@ async fn wait_on_spawning_pid(
     codanna_dir: &Path,
     lock_path: &Path,
     spawning_pid: u32,
-    timeout: Duration,
     max_wait: Duration,
     poll_interval: Duration,
 ) -> Option<DiscoveryResult<ServeRecord>> {
     let start = Instant::now();
-    let deadline = start + timeout.max(max_wait);
+    let deadline = start + max_wait;
     loop {
-        if !pid_is_alive(spawning_pid) {
+        // See `wait_until_healthy`'s equivalent comment: `pid_is_alive` is a
+        // blocking procfs call, run via `block_in_place` for the same reason.
+        if !tokio::task::block_in_place(|| pid_is_alive(spawning_pid)) {
             return None;
         }
         if let Some(record) = discover_live(codanna_dir).await {
@@ -1127,12 +1140,12 @@ pub async fn discover_or_spawn(
     // workspace, wait on THAT pid instead. `find_spawning_for` already
     // filters out a dead pid (a genuine startup failure, not merely slow),
     // so `None` here means it is safe to proceed with a normal spawn.
-    if let Some(spawning) = crate::serve_registry::find_spawning_for(workspace_root)
+    if let Some(spawning) =
+        tokio::task::block_in_place(|| crate::serve_registry::find_spawning_for(workspace_root))
         && let Some(outcome) = wait_on_spawning_pid(
             &codanna_dir,
             &lock_path,
             spawning.pid,
-            timeout,
             max_wait,
             poll_interval,
         )
@@ -1229,7 +1242,17 @@ pub async fn discover_or_spawn(
                 max_wait,
                 poll_interval,
                 None,
-                || crate::serve_registry::find_spawning_for(workspace_root).is_some(),
+                // `find_spawning_for` scans every entry in the per-user
+                // server registry (blocking `read_dir` + a `read_to_string`
+                // per file), not just this workspace's. Run it via
+                // `block_in_place` so polling this once per iteration for up
+                // to `max_wait` doesn't repeatedly block this tokio worker
+                // thread on registry-wide filesystem I/O.
+                || {
+                    tokio::task::block_in_place(|| {
+                        crate::serve_registry::find_spawning_for(workspace_root).is_some()
+                    })
+                },
             )
             .await
         }
@@ -1480,7 +1503,13 @@ mod tests {
     /// full duration. Hermetic -- no process is spawned; the slot is
     /// populated directly, exactly as the reaper thread in `spawn_detached`
     /// would populate it after a real exit.
-    #[tokio::test]
+    ///
+    /// `multi_thread` flavor: `wait_until_healthy`'s loop body uses
+    /// `tokio::task::block_in_place`, which panics ("can call blocking only
+    /// when running on the multi-threaded runtime") under the default
+    /// single-threaded test runtime. Same for the other `wait_until_healthy`
+    /// tests below.
+    #[tokio::test(flavor = "multi_thread")]
     async fn wait_until_healthy_returns_captured_exit_without_waiting_out_timeout() {
         let workspace = TempDir::new().unwrap();
         let codanna_dir = workspace.path().join(crate::init::local_dir_name());
@@ -1523,7 +1552,7 @@ mod tests {
     /// A spawn still in flight at `timeout` keeps the wait going up to
     /// `max_wait` rather than failing: giving up on a slow cold start frees
     /// the workspace for a caller that spawns a duplicate server.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn wait_until_healthy_extends_past_timeout_while_spawn_in_flight() {
         let workspace = TempDir::new().unwrap();
         let codanna_dir = workspace.path().join(crate::init::local_dir_name());
@@ -1554,7 +1583,7 @@ mod tests {
 
     /// With no spawn in flight, `timeout` still applies: `max_wait` only
     /// extends a wait on a live spawn.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn wait_until_healthy_stops_at_timeout_when_nothing_in_flight() {
         let workspace = TempDir::new().unwrap();
         let codanna_dir = workspace.path().join(crate::init::local_dir_name());
@@ -1583,7 +1612,41 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    /// `spawn_max_wait_ms` is documented (see `config::defaults::default_spawn_max_wait_ms`)
+    /// as a hard ceiling on this wait -- it must bound the wait even when a
+    /// misconfigured `spawn_timeout_ms` is larger than it, not the other way
+    /// around (the regression `deadline = start + timeout.max(max_wait)`
+    /// produced: a larger `timeout` silently overrode the ceiling).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wait_until_healthy_hard_deadline_is_capped_by_max_wait_even_when_timeout_is_larger() {
+        let workspace = TempDir::new().unwrap();
+        let codanna_dir = workspace.path().join(crate::init::local_dir_name());
+        let lock_path = codanna_dir.join("http.lock");
+
+        let start = Instant::now();
+        let result = wait_until_healthy(
+            &codanna_dir,
+            &lock_path,
+            Duration::from_secs(5),
+            Duration::from_millis(100),
+            Duration::from_millis(10),
+            None,
+            || true,
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(result, Err(DiscoveryError::SpawnTimeout { .. })),
+            "expected SpawnTimeout, got: {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "max_wait must be the true ceiling even when timeout is larger; elapsed = {elapsed:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn discover_or_spawn_returns_live_record_without_spawning() {
         // Given a workspace with a serve.json whose PID is a live process
         // whose cmdline matches a codanna HTTP serve process AND whose
@@ -1637,7 +1700,7 @@ mod tests {
     /// record, this returns `Ok(record)`; if it correctly falls through, the
     /// auto_spawn guard fires with an actionable error instead of attempting
     /// to spawn a real `codanna` binary the test harness does not have.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn fast_path_rejects_live_record_with_wrong_token() {
         let mut fake_server = spawn_fake_http_serve_process();
         let workspace = TempDir::new().unwrap();
@@ -1683,7 +1746,7 @@ mod tests {
     /// tree. `Settings::workspace_root` walks up for the *directory* only, so
     /// without this guard a bare or leftover `.codanna/` anywhere up the tree
     /// would silently receive a spawned server and an index it never asked for.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn refuses_to_spawn_when_tree_has_no_settings_toml() {
         let workspace = TempDir::new().unwrap();
         let codanna_dir = workspace.path().join(crate::init::local_dir_name());
@@ -1708,7 +1771,7 @@ mod tests {
 
     /// `[server] auto_spawn = false` must actually be honoured. With no live
     /// server to attach to there is nothing to use and nothing we may create.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn refuses_to_spawn_when_auto_spawn_is_disabled() {
         let workspace = TempDir::new().unwrap();
         let codanna_dir = workspace.path().join(crate::init::local_dir_name());
@@ -1734,7 +1797,7 @@ mod tests {
     /// The guards gate *creating* a server, never *using* one. A live server is
     /// attached to even when this process would not have been allowed to spawn
     /// it (auto_spawn off, and no settings.toml on disk).
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn discovers_live_server_even_when_spawning_would_be_refused() {
         let mut fake_server = spawn_fake_http_serve_process();
         let workspace = TempDir::new().unwrap();
@@ -2001,7 +2064,7 @@ mod tests {
 
     /// Proves the writer (`write_record` via `discovery_dir`) and the reader
     /// (`discover_or_spawn`'s fast path) agree on exactly one directory.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn discovery_dir_matches_discover_or_spawn_fast_path() {
         let mut fake_server = spawn_fake_http_serve_process();
         let workspace = TempDir::new().unwrap();

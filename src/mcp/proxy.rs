@@ -1149,6 +1149,71 @@ mod tests {
             CallToolResponse::Complete(r) => assert_eq!(r.result_type, Some(ResultType::COMPLETE)),
             other => panic!("variant changed: {other:?}"),
         }
+
+        // The remaining four `impl_mark_complete!` types plus the other two
+        // Complete-variant response enums are macro/match-generated
+        // identically to the two above; covered here so a future refactor
+        // that renames one enum's `Complete`-variant field is caught rather
+        // than only breaking at runtime. `..T::with_all_items(..)`/`..T::new(..)`
+        // struct-update syntax builds a base instance (each type is
+        // `#[non_exhaustive]`, so it can't be built as a full literal outside
+        // the defining crate) with `result_type` overridden to `None`.
+        let resources = ListResourcesResult {
+            result_type: None,
+            ..ListResourcesResult::with_all_items(Vec::new())
+        };
+        assert_eq!(
+            resources.mark_complete().result_type,
+            Some(ResultType::COMPLETE)
+        );
+
+        let templates = ListResourceTemplatesResult {
+            result_type: None,
+            ..ListResourceTemplatesResult::with_all_items(Vec::new())
+        };
+        assert_eq!(
+            templates.mark_complete().result_type,
+            Some(ResultType::COMPLETE)
+        );
+
+        let prompts = ListPromptsResult {
+            result_type: None,
+            ..ListPromptsResult::with_all_items(Vec::new())
+        };
+        assert_eq!(
+            prompts.mark_complete().result_type,
+            Some(ResultType::COMPLETE)
+        );
+
+        // `CompleteResult`/`ReadResourceResult`/`GetPromptResult` are
+        // `#[non_exhaustive]`, which (unlike the `ListXResult` types above)
+        // also blocks `..base` struct-update syntax outside the defining
+        // crate -- build via their constructor, then clear `result_type` by
+        // field assignment on the existing instance instead.
+        let mut complete = CompleteResult::default();
+        complete.result_type = None;
+        assert_eq!(
+            complete.mark_complete().result_type,
+            Some(ResultType::COMPLETE)
+        );
+
+        let mut read = rmcp::model::ReadResourceResult::new(Vec::new());
+        read.result_type = None;
+        match ReadResourceResponse::Complete(read).mark_complete() {
+            ReadResourceResponse::Complete(r) => {
+                assert_eq!(r.result_type, Some(ResultType::COMPLETE))
+            }
+            other => panic!("variant changed: {other:?}"),
+        }
+
+        let mut prompt = rmcp::model::GetPromptResult::new(Vec::new());
+        prompt.result_type = None;
+        match GetPromptResponse::Complete(prompt).mark_complete() {
+            GetPromptResponse::Complete(r) => {
+                assert_eq!(r.result_type, Some(ResultType::COMPLETE))
+            }
+            other => panic!("variant changed: {other:?}"),
+        }
     }
 
     fn notification(method: &str) -> CustomNotification {

@@ -348,6 +348,16 @@ impl Default for CallerClassificationConfig {
     }
 }
 
+/// Upper bound, in milliseconds, clamped onto `ServerConfig::spawn_timeout_ms`
+/// and `ServerConfig::spawn_max_wait_ms` at load time (see
+/// `Settings::normalize_loaded`). Both values feed `Duration::from_millis`
+/// and `Instant::now() + duration` in `serve_discovery`'s wait loops, and
+/// `Instant` addition panics on overflow; an unreasonably large configured
+/// value (e.g. a typo adding extra zeros) is clamped here rather than left to
+/// panic deep in a wait loop. One hour comfortably exceeds any legitimate
+/// cold-start wait.
+const MAX_SPAWN_WAIT_MS: u64 = 3_600_000;
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ServerConfig {
     /// Default server mode: "stdio" or "http"
@@ -625,6 +635,8 @@ impl Settings {
         if let Some(root) = self.workspace_root.take() {
             self.workspace_root = Some(root.canonicalize().unwrap_or(root));
         }
+        self.server.spawn_timeout_ms = self.server.spawn_timeout_ms.min(MAX_SPAWN_WAIT_MS);
+        self.server.spawn_max_wait_ms = self.server.spawn_max_wait_ms.min(MAX_SPAWN_WAIT_MS);
         self.sync_indexed_path_cache();
         self
     }
@@ -797,6 +809,30 @@ enabled = false
         assert_eq!(settings.indexing.parallelism, 4);
         assert_eq!(settings.mcp.max_context_size, 200000);
         assert!(!settings.languages["rust"].enabled);
+    }
+
+    /// Both fields feed `Duration::from_millis` and `Instant::now() + dur` in
+    /// `serve_discovery`'s wait loops; `Instant` addition panics on overflow,
+    /// so a configured value larger than [`MAX_SPAWN_WAIT_MS`] must be
+    /// clamped at load time rather than left to panic in a wait loop.
+    #[test]
+    fn load_from_clamps_oversized_spawn_wait_fields() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("settings.toml");
+
+        fs::write(
+            &config_path,
+            format!(
+                "[server]\nspawn_timeout_ms = {}\nspawn_max_wait_ms = {}\n",
+                i64::MAX,
+                MAX_SPAWN_WAIT_MS + 1
+            ),
+        )
+        .unwrap();
+
+        let settings = Settings::load_from(&config_path).unwrap();
+        assert_eq!(settings.server.spawn_timeout_ms, MAX_SPAWN_WAIT_MS);
+        assert_eq!(settings.server.spawn_max_wait_ms, MAX_SPAWN_WAIT_MS);
     }
 
     #[cfg(unix)]
