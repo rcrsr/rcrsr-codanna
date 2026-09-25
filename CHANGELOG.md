@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`serve --proxy` omitted `resultType` for 2026-07-28 clients:** the proxy's upstream leg negotiates a legacy session, so the backing server stripped `resultType: "complete"` and the proxy forwarded results without it; Claude Code rejected `tools/list` with "missing required resultType". Forwarded results now carry `resultType: "complete"` when absent (still stripped for legacy downstream clients).
+
 ### Changed
 
 - **Previous-generation GC is now age-based, not count-based:** `gc()` used to keep the single newest `previous` generation indefinitely; it now deletes any `previous` generation older than `indexing.previous_generation_max_age_hours` (default `24`), regardless of count, since a rollback target's value decays with the age of the source tree, not with generation count. Set the new config knob to `0` to delete every `previous` generation on the next GC pass instead of waiting. ([#102](https://github.com/rcrsr/rcrsr-codanna/pull/102))
