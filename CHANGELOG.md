@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0+rcrsr.9] - 2026-09-25
+
 ### Fixed
 
 - **`serve --proxy` omitted `resultType` for 2026-07-28 clients:** the proxy's upstream leg negotiates a legacy session, so the backing server stripped `resultType: "complete"` and the proxy forwarded results without it; Claude Code rejected `tools/list` with "missing required resultType". Forwarded results now carry `resultType: "complete"` when absent (still stripped for legacy downstream clients). ([#103](https://github.com/rcrsr/rcrsr-codanna/pull/103))
