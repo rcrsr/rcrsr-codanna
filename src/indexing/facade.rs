@@ -1455,6 +1455,28 @@ impl IndexFacade {
         path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
     }
 
+    /// Canonical form of a set of indexed-path roots, for comparing
+    /// `settings.toml`'s raw `indexed_paths` against the canonical paths
+    /// stored in `index.meta`. Raw `PathBuf` equality reads `"."` and the
+    /// absolute workspace path as different roots, so every start saw a
+    /// "new" root and re-indexed it. Nonexistent paths pass through raw.
+    pub fn canonical_path_set<'a>(
+        paths: impl IntoIterator<Item = &'a PathBuf>,
+    ) -> HashSet<PathBuf> {
+        paths
+            .into_iter()
+            .map(|p| Self::canonical_or_raw(p))
+            .collect()
+    }
+
+    /// Whether `sync_with_config` would act on these canonical root sets:
+    /// it indexes added roots only when they are existing directories and
+    /// always drops removed roots. Callers gate on this so an idle guard
+    /// means a no-op sync (a configured-but-missing root never triggers one).
+    pub fn indexed_paths_need_sync(stored: &HashSet<PathBuf>, config: &HashSet<PathBuf>) -> bool {
+        config.difference(stored).any(|p| p.is_dir()) || stored.difference(config).next().is_some()
+    }
+
     /// Files the index walk would discover under `scope`.
     ///
     /// Decided by the same walker `index_directory` uses, rooted at the
@@ -1915,8 +1937,8 @@ impl IndexFacade {
         progress: bool,
     ) -> FacadeResult<SyncStats> {
         let stored = stored_paths.unwrap_or_default();
-        let stored_set: HashSet<PathBuf> = stored.iter().cloned().collect();
-        let config_set: HashSet<PathBuf> = config_paths.iter().cloned().collect();
+        let stored_set = Self::canonical_path_set(&stored);
+        let config_set = Self::canonical_path_set(config_paths);
 
         // Determine what to add and remove
         let to_add: Vec<&PathBuf> = config_set.difference(&stored_set).collect();
@@ -1932,11 +1954,28 @@ impl IndexFacade {
         }
 
         // Index new directories with progress if enabled.
-        // Use force=true since these are new directories being indexed for
-        // the first time; resolution is deferred until every new root has
-        // walked so cross-root imports bind regardless of add order.
+        // Force only on an empty index (clean index behaves like --force);
+        // otherwise run the incremental lane so unchanged files are
+        // hash-skipped instead of re-parsed and re-embedded. Resolution is
+        // deferred until every new root has walked so cross-root imports
+        // bind regardless of add order.
         let mut pending = crate::indexing::pipeline::PendingResolution::default();
+        let mut skipped: Vec<PathBuf> = Vec::new();
         for path in &to_add {
+            // A bad config entry must not abort the whole sync.
+            if !path.is_dir() {
+                tracing::warn!(
+                    "skipping configured path (missing or not a directory): {}",
+                    path.display()
+                );
+                skipped.push((*path).clone());
+                continue;
+            }
+
+            // Decided per root: the first forced root makes the index
+            // non-empty, so later roots take the incremental lane.
+            let force = self.document_count().unwrap_or(0) == 0;
+
             // Visual separator and directory label (stderr syncs with progress bars)
             eprintln!();
             eprintln!(
@@ -1944,13 +1983,13 @@ impl IndexFacade {
                 crate::parsing::paths::render_absolute_path(path).display()
             );
 
-            // Count files first for accurate progress bar. Uses `walk_quiet`
-            // rather than `walk` because `index_incremental_with_progress_flag`
-            // below performs its own full walk of the same directory via
-            // `DiscoverStage`; both walk sites call
-            // `warn_if_skipped_symlink_dir` per entry, so warning here too
-            // would log a symlinked-directory skip twice per run.
-            let file_count = if progress {
+            // Count files first for an accurate progress bar (forced lane
+            // only; the incremental lane derives its count from discovery).
+            // Uses `walk_quiet` because the pipeline below walks the same
+            // directory via `DiscoverStage`, and both walks call
+            // `warn_if_skipped_symlink_dir` per entry; `walk` here would
+            // log a symlinked-directory skip twice per run.
+            let file_count = if force && progress {
                 use crate::indexing::FileWalker;
                 let walker = FileWalker::new(Arc::clone(&self.settings));
                 walker.walk_quiet(path)?.count()
@@ -1963,7 +2002,7 @@ impl IndexFacade {
                 Arc::clone(&self.document_index),
                 self.semantic_search.clone(),
                 self.embedding_pool.clone(),
-                true, // force: new directories should be fully indexed
+                force, // forced only on an empty index; else incremental hash-skip
                 progress,
                 file_count,
                 &mut pending,
@@ -1980,7 +2019,7 @@ impl IndexFacade {
             self.semantic_search.clone(),
             progress,
         )?;
-        stats.added_dirs = to_add.len();
+        stats.added_dirs = to_add.len() - skipped.len();
 
         // Remove files from removed directories
         for path in &to_remove {
@@ -1988,7 +2027,14 @@ impl IndexFacade {
         }
         stats.removed_dirs = to_remove.len();
 
-        // Update tracked paths
+        // Update tracked paths. Assigned canonical rather than via
+        // `add_indexed_path`, which collapses child roots under parents and
+        // would leave stored != config, re-triggering sync on every start.
+        // Skipped roots stay untracked so they warn and retry next start.
+        let mut config_set = config_set;
+        for path in &skipped {
+            config_set.remove(path);
+        }
         self.indexed_paths = config_set;
 
         Ok(stats)
@@ -6906,7 +6952,8 @@ mod tests {
         facade.index_directory(&src, false).unwrap();
 
         // Second session: tests added to config; sync indexes the new
-        // root through its force lane.
+        // root through its incremental lane (module paths resolve via the
+        // indexed_paths_cache fallback).
         facade
             .sync_with_config(
                 Some(vec![src.clone()]),
@@ -6915,6 +6962,201 @@ mod tests {
             )
             .unwrap();
         assert_cross_root_edge(&facade, "sync-added root");
+    }
+
+    fn set_of(paths: &[&Path]) -> HashSet<PathBuf> {
+        paths.iter().map(|p| p.to_path_buf()).collect()
+    }
+
+    // A config root spelled non-canonically (`x/sub/..`) is the same root
+    // as the stored canonical one: sync must be a no-op.
+    #[test]
+    fn sync_non_canonical_config_root_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let (src, tests) = write_two_root_python_fixture(dir.path());
+        let src = src.canonicalize().unwrap();
+        let mut facade = two_root_facade(dir.path(), &src, &tests);
+        facade.index_directory(&src, false).unwrap();
+        let docs_before = facade.document_count().unwrap();
+
+        let non_canonical = src.join("pkg/..");
+        let stats = facade
+            .sync_with_config(Some(vec![src.clone()]), &[non_canonical], false)
+            .unwrap();
+
+        assert_eq!(stats.added_dirs, 0);
+        assert_eq!(stats.files_indexed, 0);
+        assert!(!stats.has_changes());
+        assert_eq!(facade.document_count().unwrap(), docs_before);
+    }
+
+    // A symlinked spelling of an indexed root is also the same root.
+    #[cfg(unix)]
+    #[test]
+    fn sync_symlinked_config_root_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let (src, tests) = write_two_root_python_fixture(dir.path());
+        let src = src.canonicalize().unwrap();
+        let link = dir.path().join("src_link");
+        std::os::unix::fs::symlink(&src, &link).unwrap();
+        let mut facade = two_root_facade(dir.path(), &src, &tests);
+        facade.index_directory(&src, false).unwrap();
+
+        let stats = facade
+            .sync_with_config(Some(vec![src.clone()]), &[link], false)
+            .unwrap();
+
+        assert!(!stats.has_changes());
+        assert_eq!(stats.files_indexed, 0);
+    }
+
+    // An added root nested in an already-indexed root takes the
+    // incremental lane: unchanged files are hash-skipped, and a file added
+    // later is indexed exactly once.
+    #[test]
+    fn sync_added_child_root_hash_skips_then_catches_up_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        let child = parent.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(parent.join("top.py"), "def top_symbol():\n    return 1\n").unwrap();
+        std::fs::write(
+            child.join("inner.py"),
+            "def inner_symbol():\n    return 2\n",
+        )
+        .unwrap();
+        let parent = parent.canonicalize().unwrap();
+        let child = child.canonicalize().unwrap();
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(parent.clone()).unwrap();
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+        facade.index_directory(&parent, false).unwrap();
+        let docs_before = facade.document_count().unwrap();
+
+        let stats = facade
+            .sync_with_config(
+                Some(vec![parent.clone()]),
+                &[parent.clone(), child.clone()],
+                false,
+            )
+            .unwrap();
+        assert_eq!(stats.added_dirs, 1);
+        assert_eq!(
+            stats.files_indexed, 0,
+            "already-indexed files under the new root must be hash-skipped"
+        );
+        assert_eq!(facade.document_count().unwrap(), docs_before);
+
+        std::fs::write(
+            child.join("fresh.py"),
+            "def fresh_symbol():\n    return 3\n",
+        )
+        .unwrap();
+        let stats = facade
+            .sync_with_config(
+                Some(vec![parent.clone()]),
+                &[parent.clone(), child.clone()],
+                false,
+            )
+            .unwrap();
+        assert_eq!(stats.files_indexed, 1);
+        assert_eq!(facade.find_symbols_by_name("fresh_symbol", None).len(), 1);
+        assert_eq!(facade.find_symbols_by_name("inner_symbol", None).len(), 1);
+    }
+
+    // After a sync the tracked set equals the canonical config set, the
+    // idle predicate agrees, and a repeat sync reports nothing.
+    #[test]
+    fn sync_reaches_fixed_point() {
+        let dir = tempfile::tempdir().unwrap();
+        let (src, tests) = write_two_root_python_fixture(dir.path());
+        let src = src.canonicalize().unwrap();
+        let tests = tests.canonicalize().unwrap();
+        let mut facade = two_root_facade(dir.path(), &src, &tests);
+        facade.index_directory(&src, false).unwrap();
+
+        let config = vec![src.clone(), tests.join("x/..")];
+        std::fs::create_dir_all(tests.join("x")).unwrap();
+        let first = facade
+            .sync_with_config(Some(vec![src.clone()]), &config, false)
+            .unwrap();
+        assert!(first.has_changes());
+
+        let expected = set_of(&[&src, &tests]);
+        assert_eq!(facade.get_indexed_paths(), &expected);
+        let stored: Vec<PathBuf> = facade.get_indexed_paths().iter().cloned().collect();
+        assert!(!IndexFacade::indexed_paths_need_sync(
+            &IndexFacade::canonical_path_set(&stored),
+            &IndexFacade::canonical_path_set(&config),
+        ));
+
+        let second = facade
+            .sync_with_config(Some(stored), &config, false)
+            .unwrap();
+        assert!(!second.has_changes());
+        assert_eq!(second.files_indexed, 0);
+    }
+
+    // A configured path that does not exist must not abort the sync nor
+    // be recorded as tracked.
+    #[test]
+    fn sync_skips_nonexistent_config_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let (src, tests) = write_two_root_python_fixture(dir.path());
+        let src = src.canonicalize().unwrap();
+        let mut facade = two_root_facade(dir.path(), &src, &tests);
+        facade.index_directory(&src, false).unwrap();
+        let missing = dir.path().join("does_not_exist");
+
+        let stats = facade
+            .sync_with_config(
+                Some(vec![src.clone()]),
+                &[src.clone(), missing.clone()],
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(stats.added_dirs, 0);
+        assert_eq!(stats.removed_dirs, 0);
+        assert!(!facade.get_indexed_paths().contains(&missing));
+        assert_eq!(facade.get_indexed_paths(), &set_of(&[&src]));
+    }
+
+    #[test]
+    fn indexed_paths_need_sync_predicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().to_path_buf();
+        let missing = dir.path().join("missing");
+
+        // Missing and stored (e.g. dir deleted since): same set, idle.
+        assert!(!IndexFacade::indexed_paths_need_sync(
+            &set_of(&[&missing]),
+            &set_of(&[&missing])
+        ));
+        // Missing and not stored: sync would skip it, so idle.
+        assert!(!IndexFacade::indexed_paths_need_sync(
+            &HashSet::new(),
+            &set_of(&[&missing])
+        ));
+        // Existing added root: sync.
+        assert!(IndexFacade::indexed_paths_need_sync(
+            &HashSet::new(),
+            &set_of(&[&existing])
+        ));
+        // Removed root: sync.
+        assert!(IndexFacade::indexed_paths_need_sync(
+            &set_of(&[&existing]),
+            &HashSet::new()
+        ));
+        // Equal: idle.
+        assert!(!IndexFacade::indexed_paths_need_sync(
+            &set_of(&[&existing]),
+            &set_of(&[&existing])
+        ));
     }
 
     // Serve-lane shape: a settled burst creates the importing and the

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Index-reading commands re-ran a forced full reindex on every start when `indexing.indexed_paths` used a non-canonical spelling:** `serve`, `retrieve`, `mcp`, and `dump` re-parsed and re-embedded every file each start when `settings.toml` held a relative `.`, a symlink, or a `..` path, because the pre-dispatch sync compared raw config paths against the canonical paths stored in the index; a `codanna index` run moments before did not help, and for `serve --http` the rebuild ran before the listener bound, so `serve --proxy` auto-spawn could exceed `spawn_max_wait_ms`. Paths are now compared canonically, a newly configured root is caught up incrementally (unchanged files are hash-skipped; a full forced index only on an empty index), and a configured root that does not exist is skipped with a warning and retried on the next start instead of aborting the sync. ([#108](https://github.com/rcrsr/rcrsr-codanna/issues/108))
+
 ## [0.16.0+rcrsr.10] - 2026-09-30
 
 ### Fixed

@@ -931,16 +931,15 @@ async fn main() {
         // syncing on it, and publishing it only if it actually changed
         // anything; a no-op build is discarded on the spot.
         if let Some(metadata) = persistence.current_metadata() {
-            let stored_set: std::collections::HashSet<PathBuf> = metadata
-                .indexed_paths
-                .clone()
-                .unwrap_or_default()
-                .into_iter()
-                .collect();
-            let config_set: std::collections::HashSet<PathBuf> =
-                config.indexing.indexed_paths.iter().cloned().collect();
+            // Stored paths are canonical while config paths are raw (`.`,
+            // symlinks), so compare canonical forms; the predicate is the
+            // exact rule `sync_with_config` acts on, so an idle guard means
+            // a no-op sync and no throwaway build is opened.
+            let stored_set =
+                IndexFacade::canonical_path_set(metadata.indexed_paths.iter().flatten());
+            let config_set = IndexFacade::canonical_path_set(&config.indexing.indexed_paths);
 
-            if stored_set != config_set {
+            if IndexFacade::indexed_paths_need_sync(&stored_set, &config_set) {
                 match persistence.open_build(settings.clone(), BuildMode::CloneCurrent) {
                     Ok(mut build) => {
                         let stats =
