@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **MCP server instructions no longer imply the index may be stale when scoping `get_calls`/`find_callers`/`analyze_impact` as approximate:** the caveat, still scoped to exactly those three tools, previously read "treat as hints" without saying why; it now explains that these tools report call edges resolved statically at index time (an edge is only recorded when its target resolves unambiguously), so an empty or short result is not evidence that the index is stale or that other tools are unreliable. Server instructions also gain an INDEX FRESHNESS clause: `find_symbol`/`search_symbols`/`get_file_outline`/`read_symbol` report indexed facts, `read_symbol` refuses stale spans, and whether a file watcher is active for the serving process (when it is, on-disk edits including uncommitted ones are picked up automatically). `get_index_info` now reports the same file-watch state in both its text and JSON output. ([#105](https://github.com/rcrsr/rcrsr-codanna/issues/105))
+
 ## [0.16.0+rcrsr.9] - 2026-09-25
 
 ### Fixed

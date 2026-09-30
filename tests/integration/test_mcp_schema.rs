@@ -319,6 +319,160 @@ async fn test_reindex_tool_present_in_list_tools_for_all_constructors() {
     );
 }
 
+/// Proves `get_info().instructions` carries the reworked call-graph caveat
+/// (statically-resolved edges, not "hints") for EACH of the three
+/// `CodeIntelligenceServer` constructors, so the wording can't silently
+/// regress to the old "treat as hints" phrasing on any one construction
+/// path.
+#[tokio::test]
+async fn test_get_info_instructions_describe_static_call_edges_for_all_constructors() {
+    use rmcp::ServerHandler;
+
+    // Constructor 1: `new` -- takes ownership of a bare `IndexFacade`.
+    {
+        let (_temp_dir, facade) = build_test_facade();
+        let server = CodeIntelligenceServer::new(facade);
+        let instructions = server.get_info().instructions;
+        assert!(
+            instructions.is_some(),
+            "CodeIntelligenceServer::new should provide instructions"
+        );
+        let instructions = instructions.unwrap();
+        assert!(
+            !instructions.contains("as hints"),
+            "instructions should no longer describe call-graph tools as hints, got: {instructions}"
+        );
+        assert!(
+            instructions.contains("not evidence"),
+            "instructions should state an empty/short result is not evidence of a stale index or unreliable tools, got: {instructions}"
+        );
+    }
+
+    // Constructor 2: `from_facade` -- shares an already-`Arc<RwLock<_>>`-wrapped facade.
+    {
+        let (_temp_dir, facade) = build_test_facade();
+        let server = CodeIntelligenceServer::from_facade(Arc::new(RwLock::new(facade)));
+        let instructions = server.get_info().instructions;
+        assert!(
+            instructions.is_some(),
+            "CodeIntelligenceServer::from_facade should provide instructions"
+        );
+        let instructions = instructions.unwrap();
+        assert!(
+            !instructions.contains("as hints"),
+            "instructions should no longer describe call-graph tools as hints, got: {instructions}"
+        );
+        assert!(
+            instructions.contains("not evidence"),
+            "instructions should state an empty/short result is not evidence of a stale index or unreliable tools, got: {instructions}"
+        );
+    }
+
+    // Constructor 3: `new_with_facade` -- the HTTP server's construction path.
+    {
+        let (_temp_dir, facade) = build_test_facade();
+        let settings = Arc::new(Settings::default());
+        let server =
+            CodeIntelligenceServer::new_with_facade(Arc::new(RwLock::new(facade)), settings);
+        let instructions = server.get_info().instructions;
+        assert!(
+            instructions.is_some(),
+            "CodeIntelligenceServer::new_with_facade should provide instructions"
+        );
+        let instructions = instructions.unwrap();
+        assert!(
+            !instructions.contains("as hints"),
+            "instructions should no longer describe call-graph tools as hints, got: {instructions}"
+        );
+        assert!(
+            instructions.contains("not evidence"),
+            "instructions should state an empty/short result is not evidence of a stale index or unreliable tools, got: {instructions}"
+        );
+    }
+
+    println!(
+        "[OK] get_info().instructions describes statically-resolved call edges for new, from_facade, and new_with_facade."
+    );
+}
+
+/// Proves the default-constructed server (no `with_file_watch` call, so
+/// `file_watch` stays `false`) describes the inactive-watcher state: edits
+/// are not picked up until a manual `reindex`.
+#[tokio::test]
+async fn test_get_info_instructions_describe_inactive_file_watch_by_default() {
+    use rmcp::ServerHandler;
+
+    let (_temp_dir, facade) = build_test_facade();
+    let server = CodeIntelligenceServer::new(facade);
+    let instructions = server
+        .get_info()
+        .instructions
+        .expect("instructions should be present");
+
+    assert!(
+        instructions.contains("reindex"),
+        "default (no file watcher) instructions should name the 'reindex' tool, got: {instructions}"
+    );
+    assert!(
+        !instructions.contains("automatically"),
+        "default (no file watcher) instructions should not claim automatic pickup, got: {instructions}"
+    );
+}
+
+/// Proves `with_file_watch(true)` switches the instructions to the
+/// active-watcher state: changes picked up automatically after a debounce,
+/// and the inactive-state clause is no longer present.
+#[tokio::test]
+async fn test_get_info_instructions_describe_active_file_watch_when_set() {
+    use rmcp::ServerHandler;
+
+    let (_temp_dir, facade) = build_test_facade();
+    let server = CodeIntelligenceServer::new(facade).with_file_watch(true);
+    let instructions = server
+        .get_info()
+        .instructions
+        .expect("instructions should be present");
+
+    assert!(
+        instructions.contains("automatically") && instructions.contains("debounce"),
+        "active file watcher instructions should describe automatic, debounced pickup, got: {instructions}"
+    );
+    assert!(
+        !instructions.contains("are not picked up until you call the 'reindex' tool"),
+        "active file watcher instructions should not contain the inactive-state clause, got: {instructions}"
+    );
+    assert!(
+        instructions.contains("including uncommitted edits"),
+        "active file watcher instructions should say uncommitted edits are covered, got: {instructions}"
+    );
+}
+
+/// Proves the instructions scope the call-resolution caveat away from the
+/// symbol/outline/read tools (#105): those report indexed facts, and
+/// `get_index_info` is named as the way to check index health.
+#[tokio::test]
+async fn test_get_info_instructions_name_indexed_fact_tools() {
+    use rmcp::ServerHandler;
+
+    let (_temp_dir, facade) = build_test_facade();
+    let server = CodeIntelligenceServer::new(facade);
+    let instructions = server
+        .get_info()
+        .instructions
+        .expect("instructions should be present");
+
+    assert!(
+        instructions.contains(
+            "'find_symbol', 'search_symbols', 'get_file_outline', and 'read_symbol' report what is in the index"
+        ),
+        "instructions should state the symbol/outline/read tools report indexed facts, got: {instructions}"
+    );
+    assert!(
+        instructions.contains("'get_index_info' to check index health"),
+        "instructions should point to get_index_info for index health, got: {instructions}"
+    );
+}
+
 /// `reindex documents:true` discovers new files added to a configured
 /// markdown collection since the document store was last synced, and
 /// aggregates non-zero totals across the collection; `documents:false`
@@ -849,6 +1003,82 @@ async fn get_index_info_text_staleness_warning_matches_fingerprint_mismatch() {
 
     println!(
         "[OK] get_index_info text staleness warning appears iff the on-disk fingerprint mismatches."
+    );
+}
+
+/// `get_index_info` reports file-watch state in both output formats,
+/// sourced from the server's own `with_file_watch` value (never guessed):
+/// with the default server (no watcher), text says "Inactive" and the JSON
+/// envelope's `data.file_watch` is `false`; with `.with_file_watch(true)`,
+/// text says "Active" (and not "Inactive") and JSON `data.file_watch` is
+/// `true`. Fails if the field is dropped from either rendering, or if the
+/// two renderings disagree with each other or with the server's own state.
+#[tokio::test]
+async fn get_index_info_reports_file_watch_state_in_text_and_json() {
+    // Default server: file watching inactive.
+    {
+        let (_temp_dir, facade) = build_test_facade();
+        let server = CodeIntelligenceServer::new(facade);
+
+        let text_result = server
+            .get_index_info(Parameters(GetIndexInfoRequest {
+                output_format: OutputFormat::Text,
+            }))
+            .await
+            .expect("get_index_info (text) should succeed");
+        let text = call_tool_result_text(&text_result);
+        assert!(
+            text.contains("Inactive"),
+            "default server's text output must report file watching as Inactive, got:\n{text}"
+        );
+
+        let json_result = server
+            .get_index_info(Parameters(GetIndexInfoRequest {
+                output_format: OutputFormat::Json,
+            }))
+            .await
+            .expect("get_index_info (json) should succeed");
+        let envelope = call_tool_result_json(&json_result);
+        assert_eq!(
+            envelope["data"]["file_watch"],
+            serde_json::json!(false),
+            "default server's JSON envelope must report data.file_watch=false, got: {envelope:?}"
+        );
+    }
+
+    // `.with_file_watch(true)`: file watching active.
+    {
+        let (_temp_dir, facade) = build_test_facade();
+        let server = CodeIntelligenceServer::new(facade).with_file_watch(true);
+
+        let text_result = server
+            .get_index_info(Parameters(GetIndexInfoRequest {
+                output_format: OutputFormat::Text,
+            }))
+            .await
+            .expect("get_index_info (text) should succeed");
+        let text = call_tool_result_text(&text_result);
+        assert!(
+            text.contains("Active") && !text.contains("Inactive"),
+            "active-watch server's text output must report Active (and not Inactive), got:\n{text}"
+        );
+
+        let json_result = server
+            .get_index_info(Parameters(GetIndexInfoRequest {
+                output_format: OutputFormat::Json,
+            }))
+            .await
+            .expect("get_index_info (json) should succeed");
+        let envelope = call_tool_result_json(&json_result);
+        assert_eq!(
+            envelope["data"]["file_watch"],
+            serde_json::json!(true),
+            "active-watch server's JSON envelope must report data.file_watch=true, got: {envelope:?}"
+        );
+    }
+
+    println!(
+        "[OK] get_index_info reports file-watch state consistently in text (Active/Inactive) and JSON (data.file_watch)."
     );
 }
 

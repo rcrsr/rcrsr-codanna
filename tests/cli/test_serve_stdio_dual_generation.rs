@@ -100,6 +100,50 @@ enabled = false
     std::fs::write(codanna_dir.join("settings.toml"), settings).expect("write settings");
 }
 
+/// Settings variant with `[file_watch] enabled = false` — used to prove
+/// the reported watch state tracks whether the unified watcher's task
+/// actually spawned, not `config.file_watch.enabled` (which `--watch`
+/// overrides at the CLI level regardless of this setting).
+fn write_settings_file_watch_disabled(workspace: &Path) {
+    let codanna_dir = workspace.join(".codanna");
+    std::fs::create_dir_all(&codanna_dir).expect("create .codanna");
+
+    let src_abs = workspace
+        .join("src")
+        .canonicalize()
+        .expect("src dir should exist and be resolvable");
+    let src_path = crate::common::toml_path_literal(&src_abs);
+
+    let settings = format!(
+        r#"
+index_path = ".codanna/index"
+
+[indexing]
+indexed_paths = [{src_path}]
+
+[semantic_search]
+enabled = false
+
+[file_watch]
+enabled = false
+"#
+    );
+
+    std::fs::write(codanna_dir.join("settings.toml"), settings).expect("write settings");
+}
+
+fn seed_workspace_with_file_watch_disabled() -> TempDir {
+    let workspace = TempDir::new().expect("temp dir");
+    write_fixture(workspace.path());
+    write_settings_file_watch_disabled(workspace.path());
+    let (code, stdout, stderr) = run_cli(workspace.path(), &["index", "src", "--no-progress"]);
+    assert_eq!(
+        code, 0,
+        "seed index should succeed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    workspace
+}
+
 fn tamper_emission_version(workspace: &Path) {
     let path = crate::support::index_meta_path(workspace);
     let raw = std::fs::read_to_string(&path).expect("read index.meta");
@@ -816,6 +860,75 @@ fn serve_stdio_no_optin_no_unsolicited_notifications() {
     drop(session.stdin);
     let status = wait_with_timeout(&mut session.child, Duration::from_secs(10));
     assert!(status.success(), "clean exit, got {status:?}");
+}
+
+/// The reported watch state tracks whether the unified watcher's task
+/// actually spawned, not `config.file_watch.enabled`: with `[file_watch]
+/// enabled = false` in settings and `--watch` on the CLI, the watcher
+/// still starts (the CLI flag forces it on independent of the config
+/// value), so instructions must carry the active-watch phrase.
+#[test]
+fn serve_stdio_watch_flag_overrides_disabled_config_and_reports_active() {
+    let workspace = seed_workspace_with_file_watch_disabled();
+    let mut session = spawn_serve_watch(workspace.path());
+
+    writeln!(
+        session.stdin,
+        "{}",
+        json!({"jsonrpc": "2.0", "id": 1, "method": "server/discover"})
+    )
+    .expect("write discover");
+    session.stdin.flush().expect("flush discover");
+
+    let discover = recv_json(&session.rx);
+    let instructions = discover["result"]["instructions"]
+        .as_str()
+        .unwrap_or_else(|| panic!("discover result carries instructions\n{discover}"));
+    assert!(
+        instructions.contains("automatically"),
+        "instructions must report an active watcher when --watch spawns it \
+         despite [file_watch] enabled = false in config\n{instructions}"
+    );
+
+    // A discover-only probe session (no handshake, no stateless request)
+    // is not a clean-shutdown scenario on this transport; kill directly
+    // rather than asserting exit status, which other tests only assert
+    // after a full session (handshake or a served stateless request).
+    let _ = session.child.kill();
+    let _ = session.child.wait();
+}
+
+/// Plain `serve` (no `--watch`) with `[file_watch] enabled = false` in
+/// config never spawns the unified watcher, so instructions must carry
+/// the inactive-watch phrase.
+#[test]
+fn serve_stdio_no_watch_flag_reports_inactive() {
+    let workspace = seed_workspace_with_file_watch_disabled();
+    let mut session = spawn_serve(workspace.path());
+
+    writeln!(
+        session.stdin,
+        "{}",
+        json!({"jsonrpc": "2.0", "id": 1, "method": "server/discover"})
+    )
+    .expect("write discover");
+    session.stdin.flush().expect("flush discover");
+
+    let discover = recv_json(&session.rx);
+    let instructions = discover["result"]["instructions"]
+        .as_str()
+        .unwrap_or_else(|| panic!("discover result carries instructions\n{discover}"));
+    assert!(
+        instructions.contains("reindex"),
+        "instructions must report an inactive watcher without --watch\n{instructions}"
+    );
+    assert!(
+        !instructions.contains("automatically"),
+        "inactive instructions must not claim automatic pickup\n{instructions}"
+    );
+
+    let _ = session.child.kill();
+    let _ = session.child.wait();
 }
 
 /// The legacy notification lane emits only standard MCP methods:

@@ -1481,7 +1481,7 @@ pub async fn run(
     match result {
         Ok(call_result) => {
             if json && tool == "get_index_info" {
-                let envelope = crate::mcp::service::index_info_envelope(&indexer);
+                let envelope = crate::mcp::service::index_info_envelope(&indexer, None);
                 let output = render_envelope_json(&envelope, fields.as_ref());
                 println!("{output}");
             } else if json && tool == "find_symbol" {

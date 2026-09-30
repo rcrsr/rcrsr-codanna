@@ -773,6 +773,16 @@ upstream.
 - **Slimmer `analyze_impact`.** `count_only` (symbol and file counts only),
   `max_results` (truncates and flags `truncated` in `meta`), and `group_by:
   kind | file`.
+- **File-watch state in server instructions and `get_index_info`.** Server
+  instructions gain an INDEX FRESHNESS clause telling agents whether a file
+  watcher is active for the serving process — "active" means the unified
+  watcher actually started (a `--watch` stdio session, or `--http`/`--https`
+  with the watcher spawned), not just `[file_watch] enabled = true` in
+  config, since a disabled or failed-to-start watcher never picks up edits.
+  `get_index_info` reports the same state: `Active`/`Inactive` in its text
+  output, and `file_watch: true | false | null` in JSON, where `null` means
+  the CLI one-shot path (`codanna mcp get_index_info`, which has only a
+  facade and no running server) rather than a guessed `false`.
 
 ### Test/production classification on `find_callers`
 

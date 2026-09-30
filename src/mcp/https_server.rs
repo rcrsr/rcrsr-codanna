@@ -212,10 +212,15 @@ pub async fn serve_https(config: crate::Settings, watch: bool, bind: String) -> 
     let indexer_for_service = indexer.clone();
     let config_for_service = Arc::new(config.clone());
 
+    // Whether the unified watcher's watch task actually spawned, captured
+    // once here (not derived from config/CLI intent).
+    let unified_watcher_active = unified_watcher_handle.is_some();
+
     // Create a shared service instance that all connections will use
     let shared_service =
         CodeIntelligenceServer::new_with_facade(indexer_for_service, config_for_service)
-            .with_broadcaster(broadcaster.clone());
+            .with_broadcaster(broadcaster.clone())
+            .with_file_watch(unified_watcher_active);
 
     // Attach document store if available
     let shared_service = if let Some(store_arc) = document_store_arc {

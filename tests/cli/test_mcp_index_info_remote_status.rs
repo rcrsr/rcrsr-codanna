@@ -214,4 +214,10 @@ fn mcp_get_index_info_reports_remote_semantic_status_and_model() {
         .as_u64()
         .expect("semantic embeddings count should be present");
     assert!(embeddings > 0, "expected persisted embeddings count > 0");
+
+    assert_eq!(
+        payload["data"]["file_watch"],
+        Value::Null,
+        "the CLI one-shot path has no serving process, so file_watch must be JSON null, got: {payload:?}"
+    );
 }

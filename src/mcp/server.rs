@@ -79,6 +79,11 @@ pub struct CodeIntelligenceServer {
     tool_router: ToolRouter<Self>,
     pub(super) peer: Arc<Mutex<Option<Peer<RoleServer>>>>,
     broadcaster: Option<Arc<crate::mcp::notifications::NotificationBroadcaster>>,
+    /// Whether the serve path's unified file watcher actually started for
+    /// this server. Set once via [`Self::with_file_watch`] and not updated
+    /// after startup; defaults to `false` ("not known to be watching")
+    /// because no constructor here starts a watcher itself.
+    file_watch: bool,
 }
 
 impl CodeIntelligenceServer {
@@ -89,6 +94,7 @@ impl CodeIntelligenceServer {
             tool_router: Self::symbols_router() + Self::search_router() + Self::admin_router(),
             peer: Arc::new(Mutex::new(None)),
             broadcaster: None,
+            file_watch: false,
         }
     }
 
@@ -100,6 +106,7 @@ impl CodeIntelligenceServer {
             tool_router: Self::symbols_router() + Self::search_router() + Self::admin_router(),
             peer: Arc::new(Mutex::new(None)),
             broadcaster: None,
+            file_watch: false,
         }
     }
 
@@ -111,6 +118,7 @@ impl CodeIntelligenceServer {
             tool_router: Self::symbols_router() + Self::search_router() + Self::admin_router(),
             peer: Arc::new(Mutex::new(None)),
             broadcaster: None,
+            file_watch: false,
         }
     }
 
@@ -121,6 +129,23 @@ impl CodeIntelligenceServer {
     ) -> Self {
         self.broadcaster = Some(broadcaster);
         self
+    }
+
+    /// Record whether a file watcher is active for this server instance;
+    /// reflected in `get_info()`'s instructions so agents know whether
+    /// source edits are picked up automatically or require a manual
+    /// `reindex`.
+    pub fn with_file_watch(mut self, active: bool) -> Self {
+        self.file_watch = active;
+        self
+    }
+
+    /// Whether this server instance has a file watcher active, as captured
+    /// via [`Self::with_file_watch`]. Exposed for `get_index_info`
+    /// (`crate::mcp::tools::search`), which is outside `file_watch`'s
+    /// module-privacy scope.
+    pub(crate) fn file_watch(&self) -> bool {
+        self.file_watch
     }
 
     /// Add document store for document search capability
@@ -220,6 +245,17 @@ impl ServerHandler for CodeIntelligenceServer {
     }
 
     fn get_info(&self) -> ServerInfo {
+        let watch_sentence = if self.file_watch {
+            "A file watcher is active for this server, so on-disk source changes - including uncommitted edits and new files - are picked up automatically after a short debounce; this is not instant, so a read immediately after an edit can still race the watcher. "
+        } else {
+            "No file watcher is active for this server, so edits made after the index was built are not picked up until you call the 'reindex' tool. "
+        };
+        let freshness_clause = format!(
+            "INDEX FRESHNESS: 'find_symbol', 'search_symbols', 'get_file_outline', and 'read_symbol' report what is in the index; they are not approximations. \
+            'read_symbol' refuses to return a span whose file has changed on disk since indexing (STALE_INDEX error, detected via a SHA256 hash comparison) - reindex if you hit it. \
+            {watch_sentence}\
+            Call 'get_index_info' to check index health and the current file-watch state rather than assuming the index is stale. "
+        );
         ServerInfo::new(
             ServerCapabilities::builder()
                 .enable_tools()
@@ -233,19 +269,20 @@ impl ServerHandler for CodeIntelligenceServer {
                 .with_title("Codanna Code Intelligence")
                 .with_website_url("https://github.com/bartolli/codanna"),
         )
-        .with_instructions(
+        .with_instructions(format!(
             "This server provides code intelligence tools for analyzing this codebase. \
             WORKFLOW: Start with 'semantic_search_with_context' or 'semantic_search_docs' to anchor on the right files and APIs - they provide the highest-quality context. \
             Then use 'find_symbol' and 'search_symbols' to lock onto exact files and kinds. \
-            Treat 'get_calls', 'find_callers', and 'analyze_impact' as hints; confirm with code reading or tighter queries (unique names, kind filters). \
+            'get_calls', 'find_callers', and 'analyze_impact' report call edges resolved statically at index time; an edge is only recorded when its target resolves unambiguously, so calls via dynamic dispatch (trait objects/interfaces), callbacks/closures, macro-generated code, or ambiguous same-named symbols may be missing, and common names can occasionally resolve to the wrong target. An empty or short result means no statically resolved edge was found - it is not evidence that the index is stale or that other tools are unreliable. To confirm, read the code or narrow the query (unique names, symbol_id, kind filters). \
+            {freshness_clause}\
             Use 'search_documents' to find relevant project documentation (markdown files). \
             Use 'get_index_info' to understand what's indexed. \
             OUTPUT FORMAT: every tool above accepts an optional `output_format` parameter, \
             either \"text\" (the default, human-readable) or \"json\" (a single machine-readable \
             content block containing a schema_version-tagged envelope with status \
             success/not_found/ambiguous/error and a typed `data` payload). Use \"json\" when \
-            you need to parse results programmatically rather than read prose.",
-        )
+            you need to parse results programmatically rather than read prose."
+        ))
     }
 
     async fn initialize(

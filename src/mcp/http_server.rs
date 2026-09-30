@@ -407,6 +407,11 @@ pub async fn serve_http(config: crate::Settings, watch: bool, bind: String) -> a
         }
     }
 
+    // Whether the unified watcher's watch task actually spawned, captured
+    // once here (not derived from config/CLI intent) and reused for every
+    // per-session server instance below.
+    let unified_watcher_active = unified_watcher_handle.is_some();
+
     // Create streamable HTTP service for MCP connections
     let indexer_for_service = indexer.clone();
     let config_for_service = Arc::new(config.clone());
@@ -421,7 +426,8 @@ pub async fn serve_http(config: crate::Settings, watch: bool, bind: String) -> a
                 indexer_for_service.clone(),
                 config_for_service.clone(),
             )
-            .with_broadcaster(broadcaster.clone());
+            .with_broadcaster(broadcaster.clone())
+            .with_file_watch(unified_watcher_active);
 
             // Attach document store if available
             let server = if let Some(ref store_arc) = document_store_for_service {
