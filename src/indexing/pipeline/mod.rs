@@ -49,7 +49,7 @@ pub use stages::parse::{ParseStage, init_parser_cache, parse_file, preflight_fil
 pub use stages::resolve::{ResolveStage, ResolveStats};
 pub use stages::semantic_embed::{SemanticEmbedStage, SemanticEmbedStats};
 pub use stages::write::{WriteStage, WriteStats};
-pub use stats::{IncrementalStats, Phase2Stats, PipelineStats, StageTimings, SyncStats};
+pub use stats::{IncrementalStats, Phase2Stats, PipelineStats, StageTimings};
 pub use types::{
     DiscoverResult, EmbedOptions, EmbeddingBatch, FileBarriers, FileBindings, FileContent,
     FileRegistration, FileSource, IndexBatch, ParsedFile, Phase1Options, PipelineError,

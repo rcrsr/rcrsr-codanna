@@ -3,25 +3,6 @@
 use super::stages::cleanup::CleanupStats;
 use crate::indexing::IndexStats;
 
-/// Statistics from sync_with_config operation.
-#[derive(Debug, Default)]
-pub struct SyncStats {
-    /// Number of new directories indexed
-    pub added_dirs: usize,
-    /// Number of directories removed from index
-    pub removed_dirs: usize,
-    /// Total files indexed from new directories
-    pub files_indexed: usize,
-    /// Total symbols found in new directories
-    pub symbols_found: usize,
-    /// Files removed during cleanup
-    pub files_removed: usize,
-    /// Symbols removed during cleanup
-    pub symbols_removed: usize,
-    /// Time taken
-    pub elapsed: std::time::Duration,
-}
-
 /// Statistics from incremental indexing.
 #[derive(Debug, Default)]
 pub struct IncrementalStats {
