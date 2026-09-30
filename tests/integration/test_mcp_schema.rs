@@ -396,7 +396,7 @@ async fn test_get_info_instructions_describe_static_call_edges_for_all_construct
 }
 
 /// Proves the default-constructed server (no `with_file_watch` call, so
-/// `file_watch` stays `false`) describes the inactive-watcher state: edits
+/// `file_watch` stays `None`, treated as inactive) describes the inactive-watcher state: edits
 /// are not picked up until a manual `reindex`.
 #[tokio::test]
 async fn test_get_info_instructions_describe_inactive_file_watch_by_default() {
@@ -1008,14 +1008,14 @@ async fn get_index_info_text_staleness_warning_matches_fingerprint_mismatch() {
 
 /// `get_index_info` reports file-watch state in both output formats,
 /// sourced from the server's own `with_file_watch` value (never guessed):
-/// with the default server (no watcher), text says "Inactive" and the JSON
-/// envelope's `data.file_watch` is `false`; with `.with_file_watch(true)`,
+/// with the default server (state unknown), text says "Unknown" and the JSON
+/// envelope's `data.file_watch` is `null`; with `.with_file_watch(true)`,
 /// text says "Active" (and not "Inactive") and JSON `data.file_watch` is
 /// `true`. Fails if the field is dropped from either rendering, or if the
 /// two renderings disagree with each other or with the server's own state.
 #[tokio::test]
 async fn get_index_info_reports_file_watch_state_in_text_and_json() {
-    // Default server: file watching inactive.
+    // Default server: file-watch state unknown (never guessed as inactive).
     {
         let (_temp_dir, facade) = build_test_facade();
         let server = CodeIntelligenceServer::new(facade);
@@ -1028,8 +1028,8 @@ async fn get_index_info_reports_file_watch_state_in_text_and_json() {
             .expect("get_index_info (text) should succeed");
         let text = call_tool_result_text(&text_result);
         assert!(
-            text.contains("Inactive"),
-            "default server's text output must report file watching as Inactive, got:\n{text}"
+            text.contains("Unknown") && !text.contains("Inactive"),
+            "default server's text output must report file watching as Unknown, got:\n{text}"
         );
 
         let json_result = server
@@ -1041,8 +1041,8 @@ async fn get_index_info_reports_file_watch_state_in_text_and_json() {
         let envelope = call_tool_result_json(&json_result);
         assert_eq!(
             envelope["data"]["file_watch"],
-            serde_json::json!(false),
-            "default server's JSON envelope must report data.file_watch=false, got: {envelope:?}"
+            serde_json::Value::Null,
+            "default server's JSON envelope must report data.file_watch=null, got: {envelope:?}"
         );
     }
 
@@ -1078,7 +1078,7 @@ async fn get_index_info_reports_file_watch_state_in_text_and_json() {
     }
 
     println!(
-        "[OK] get_index_info reports file-watch state consistently in text (Active/Inactive) and JSON (data.file_watch)."
+        "[OK] get_index_info reports file-watch state consistently in text (Active/Inactive/Unknown) and JSON (data.file_watch)."
     );
 }
 

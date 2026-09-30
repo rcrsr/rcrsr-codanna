@@ -28,7 +28,7 @@ impl CodeIntelligenceServer {
         if output_format == OutputFormat::Json {
             return Ok(json_result(service::index_info_envelope(
                 &indexer,
-                Some(self.file_watch()),
+                self.file_watch(),
             )));
         }
         let symbol_count = indexer.symbol_count();
@@ -66,10 +66,10 @@ impl CodeIntelligenceServer {
 
         let file_watch_info = format!(
             "\n\nFile Watching:\n  - Status: {}",
-            if self.file_watch() {
-                "Active"
-            } else {
-                "Inactive"
+            match self.file_watch() {
+                Some(true) => "Active",
+                Some(false) => "Inactive",
+                None => "Unknown",
             }
         );
 

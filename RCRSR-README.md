@@ -779,10 +779,11 @@ upstream.
   watcher actually started (a `--watch` stdio session, or `--http`/`--https`
   with the watcher spawned), not just `[file_watch] enabled = true` in
   config, since a disabled or failed-to-start watcher never picks up edits.
-  `get_index_info` reports the same state: `Active`/`Inactive` in its text
-  output, and `file_watch: true | false | null` in JSON, where `null` means
+  `get_index_info` reports the same state: `Active`/`Inactive`/`Unknown` in its
+  text output, and `file_watch: true | false | null` in JSON, where `null` means
   the CLI one-shot path (`codanna mcp get_index_info`, which has only a
-  facade and no running server) rather than a guessed `false`.
+  facade and no running server; text output says `Unknown`) rather than a
+  guessed `false`.
 
 ### Test/production classification on `find_callers`
 

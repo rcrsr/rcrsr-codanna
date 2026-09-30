@@ -81,9 +81,10 @@ pub struct CodeIntelligenceServer {
     broadcaster: Option<Arc<crate::mcp::notifications::NotificationBroadcaster>>,
     /// Whether the serve path's unified file watcher actually started for
     /// this server. Set once via [`Self::with_file_watch`] and not updated
-    /// after startup; defaults to `false` ("not known to be watching")
-    /// because no constructor here starts a watcher itself.
-    file_watch: bool,
+    /// after startup; `None` ("unknown") until then, because no constructor
+    /// here starts a watcher itself and a bare server (e.g. the CLI one-shot
+    /// path) has no way to know whether another process is watching.
+    file_watch: Option<bool>,
 }
 
 impl CodeIntelligenceServer {
@@ -94,7 +95,7 @@ impl CodeIntelligenceServer {
             tool_router: Self::symbols_router() + Self::search_router() + Self::admin_router(),
             peer: Arc::new(Mutex::new(None)),
             broadcaster: None,
-            file_watch: false,
+            file_watch: None,
         }
     }
 
@@ -106,7 +107,7 @@ impl CodeIntelligenceServer {
             tool_router: Self::symbols_router() + Self::search_router() + Self::admin_router(),
             peer: Arc::new(Mutex::new(None)),
             broadcaster: None,
-            file_watch: false,
+            file_watch: None,
         }
     }
 
@@ -118,7 +119,7 @@ impl CodeIntelligenceServer {
             tool_router: Self::symbols_router() + Self::search_router() + Self::admin_router(),
             peer: Arc::new(Mutex::new(None)),
             broadcaster: None,
-            file_watch: false,
+            file_watch: None,
         }
     }
 
@@ -136,15 +137,15 @@ impl CodeIntelligenceServer {
     /// source edits are picked up automatically or require a manual
     /// `reindex`.
     pub fn with_file_watch(mut self, active: bool) -> Self {
-        self.file_watch = active;
+        self.file_watch = Some(active);
         self
     }
 
     /// Whether this server instance has a file watcher active, as captured
     /// via [`Self::with_file_watch`]. Exposed for `get_index_info`
     /// (`crate::mcp::tools::search`), which is outside `file_watch`'s
-    /// module-privacy scope.
-    pub(crate) fn file_watch(&self) -> bool {
+    /// module-privacy scope. `None` means the state is unknown.
+    pub(crate) fn file_watch(&self) -> Option<bool> {
         self.file_watch
     }
 
@@ -245,7 +246,7 @@ impl ServerHandler for CodeIntelligenceServer {
     }
 
     fn get_info(&self) -> ServerInfo {
-        let watch_sentence = if self.file_watch {
+        let watch_sentence = if self.file_watch == Some(true) {
             "A file watcher is active for this server, so on-disk source changes - including uncommitted edits and new files - are picked up automatically after a short debounce; this is not instant, so a read immediately after an edit can still race the watcher. "
         } else {
             "No file watcher is active for this server, so edits made after the index was built are not picked up until you call the 'reindex' tool. "
