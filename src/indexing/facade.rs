@@ -1653,18 +1653,21 @@ impl IndexFacade {
     /// Uses the Pipeline's cleanup stage to remove symbols and embeddings.
     pub fn remove_file(&mut self, path: impl AsRef<std::path::Path>) -> crate::IndexResult<()> {
         let path = &Self::canonical_or_raw(path.as_ref());
-        let semantic_path = self.semantic_dir();
-
-        use crate::indexing::pipeline::stages::CleanupStage;
-        let cleanup_stage = if let Some(ref sem) = self.semantic_search {
-            CleanupStage::new(Arc::clone(&self.document_index), &semantic_path)
-                .with_semantic(Arc::clone(sem))
-        } else {
-            CleanupStage::new(Arc::clone(&self.document_index), &semantic_path)
-        };
-
-        cleanup_stage.cleanup_files(std::slice::from_ref(path))?;
+        self.cleanup_stage()
+            .cleanup_files(std::slice::from_ref(path))?;
         Ok(())
+    }
+
+    /// Cleanup stage over this facade's index, with the semantic store
+    /// attached when semantic search is active.
+    fn cleanup_stage(&self) -> crate::indexing::pipeline::stages::CleanupStage {
+        use crate::indexing::pipeline::stages::CleanupStage;
+        let semantic_path = self.semantic_dir();
+        let stage = CleanupStage::new(Arc::clone(&self.document_index), &semantic_path);
+        match self.semantic_search {
+            Some(ref sem) => stage.with_semantic(Arc::clone(sem)),
+            None => stage,
+        }
     }
 
     /// Index a directory using the parallel pipeline.
@@ -2021,9 +2024,14 @@ impl IndexFacade {
         )?;
         stats.added_dirs = to_add.len() - skipped.len();
 
-        // Remove files from removed directories
-        for path in &to_remove {
-            self.remove_directory_files(path)?;
+        // Purge the removed roots' content. A failure propagates before the
+        // tracked set or `removed_dirs` change, so the next start retries.
+        if !to_remove.is_empty() {
+            let cleaned = self.remove_directory_files(&to_remove, &config_set)?;
+            tracing::info!(
+                "removed {cleaned} indexed files from {} dropped root(s)",
+                to_remove.len()
+            );
         }
         stats.removed_dirs = to_remove.len();
 
@@ -2040,11 +2048,43 @@ impl IndexFacade {
         Ok(stats)
     }
 
-    /// Remove all files from a directory.
-    fn remove_directory_files(&self, _dir: &Path) -> FacadeResult<()> {
-        // TODO: Implement using CleanupStage
-        // For now, this is a placeholder
-        Ok(())
+    /// Purge the indexed content (symbols, relationships, embeddings) of
+    /// dropped roots in one batched cleanup; returns the files cleaned.
+    ///
+    /// A stored file is purged when it lies under a removed root and under
+    /// no `survivors` root, so a removed root nested in a surviving one
+    /// purges nothing it shares. Stored paths are workspace-relative when
+    /// `workspace_root` is set, so each is resolved against it (lexically)
+    /// before comparing; it must not canonicalize per file, or a root
+    /// deleted from disk would never be purged. The stored form is what
+    /// cleanup keys on, so that is what gets passed on.
+    ///
+    /// `get_all_indexed_paths` caps at 100k files, so a purge on a larger
+    /// index is partial.
+    fn remove_directory_files(
+        &self,
+        removed: &[&PathBuf],
+        survivors: &HashSet<PathBuf>,
+    ) -> FacadeResult<usize> {
+        let workspace_root = self.settings.workspace_root.as_deref();
+        let files: Vec<PathBuf> = self
+            .document_index
+            .get_all_indexed_paths()?
+            .into_iter()
+            .filter(|stored| {
+                let abs = match workspace_root {
+                    Some(root) if stored.is_relative() => root.join(stored),
+                    _ => stored.clone(),
+                };
+                removed.iter().any(|r| abs.starts_with(r))
+                    && !survivors.iter().any(|s| abs.starts_with(s))
+            })
+            .collect();
+        if files.is_empty() {
+            return Ok(0);
+        }
+        self.cleanup_stage().cleanup_files(&files)?;
+        Ok(files.len())
     }
 
     /// Captures cloneable handles under the caller's lock so the heavy walk
@@ -7124,6 +7164,209 @@ mod tests {
         assert_eq!(stats.removed_dirs, 0);
         assert!(!facade.get_indexed_paths().contains(&missing));
         assert_eq!(facade.get_indexed_paths(), &set_of(&[&src]));
+    }
+
+    // Dropping a root from config purges its files, symbols and rows while
+    // the surviving root stays intact.
+    #[test]
+    fn sync_removed_root_purges_its_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let (src, tests) = write_two_root_python_fixture(dir.path());
+        let src = src.canonicalize().unwrap();
+        let tests = tests.canonicalize().unwrap();
+        let mut facade = two_root_facade(dir.path(), &src, &tests);
+        facade.index_directory(&src, false).unwrap();
+        facade.index_directory(&tests, false).unwrap();
+        let docs_before = facade.document_count().unwrap();
+        assert_eq!(
+            facade
+                .find_symbols_by_name("test_target_function", None)
+                .len(),
+            1
+        );
+
+        let stats = facade
+            .sync_with_config(
+                Some(vec![src.clone(), tests.clone()]),
+                std::slice::from_ref(&src),
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(stats.removed_dirs, 1);
+        assert!(facade.document_count().unwrap() < docs_before);
+        assert!(
+            facade
+                .find_symbols_by_name("test_target_function", None)
+                .is_empty()
+        );
+        assert_eq!(
+            facade.find_symbols_by_name("target_function", None).len(),
+            1
+        );
+    }
+
+    // A removed root nested under a surviving root keeps the shared files;
+    // a removed parent purges its files outside the surviving child.
+    #[test]
+    fn sync_removed_nested_root_respects_survivors() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        let child = parent.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(parent.join("top.py"), "def top_symbol():\n    return 1\n").unwrap();
+        std::fs::write(
+            child.join("inner.py"),
+            "def inner_symbol():\n    return 2\n",
+        )
+        .unwrap();
+        let parent = parent.canonicalize().unwrap();
+        let child = child.canonicalize().unwrap();
+        let settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+        facade.index_directory(&parent, false).unwrap();
+
+        // Child dropped, parent survives: nothing purged.
+        let stats = facade
+            .sync_with_config(
+                Some(vec![parent.clone(), child.clone()]),
+                std::slice::from_ref(&parent),
+                false,
+            )
+            .unwrap();
+        assert_eq!(stats.removed_dirs, 1);
+        assert_eq!(facade.find_symbols_by_name("inner_symbol", None).len(), 1);
+        assert_eq!(facade.find_symbols_by_name("top_symbol", None).len(), 1);
+
+        // Parent dropped, child survives: only the child's files remain.
+        facade
+            .sync_with_config(
+                Some(vec![parent.clone()]),
+                std::slice::from_ref(&child),
+                false,
+            )
+            .unwrap();
+        assert!(facade.find_symbols_by_name("top_symbol", None).is_empty());
+        assert_eq!(facade.find_symbols_by_name("inner_symbol", None).len(), 1);
+    }
+
+    // A root deleted from disk is still purged: matching is lexical on the
+    // stored paths, never per-file canonicalization.
+    #[test]
+    fn sync_removed_root_deleted_from_disk_is_purged() {
+        let dir = tempfile::tempdir().unwrap();
+        let (src, tests) = write_two_root_python_fixture(dir.path());
+        let src = src.canonicalize().unwrap();
+        let tests = tests.canonicalize().unwrap();
+        let mut facade = two_root_facade(dir.path(), &src, &tests);
+        facade.index_directory(&src, false).unwrap();
+        facade.index_directory(&tests, false).unwrap();
+        std::fs::remove_dir_all(&tests).unwrap();
+
+        let stats = facade
+            .sync_with_config(
+                Some(vec![src.clone(), tests.clone()]),
+                std::slice::from_ref(&src),
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(stats.removed_dirs, 1);
+        assert!(
+            facade
+                .find_symbols_by_name("test_target_function", None)
+                .is_empty()
+        );
+        assert_eq!(
+            facade.find_symbols_by_name("target_function", None).len(),
+            1
+        );
+    }
+
+    fn workspace_facade(index_dir: &Path, root: &Path) -> IndexFacade {
+        let settings = Settings {
+            index_path: index_dir.join("index"),
+            workspace_root: Some(root.to_path_buf()),
+            ..Default::default()
+        };
+        IndexFacade::new(std::sync::Arc::new(settings)).unwrap()
+    }
+
+    // With `workspace_root` set (every real run) stored paths are
+    // workspace-relative; the purge must still find the removed root.
+    #[test]
+    fn sync_removed_root_purges_with_workspace_root_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let (src, tests) = write_two_root_python_fixture(dir.path());
+        let root = dir.path().canonicalize().unwrap();
+        let src = src.canonicalize().unwrap();
+        let tests = tests.canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let mut facade = workspace_facade(outside.path(), &root);
+        facade.index_directory(&src, false).unwrap();
+        facade.index_directory(&tests, false).unwrap();
+        let docs_before = facade.document_count().unwrap();
+        assert_eq!(
+            facade
+                .find_symbols_by_name("test_target_function", None)
+                .len(),
+            1
+        );
+
+        let stats = facade
+            .sync_with_config(
+                Some(vec![src.clone(), tests.clone()]),
+                std::slice::from_ref(&src),
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(stats.removed_dirs, 1);
+        assert!(facade.document_count().unwrap() < docs_before);
+        assert!(
+            facade
+                .find_symbols_by_name("test_target_function", None)
+                .is_empty()
+        );
+        assert_eq!(
+            facade.find_symbols_by_name("target_function", None).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn sync_removed_parent_keeps_surviving_child_with_workspace_root_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        let child = parent.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(parent.join("top.py"), "def top_symbol():\n    return 1\n").unwrap();
+        std::fs::write(
+            child.join("inner.py"),
+            "def inner_symbol():\n    return 2\n",
+        )
+        .unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let parent = parent.canonicalize().unwrap();
+        let child = child.canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let mut facade = workspace_facade(outside.path(), &root);
+        facade.index_directory(&parent, false).unwrap();
+
+        facade
+            .sync_with_config(
+                Some(vec![parent.clone()]),
+                std::slice::from_ref(&child),
+                false,
+            )
+            .unwrap();
+
+        assert!(facade.find_symbols_by_name("top_symbol", None).is_empty());
+        assert_eq!(facade.find_symbols_by_name("inner_symbol", None).len(), 1);
     }
 
     #[test]

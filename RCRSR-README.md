@@ -523,7 +523,11 @@ Two separate stores track directory roots, and they are pruned differently:
   directory indexed once and later deleted — and each such rebuild then
   warns once per stale entry (`Skipping stale indexed path …`) rather than
   failing on it. The warning points at `codanna remove-dir <path>`, which
-  edits this file.
+  edits this file. Removing an entry from this list purges that root's
+  indexed content (files, symbols, relationships, embeddings) at the next
+  startup sync, except files still covered by another configured root. If the
+  purge fails the sync errors and retries on the next start; on an index of
+  more than 100k files the purge is partial.
 - **Each generation's `index.meta`** — the directory roots that generation
   was actually built from. Its own ghost (no longer a directory on disk) and
   stray (outside `workspace_root` *and* not listed under
