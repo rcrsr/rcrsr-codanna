@@ -24,6 +24,29 @@
       "_conduct": true
     },
     {
+      "name": "codanna-settings",
+      "paths": [
+        ".codanna"
+      ],
+      "checks": {
+        ".toml": [
+          {
+            "name": "codanna-settings",
+            "command": "node",
+            "args": [
+              "conduct/resources/scripts/check-codanna-settings.mjs",
+              "--file",
+              "$FILE",
+              "--json"
+            ],
+            "parser": "jsonl",
+            "_conduct": true
+          }
+        ]
+      },
+      "_conduct": true
+    },
+    {
       "name": "rust",
       "paths": [
         "."

@@ -1048,7 +1048,10 @@ async fn run_stdio_server(
         eprintln!("Hot-reload watcher started");
     }
 
-    // Start unified file watcher if enabled
+    // Start unified file watcher if enabled. This tracks whether the watch
+    // task actually spawned (not the config/CLI intent to watch), so it can
+    // be reported accurately via `with_file_watch` below.
+    let mut unified_watcher_started = false;
     if watch || config.file_watch.enabled {
         use crate::watcher::UnifiedWatcher;
         use crate::watcher::handlers::{CodeFileHandler, ConfigFileHandler, DocumentFileHandler};
@@ -1104,6 +1107,7 @@ async fn run_stdio_server(
         // Build and start the unified watcher
         match builder.build() {
             Ok(unified_watcher) => {
+                unified_watcher_started = true;
                 tokio::spawn(async move {
                     if let Err(e) = unified_watcher.watch().await {
                         eprintln!("Unified watcher error: {e}");
@@ -1126,6 +1130,8 @@ async fn run_stdio_server(
             }
         }
     }
+
+    let server = server.with_file_watch(unified_watcher_started);
 
     // Start server with stdio transport
     use rmcp::{ServerHandler, ServiceExt};

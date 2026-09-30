@@ -911,6 +911,12 @@ fn staleness_round_trip_detects_ignore_rule_changes_after_index() {
         info3_stdout.contains("index may be stale: ignore rules changed since last index"),
         "text output must warn about stale ignore rules\nstdout:\n{info3_stdout}"
     );
+    // The one-shot CLI has no serving process, so file-watch state is unknown
+    // and must never be asserted as inactive.
+    assert!(
+        !info3_stdout.contains("Inactive") && info3_stdout.contains("Unknown"),
+        "one-shot text output must not claim the watcher is Inactive\nstdout:\n{info3_stdout}"
+    );
 }
 
 #[test]

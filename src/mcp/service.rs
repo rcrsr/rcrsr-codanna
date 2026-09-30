@@ -938,6 +938,13 @@ pub struct IndexInfo {
     /// reported as `Some(true)` ("changed"). Detect-and-report only: this
     /// does not trigger reindexing or reconciliation (issue #28).
     pub ignore_rules_changed: Option<bool>,
+    /// Whether a file watcher is active for the serving process that
+    /// answered this request. `None` means no serving process / not
+    /// applicable / unknown -- e.g. the CLI one-shot path (`codanna mcp
+    /// get_index_info`), which has only a facade and no server, always
+    /// reports `None` here rather than guessing `Some(false)`. Mirrors
+    /// [`IndexInfo::ignore_rules_changed`]'s never-fabricate semantics.
+    pub file_watch: Option<bool>,
     pub generation: GenerationInfo,
 }
 
@@ -1014,6 +1021,10 @@ pub fn index_info_data(facade: &IndexFacade) -> IndexInfo {
         languages,
         semantic_search,
         ignore_rules_changed: ignore_rules_changed(facade),
+        // `index_info_data` has only a facade, no server, so it never knows
+        // watch state; `index_info_envelope` overlays the real value when a
+        // caller has one (see `IndexInfo::file_watch`).
+        file_watch: None,
         generation: GenerationInfo {
             id: facade.generation_id().as_str().to_string(),
             state: crate::storage::generation::classify(
@@ -1533,9 +1544,13 @@ pub fn semantic_search_with_context_envelope(
     envelope
 }
 
-/// Build the `get_index_info` envelope.
-pub fn index_info_envelope(facade: &IndexFacade) -> Envelope<IndexInfo> {
-    let info = index_info_data(facade);
+/// Build the `get_index_info` envelope. `file_watch` is the calling
+/// server's watch-state (`None` when there is no serving process, e.g. the
+/// CLI one-shot path) and is overlaid onto the `IndexInfo` built from
+/// `facade` alone, which cannot know it.
+pub fn index_info_envelope(facade: &IndexFacade, file_watch: Option<bool>) -> Envelope<IndexInfo> {
+    let mut info = index_info_data(facade);
+    info.file_watch = file_watch;
     let hint =
         generate_guidance_from_config(&facade.settings().guidance, "get_index_info", None, 1);
     let mut envelope = Envelope::success(info).with_message("Index statistics");

@@ -121,10 +121,21 @@ impl Drop for HttpServe {
 }
 
 fn spawn_http_serve(workspace: &Path) -> HttpServe {
+    spawn_http_serve_with_args(workspace, &[])
+}
+
+fn spawn_http_serve_with_args(workspace: &Path, extra_args: &[&str]) -> HttpServe {
     let port = free_port();
     let test_home = workspace.join(".home");
+    let mut args = vec![
+        "serve".to_string(),
+        "--http".to_string(),
+        "--bind".to_string(),
+        format!("127.0.0.1:{port}"),
+    ];
+    args.extend(extra_args.iter().map(|s| s.to_string()));
     let child = Command::new(codanna_binary())
-        .args(["serve", "--http", "--bind", &format!("127.0.0.1:{port}")])
+        .args(&args)
         .current_dir(workspace)
         .env("HOME", &test_home)
         .stdin(Stdio::null())
@@ -146,6 +157,56 @@ fn spawn_http_serve(workspace: &Path) -> HttpServe {
         );
         std::thread::sleep(Duration::from_millis(200));
     }
+}
+
+/// Settings variant with `[file_watch] enabled = false` — used to prove
+/// the reported watch state tracks whether the unified watcher's task
+/// actually spawned, not `config.file_watch.enabled` (which `--watch`
+/// overrides at the CLI level regardless of this setting).
+fn write_settings_file_watch_disabled(workspace: &Path) {
+    let codanna_dir = workspace.join(".codanna");
+    std::fs::create_dir_all(&codanna_dir).expect("create .codanna");
+
+    let src_abs = workspace
+        .join("src")
+        .canonicalize()
+        .expect("src dir should exist and be resolvable");
+    let src_path = crate::common::toml_path_literal(&src_abs);
+
+    let settings = format!(
+        r#"
+index_path = ".codanna/index"
+
+[indexing]
+indexed_paths = [{src_path}]
+
+[semantic_search]
+enabled = false
+
+[file_watch]
+enabled = false
+"#
+    );
+
+    std::fs::write(codanna_dir.join("settings.toml"), settings).expect("write settings");
+}
+
+fn seed_workspace_with_file_watch_disabled() -> TempDir {
+    let workspace = TempDir::new().expect("temp dir");
+    write_fixture(workspace.path());
+    write_settings_file_watch_disabled(workspace.path());
+    let test_home = workspace.path().join(".home");
+    std::fs::create_dir_all(&test_home).expect("create test home");
+    let status = Command::new(codanna_binary())
+        .args(["index", "src", "--no-progress"])
+        .current_dir(workspace.path())
+        .env("HOME", &test_home)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("run seed index");
+    assert!(status.success(), "seed index should succeed");
+    workspace
 }
 
 /// Minimal HTTP/1.1 exchange over std TCP. SSE responses never EOF, so
@@ -514,6 +575,56 @@ fn serve_http_stateless_missing_meta_invalid_params() {
         payload["result"]["tools"].as_array().map(Vec::len),
         Some(13),
         "well-formed request still serves\n{payload}"
+    );
+}
+
+/// The reported watch state tracks whether the unified watcher's task
+/// actually spawned, not `config.file_watch.enabled`: with `[file_watch]
+/// enabled = false` in settings and `--watch` on the CLI, the watcher
+/// still starts (the CLI flag forces it on independent of the config
+/// value), so a stateless `get_index_info` call must report the watcher
+/// as active. This catches HTTP wiring (`.with_file_watch(...)`) that
+/// was silently skipped at the per-session server-construction closure.
+#[test]
+fn serve_http_stateless_get_index_info_reports_active_watch() {
+    let workspace = seed_workspace_with_file_watch_disabled();
+    let serve = spawn_http_serve_with_args(workspace.path(), &["--watch"]);
+
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "_meta": stateless_meta(),
+            "name": "get_index_info",
+            "arguments": {}
+        }
+    })
+    .to_string();
+
+    let (status, head, resp_body) = http_request(
+        serve.port,
+        "POST",
+        "/mcp",
+        &mcp_headers(
+            "tools/call",
+            &[
+                ("MCP-Protocol-Version", "2026-07-28"),
+                ("Mcp-Name", "get_index_info"),
+            ],
+        ),
+        Some(&body),
+    );
+
+    assert_eq!(status, 200, "stateless tools/call succeeds\nhead:\n{head}");
+    let payload = response_payload(&resp_body);
+    let text = payload["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("get_index_info returns text content\n{payload}"));
+    assert!(
+        text.contains("File Watching") && text.contains("Active"),
+        "get_index_info must report the watcher as active when --watch \
+         spawned it, despite [file_watch] enabled = false in config\n{text}"
     );
 }
 
