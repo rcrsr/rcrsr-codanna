@@ -450,6 +450,19 @@ impl Default for ProjectRegistry {
 
 // Path Resolution Utilities
 
+/// Directory that relative paths in a config file resolve against: the
+/// workspace root when the file sits in the local config directory
+/// (`<root>/.codanna/settings.toml`), otherwise the file's own directory.
+pub(crate) fn config_anchor_dir(config_path: &Path) -> Option<PathBuf> {
+    let parent = config_path.parent()?;
+    if parent.file_name() == Some(std::ffi::OsStr::new(local_dir_name()))
+        && let Some(workspace) = parent.parent()
+    {
+        return Some(workspace.to_path_buf());
+    }
+    Some(parent.to_path_buf())
+}
+
 /// Resolve the index path from settings, accounting for --config flag usage
 ///
 /// When using --config from outside the project:
@@ -468,18 +481,9 @@ pub fn resolve_index_path(
 
     // If we loaded from a specific config file, resolve relative to it
     if let Some(cfg_path) = config_path
-        && let Some(parent) = cfg_path.parent()
+        && let Some(base) = config_anchor_dir(cfg_path)
     {
-        // Check if parent is our local config directory
-        let local_dir = local_dir_name();
-        if parent.file_name() == Some(std::ffi::OsStr::new(local_dir)) {
-            // Go up one more level to get workspace root
-            if let Some(workspace) = parent.parent() {
-                return workspace.join(&settings.index_path);
-            }
-        }
-        // Otherwise resolve relative to config directory
-        return parent.join(&settings.index_path);
+        return base.join(&settings.index_path);
     }
 
     // If workspace_root is set in settings, use it

@@ -3,17 +3,41 @@
 use super::Settings;
 use std::path::{Path, PathBuf};
 
+/// Make a (possibly CWD-relative) path absolute; keep it as-is on failure.
+fn absolutize(path: &Path) -> PathBuf {
+    std::path::absolute(path)
+        .or_else(|_| std::env::current_dir().map(|cwd| cwd.join(path)))
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
 impl Settings {
     /// The cache is the comparison surface (strip-base selection tests
     /// canonicalized file paths against it); hand-edited or legacy entries
     /// may carry symlink components, so canonicalize here. The serialized
     /// `indexing.indexed_paths` stays verbatim to round-trip the user's file.
-    pub(super) fn sync_indexed_path_cache(&mut self) {
+    ///
+    /// Relative entries resolve against an anchor: the directory derived from
+    /// `config_path` (itself made absolute first, since a relative config path
+    /// is CWD-relative by construction), else `workspace_root`, else the
+    /// current directory (only when neither is known). A relative entry whose
+    /// directory is missing keeps its absolute joined form.
+    pub(super) fn sync_indexed_path_cache(&mut self, config_path: Option<&Path>) {
+        let anchor = config_path
+            .map(absolutize)
+            .and_then(|p| crate::init::config_anchor_dir(&p))
+            .or_else(|| self.workspace_root.clone())
+            .or_else(|| std::env::current_dir().ok());
         self.indexed_paths_cache = self
             .indexing
             .indexed_paths
             .iter()
-            .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
+            .map(|p| {
+                let resolved = match (&anchor, p.is_relative()) {
+                    (Some(base), true) => base.join(p),
+                    _ => p.clone(),
+                };
+                resolved.canonicalize().unwrap_or(resolved)
+            })
             .collect();
     }
 
@@ -91,7 +115,8 @@ impl Settings {
         Ok(())
     }
 
-    /// Get all indexed paths
+    /// Get the verbatim configured `indexed_paths` entries (unresolved, as written in
+    /// settings); use `indexed_paths_cache` for anchor-resolved absolute roots.
     /// Returns empty vector if none are configured (maintains backward compatibility)
     pub fn get_indexed_paths(&self) -> Vec<PathBuf> {
         self.indexing.indexed_paths.clone()
@@ -101,6 +126,39 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use crate::Settings;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn sync_indexed_path_cache_falls_back_to_workspace_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("canonicalize");
+        std::fs::create_dir(root.join("src")).expect("create dir");
+
+        let mut settings = Settings {
+            workspace_root: Some(root.clone()),
+            ..Settings::default()
+        };
+        settings.indexing.indexed_paths = vec![PathBuf::from("."), PathBuf::from("src")];
+        settings.sync_indexed_path_cache(None);
+
+        assert_eq!(
+            settings.indexed_paths_cache,
+            vec![root.clone(), root.join("src")]
+        );
+    }
+
+    #[test]
+    fn sync_indexed_path_cache_absolutizes_relative_config_path() {
+        let mut settings = Settings::default();
+        settings.indexing.indexed_paths = vec![PathBuf::from(".")];
+        settings.sync_indexed_path_cache(Some(Path::new("settings.toml")));
+
+        let cwd = std::env::current_dir()
+            .expect("cwd")
+            .canonicalize()
+            .expect("canonicalize cwd");
+        assert_eq!(settings.indexed_paths_cache, vec![cwd]);
+    }
 
     #[test]
     fn remove_indexed_path_drops_a_directory_that_no_longer_exists() {

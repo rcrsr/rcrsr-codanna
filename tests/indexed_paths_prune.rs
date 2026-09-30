@@ -97,6 +97,8 @@ fn prune_drops_ghost_and_stray_entries_but_keeps_configured_out_of_tree_roots() 
             .canonicalize()
             .expect("canonicalize configured corpus"),
     ];
+    // `Settings::load` fills the resolved-roots cache that prune reads.
+    settings.indexed_paths_cache = settings.indexing.indexed_paths.clone();
     let settings = Arc::new(settings);
 
     let mut facade = IndexFacade::new(Arc::clone(&settings)).expect("create facade");
@@ -218,4 +220,52 @@ fn prune_without_workspace_root_drops_only_ghosts() {
         "with no workspace_root there is no stray criterion; existing dirs survive"
     );
     assert_eq!(after.len(), 2);
+}
+
+#[test]
+fn prune_with_unresolved_configured_roots_drops_only_ghosts() {
+    let temp = tempfile::tempdir().expect("create temp root");
+
+    let workspace_root = temp.path().join("workspace");
+    let in_root = workspace_root.join("src");
+    write_py_fixture(&in_root, "valid.py", "valid_symbol");
+    let configured_out_of_tree = temp.path().join("configured-corpus");
+    std::fs::create_dir_all(&configured_out_of_tree).expect("create configured corpus");
+    let ghost = temp.path().join("ghost-was-here");
+
+    // Raw entries set, resolved cache left empty (settings never loaded).
+    let mut settings = settings_for(&temp.path().join("index"), Some(workspace_root));
+    settings.indexing.indexed_paths = vec![
+        in_root.canonicalize().expect("canonicalize in-root dir"),
+        configured_out_of_tree
+            .canonicalize()
+            .expect("canonicalize configured corpus"),
+    ];
+    let settings = Arc::new(settings);
+
+    let mut facade = IndexFacade::new(Arc::clone(&settings)).expect("create facade");
+    let mut tracked = settings.indexing.indexed_paths.clone();
+    tracked.push(ghost.clone());
+    facade.set_indexed_paths(tracked);
+    facade
+        .index_directory(&in_root, false)
+        .expect("seed index with the in-root directory's symbols");
+    let persistence = IndexPersistence::new(settings.index_path.clone());
+    persistence
+        .save_facade(&facade)
+        .expect("save seeded facade");
+    drop(facade);
+
+    run_prune_indexed_paths(&settings);
+
+    let after = recorded_indexed_paths(&persistence);
+    assert!(!after.contains(&ghost), "ghost entry must still be pruned");
+    assert!(
+        after.contains(
+            &configured_out_of_tree
+                .canonicalize()
+                .expect("canonicalize configured corpus")
+        ),
+        "unresolved roots must not cause configured out-of-tree roots to be dropped"
+    );
 }

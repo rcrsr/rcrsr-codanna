@@ -138,7 +138,7 @@ pub fn run(
         }
     } else {
         // No CLI paths - use settings.toml indexed_paths
-        let config_paths = config.get_indexed_paths();
+        let config_paths = config.indexed_paths_cache.clone();
 
         if config_paths.is_empty() {
             eprintln!("Error: No paths to index");
@@ -621,12 +621,18 @@ pub fn run_prune_indexed_paths(config: &Settings) {
         .workspace_root
         .as_ref()
         .map(|root| root.canonicalize().unwrap_or_else(|_| root.clone()));
-    let configured_roots: Vec<PathBuf> = config
-        .indexing
-        .indexed_paths
-        .iter()
-        .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
-        .collect();
+    let configured_roots: &[PathBuf] = &config.indexed_paths_cache;
+    // Raw entries without resolved roots means the settings never went through
+    // `Settings::load`/`load_from`. Falling back to the raw list would resolve
+    // relative entries against the cwd, so skip the destructive stray rule.
+    let roots_unresolved =
+        config.indexed_paths_cache.is_empty() && !config.indexing.indexed_paths.is_empty();
+    if roots_unresolved {
+        eprintln!(
+            "Warning: configured indexed_paths are unresolved (settings not loaded via \
+             Settings::load/load_from); skipping stray-root pruning, ghosts only."
+        );
+    }
     let existing: Vec<PathBuf> = facade.get_indexed_paths().iter().cloned().collect();
 
     let mut retained: Vec<PathBuf> = Vec::new();
@@ -638,7 +644,7 @@ pub fn run_prune_indexed_paths(config: &Settings) {
             continue;
         }
 
-        if let Some(root) = &canonical_root {
+        if let Some(root) = canonical_root.as_ref().filter(|_| !roots_unresolved) {
             let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
             let in_root = canonical.starts_with(root);
             let configured = configured_roots.iter().any(|r| canonical.starts_with(r));

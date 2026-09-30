@@ -528,6 +528,22 @@ Two separate stores track directory roots, and they are pruned differently:
   startup sync, except files still covered by another configured root. If the
   purge fails the sync errors and retries on the next start; on an index of
   more than 100k files the purge is partial.
+
+  Relative entries (`"."`, `"src"`) resolve against the workspace, not the
+  directory you run `codanna` from. The anchor is the directory containing
+  `.codanna/` (for a config file outside `.codanna`, its parent directory; a
+  relative `--config` is first made absolute against the current directory),
+  then `workspace_root`, then the current directory as a last resort.
+  `settings.toml` keeps the entry exactly as written; only the in-memory
+  list is resolved. A relative entry naming a missing directory keeps its
+  absolute joined form, so it is skipped with a "not found" warning rather
+  than re-resolved against a different directory.
+  `--prune-indexed-paths` falls back to ghost-only pruning (with a warning)
+  if the resolved list is unavailable. Known limit: server-side reindex
+  paths that read the raw list (`reindex` / `codanna mcp reindex` with no
+  `paths`, the stale-generation check) still resolve relative entries
+  against the process directory, so prefer absolute entries if you start
+  `serve` from a subdirectory.
 - **Each generation's `index.meta`** — the directory roots that generation
   was actually built from. Its own ghost (no longer a directory on disk) and
   stray (outside `workspace_root` *and* not listed under

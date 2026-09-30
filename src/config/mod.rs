@@ -23,7 +23,7 @@ use figment::{
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 mod defaults;
 mod init;
@@ -585,7 +585,9 @@ impl Settings {
     pub fn load() -> Result<Self, Box<figment::Error>> {
         // Try to find the workspace root by looking for config directory
         let local_dir = crate::init::local_dir_name();
-        let config_path = Self::find_workspace_config()
+        let found_config = Self::find_workspace_config();
+        let config_path = found_config
+            .clone()
             .unwrap_or_else(|| PathBuf::from(local_dir).join("settings.toml"));
 
         Figment::new()
@@ -610,7 +612,7 @@ impl Settings {
                 if settings.workspace_root.is_none() {
                     settings.workspace_root = Self::workspace_root();
                 }
-                let settings = settings.normalize_loaded();
+                let settings = settings.normalize_loaded(found_config.as_deref());
 
                 // `churn_threshold` is reserved for a future churn-based
                 // refresh trigger and is not yet consumed by the watcher;
@@ -631,13 +633,13 @@ impl Settings {
     /// canonicalized file paths downstream; a symlink component in a recorded
     /// path silently kills those comparisons. Canonicalize at the load
     /// boundary; nonexistent paths stay verbatim.
-    fn normalize_loaded(mut self) -> Self {
+    fn normalize_loaded(mut self, config_path: Option<&Path>) -> Self {
         if let Some(root) = self.workspace_root.take() {
             self.workspace_root = Some(root.canonicalize().unwrap_or(root));
         }
         self.server.spawn_timeout_ms = self.server.spawn_timeout_ms.min(MAX_SPAWN_WAIT_MS);
         self.server.spawn_max_wait_ms = self.server.spawn_max_wait_ms.min(MAX_SPAWN_WAIT_MS);
-        self.sync_indexed_path_cache();
+        self.sync_indexed_path_cache(config_path);
         self
     }
 
@@ -706,12 +708,13 @@ impl Settings {
 
     /// Load configuration from a specific file
     pub fn load_from(path: impl AsRef<std::path::Path>) -> Result<Self, Box<figment::Error>> {
+        let config_path = path.as_ref().to_path_buf();
         Figment::new()
             .merge(Serialized::defaults(Settings::default()))
-            .merge(Toml::file(path))
+            .merge(Toml::file(&config_path))
             .merge(Env::prefixed("CI_").split("_"))
             .extract()
-            .map(Settings::normalize_loaded)
+            .map(|settings: Settings| settings.normalize_loaded(Some(&config_path)))
             .map_err(Box::new)
     }
 
@@ -910,6 +913,94 @@ enabled = false
             vec![link],
             "serialized list must round-trip the user's file verbatim"
         );
+    }
+
+    fn write_settings(dir: &Path, name: &str, body: &str) -> PathBuf {
+        fs::create_dir_all(dir).unwrap();
+        let path = dir.join(name);
+        fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn load_from_resolves_relative_indexed_paths_against_workspace_not_cwd() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        let config = write_settings(
+            &root.join(crate::init::local_dir_name()),
+            "settings.toml",
+            "[indexing]\nindexed_paths = [\".\", \"src\"]\n",
+        );
+
+        let settings = Settings::load_from(&config).unwrap();
+        assert_eq!(
+            settings.indexed_paths_cache,
+            vec![root.clone(), root.join("src")]
+        );
+        assert_eq!(
+            settings.indexing.indexed_paths,
+            vec![PathBuf::from("."), PathBuf::from("src")]
+        );
+    }
+
+    #[test]
+    fn load_from_resolves_relative_paths_against_config_parent_outside_local_dir() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path().canonicalize().unwrap();
+        let config = write_settings(
+            &root,
+            "custom.toml",
+            "[indexing]\nindexed_paths = [\".\"]\n",
+        );
+
+        let settings = Settings::load_from(&config).unwrap();
+        assert_eq!(settings.indexed_paths_cache, vec![root]);
+    }
+
+    #[test]
+    fn load_from_keeps_absolute_joined_path_for_missing_relative_root() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path().canonicalize().unwrap();
+        let config = write_settings(
+            &root.join(crate::init::local_dir_name()),
+            "settings.toml",
+            "[indexing]\nindexed_paths = [\"missing\"]\n",
+        );
+
+        let settings = Settings::load_from(&config).unwrap();
+        assert_eq!(settings.indexed_paths_cache, vec![root.join("missing")]);
+    }
+
+    #[test]
+    fn load_from_ignores_stale_serialized_workspace_root_for_relative_paths() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path().canonicalize().unwrap();
+        let config = write_settings(
+            &root.join(crate::init::local_dir_name()),
+            "settings.toml",
+            "workspace_root = \"/nonexistent/old\"\n[indexing]\nindexed_paths = [\".\"]\n",
+        );
+
+        let settings = Settings::load_from(&config).unwrap();
+        assert_eq!(settings.indexed_paths_cache, vec![root]);
+    }
+
+    #[test]
+    fn save_round_trips_relative_indexed_paths_verbatim() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path().canonicalize().unwrap();
+        let config = write_settings(
+            &root.join(crate::init::local_dir_name()),
+            "settings.toml",
+            "[indexing]\nindexed_paths = [\".\"]\n",
+        );
+
+        let settings = Settings::load_from(&config).unwrap();
+        let saved = root.join("saved.toml");
+        settings.save(&saved).unwrap();
+        let reloaded = Settings::load_from(&saved).unwrap();
+        assert_eq!(reloaded.indexing.indexed_paths, vec![PathBuf::from(".")]);
     }
 
     #[test]

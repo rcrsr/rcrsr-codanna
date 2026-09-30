@@ -639,8 +639,8 @@ async fn main() {
             if missing {
                 std::process::exit(1);
             }
-        } else if index_preexisted && !config.indexing.indexed_paths.iter().any(|p| p.exists()) {
-            for path in &config.indexing.indexed_paths {
+        } else if index_preexisted && !config.indexed_paths_cache.iter().any(|p| p.exists()) {
+            for path in &config.indexed_paths_cache {
                 eprintln!(
                     "Error: Configured path does not exist: {}",
                     codanna::parsing::paths::render_absolute_path(path).display()
@@ -694,7 +694,7 @@ async fn main() {
     let seed_report = if let Some(ref mut h) = handle {
         Some(seed_indexer_with_config_paths(
             h.facade_mut(),
-            &config.indexing.indexed_paths,
+            &config.indexed_paths_cache,
         ))
     } else {
         None
@@ -749,8 +749,7 @@ async fn main() {
                     .filter_map(|p| p.canonicalize().ok())
                     .collect();
                 let not_rebuilt: Vec<String> = config
-                    .indexing
-                    .indexed_paths
+                    .indexed_paths_cache
                     .iter()
                     .filter(|p| {
                         let canon = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
@@ -785,10 +784,9 @@ async fn main() {
                     "Rebuilding index for configured roots: {}",
                     roots.join(", ")
                 );
-            } else if !config.indexing.indexed_paths.is_empty() {
+            } else if !config.indexed_paths_cache.is_empty() {
                 let roots: Vec<String> = config
-                    .indexing
-                    .indexed_paths
+                    .indexed_paths_cache
                     .iter()
                     .map(|p| {
                         codanna::parsing::paths::render_absolute_path(p)
@@ -853,7 +851,7 @@ async fn main() {
         config: &Settings,
         show_progress: bool,
     ) -> codanna::indexing::SyncStats {
-        match on.sync_with_config(stored_paths, &config.indexing.indexed_paths, show_progress) {
+        match on.sync_with_config(stored_paths, &config.indexed_paths_cache, show_progress) {
             Ok(stats) => {
                 if stats.added_dirs > 0 {
                     tracing::info!(
@@ -937,7 +935,7 @@ async fn main() {
             // a no-op sync and no throwaway build is opened.
             let stored_set =
                 IndexFacade::canonical_path_set(metadata.indexed_paths.iter().flatten());
-            let config_set = IndexFacade::canonical_path_set(&config.indexing.indexed_paths);
+            let config_set = IndexFacade::canonical_path_set(&config.indexed_paths_cache);
 
             if IndexFacade::indexed_paths_need_sync(&stored_set, &config_set) {
                 match persistence.open_build(settings.clone(), BuildMode::CloneCurrent) {
@@ -1265,7 +1263,7 @@ async fn main() {
             // no-op build becomes an orphan generation reclaimed by a later
             // `gc` pass, never manually cleaned up at this call site.
             if watch {
-                let paths = config.get_indexed_paths();
+                let paths = config.indexed_paths_cache.clone();
                 if !paths.is_empty() {
                     match persistence.open_build(settings.clone(), BuildMode::CloneCurrent) {
                         Ok(mut build) => {
