@@ -4,8 +4,8 @@ use super::stages::{CleanupStage, CollectStage, DiscoverStage, IndexStage, ReadS
 use super::{
     CleanupStats, DiscoverResult, EmbedOptions, FileBarriers, FileBindings, FileSource,
     IncrementalStats, ParseStage, Phase1Options, Phase2Stats, Pipeline, PipelineError,
-    PipelineResult, ProgressSink, SingleFileStats, SymbolLookupCache, SyncStats,
-    UnresolvedRelationship, init_parser_cache,
+    PipelineResult, ProgressSink, SingleFileStats, SymbolLookupCache, UnresolvedRelationship,
+    init_parser_cache,
 };
 use crate::FileId;
 use crate::indexing::IndexStats;
@@ -358,13 +358,13 @@ impl Pipeline {
     ) -> PipelineResult<IncrementalStats> {
         // Callers of this entry point always process exactly one root per
         // call and, for force mode, either walk every registered root
-        // (`indexed_paths.len() == 1` implies this is the only one) or a
+        // (`resolved_indexed_paths().len() == 1` implies this is the only one) or a
         // single new directory being folded into an existing single-root
         // workspace. Batches that force-reindex several explicit
         // sub-paths of one registered root in the same call must use
         // `index_incremental_scoped` instead, or the fast path wrongly
         // scopes symbol resolution to just this walk.
-        let single_root_batch = self.settings.indexing.indexed_paths.len() <= 1;
+        let single_root_batch = self.settings.resolved_indexed_paths().len() <= 1;
         self.index_incremental_with_progress(
             root,
             index,
@@ -982,186 +982,6 @@ impl Pipeline {
             phase2_stats,
             elapsed: start.elapsed(),
         })
-    }
-
-    /// Synchronize index with configuration (directory-level change detection).
-    ///
-    /// Compares stored indexed paths (from IndexMetadata) with current config paths
-    /// (from settings.toml). Indexes new directories and removes files from
-    /// directories no longer in config.
-    ///
-    /// This is the Pipeline equivalent of SimpleIndexer::sync_with_config.
-    ///
-    /// # Arguments
-    /// * `stored_paths` - Previously indexed directory paths (from IndexMetadata)
-    /// * `config_paths` - Current directory paths from settings.toml
-    /// * `index` - DocumentIndex for storage
-    /// * `semantic` - Optional semantic search for embeddings
-    /// * `_progress` - Whether to show progress (currently unused)
-    ///
-    /// # Returns
-    /// SyncStats with counts of added/removed directories and files/symbols indexed
-    pub fn sync_with_config(
-        &self,
-        stored_paths: Option<Vec<PathBuf>>,
-        config_paths: &[PathBuf],
-        index: Arc<DocumentIndex>,
-        semantic: Option<Arc<Mutex<SimpleSemanticSearch>>>,
-        embedding_pool: Option<Arc<crate::semantic::EmbeddingBackend>>,
-        _progress: bool,
-    ) -> PipelineResult<SyncStats> {
-        use std::collections::HashSet;
-
-        let start = Instant::now();
-        let semantic_path = self.semantic_dir.clone();
-
-        // Canonicalize both path sets for accurate comparison
-        let stored_set: HashSet<PathBuf> = stored_paths
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|p| p.canonicalize().ok())
-            .collect();
-
-        let config_set: HashSet<PathBuf> = config_paths
-            .iter()
-            .filter_map(|p| p.canonicalize().ok())
-            .collect();
-
-        // Find new paths (in config but not stored)
-        let new_paths: Vec<PathBuf> = config_set.difference(&stored_set).cloned().collect();
-
-        // Find removed paths (in stored but not in config)
-        let removed_paths: Vec<PathBuf> = stored_set.difference(&config_set).cloned().collect();
-
-        // Early return if no changes
-        if new_paths.is_empty() && removed_paths.is_empty() {
-            return Ok(SyncStats {
-                elapsed: start.elapsed(),
-                ..Default::default()
-            });
-        }
-
-        let mut stats = SyncStats::default();
-
-        // Index new directories
-        if !new_paths.is_empty() {
-            tracing::info!(
-                target: "pipeline",
-                "Sync: Found {} new directories to index",
-                new_paths.len()
-            );
-
-            for path in &new_paths {
-                tracing::debug!(target: "pipeline", "  + {}", path.display());
-
-                match self.index_incremental(
-                    path,
-                    Arc::clone(&index),
-                    semantic.clone(),
-                    embedding_pool.clone(),
-                    false,
-                ) {
-                    Ok(inc_stats) => {
-                        stats.files_indexed += inc_stats.index_stats.files_indexed;
-                        stats.symbols_found += inc_stats.index_stats.symbols_found;
-                        tracing::info!(
-                            target: "pipeline",
-                            "  Indexed {} files, {} symbols from {}",
-                            inc_stats.index_stats.files_indexed,
-                            inc_stats.index_stats.symbols_found,
-                            path.display()
-                        );
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            target: "pipeline",
-                            "  Failed to index {}: {e}",
-                            path.display()
-                        );
-                    }
-                }
-            }
-            stats.added_dirs = new_paths.len();
-        }
-
-        // Remove files from deleted directories
-        if !removed_paths.is_empty() {
-            tracing::info!(
-                target: "pipeline",
-                "Sync: Found {} directories to remove",
-                removed_paths.len()
-            );
-
-            // Get all indexed files and filter those under removed directories
-            let all_files = match index.get_all_indexed_paths() {
-                Ok(paths) => paths,
-                Err(e) => {
-                    tracing::error!(target: "pipeline", "  Failed to get indexed paths: {e}");
-                    Vec::new()
-                }
-            };
-            let mut files_to_remove = Vec::new();
-
-            for file_path in all_files {
-                if let Ok(file_canonical) = file_path.canonicalize() {
-                    for removed_path in &removed_paths {
-                        if file_canonical.starts_with(removed_path) {
-                            files_to_remove.push(file_path.clone());
-                            break;
-                        }
-                    }
-                }
-            }
-
-            if !files_to_remove.is_empty() {
-                tracing::debug!(
-                    target: "pipeline",
-                    "  Removing {} files from deleted directories",
-                    files_to_remove.len()
-                );
-
-                // Use CleanupStage to remove files
-                let cleanup_stage = if let Some(ref sem) = semantic {
-                    CleanupStage::new(Arc::clone(&index), &semantic_path)
-                        .with_semantic(Arc::clone(sem))
-                } else {
-                    CleanupStage::new(Arc::clone(&index), &semantic_path)
-                };
-
-                match cleanup_stage.cleanup_files(&files_to_remove) {
-                    Ok(cleanup_stats) => {
-                        stats.files_removed = cleanup_stats.files_cleaned;
-                        stats.symbols_removed = cleanup_stats.symbols_removed;
-                        tracing::info!(
-                            target: "pipeline",
-                            "  Removed {} files, {} symbols",
-                            cleanup_stats.files_cleaned,
-                            cleanup_stats.symbols_removed
-                        );
-                    }
-                    Err(e) => {
-                        tracing::error!(target: "pipeline", "  Cleanup failed: {e}");
-                    }
-                }
-            }
-
-            stats.removed_dirs = removed_paths.len();
-        }
-
-        stats.elapsed = start.elapsed();
-
-        tracing::info!(
-            target: "pipeline",
-            "Sync complete: {} dirs added ({} files, {} symbols), {} dirs removed ({} files) in {:?}",
-            stats.added_dirs,
-            stats.files_indexed,
-            stats.symbols_found,
-            stats.removed_dirs,
-            stats.files_removed,
-            stats.elapsed
-        );
-
-        Ok(stats)
     }
 }
 

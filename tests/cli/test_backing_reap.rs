@@ -18,7 +18,7 @@
 //! gap, this test drives a REAL, connected `rmcp` stdio client through the
 //! proxy (mirroring `proxy_revives_dead_upstream_mid_session` in
 //! `test_serve_proxy_discovery.rs`) and, after killing the backing server,
-//! makes the proxy's demonstrated survival AND successful revive-and-retry a
+//! makes the proxy's demonstrated survival AND successful background-redial a
 //! HARD PRECONDITION -- via a real tool call that must succeed -- before
 //! ever inspecting the killed pid's process status. That closes the loophole:
 //! the proxy (the backing server's actual OS parent) is proven alive for the
@@ -42,7 +42,7 @@ use crate::support::{codanna_binary, run_cli};
 const REAP_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Upper bound for every other (fast) wait in this file, including the
-/// hard-precondition revive-and-retry tool call.
+/// hard-precondition background-redial tool call.
 const FAST_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Build a minimal indexed workspace, mirroring
@@ -120,6 +120,40 @@ async fn connect_proxy_client(ws: &Path) -> RunningService<RoleClient, ()> {
     .expect("rmcp client should complete the stdio initialize handshake with the proxy")
 }
 
+/// The proxy's "backend still starting" tool-result text.
+const NOT_READY_TEXT: &str =
+    "codanna index not available yet \u{2014} backend starting, check back shortly";
+
+/// Poll `get_index_info` through the proxy until it stops returning the
+/// NOT_READY result, bounded by [`FAST_DEADLINE`], and return that result.
+/// The handshake and `list_tools` are answered locally by the proxy, so a
+/// real tool call is the only readiness signal for the backing server.
+async fn wait_until_ready(client: &RunningService<RoleClient, ()>) -> rmcp::model::CallToolResult {
+    let start = std::time::Instant::now();
+    loop {
+        let result = tokio::time::timeout(
+            FAST_DEADLINE,
+            client.call_tool(rmcp::model::CallToolRequestParams::new("get_index_info")),
+        )
+        .await
+        .expect("get_index_info should return promptly, even while the backend is unavailable")
+        .expect("proxy should answer tool calls with a result, not a protocol error");
+        let not_ready = result.is_error == Some(true)
+            && result.content.iter().any(|block| match block {
+                rmcp::model::ContentBlock::Text(text) => text.text.contains(NOT_READY_TEXT),
+                _ => false,
+            });
+        if !not_ready {
+            return result;
+        }
+        assert!(
+            start.elapsed() < FAST_DEADLINE,
+            "proxy still reported NOT_READY after {FAST_DEADLINE:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 /// Best-effort termination of `pid` via sysinfo, used both to trigger the
 /// backing server's exit and to reap any process left running at test
 /// teardown. `Process::kill()` sends a generic terminate signal (not
@@ -187,7 +221,7 @@ impl Drop for Reaper {
 /// `spawn_detached` (`src/serve_discovery.rs`). Kills the backing server
 /// directly, then -- as a HARD PRECONDITION, not an inference -- makes a
 /// second tool call on the SAME client connection that must succeed via the
-/// proxy's revive-and-retry path (`DelegatingProxyHandler::delegate` in
+/// proxy's background-redial path (`DelegatingProxyHandler::delegate` in
 /// `src/mcp/proxy.rs`), proving the proxy (the backing server's real OS
 /// parent) is still alive and functioning for the whole assertion window.
 /// Only then does it assert the killed pid is reaped by that demonstrably
@@ -204,15 +238,13 @@ async fn killed_backing_server_is_reaped_not_left_as_zombie() {
         .await
         .expect("proxy client should connect within the deadline");
 
-    // First call: proves the initial connection is live and lets the
-    // discovery record converge before anything is killed.
-    let tools_before = tokio::time::timeout(FAST_DEADLINE, client.list_tools(Default::default()))
-        .await
-        .expect("first list_tools should complete within the deadline")
-        .expect("first list_tools should succeed through the freshly-dialed upstream");
-    assert!(
-        !tools_before.tools.is_empty(),
-        "first list_tools should relay a non-empty tool list from the live upstream"
+    // First call: proves the background dial reached a live backing server
+    // and lets the discovery record converge before anything is killed.
+    let ready = wait_until_ready(&client).await;
+    assert_ne!(
+        ready.is_error,
+        Some(true),
+        "backing server should become ready, got: {ready:?}"
     );
 
     let record_before = codanna::serve_discovery::read_record(&codanna_dir)
@@ -225,28 +257,15 @@ async fn killed_backing_server_is_reaped_not_left_as_zombie() {
 
     kill_pid(backing_pid);
 
-    // HARD PRECONDITION: a tool CALL (not `list_tools`, which rmcp 3.x serves
-    // from the client-side cache and would never reach the dead backing) on
-    // the SAME client connection must succeed via the proxy's
-    // revive-and-retry path. If the proxy itself died (e.g. because this
-    // test lacked an active session, as an earlier version of it did), this
-    // call fails/times out and the test fails loudly here -- it can no
-    // longer silently fall through to a trivially-passing zombie check.
-    let revived_call = tokio::time::timeout(
-        FAST_DEADLINE,
-        client.call_tool(rmcp::model::CallToolRequestParams::new("get_index_info")),
-    )
-    .await
-    .expect(
-        "a tool call through the proxy must complete within the deadline after the backing \
-         server is killed -- a timeout here means the proxy itself died instead of reviving, \
-         which would make any later zombie-reap check meaningless",
-    )
-    .expect(
-        "a tool call through the proxy must succeed via revive-and-retry after the backing \
-         server is killed -- an error here means the proxy did not survive/revive, which would \
-         make any later zombie-reap check meaningless",
-    );
+    // HARD PRECONDITION: tool CALLS (not `list_tools`, which the proxy answers
+    // locally and would never reach the dead backing) on the SAME client
+    // connection must eventually succeed via the proxy's background redial.
+    // The first call after the kill returns NOT_READY without blocking;
+    // polling until it settles proves the proxy survived and revived. If the
+    // proxy itself died, a call fails/times out and the test fails loudly
+    // here -- it can no longer silently fall through to a trivially-passing
+    // zombie check.
+    let revived_call = wait_until_ready(&client).await;
     assert_ne!(
         revived_call.is_error,
         Some(true),
@@ -264,7 +283,7 @@ async fn killed_backing_server_is_reaped_not_left_as_zombie() {
     );
 
     // The proxy (backing_pid's real OS parent) has just been proven alive
-    // and functioning by the successful revive-and-retry call above. Any
+    // and functioning by the successful background-redial call above. Any
     // zombie state observed for `backing_pid` from here on can only be
     // explained by `spawn_detached`'s reaper thread, not by the proxy itself
     // having exited and orphaned it to init.

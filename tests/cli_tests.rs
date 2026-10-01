@@ -88,3 +88,6 @@ mod test_dump;
 /// `codanna ls` merged server/proxy listing
 #[path = "cli/test_ls.rs"]
 mod test_ls;
+
+#[path = "cli/test_relative_indexed_paths_subdir.rs"]
+mod test_relative_indexed_paths_subdir;

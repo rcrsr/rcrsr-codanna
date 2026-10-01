@@ -21,6 +21,7 @@ mod schema;
 mod writer;
 
 pub use codec::VectorMetadata;
+pub use query::MAX_INDEXED_PATHS;
 pub use schema::IndexSchema;
 
 /// Search result with rich metadata
@@ -147,10 +148,8 @@ impl DocumentIndex {
             bases.push(root.canonicalize().unwrap_or_else(|_| root.clone()));
         }
         let mut roots: Vec<PathBuf> = settings
-            .indexing
-            .indexed_paths
+            .resolved_indexed_paths()
             .iter()
-            .chain(settings.indexed_paths_cache.iter())
             .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
             .collect();
         roots.sort_by_key(|p| std::cmp::Reverse(p.as_os_str().len()));
@@ -244,6 +243,31 @@ mod tests {
         let debug_str = format!("{index:?}");
         assert!(debug_str.contains("DocumentIndex"));
         assert!(debug_str.contains("index_path"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn test_strip_bases_anchor_relative_roots_at_workspace_not_cwd() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let config_dir = root.join(crate::init::local_dir_name());
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config = config_dir.join("settings.toml");
+        std::fs::write(&config, "[indexing]\nindexed_paths = [\".\"]\n").unwrap();
+        let settings = crate::config::Settings::load_from(&config).unwrap();
+        let index_dir = TempDir::new().unwrap();
+        let index = DocumentIndex::new(index_dir.path(), &settings).unwrap();
+
+        // Under the process cwd (crate root) but outside the workspace: the
+        // relative "." must not have become a cwd-derived strip base.
+        let outside = format!("{}/src/lib.rs", env!("CARGO_MANIFEST_DIR"));
+        assert_eq!(index.to_portable_file_path(&outside), None);
+
+        let inside = root.join("a").join("b.rs");
+        assert_eq!(
+            index.to_portable_file_path(inside.to_str().unwrap()),
+            Some("a/b.rs".to_string())
+        );
     }
 
     // ==================== Language Filtering Tests ====================

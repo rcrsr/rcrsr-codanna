@@ -16,9 +16,6 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
-// Arc/Mutex are only used by the https-server-gated pinned-cert test below.
-#[cfg(feature = "https-server")]
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -561,34 +558,214 @@ fn killed_server_is_respawned_and_record_is_updated() {
     );
 }
 
-/// Connect a real `rmcp` stdio client to `codanna serve --proxy` rooted at
-/// `ws`, mirroring the exact `().serve(TokioChildProcess::new(..))` pattern
-/// `CodeIntelligenceClient::test_server` uses in `src/mcp/client.rs:28-39`,
-/// but pointed at the `--proxy` subcommand (which that helper hardcodes away
-/// from at `client.rs:36`) and returning the connected client instead of
-/// printing to stdout.
-async fn connect_proxy_client(
+/// Text a delegated tool call carries while the backing server is still being
+/// dialed (pinned copy from `src/mcp/proxy.rs`).
+const NOT_READY_TEXT: &str =
+    "codanna index not available yet \u{2014} backend starting, check back shortly";
+
+/// Stable prefix of the text a delegated tool call carries after a failed dial
+/// round (pinned copy from `src/mcp/proxy.rs`).
+const FAILED_PREFIX: &str = "codanna backend unavailable:";
+
+/// Every tool the proxy must advertise locally, whatever the backend state.
+const EXPECTED_TOOLS: [&str; 13] = [
+    "find_symbol",
+    "find_symbols",
+    "get_calls",
+    "find_callers",
+    "analyze_impact",
+    "get_index_info",
+    "search_symbols",
+    "semantic_search_docs",
+    "semantic_search_with_context",
+    "search_documents",
+    "reindex",
+    "get_file_outline",
+    "read_symbol",
+];
+
+type ProxyClient = rmcp::service::RunningService<rmcp::service::RoleClient, ()>;
+
+/// Kills a spawned child and reaps it when dropped, so a failing assertion
+/// never leaks a backing server.
+struct ChildGuard(Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Registry directory `home` resolves to (matching `connect_proxy_client_with_env`,
+/// which pins `XDG_STATE_HOME` to `<home>/.local/state`).
+fn registry_dir_for(home: &Path) -> PathBuf {
+    home.join(".local")
+        .join("state")
+        .join("codanna")
+        .join("servers")
+}
+
+/// Every parseable registry entry under `home` whose workspace root is `ws`.
+fn registry_entries_for_workspace(
+    home: &Path,
     ws: &Path,
-) -> rmcp::service::RunningService<rmcp::service::RoleClient, ()> {
+) -> Vec<codanna::serve_registry::RegistryEntry> {
+    let canonical_ws = ws.canonicalize().expect("canonicalize workspace root");
+    let Ok(read_dir) = std::fs::read_dir(registry_dir_for(home)) else {
+        return Vec::new();
+    };
+    read_dir
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let contents = std::fs::read_to_string(entry.path()).ok()?;
+            let parsed: codanna::serve_registry::RegistryEntry =
+                serde_json::from_str(&contents).ok()?;
+            let root = parsed.workspace_root.canonicalize().ok()?;
+            (root == canonical_ws).then_some(parsed)
+        })
+        .collect()
+}
+
+/// Kills every process registered for `ws` under `home` when dropped
+/// (backing servers spawned by a proxy that may never publish `serve.json`).
+struct RegistryReaper {
+    home: PathBuf,
+    ws: PathBuf,
+}
+
+impl Drop for RegistryReaper {
+    fn drop(&mut self) {
+        for entry in registry_entries_for_workspace(&self.home, &self.ws) {
+            kill_pid(entry.pid);
+        }
+    }
+}
+
+/// Async deadline-bounded poll (does not block the runtime's other tasks).
+async fn wait_until_async(mut predicate: impl FnMut() -> bool, what: &str) {
+    let start = std::time::Instant::now();
+    loop {
+        if predicate() {
+            return;
+        }
+        assert!(start.elapsed() < DEADLINE, "timed out waiting for: {what}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Connect a real `rmcp` stdio client to `codanna serve --proxy` rooted at
+/// `ws` WITHOUT waiting for the backing server: returns as soon as the
+/// initialize handshake (answered locally by the proxy) completes.
+async fn connect_proxy_client_nowait(ws: &Path) -> ProxyClient {
+    connect_proxy_client_with_env(ws, &[]).await
+}
+
+/// Like [`connect_proxy_client_nowait`], with extra environment variables for
+/// the proxy process (inherited by the backing server it spawns).
+async fn connect_proxy_client_with_env(ws: &Path, extra_env: &[(&str, &str)]) -> ProxyClient {
     use rmcp::service::ServiceExt;
     use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
 
     let test_home = ws.join(".home");
     std::fs::create_dir_all(&test_home).expect("create test home");
+    let state_home = test_home.join(".local").join("state");
 
     let ws = ws.to_path_buf();
-    ().serve(
-        TokioChildProcess::new(
-            tokio::process::Command::new(codanna_binary()).configure(|cmd| {
-                cmd.args(["serve", "--proxy"])
-                    .current_dir(&ws)
-                    .env("HOME", &test_home);
-            }),
-        )
-        .expect("spawn codanna serve --proxy as an rmcp child transport"),
+    let extra_env: Vec<(String, String)> = extra_env
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    tokio::time::timeout(
+        DEADLINE,
+        ().serve(
+            TokioChildProcess::new(tokio::process::Command::new(codanna_binary()).configure(
+                |cmd| {
+                    cmd.args(["serve", "--proxy"])
+                        .current_dir(&ws)
+                        // Same `HOME`/`XDG_CONFIG_HOME` pairing as
+                        // `start_proxy`; `XDG_STATE_HOME` pins the per-user
+                        // server registry under the per-test home.
+                        .env("HOME", &test_home)
+                        .env("XDG_CONFIG_HOME", &test_home)
+                        .env("XDG_STATE_HOME", &state_home);
+                    for (key, value) in &extra_env {
+                        cmd.env(key, value);
+                    }
+                },
+            ))
+            .expect("spawn codanna serve --proxy as an rmcp child transport"),
+        ),
     )
     .await
+    .expect("proxy handshake should complete within the deadline")
     .expect("rmcp client should complete the stdio initialize handshake with the proxy")
+}
+
+/// Concatenated text blocks of a tool result.
+fn result_text(result: &rmcp::model::CallToolResult) -> String {
+    result
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            rmcp::model::ContentBlock::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// True for the proxy's "backend still starting" tool result.
+fn is_not_ready(result: &rmcp::model::CallToolResult) -> bool {
+    result.is_error == Some(true) && result_text(result).contains(NOT_READY_TEXT)
+}
+
+/// One `get_index_info` call through the proxy (a protocol-level failure
+/// panics: unavailability is reported as an `isError` result, never an `Err`).
+async fn call_get_index_info(client: &ProxyClient) -> rmcp::model::CallToolResult {
+    tokio::time::timeout(
+        DEADLINE,
+        client.call_tool(rmcp::model::CallToolRequestParams::new("get_index_info")),
+    )
+    .await
+    .expect("get_index_info should return promptly, even while the backend is unavailable")
+    .expect("proxy should answer tool calls with a result, not a protocol error")
+}
+
+/// Poll `get_index_info` until the result is not the NOT_READY one, bounded
+/// by [`DEADLINE`], and return that result (which may still be an error such
+/// as the FAILED text).
+async fn wait_until_not_not_ready(client: &ProxyClient) -> rmcp::model::CallToolResult {
+    let start = std::time::Instant::now();
+    loop {
+        let result = call_get_index_info(client).await;
+        if !is_not_ready(&result) {
+            return result;
+        }
+        assert!(
+            start.elapsed() < DEADLINE,
+            "proxy still reported NOT_READY after {DEADLINE:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Connect a real `rmcp` stdio client to `codanna serve --proxy` rooted at
+/// `ws`, mirroring the exact `().serve(TokioChildProcess::new(..))` pattern
+/// `CodeIntelligenceClient::test_server` uses in `src/mcp/client.rs`, then
+/// wait until the backing server is ready: the handshake and `list_tools` are
+/// answered locally, so readiness is observed by polling `get_index_info`
+/// until it stops returning NOT_READY. Panics if the backend failed instead.
+async fn connect_proxy_client(ws: &Path) -> ProxyClient {
+    let client = connect_proxy_client_nowait(ws).await;
+    let result = wait_until_not_not_ready(&client).await;
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "backing server should become ready, got: {}",
+        result_text(&result)
+    );
+    client
 }
 
 #[tokio::test]
@@ -600,11 +777,11 @@ async fn proxy_serves_real_mcp_traffic_from_shared_upstream() {
         .await
         .expect("proxy client should connect within the deadline");
 
-    // C1: the negotiated server name is the UPSTREAM's ("codanna",
-    // server.rs:148), not the proxy's own local `get_info()` fallback
-    // ("codanna-proxy", proxy.rs:176-179). Only reachable if the proxy
-    // actually relayed the upstream's `initialize` response rather than
-    // answering from its own fallback.
+    // C1: the proxy answers `initialize` LOCALLY, from the same in-binary
+    // server info the backend uses, so the negotiated identity must match the
+    // backend's ("codanna"), not a distinct proxy-only identity. This proves
+    // local identity parity with the backend; it does NOT prove relay (relay
+    // provenance is C3).
     let server_info = client
         .peer_info()
         .expect("proxy should have negotiated peer info during initialize");
@@ -615,17 +792,17 @@ async fn proxy_serves_real_mcp_traffic_from_shared_upstream() {
         .expect("negotiated peer info should carry a server implementation identity");
     assert_eq!(
         server_name, "codanna",
-        "proxy should relay the upstream server's negotiated name, not answer locally"
+        "proxy's locally-answered identity should match the backend's"
     );
     assert_ne!(
         server_name, "codanna-proxy",
-        "proxy must not fall back to its own local get_info() when an upstream is connected"
+        "proxy must not advertise a distinct proxy-only identity"
     );
 
-    // C2 + C4: a non-empty, real tool list can only originate upstream (the
-    // proxy registers no tools of its own), and this also proves the Bearer
-    // handshake to the backing HTTP server succeeded -- a token mismatch
-    // would 401 at http_server.rs:433 and fail this call outright.
+    // C2: `tools/list` is also answered locally from the same in-binary
+    // routers as the backend, so a non-empty list proves local parity with
+    // the backend's tool set -- not that anything was relayed. The Bearer
+    // handshake to the backing HTTP server is proven only by C3 below.
     let tools = tokio::time::timeout(DEADLINE, client.list_tools(Default::default()))
         .await
         .expect("list_tools should complete within the deadline")
@@ -633,16 +810,17 @@ async fn proxy_serves_real_mcp_traffic_from_shared_upstream() {
     let tool_names: Vec<&str> = tools.tools.iter().map(|t| t.name.as_ref()).collect();
     assert!(
         tool_names.contains(&"find_symbol"),
-        "upstream tool list relayed through the proxy should contain find_symbol, got: {tool_names:?}"
+        "locally-served tool list should contain find_symbol, got: {tool_names:?}"
     );
     assert!(
         tool_names.contains(&"search_symbols"),
-        "upstream tool list relayed through the proxy should contain search_symbols, got: {tool_names:?}"
+        "locally-served tool list should contain search_symbols, got: {tool_names:?}"
     );
 
     // C3: a real find_symbol call against the fixture symbol. The proxy
-    // holds no `IndexFacade` (proxy.rs:8-9), so a match can only come from
-    // the upstream index.
+    // holds no `IndexFacade`, so a match can only come from the upstream
+    // index: this is the relay provenance check (and, since the backing HTTP
+    // server rejects a bad Bearer token, the authenticated-handshake check).
     let call_result = tokio::time::timeout(
         DEADLINE,
         client.call_tool(
@@ -986,17 +1164,20 @@ fn proxy_discovers_and_dials_existing_https_server() {
 /// different keypair) before starting the proxy. `serve_tls::pinned_client`
 /// pins trust to whatever PEM is on disk at connect time, so the proxy now
 /// pins the wrong certificate and its TLS handshake against the real backing
-/// server must fail closed -- no delegation line should ever appear. If
-/// `tls_certs_only` were ever replaced with `danger_accept_invalid_certs` (or
-/// any other verification bypass), this is the test that would start passing
-/// when it must not.
-#[test]
+/// server must fail closed. The proxy no longer exits on a failed dial: it
+/// stays up, answers the handshake locally, and reports the failure through
+/// tool calls. So the load-bearing signal is that EVERY tool call, once the
+/// proxy stops saying "starting", is an `isError` result naming the pinned
+/// `https://` upstream and "failed to connect" -- a verification bypass
+/// (`danger_accept_invalid_certs`, or dropping `tls_certs_only`) would make
+/// a call succeed, which this test treats as a failure.
+#[tokio::test]
 #[cfg(feature = "https-server")]
-fn proxy_refuses_https_when_pinned_cert_does_not_match() {
+async fn proxy_refuses_https_when_pinned_cert_does_not_match() {
     let workspace = prepare_workspace();
     let _reaper = Reaper(workspace.path().to_path_buf());
 
-    let mut https_server = start_https_server(workspace.path());
+    let https_server = ChildGuard(start_https_server(workspace.path()));
     let record = wait_for_https_record(workspace.path());
     assert_eq!(record.scheme, codanna::serve_discovery::ServeScheme::Https);
 
@@ -1018,84 +1199,48 @@ fn proxy_refuses_https_when_pinned_cert_does_not_match() {
     std::fs::write(&cert_path, unrelated.cert.pem())
         .expect("overwrite pinned cert with an unrelated certificate");
 
-    let mut proxy = start_proxy(workspace.path());
+    // `connect_proxy_client_nowait` sets HOME + XDG_CONFIG_HOME to the same
+    // per-test dir the https server used, so the proxy pins the (now
+    // overwritten) cert at `cert_path`.
+    let client = connect_proxy_client_nowait(workspace.path()).await;
 
-    // NOTE: the `Proxy: delegating to ...` line prints the discovered
-    // record's scheme/port BEFORE the proxy attempts to actually dial it
-    // (see `serve_proxy` in `src/mcp/proxy.rs`), so its presence alone does
-    // not prove the connection succeeded -- it always prints once discovery
-    // resolves a record, mismatched cert or not. The load-bearing signal for
-    // a fail-closed pinned-cert mismatch is therefore the process's exit
-    // status: `serve_proxy` propagates the TLS/handshake failure as an `Err`
-    // and never reaches `service.waiting()`, so the process exits
-    // non-zero instead of running indefinitely as a working proxy. Drain
-    // stderr on a background thread purely so a full pipe buffer cannot
-    // block the child from exiting.
-    let stderr = proxy
-        .stderr
-        .take()
-        .expect("proxy child stderr should be piped");
-    let collected = Arc::new(Mutex::new(String::new()));
-    let sink = Arc::clone(&collected);
-    thread::spawn(move || {
-        let reader = BufReader::new(stderr);
-        for line in reader.lines().map_while(Result::ok) {
-            if let Ok(mut buf) = sink.lock() {
-                buf.push_str(&line);
-                buf.push('\n');
-            }
-        }
-    });
-
-    // Dropping stdin unblocks the proxy's stdio transport if it is somehow
-    // still waiting on input despite the failed handshake (it should not be).
-    drop(proxy.stdin.take());
-
-    // The proxy must terminate BY ITSELF. Asserting merely `!status.success()`
-    // would be vacuous: the harness SIGKILLs a still-running child at the
-    // deadline, and a killed process is also "not success" --
-    // so a proxy that happily dialed the mismatched cert and kept serving would
-    // be killed by the harness and still satisfy the assertion. A verification
-    // bypass must not be able to pass this test, so require a self-exit.
-    let exit_status = wait_for_self_exit(&mut proxy, DEADLINE);
-    let stderr_text = collected.lock().map(|b| b.clone()).unwrap_or_default();
-
-    let _ = https_server.kill();
-    let _ = https_server.wait();
-
-    let Some(exit_status) = exit_status else {
-        panic!(
-            "proxy kept running against a MISMATCHED pinned certificate -- it must fail closed \
-             and exit. This is what a TLS verification bypass (danger_accept_invalid_certs, or \
-             dropping tls_certs_only) looks like from the outside. stderr:\n{stderr_text}"
-        );
-    };
-    assert!(
-        !exit_status.success(),
-        "proxy exited cleanly despite a mismatched pinned certificate; it must fail closed. \
-         stderr:\n{stderr_text}"
+    // Poll until the proxy stops reporting NOT_READY; the settled result must
+    // be the dial failure. Any success means the mismatched pin was accepted.
+    let result = wait_until_not_not_ready(&client).await;
+    let text = result_text(&result);
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a tool call succeeded through the proxy against a MISMATCHED pinned certificate -- it \
+         must fail closed. This is what a TLS verification bypass looks like from the outside. \
+         got: {text}"
     );
-
-    // Provenance: it must have exited for the RIGHT reason -- while dialing the
-    // HTTPS upstream -- not from some unrelated startup crash that would also
-    // satisfy the assertions above.
-    //
-    // We deliberately do NOT assert on the words "certificate"/"handshake":
-    // rmcp surfaces the failure as a transport/send error and does not render
-    // rustls's underlying cause in the chain, so the proxy legitimately reports
-    // only `failed to connect ... error sending request for url (https://...)`.
-    // Asserting on wording this error layer never emits would make the test
-    // fail against correct code. What the message DOES prove is that the proxy
-    // dialed the pinned `https://` upstream and could not establish the
-    // connection -- which, combined with the self-exit above, is precisely the
-    // fail-closed behavior a verification bypass cannot produce.
-    let lowered = stderr_text.to_lowercase();
+    // We deliberately do NOT assert on "certificate"/"handshake": rmcp
+    // surfaces the failure as a transport/send error without rendering
+    // rustls's cause, so the proxy reports only `failed to connect ... error
+    // sending request for url (https://...)`. That text proves the proxy
+    // dialed the pinned `https://` upstream and could not connect.
+    let lowered = text.to_lowercase();
     assert!(
         lowered.contains("https://127.0.0.1") && lowered.contains("failed to connect"),
-        "proxy exited non-zero, but its stderr does not show it failing to connect to the \
-         pinned https:// upstream, so this test is not actually observing the pinned-cert \
-         rejection. stderr:\n{stderr_text}"
+        "the error result does not show a failed connection to the pinned https:// upstream, so \
+         this test is not observing the pinned-cert rejection. got: {text}"
     );
+
+    // The retry call must fail the same way -- never succeed on a later round.
+    let second = wait_until_not_not_ready(&client).await;
+    assert_eq!(
+        second.is_error,
+        Some(true),
+        "a retried call succeeded against a MISMATCHED pinned certificate; got: {}",
+        result_text(&second)
+    );
+
+    client
+        .cancel()
+        .await
+        .expect("proxy client should shut down cleanly after a failed dial");
+    drop(https_server);
 }
 
 /// THE EMISSION-GATE x PROXY-MODE REGRESSION TEST.
@@ -1361,45 +1506,27 @@ fn wait_for_record(ws: &Path) -> codanna::serve_discovery::ServeRecord {
 /// THE PROXY-LEVEL REVIVE REGRESSION TEST.
 ///
 /// Drives a single long-lived stdio client connection through a real
-/// `codanna serve --proxy` process: a first tool call proves the initial
+/// `codanna serve --proxy` process: a readiness wait proves the initial
 /// connection is live, then the backing `serve --http` process is SIGKILLed
 /// out from under it (skipping graceful shutdown, so `serve.json` is left
-/// stale -- the scenario `UpstreamHandle::revive` exists to recover from), and
-/// a second tool call is made ON THE SAME CLIENT CONNECTION. That second call
-/// must succeed transparently (one dead-transport failure, one revive, one
-/// retry -- see `DelegatingProxyHandler::delegate` in `src/mcp/proxy.rs`) and
-/// the backing server it lands on must be a genuinely new process.
+/// stale -- the scenario `UpstreamHandle::revive` exists to recover from). The
+/// next tool call ON THE SAME CLIENT CONNECTION must NOT block on an inline
+/// revive: the proxy flips the dead connection back to "connecting", starts a
+/// background dial, and answers NOT_READY immediately. Polling the same
+/// session then yields a successful result from a genuinely new backing
+/// server.
 ///
-/// Notification continuity after a revive (e.g. a `notifications/codanna/*`
-/// hot-reload signal still reaching the stdio client post-revive) is NOT
-/// exercised end-to-end here: reliably triggering a server-initiated custom
-/// notification from a fresh, just-revived backing server within this
-/// harness's deadline was impractical to wire up alongside the kill/respawn
-/// timing this test already needs. That continuity invariant is instead
-/// covered by the unit test `revive_preserves_downstream_state` in
-/// `src/mcp/proxy.rs`, which proves every dial (initial connect or later
-/// revive) reads the identical `state` `Arc`, rather than
-/// `NotificationRelay::default()`'s fresh, forever-undrained one.
+/// Notification continuity after a revive is covered by the unit test
+/// `revive_preserves_downstream_state` in `src/mcp/proxy.rs`.
 #[tokio::test]
 async fn proxy_revives_dead_upstream_mid_session() {
     let workspace = prepare_workspace();
     let _reaper = Reaper(workspace.path().to_path_buf());
     let codanna_dir = workspace.path().join(".codanna");
 
-    let client = tokio::time::timeout(DEADLINE, connect_proxy_client(workspace.path()))
-        .await
-        .expect("proxy client should connect within the deadline");
-
-    // First call: proves the initial connection is live before anything is
-    // killed.
-    let tools_before = tokio::time::timeout(DEADLINE, client.list_tools(Default::default()))
-        .await
-        .expect("first list_tools should complete within the deadline")
-        .expect("first list_tools should succeed through the freshly-dialed upstream");
-    assert!(
-        !tools_before.tools.is_empty(),
-        "first list_tools should relay a non-empty tool list from the live upstream"
-    );
+    // `connect_proxy_client` returns only once `get_index_info` stops
+    // reporting NOT_READY, i.e. the initial connection is live.
+    let client = connect_proxy_client(workspace.path()).await;
 
     let record_before = codanna::serve_discovery::read_record(&codanna_dir)
         .expect("serve.json should exist once the proxy has converged on a backing server");
@@ -1412,20 +1539,25 @@ async fn proxy_revives_dead_upstream_mid_session() {
     kill_pid(pid_before);
     wait_until_dead_or_zombie(pid_before, DEADLINE);
 
-    // Second call, ON THE SAME CLIENT CONNECTION -- the proxy's stdio session
-    // is never restarted. A tool CALL (not `list_tools`, which rmcp 3.x serves
-    // from the client-side tool-list cache for its advertised TTL and so would
-    // never reach the dead backing) delegates to the backing server, observes
-    // a dead transport, and `DelegatingProxyHandler::delegate` revives the
-    // upstream (respawning a fresh backing server, since the stale record is
-    // unusable); the single retry succeeds -- transparently to this client.
-    tokio::time::timeout(
-        DEADLINE,
-        client.call_tool(rmcp::model::CallToolRequestParams::new("get_index_info")),
-    )
-    .await
-    .expect("second call should complete within the deadline")
-    .expect("the tool call should succeed after the proxy transparently revives its upstream");
+    // First call after the kill, ON THE SAME CLIENT CONNECTION: the dead
+    // transport is detected, the slot flips to connecting, and the call
+    // returns NOT_READY without waiting for the revive.
+    let first_after_kill = call_get_index_info(&client).await;
+    assert!(
+        is_not_ready(&first_after_kill),
+        "the first call after the backend dies must return NOT_READY immediately (non-blocking \
+         flip), got: {first_after_kill:?}"
+    );
+
+    // Polling the same session must reach a successful result served by the
+    // revived backing server.
+    let revived = wait_until_not_not_ready(&client).await;
+    assert_ne!(
+        revived.is_error,
+        Some(true),
+        "the call should succeed once the proxy has revived its upstream, got: {}",
+        result_text(&revived)
+    );
 
     let record_after = codanna::serve_discovery::read_record(&codanna_dir)
         .expect("serve.json should exist again after the proxy revived its upstream");
@@ -1446,63 +1578,59 @@ async fn proxy_revives_dead_upstream_mid_session() {
 
 /// THE AUTO-SPAWN-DISABLED REVIVE REGRESSION TEST.
 ///
-/// With `[server] auto_spawn = false`, the FIRST call through the proxy must
-/// still succeed by discovering an already-live backing server started
-/// manually (discovery of a live record is not subject to the auto_spawn
-/// guard; only spawning a new one is -- see `discover_or_spawn`'s "Guard 2"
-/// in `src/serve_discovery.rs`). Once that backing server is killed, the
-/// SECOND call must fail with an actionable error naming auto-spawn as the
-/// fix, rather than silently spawning a server anyway or hanging.
+/// With `[server] auto_spawn = false`, the proxy must still become ready by
+/// discovering an already-live backing server started manually (discovery of a
+/// live record is not subject to the auto_spawn guard; only spawning a new
+/// one is -- see `discover_or_spawn`'s "Guard 2" in `src/serve_discovery.rs`).
+/// Once that backing server is killed, the first call returns NOT_READY (the
+/// non-blocking mid-session flip), and polling then settles on an `isError`
+/// result carrying the actionable FAILED text that names auto-spawn as the fix
+/// and the workspace, rather than silently spawning a server anyway or hanging.
 #[tokio::test]
 async fn proxy_revive_respects_auto_spawn_disabled() {
     let workspace = prepare_workspace_with_auto_spawn_disabled();
     let _reaper = Reaper(workspace.path().to_path_buf());
 
     // Start the backing server manually: with `auto_spawn = false` the proxy
-    // itself would refuse to create one, so the first call below can only
-    // succeed by discovering this already-live process.
-    let mut http_server = start_http_server(workspace.path());
+    // itself would refuse to create one, so readiness below can only come
+    // from discovering this already-live process.
+    let mut http_server = ChildGuard(start_http_server(workspace.path()));
     let record = wait_for_record(workspace.path());
     let pid_before = record.pid;
 
-    let client = tokio::time::timeout(DEADLINE, connect_proxy_client(workspace.path()))
-        .await
-        .expect("proxy client should connect within the deadline");
-
-    let tools_before = tokio::time::timeout(DEADLINE, client.list_tools(Default::default()))
-        .await
-        .expect("first list_tools should complete within the deadline")
-        .expect("first list_tools should succeed against the manually-started backing server");
-    assert!(
-        !tools_before.tools.is_empty(),
-        "first list_tools should relay a non-empty tool list from the manually-started server"
-    );
+    // Readiness wait: succeeds against the manually-started backing server.
+    let client = connect_proxy_client(workspace.path()).await;
 
     kill_pid(pid_before);
     wait_until_dead_or_zombie(pid_before, DEADLINE);
-    let _ = http_server.wait();
+    let _ = http_server.0.wait();
 
-    // The second call must fail with an actionable error, and must do so
-    // within the deadline rather than hanging or panicking -- a `delegate`
-    // that looped on `AutoSpawnDisabled` instead of surfacing it would hang
-    // here.
-    // A tool CALL, not `list_tools`: rmcp 3.x serves `list_tools` from the
-    // client-side cache for its advertised TTL, so it would never reach the
-    // dead backing to observe the revive failure.
-    let second_call = tokio::time::timeout(
-        DEADLINE,
-        client.call_tool(rmcp::model::CallToolRequestParams::new("get_index_info")),
-    )
-    .await
-    .expect("second call must not hang -- it should return promptly with an error");
-
-    let err = second_call.expect_err(
-        "second tool call must fail once the backing server is dead and auto_spawn = false",
+    // First call after the kill: non-blocking flip, so NOT_READY.
+    let first_after_kill = call_get_index_info(&client).await;
+    assert!(
+        is_not_ready(&first_after_kill),
+        "the first call after the backend dies must return NOT_READY immediately, got: \
+         {first_after_kill:?}"
     );
-    let message = format!("{err:?}").to_lowercase();
+
+    // Poll until the failed dial round settles. It must surface as an error
+    // RESULT (not a protocol error, not a hang) with the actionable text.
+    let failed = wait_until_not_not_ready(&client).await;
+    assert_eq!(
+        failed.is_error,
+        Some(true),
+        "with the backend dead and auto_spawn = false the call must be an error result, got: {}",
+        result_text(&failed)
+    );
+    let text = result_text(&failed);
+    let message = text.to_lowercase();
+    assert!(
+        message.starts_with(FAILED_PREFIX),
+        "the failure should carry the stable FAILED prefix, got: {text}"
+    );
     assert!(
         message.contains("auto-spawn") || message.contains("auto_spawn"),
-        "the revive failure should name auto-spawn as the actionable fix, got: {err:?}"
+        "the revive failure should name auto-spawn as the actionable fix, got: {text}"
     );
     let workspace_name = workspace
         .path()
@@ -1512,14 +1640,200 @@ async fn proxy_revive_respects_auto_spawn_disabled() {
         .to_lowercase();
     assert!(
         message.contains(&workspace_name),
-        "the revive failure should name the workspace root, got: {err:?}"
+        "the revive failure should name the workspace root, got: {text}"
     );
 
-    // The proxy process itself must still be alive and responsive to a clean
-    // shutdown, not have panicked or wedged while handling the failed
-    // revive.
+    // The proxy process itself must still be responsive to a clean shutdown,
+    // not have panicked or wedged while handling the failed revive.
     client
         .cancel()
         .await
         .expect("proxy client should shut down cleanly even after a failed delegated call");
+}
+
+/// While the backing server is still starting (artificially delayed), the
+/// proxy answers the handshake and `tools/list` locally, reports NOT_READY on
+/// tool calls, and has already registered itself as a healthy proxy; the same
+/// session then becomes ready and relays a real `find_symbol`.
+#[tokio::test]
+async fn proxy_answers_locally_and_reports_not_ready_while_backend_spawns() {
+    let workspace = prepare_workspace();
+    let home = workspace.path().join(".home");
+    let codanna_dir = workspace.path().join(".codanna");
+    let _reaper = Reaper(workspace.path().to_path_buf());
+    let _registry_reaper = RegistryReaper {
+        home: home.clone(),
+        ws: workspace.path().to_path_buf(),
+    };
+
+    let client = connect_proxy_client_with_env(
+        workspace.path(),
+        &[("CODANNA_TEST_SPAWN_DELAY_MS", "10000")],
+    )
+    .await;
+
+    // Local list_tools: all 13 names, with the backend still asleep.
+    let tools = tokio::time::timeout(DEADLINE, client.list_tools(Default::default()))
+        .await
+        .expect("list_tools should complete within the deadline")
+        .expect("list_tools must succeed locally while the backend is starting");
+    let mut names: Vec<&str> = tools.tools.iter().map(|t| t.name.as_ref()).collect();
+    names.sort_unstable();
+    let mut expected = EXPECTED_TOOLS.to_vec();
+    expected.sort_unstable();
+    assert_eq!(
+        names, expected,
+        "the proxy must advertise the backend's full tool set locally"
+    );
+
+    // Tool calls report NOT_READY as an error result.
+    let early = call_get_index_info(&client).await;
+    assert!(
+        is_not_ready(&early),
+        "a tool call while the backend is spawning must return NOT_READY, got: {early:?}"
+    );
+
+    // At that moment: no serve.json, backend entry Spawning, proxy entry
+    // Healthy with role Proxy.
+    let ws = workspace.path().to_path_buf();
+    wait_until_async(
+        || {
+            registry_entries_for_workspace(&home, &ws).iter().any(|e| {
+                e.role == codanna::serve_registry::ServerRole::Server
+                    && e.status == codanna::serve_registry::ServerStatus::Spawning
+            })
+        },
+        "backend registry entry to be Spawning",
+    )
+    .await;
+    assert!(
+        codanna::serve_discovery::read_record(&codanna_dir).is_none(),
+        "serve.json must not exist while the backend is still spawning"
+    );
+    let entries = registry_entries_for_workspace(&home, workspace.path());
+    let proxy_entries: Vec<_> = entries
+        .iter()
+        .filter(|e| e.role == codanna::serve_registry::ServerRole::Proxy)
+        .collect();
+    assert_eq!(
+        proxy_entries.len(),
+        1,
+        "exactly one proxy registry entry expected, got: {entries:?}"
+    );
+    assert_eq!(
+        proxy_entries[0].status,
+        codanna::serve_registry::ServerStatus::Healthy,
+        "the proxy registers itself Healthy (never Spawning) before the backend is ready"
+    );
+
+    // Same session: poll until ready, then a real relayed find_symbol.
+    let ready = wait_until_not_not_ready(&client).await;
+    assert_ne!(
+        ready.is_error,
+        Some(true),
+        "the backend should become ready, got: {}",
+        result_text(&ready)
+    );
+    let found = tokio::time::timeout(
+        DEADLINE,
+        client.call_tool(
+            rmcp::model::CallToolRequestParams::new("find_symbol").with_arguments(
+                serde_json::json!({ "name": "codanna_proxy_e2e_marker" })
+                    .as_object()
+                    .cloned()
+                    .expect("json object literal"),
+            ),
+        ),
+    )
+    .await
+    .expect("find_symbol should complete within the deadline")
+    .expect("find_symbol should succeed once the backend is ready");
+    assert!(
+        result_text(&found).contains("codanna_proxy_e2e_marker"),
+        "find_symbol on the same session should return the fixture marker, got: {found:?}"
+    );
+
+    client
+        .cancel()
+        .await
+        .expect("proxy client should shut down cleanly");
+}
+
+/// Cancelling the client while the backend is still spawning makes the proxy
+/// exit promptly instead of waiting out the dial: the detached backend keeps
+/// running (its Spawning entry survives) and the proxy leaves no `http.lock`.
+#[tokio::test]
+async fn proxy_exits_promptly_when_client_cancels_during_backend_spawn() {
+    const SPAWN_DELAY: Duration = Duration::from_secs(20);
+
+    let workspace = prepare_workspace();
+    let home = workspace.path().join(".home");
+    let codanna_dir = workspace.path().join(".codanna");
+    let _reaper = Reaper(workspace.path().to_path_buf());
+    let _registry_reaper = RegistryReaper {
+        home: home.clone(),
+        ws: workspace.path().to_path_buf(),
+    };
+
+    let client = connect_proxy_client_with_env(
+        workspace.path(),
+        &[("CODANNA_TEST_SPAWN_DELAY_MS", "20000")],
+    )
+    .await;
+
+    // Wait for both the detached backend (Spawning) and the proxy's own
+    // entry, remembering their pids.
+    let ws = workspace.path().to_path_buf();
+    wait_until_async(
+        || {
+            let entries = registry_entries_for_workspace(&home, &ws);
+            entries.iter().any(|e| {
+                e.role == codanna::serve_registry::ServerRole::Server
+                    && e.status == codanna::serve_registry::ServerStatus::Spawning
+            }) && entries
+                .iter()
+                .any(|e| e.role == codanna::serve_registry::ServerRole::Proxy)
+        },
+        "backend Spawning entry and proxy entry to be registered",
+    )
+    .await;
+    let entries = registry_entries_for_workspace(&home, workspace.path());
+    let spawning_pid = entries
+        .iter()
+        .find(|e| e.role == codanna::serve_registry::ServerRole::Server)
+        .expect("spawning backend entry")
+        .pid;
+    let proxy_pid = entries
+        .iter()
+        .find(|e| e.role == codanna::serve_registry::ServerRole::Proxy)
+        .expect("proxy entry")
+        .pid;
+
+    let started = std::time::Instant::now();
+    client
+        .cancel()
+        .await
+        .expect("proxy client should shut down cleanly");
+    wait_until_dead_or_zombie(proxy_pid, DEADLINE);
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < SPAWN_DELAY / 2,
+        "the proxy must self-exit well before the {SPAWN_DELAY:?} backend delay elapses, took \
+         {elapsed:?}"
+    );
+    assert!(
+        process_is_running(spawning_pid),
+        "the detached Spawning backend (pid {spawning_pid}) must survive the proxy's exit"
+    );
+    assert!(
+        !codanna_dir.join("http.lock").exists(),
+        "dropping the in-flight dial must release http.lock"
+    );
+    assert!(
+        registry_entries_for_workspace(&home, workspace.path())
+            .iter()
+            .all(|e| e.pid != proxy_pid),
+        "the exited proxy must remove its own registry entry"
+    );
 }

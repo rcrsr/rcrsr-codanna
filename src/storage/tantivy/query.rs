@@ -10,6 +10,10 @@ use tantivy::{
 
 use super::{DocumentIndex, SearchResult};
 
+/// Cap on file records `get_all_indexed_paths` returns; a result of exactly
+/// this length may be truncated.
+pub const MAX_INDEXED_PATHS: usize = 100_000;
+
 /// Stored `relation_kind` text is the `Debug` name of [`RelationKind`].
 fn relation_kind_from_stored(kind: &str) -> Option<RelationKind> {
     Some(match kind {
@@ -736,8 +740,7 @@ impl DocumentIndex {
         );
 
         // Use TopDocs to get all file_info documents
-        // Note: Adjust limit if you have more than 100k files
-        let collector = TopDocs::with_limit(100_000).order_by_score();
+        let collector = TopDocs::with_limit(MAX_INDEXED_PATHS).order_by_score();
         let top_docs = searcher.search(&query, &collector)?;
 
         let mut paths = Vec::new();

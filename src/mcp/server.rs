@@ -88,11 +88,17 @@ pub struct CodeIntelligenceServer {
 }
 
 impl CodeIntelligenceServer {
+    /// The single composition of every `#[tool_router]` block; new routers
+    /// are added here and nowhere else.
+    pub(crate) fn full_tool_router() -> ToolRouter<Self> {
+        Self::symbols_router() + Self::search_router() + Self::admin_router()
+    }
+
     pub fn new(facade: IndexFacade) -> Self {
         Self {
             facade: Arc::new(RwLock::new(facade)),
             document_store: None,
-            tool_router: Self::symbols_router() + Self::search_router() + Self::admin_router(),
+            tool_router: Self::full_tool_router(),
             peer: Arc::new(Mutex::new(None)),
             broadcaster: None,
             file_watch: None,
@@ -104,7 +110,7 @@ impl CodeIntelligenceServer {
         Self {
             facade,
             document_store: None,
-            tool_router: Self::symbols_router() + Self::search_router() + Self::admin_router(),
+            tool_router: Self::full_tool_router(),
             peer: Arc::new(Mutex::new(None)),
             broadcaster: None,
             file_watch: None,
@@ -116,7 +122,7 @@ impl CodeIntelligenceServer {
         Self {
             facade,
             document_store: None,
-            tool_router: Self::symbols_router() + Self::search_router() + Self::admin_router(),
+            tool_router: Self::full_tool_router(),
             peer: Arc::new(Mutex::new(None)),
             broadcaster: None,
             file_watch: None,
@@ -171,6 +177,67 @@ impl CodeIntelligenceServer {
 /// binary; `toolsListChanged` covers upgrades.
 pub(crate) const LIST_CACHE_TTL_MS: u64 = 3_600_000;
 
+/// Build a complete, privately cacheable `tools/list` result.
+pub(crate) fn list_tools_result(tools: Vec<Tool>) -> ListToolsResult {
+    ListToolsResult {
+        result_type: Some(ResultType::COMPLETE),
+        tools,
+        meta: None,
+        next_cursor: None,
+        ttl_ms: Some(LIST_CACHE_TTL_MS),
+        cache_scope: Some(CacheScope::Private),
+    }
+}
+
+/// Build the server info advertised at `initialize`. `file_watch` is
+/// `None` when the watch state is unknown (e.g. a proxy answering locally).
+pub(crate) fn codanna_server_info(file_watch: Option<bool>) -> ServerInfo {
+    let watch_sentence = match file_watch {
+        Some(true) => {
+            "A file watcher is active for this server, so on-disk source changes - including uncommitted edits and new files - are picked up automatically after a short debounce; this is not instant, so a read immediately after an edit can still race the watcher. "
+        }
+        Some(false) => {
+            "No file watcher is active for this server, so edits made after the index was built are not picked up until you call the 'reindex' tool. "
+        }
+        None => {
+            "Whether source edits are picked up without a manual reindex depends on how the backing server was started; call 'get_index_info' to see the current file-watch state, and use the 'reindex' tool if the index looks stale. "
+        }
+    };
+    let freshness_clause = format!(
+        "INDEX FRESHNESS: 'find_symbol', 'search_symbols', 'get_file_outline', and 'read_symbol' report what is in the index; they are not approximations. \
+        'read_symbol' refuses to return a span whose file has changed on disk since indexing (STALE_INDEX error, detected via a SHA256 hash comparison) - reindex if you hit it. \
+        {watch_sentence}\
+        Call 'get_index_info' to check index health and the current file-watch state rather than assuming the index is stale. "
+    );
+    ServerInfo::new(
+        ServerCapabilities::builder()
+            .enable_tools()
+            .enable_resources()
+            .enable_resources_list_changed()
+            .enable_resources_subscribe()
+            .build(),
+    )
+    .with_server_info(
+        Implementation::new("codanna", env!("CARGO_PKG_VERSION"))
+            .with_title("Codanna Code Intelligence")
+            .with_website_url("https://github.com/bartolli/codanna"),
+    )
+    .with_instructions(format!(
+        "This server provides code intelligence tools for analyzing this codebase. \
+        WORKFLOW: Start with 'semantic_search_with_context' or 'semantic_search_docs' to anchor on the right files and APIs - they provide the highest-quality context. \
+        Then use 'find_symbol' and 'search_symbols' to lock onto exact files and kinds. \
+        'get_calls', 'find_callers', and 'analyze_impact' report call edges resolved statically at index time; an edge is only recorded when its target resolves unambiguously, so calls via dynamic dispatch (trait objects/interfaces), callbacks/closures, macro-generated code, or ambiguous same-named symbols may be missing, and common names can occasionally resolve to the wrong target. An empty or short result means no statically resolved edge was found - it is not evidence that the index is stale or that other tools are unreliable. To confirm, read the code or narrow the query (unique names, symbol_id, kind filters). \
+        {freshness_clause}\
+        Use 'search_documents' to find relevant project documentation (markdown files). \
+        Use 'get_index_info' to understand what's indexed. \
+        OUTPUT FORMAT: every tool above accepts an optional `output_format` parameter, \
+        either \"text\" (the default, human-readable) or \"json\" (a single machine-readable \
+        content block containing a schema_version-tagged envelope with status \
+        success/not_found/ambiguous/error and a typed `data` payload). Use \"json\" when \
+        you need to parse results programmatically rather than read prose."
+    ))
+}
+
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for CodeIntelligenceServer {
     // Suppresses the tool_handler-generated list_tools, which leaves
@@ -180,14 +247,7 @@ impl ServerHandler for CodeIntelligenceServer {
         _request: Option<rmcp::model::PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
-        Ok(rmcp::model::ListToolsResult {
-            result_type: Some(rmcp::model::ResultType::COMPLETE),
-            tools: self.tool_router.list_all(),
-            meta: None,
-            next_cursor: None,
-            ttl_ms: Some(LIST_CACHE_TTL_MS),
-            cache_scope: Some(rmcp::model::CacheScope::Private),
-        })
+        Ok(list_tools_result(self.tool_router.list_all()))
     }
 
     // The watch lane emits resource-level changes only; tool and prompt
@@ -246,44 +306,7 @@ impl ServerHandler for CodeIntelligenceServer {
     }
 
     fn get_info(&self) -> ServerInfo {
-        let watch_sentence = if self.file_watch == Some(true) {
-            "A file watcher is active for this server, so on-disk source changes - including uncommitted edits and new files - are picked up automatically after a short debounce; this is not instant, so a read immediately after an edit can still race the watcher. "
-        } else {
-            "No file watcher is active for this server, so edits made after the index was built are not picked up until you call the 'reindex' tool. "
-        };
-        let freshness_clause = format!(
-            "INDEX FRESHNESS: 'find_symbol', 'search_symbols', 'get_file_outline', and 'read_symbol' report what is in the index; they are not approximations. \
-            'read_symbol' refuses to return a span whose file has changed on disk since indexing (STALE_INDEX error, detected via a SHA256 hash comparison) - reindex if you hit it. \
-            {watch_sentence}\
-            Call 'get_index_info' to check index health and the current file-watch state rather than assuming the index is stale. "
-        );
-        ServerInfo::new(
-            ServerCapabilities::builder()
-                .enable_tools()
-                .enable_resources()
-                .enable_resources_list_changed()
-                .enable_resources_subscribe()
-                .build(),
-        )
-        .with_server_info(
-            Implementation::new("codanna", env!("CARGO_PKG_VERSION"))
-                .with_title("Codanna Code Intelligence")
-                .with_website_url("https://github.com/bartolli/codanna"),
-        )
-        .with_instructions(format!(
-            "This server provides code intelligence tools for analyzing this codebase. \
-            WORKFLOW: Start with 'semantic_search_with_context' or 'semantic_search_docs' to anchor on the right files and APIs - they provide the highest-quality context. \
-            Then use 'find_symbol' and 'search_symbols' to lock onto exact files and kinds. \
-            'get_calls', 'find_callers', and 'analyze_impact' report call edges resolved statically at index time; an edge is only recorded when its target resolves unambiguously, so calls via dynamic dispatch (trait objects/interfaces), callbacks/closures, macro-generated code, or ambiguous same-named symbols may be missing, and common names can occasionally resolve to the wrong target. An empty or short result means no statically resolved edge was found - it is not evidence that the index is stale or that other tools are unreliable. To confirm, read the code or narrow the query (unique names, symbol_id, kind filters). \
-            {freshness_clause}\
-            Use 'search_documents' to find relevant project documentation (markdown files). \
-            Use 'get_index_info' to understand what's indexed. \
-            OUTPUT FORMAT: every tool above accepts an optional `output_format` parameter, \
-            either \"text\" (the default, human-readable) or \"json\" (a single machine-readable \
-            content block containing a schema_version-tagged envelope with status \
-            success/not_found/ambiguous/error and a typed `data` payload). Use \"json\" when \
-            you need to parse results programmatically rather than read prose."
-        ))
+        codanna_server_info(self.file_watch)
     }
 
     async fn initialize(
@@ -699,6 +722,72 @@ mod tests {
     use super::*;
     use crate::config::Settings;
     use std::time::Duration;
+
+    #[test]
+    fn test_full_tool_router_lists_exactly_the_known_tools() {
+        let mut names: Vec<String> = CodeIntelligenceServer::full_tool_router()
+            .list_all()
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        names.sort();
+        let mut expected: Vec<String> = [
+            "find_symbol",
+            "find_symbols",
+            "get_calls",
+            "find_callers",
+            "analyze_impact",
+            "get_index_info",
+            "search_symbols",
+            "semantic_search_docs",
+            "semantic_search_with_context",
+            "search_documents",
+            "reindex",
+            "get_file_outline",
+            "read_symbol",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        expected.sort();
+        assert_eq!(names, expected);
+    }
+
+    #[test]
+    fn test_server_info_unknown_watch_is_neutral() {
+        let info = codanna_server_info(None);
+        assert!(info.capabilities.tools.is_some());
+        let resources = info
+            .capabilities
+            .resources
+            .as_ref()
+            .expect("resources capability advertised");
+        assert_eq!(resources.list_changed, Some(true));
+        let text = info.instructions.expect("instructions present");
+        assert!(text.contains("get_index_info"));
+        assert!(!text.contains("No file watcher is active"));
+    }
+
+    #[test]
+    fn test_server_info_known_watch_states_keep_their_sentences() {
+        let on = codanna_server_info(Some(true))
+            .instructions
+            .expect("instructions present");
+        assert!(on.contains("A file watcher is active for this server"));
+        let off = codanna_server_info(Some(false))
+            .instructions
+            .expect("instructions present");
+        assert!(off.contains("No file watcher is active for this server"));
+    }
+
+    #[test]
+    fn test_list_tools_result_sets_cache_metadata() {
+        let result = list_tools_result(Vec::new());
+        assert_eq!(result.result_type, Some(ResultType::COMPLETE));
+        assert_eq!(result.ttl_ms, Some(LIST_CACHE_TTL_MS));
+        assert_eq!(result.cache_scope, Some(CacheScope::Private));
+        assert!(result.next_cursor.is_none());
+    }
 
     // `REINDEX_TEST_SERIAL` (crate-wide serialization lock for
     // reindex-driving tests, defined above `mod tests`) is brought in by
