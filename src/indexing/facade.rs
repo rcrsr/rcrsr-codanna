@@ -1870,7 +1870,7 @@ impl IndexFacade {
             }
 
             // Auto-force mode for empty indexes (clean index behaves like --force)
-            let force = force || self.document_count().unwrap_or(0) == 0;
+            let force = force || self.document_count()? == 0;
 
             if self.has_semantic_search()
                 && let Err(e) = self.ensure_embedding_pool()
@@ -1977,7 +1977,7 @@ impl IndexFacade {
 
             // Decided per root: the first forced root makes the index
             // non-empty, so later roots take the incremental lane.
-            let force = self.document_count().unwrap_or(0) == 0;
+            let force = self.document_count()? == 0;
 
             // Visual separator and directory label (stderr syncs with progress bars)
             eprintln!();
@@ -2026,14 +2026,28 @@ impl IndexFacade {
 
         // Purge the removed roots' content. A failure propagates before the
         // tracked set or `removed_dirs` change, so the next start retries.
-        if !to_remove.is_empty() {
-            let cleaned = self.remove_directory_files(&to_remove, &config_set)?;
-            tracing::info!(
-                "removed {cleaned} indexed files from {} dropped root(s)",
+        // Fail closed when a configured root cannot be resolved right now
+        // (e.g. a symlink whose target is briefly unavailable): its stored
+        // canonical form would look removed, so purging could wipe a root
+        // the config still lists. Defer removals until every root resolves.
+        let unresolved = config_paths.iter().any(|p| p.canonicalize().is_err());
+        let deferred: Vec<PathBuf> = if unresolved && !to_remove.is_empty() {
+            tracing::warn!(
+                "deferring removal of {} indexed root(s): a configured path is currently unresolvable",
                 to_remove.len()
             );
-        }
-        stats.removed_dirs = to_remove.len();
+            to_remove.iter().map(|p| (*p).clone()).collect()
+        } else {
+            if !to_remove.is_empty() {
+                let cleaned = self.remove_directory_files(&to_remove, &config_set)?;
+                tracing::info!(
+                    "removed {cleaned} indexed files from {} dropped root(s)",
+                    to_remove.len()
+                );
+            }
+            stats.removed_dirs = to_remove.len();
+            Vec::new()
+        };
 
         // Update tracked paths. Assigned canonical rather than via
         // `add_indexed_path`, which collapses child roots under parents and
@@ -2043,6 +2057,7 @@ impl IndexFacade {
         for path in &skipped {
             config_set.remove(path);
         }
+        config_set.extend(deferred);
         self.indexed_paths = config_set;
 
         Ok(stats)
@@ -2059,17 +2074,24 @@ impl IndexFacade {
     /// deleted from disk would never be purged. The stored form is what
     /// cleanup keys on, so that is what gets passed on.
     ///
-    /// `get_all_indexed_paths` caps at 100k files, so a purge on a larger
-    /// index is partial.
+    /// `get_all_indexed_paths` caps at 100k files; an index at the cap
+    /// returns an error rather than a partial purge.
     fn remove_directory_files(
         &self,
         removed: &[&PathBuf],
         survivors: &HashSet<PathBuf>,
     ) -> FacadeResult<usize> {
         let workspace_root = self.settings.workspace_root.as_deref();
-        let files: Vec<PathBuf> = self
-            .document_index
-            .get_all_indexed_paths()?
+        let all_paths = self.document_index.get_all_indexed_paths()?;
+        // A capped read may omit rows; purging a subset and then dropping
+        // the root would leave the rest as permanent stale results.
+        if all_paths.len() >= crate::storage::tantivy::MAX_INDEXED_PATHS {
+            return Err(IndexError::General(format!(
+                "cannot purge removed roots: index holds at least {} files, more than a single purge can enumerate; run `codanna index --force` to rebuild",
+                all_paths.len()
+            )));
+        }
+        let files: Vec<PathBuf> = all_paths
             .into_iter()
             .filter(|stored| {
                 let abs = match workspace_root {
@@ -7361,6 +7383,38 @@ mod tests {
             facade.find_symbols_by_name("target_function", None).len(),
             1
         );
+    }
+
+    // A configured root that cannot be resolved right now must not make a
+    // stored root look removed: removals fail closed until it resolves.
+    #[test]
+    fn sync_defers_removal_while_a_configured_root_is_unresolvable() {
+        let dir = tempfile::tempdir().unwrap();
+        let (src, tests) = write_two_root_python_fixture(dir.path());
+        let src = src.canonicalize().unwrap();
+        let tests = tests.canonicalize().unwrap();
+        let mut facade = two_root_facade(dir.path(), &src, &tests);
+        facade.index_directory(&src, false).unwrap();
+        facade.index_directory(&tests, false).unwrap();
+        let unavailable = dir.path().join("unavailable-link");
+
+        let stats = facade
+            .sync_with_config(
+                Some(vec![src.clone(), tests.clone()]),
+                &[src.clone(), unavailable.clone()],
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(stats.removed_dirs, 0);
+        assert_eq!(
+            facade
+                .find_symbols_by_name("test_target_function", None)
+                .len(),
+            1
+        );
+        assert!(facade.indexed_paths.contains(&tests));
+        assert!(!facade.indexed_paths.contains(&unavailable));
     }
 
     fn workspace_facade(index_dir: &Path, root: &Path) -> IndexFacade {

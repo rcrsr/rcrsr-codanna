@@ -21,6 +21,7 @@ mod schema;
 mod writer;
 
 pub use codec::VectorMetadata;
+pub use query::MAX_INDEXED_PATHS;
 pub use schema::IndexSchema;
 
 /// Search result with rich metadata

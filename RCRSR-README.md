@@ -266,7 +266,8 @@ Limits worth knowing before you rely on it:
 
 - **No inline retry, no loop.** A failed redial leaves the proxy in the
   "backend unavailable" state; the next call returns that error and starts one
-  more background dial. There is no backoff and no autonomous retry.
+  more background dial, at most one round per 2 seconds (calls inside that window
+  get the cached failure text). There is no autonomous retry.
 - **Single-flight per proxy, including on failure.** Concurrent requests
   hitting the dead connection share one dial; a failed dial is cached for the
   round so callers get the same error instead of each re-spawning (and each
@@ -548,7 +549,8 @@ Two separate stores track directory roots, and they are pruned differently:
   indexed content (files, symbols, relationships, embeddings) at the next
   startup sync, except files still covered by another configured root. If the
   purge fails the sync errors and retries on the next start; on an index of
-  more than 100k files the purge is partial.
+  100k or more files the purge errors rather than running partially. Removals are
+  deferred while any configured root is temporarily unresolvable.
 
   Relative entries (`"."`, `"src"`) resolve against the workspace, not the
   directory you run `codanna` from. The anchor is the directory containing

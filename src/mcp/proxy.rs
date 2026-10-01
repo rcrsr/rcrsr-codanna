@@ -406,12 +406,12 @@ impl Dialer {
             self.config_path.as_deref(),
         )
         .await?;
-        eprintln!(
+        log_stderr(format_args!(
             "Proxy: delegating to backing MCP server at {}://127.0.0.1:{} (pid {})",
             record.scheme.as_str(),
             record.port,
             record.pid
-        );
+        ));
 
         let transport_config = StreamableHttpClientTransportConfig::with_uri(format!(
             "{}://127.0.0.1:{}/mcp",
@@ -625,9 +625,25 @@ struct UpstreamHandle {
     /// *intra-process* gate that primitive does not cover.
     reconnect: tokio::sync::Mutex<()>,
     dial: Dialer,
-    /// The single in-flight (or last) background dial supervisor, kept so
-    /// shutdown can abort it.
-    dial_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The single in-flight (or last) background dial supervisor and its
+    /// inner dial task, kept so shutdown can abort and join both.
+    dial_task: std::sync::Mutex<Option<(tokio::task::JoinHandle<()>, tokio::task::AbortHandle)>>,
+    /// When the last background dial started; [`Self::begin_redial`] uses it
+    /// to rate-limit client-driven redials against a fast-failing backend.
+    last_dial_started: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+/// Minimum spacing between background dial rounds. A client polling a
+/// backend that fails fast gets the cached failure text in between instead of
+/// back-to-back `discover_or_spawn` rounds.
+const REDIAL_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Writes a diagnostic line to stderr, ignoring write errors. `eprintln!`
+/// panics when stderr is a closed pipe, which must never abort dial
+/// bookkeeping.
+fn log_stderr(args: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "{args}");
 }
 
 impl UpstreamHandle {
@@ -678,30 +694,37 @@ impl UpstreamHandle {
     /// `Connecting` forever.
     fn start_background_dial(self: &Arc<Self>, seen_generation: u64) {
         let this = Arc::clone(self);
+        let dialer = Arc::clone(self);
+        let inner = tokio::spawn(async move {
+            if let Err(err) = dialer.revive(seen_generation).await {
+                log_stderr(format_args!("Proxy: backing MCP server unavailable: {err}"));
+            }
+        });
+        let inner_abort = inner.abort_handle();
         let supervisor = tokio::spawn(async move {
-            let dialer = Arc::clone(&this);
-            let inner = tokio::spawn(async move {
-                if let Err(err) = dialer.revive(seen_generation).await {
-                    eprintln!("Proxy: backing MCP server unavailable: {err}");
-                }
-            });
             // Aborting the supervisor (shutdown) drops this guard, which
             // aborts the inner dial too.
             let _abort_inner = AbortOnDrop(inner.abort_handle());
             if let Err(e) = inner.await
                 && !e.is_cancelled()
             {
-                eprintln!("Proxy: background dial task failed: {e}");
+                // Commit before logging so a failing log write can never
+                // leave the slot in `Connecting`.
                 this.fail_if_connecting(
                     seen_generation,
                     McpError::internal_error(format!("background dial task failed: {e}"), None),
                 );
+                log_stderr(format_args!("Proxy: background dial task failed: {e}"));
             }
         });
         *self
+            .last_dial_started
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::time::Instant::now());
+        *self
             .dial_task
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(supervisor);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((supervisor, inner_abort));
     }
 
     /// Commits `Failed(err)` at `seen_generation + 1` if the slot is still the
@@ -721,7 +744,16 @@ impl UpstreamHandle {
 
     /// Flips the slot at `seen_generation` to `Connecting` and, for the one
     /// caller that wins the flip, starts the background dial.
+    /// Skipped while the last dial started less than [`REDIAL_COOLDOWN`] ago.
     fn begin_redial(self: &Arc<Self>, seen_generation: u64) {
+        let cooling_down = self
+            .last_dial_started
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some_and(|started| started.elapsed() < REDIAL_COOLDOWN);
+        if cooling_down {
+            return;
+        }
         if flip_to_connecting(&self.slot, seen_generation) {
             self.start_background_dial(seen_generation);
         }
@@ -735,12 +767,19 @@ impl UpstreamHandle {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
-        if let Some(task) = task {
+        if let Some((task, inner)) = task {
             task.abort();
             if let Err(e) = task.await
                 && !e.is_cancelled()
             {
-                eprintln!("Proxy: background dial task failed: {e}");
+                log_stderr(format_args!("Proxy: background dial task failed: {e}"));
+            }
+            // The supervisor's abort only requested the inner dial's abort;
+            // wait for it to stop so it cannot write a registry entry after
+            // shutdown removed it.
+            inner.abort();
+            while !inner.is_finished() {
+                tokio::task::yield_now().await;
             }
         }
     }
@@ -1210,6 +1249,7 @@ pub async fn serve_proxy(
             state: state.clone(),
         },
         dial_task: std::sync::Mutex::new(None),
+        last_dial_started: std::sync::Mutex::new(None),
     });
 
     // Register this proxy before dialing so `codanna serve --list` can

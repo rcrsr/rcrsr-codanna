@@ -401,6 +401,10 @@ fn failed_dial_is_retried_only_by_a_request_and_not_autonomously() {
         "the first failed dial round should leave exactly one Server-role entry"
     );
 
+    // Redials are rate-limited to one round per 2s; wait the cooldown out so
+    // the call below is allowed to start the retry.
+    thread::sleep(Duration::from_millis(2200));
+
     // Minimal MCP handshake, then one tool call while the slot is Failed.
     send_line(
         &mut proxy,
