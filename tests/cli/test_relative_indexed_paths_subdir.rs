@@ -53,9 +53,9 @@ fn assert_read_only_retrieve(workspace: &Path, cwd: &Path, extra: &[&str], gen_b
     );
 }
 
-#[test]
-fn relative_indexed_path_does_not_reindex_from_subdirectory() {
-    let temp = tempfile::TempDir::new().expect("temp workspace");
+/// Writes the fixture workspace and indexes it from the workspace root.
+/// Returns the canonical workspace and its `src/sub` directory.
+fn indexed_workspace(temp: &tempfile::TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
     let workspace = temp.path().canonicalize().expect("canonical workspace");
     let sub = workspace.join("src/sub");
     std::fs::create_dir_all(&sub).expect("create src/sub");
@@ -70,6 +70,53 @@ fn relative_indexed_path_does_not_reindex_from_subdirectory() {
 
     let (exit, out) = run_in(&workspace, &workspace, &["index", ".", "--no-progress"]);
     assert_eq!(exit, 0, "initial index must succeed\n{out}");
+    (workspace, sub)
+}
+
+fn assert_symbol_at(workspace: &Path, symbol: &str, file: &str, context: &str) {
+    let (exit, out) = run_in(workspace, workspace, &["retrieve", "symbol", symbol]);
+    assert_eq!(exit, 0, "retrieve {symbol} {context}\n{out}");
+    assert!(
+        out.contains(file),
+        "symbol `{symbol}` must be reported at {file} {context}\n{out}"
+    );
+}
+
+#[test]
+fn relative_indexed_path_reindex_from_subdirectory_keeps_all_roots() {
+    let temp = tempfile::TempDir::new().expect("temp workspace");
+    let (workspace, sub) = indexed_workspace(&temp);
+
+    // The reindex output itself is asserted because every later CLI call
+    // runs its own startup catch-up from the workspace root, which would
+    // otherwise heal a wrongly scoped rebuild before `retrieve` looks.
+    for (args, expected, context) in [
+        (
+            vec!["mcp", "reindex"],
+            "Reindexed 0 files, 2 symbols",
+            "after incremental reindex",
+        ),
+        (
+            vec!["mcp", "reindex", "force:true"],
+            "Reindexed 2 files, 2 symbols",
+            "after forced reindex",
+        ),
+    ] {
+        let (exit, out) = run_in(&workspace, &sub, &args);
+        assert_eq!(exit, 0, "{args:?} from src/sub must succeed\n{out}");
+        assert!(
+            out.contains(expected),
+            "{args:?} from src/sub must walk every workspace root\n{out}"
+        );
+        assert_symbol_at(&workspace, "a", "src/lib.rs", context);
+        assert_symbol_at(&workspace, "b", "src/sub/m.rs", context);
+    }
+}
+
+#[test]
+fn relative_indexed_path_does_not_reindex_from_subdirectory() {
+    let temp = tempfile::TempDir::new().expect("temp workspace");
+    let (workspace, sub) = indexed_workspace(&temp);
     let gen_before = current_generation(&workspace);
 
     assert_read_only_retrieve(&workspace, &workspace, &[], &gen_before);

@@ -2146,8 +2146,9 @@ impl ReindexHandles {
     ///   is unchanged (mirrors `IndexFacade::index_file_with_force`).
     /// - An explicit directory path is indexed via `Pipeline::index_incremental`
     ///   with the caller-supplied `force` flag.
-    /// - When `paths` is `None`, every directory in `indexing.indexed_paths`
-    ///   (from the pipeline's settings) is indexed with the caller-supplied
+    /// - When `paths` is `None`, every directory in the settings' resolved
+    ///   indexed roots (`Settings::resolved_indexed_paths`, anchored at the
+    ///   workspace rather than the process cwd) is indexed with the caller-supplied
     ///   `force` flag. For the `paths: None` case this is redundant with any
     ///   clear the caller already ran under lock (force mode does a full
     ///   walk of an already-empty index either way), but passing it through
@@ -2199,13 +2200,13 @@ impl ReindexHandles {
             // registered root overall -- otherwise cross-directory
             // symbols outside the current walk (e.g. another explicit
             // path in this same scoped reindex) are hidden from
-            // resolution. `indexed_paths.len() <= 1` alone is not enough
+            // resolution. `resolved_indexed_paths().len() <= 1` alone is not enough
             // signal here: a single registered root can still be
             // force-reindexed over several explicit sub-paths in one
             // call.
             let dir_path_count = paths.iter().filter(|p| Path::new(p).is_dir()).count();
             let single_root_batch =
-                dir_path_count <= 1 && pipeline.settings().indexing.indexed_paths.len() <= 1;
+                dir_path_count <= 1 && pipeline.settings().resolved_indexed_paths().len() <= 1;
             let mut total_reindexed = 0;
             for path in &paths {
                 let path = Path::new(path);
@@ -2272,7 +2273,7 @@ impl ReindexHandles {
             }
             total_reindexed
         } else {
-            let indexed_paths = pipeline.settings().indexing.indexed_paths.clone();
+            let indexed_paths = pipeline.settings().resolved_indexed_paths().to_vec();
             let mut total_reindexed = 0;
             for path in &indexed_paths {
                 if path.is_dir() {
@@ -2514,7 +2515,7 @@ fn wait_at_mid_walk_barrier_for_test(semantic_dir: &Path) {
 /// Whether the live facade's generation carries a previously-indexed root
 /// (recorded via [`IndexFacade::get_indexed_paths`], itself restored from
 /// [`IndexMetadata::indexed_paths`] at load time) that the live
-/// `indexing.indexed_paths` config no longer accounts for -- either the root
+/// `Settings::resolved_indexed_paths` no longer accounts for -- either the root
 /// was removed from config, or its directory no longer exists on disk.
 ///
 /// Used by [`reindex_locked`] to decide whether an incremental catch-up must
@@ -2523,7 +2524,7 @@ fn wait_at_mid_walk_barrier_for_test(semantic_dir: &Path) {
 /// unconditionally, so a root dropped from config would otherwise never be
 /// reconciled by the incremental walk (which only visits configured roots).
 fn generation_roots_are_stale(indexer: &IndexFacade) -> bool {
-    let current_paths = &indexer.pipeline().settings().indexing.indexed_paths;
+    let current_paths = indexer.pipeline().settings().resolved_indexed_paths();
     indexer.get_indexed_paths().iter().any(|recorded_root| {
         !recorded_root.is_dir()
             || !current_paths
@@ -2565,7 +2566,7 @@ pub(crate) async fn reindex_locked(
     // path, before `open_build(BuildMode::CloneCurrent)`'s byte-copy of the
     // semantic store and index.meta plus a full semantic mmap reload -- all
     // of it done under the exclusive write guard taken below. This brief
-    // read lock reads `indexer.pipeline().settings().indexing.indexed_paths`
+    // read lock reads `indexer.pipeline().settings().resolved_indexed_paths()`
     // -- the exact collection `ReindexHandles::run` walks below when `paths`
     // is `None` -- rather than the facade's own `indexed_paths` field, which
     // is a different collection (always empty on a freshly constructed
@@ -2584,17 +2585,22 @@ pub(crate) async fn reindex_locked(
     //
     // Hoisting this ahead of the write guard widens the check-then-act
     // window (the read lock is released before phase 1 takes the write
-    // lock), but does not reopen the bug: the only in-process writer to
-    // `indexing.indexed_paths` while a server is running is the watcher's
-    // created-directory handler (`src/watcher/handlers/code.rs`), which is
-    // add-only, so a concurrent mutation can only turn a refusal/skip into a
-    // valid run, never the reverse. A directory vanishing from disk between
+    // lock), but does not reopen the bug: there is no in-process
+    // writer to the settings' indexed roots while a server is running
+    // (`Settings` are `Arc`-immutable; the watcher's created-directory handler
+    // only copies the resolved cache), so the only way this answer changes
+    // between check and act is a directory appearing or vanishing on disk. A
+    // directory vanishing from disk between
     // this check and the clear is a pre-existing race that no ordering here
     // can close.
     if paths_is_none {
         let (has_rebuild_source, indexed_paths, symbol_count) = {
             let indexer = facade.read().await;
-            let indexed_paths = indexer.pipeline().settings().indexing.indexed_paths.clone();
+            let indexed_paths = indexer
+                .pipeline()
+                .settings()
+                .resolved_indexed_paths()
+                .to_vec();
             let has_rebuild_source = indexed_paths.iter().any(|p| p.is_dir());
             (has_rebuild_source, indexed_paths, indexer.symbol_count())
         };
@@ -6279,7 +6285,7 @@ mod tests {
     //
     // This trio is the falsifiability pair (plus a paths:Some regression
     // lock) for the `should_clear` guard added to `reindex_locked`: the
-    // guard MUST read `pipeline.settings().indexing.indexed_paths` (what
+    // guard MUST read `pipeline.settings().resolved_indexed_paths()` (what
     // `ReindexHandles::run` actually walks for `paths: None`), not the
     // facade's own `indexed_paths: HashSet` field, which is a different
     // collection that starts empty on every freshly constructed facade (see
@@ -6287,11 +6293,11 @@ mod tests {
     // generation a full force reindex opens. Reading the wrong collection
     // would make these tests pass vacuously in one direction or the other.
 
-    // Facade built via the shared `test_facade` helper has an empty
-    // `settings.indexing.indexed_paths` (never populated by
-    // `add_indexed_path`). A `force` reindex with no explicit paths has
-    // nothing to rebuild from, so `reindex_locked` must refuse rather than
-    // clear a populated index and report success.
+    // Facade built via the shared `test_facade` helper has no resolved
+    // indexed roots (never populated by `add_indexed_path`). A `force`
+    // reindex with no explicit paths has nothing to rebuild from, so
+    // `reindex_locked` must refuse rather than clear a populated index and
+    // report success.
     #[tokio::test]
     async fn reindex_force_with_no_indexed_paths_does_not_clear_populated_index() {
         let dir = tempfile::tempdir().unwrap();
@@ -6498,7 +6504,7 @@ mod tests {
     // Direct unit coverage for the fresh-fallback predicate, independent of
     // the full `reindex_locked` orchestration: a generation's own recorded
     // roots (`IndexFacade::get_indexed_paths`) must be checked against the
-    // live `indexing.indexed_paths` config and against disk, matching what
+    // live resolved indexed roots and against disk, matching what
     // `generation_roots_are_stale` claims in its doc comment.
 
     #[test]
@@ -6570,6 +6576,76 @@ mod tests {
         assert!(
             !generation_roots_are_stale(&facade),
             "a recorded root that is still configured and present on disk must not be stale"
+        );
+    }
+
+    // Loaded settings resolve a relative `indexed_paths` entry against the
+    // config-derived workspace anchor, not the process cwd. These two tests
+    // fail if a server-side reader goes back to the raw list, because cargo
+    // test's cwd is the crate root, which holds neither probe directory.
+    fn load_settings_anchored_at(dir: &Path, indexed_entry: &str) -> Settings {
+        let config_dir = dir.join(crate::init::local_dir_name());
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config = config_dir.join("settings.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "index_path = \"{}\"\n[indexing]\nindexed_paths = [\"{indexed_entry}\"]\n\
+                 [semantic_search]\nenabled = false\n",
+                dir.join("index").display()
+            ),
+        )
+        .unwrap();
+        Settings::load_from(&config).unwrap()
+    }
+
+    #[tokio::test]
+    async fn reindex_none_walks_workspace_anchored_relative_root_not_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().canonicalize().unwrap();
+        let probe_name = "codanna-anchor-probe-reindex";
+        let probe = tmp.join(probe_name);
+        std::fs::create_dir_all(&probe).unwrap();
+        std::fs::write(
+            probe.join("x.py"),
+            "def anchored_probe_symbol():\n    pass\n",
+        )
+        .unwrap();
+        assert!(
+            !Path::new(probe_name).exists(),
+            "probe dir must not exist relative to the test cwd"
+        );
+
+        let settings = load_settings_anchored_at(&tmp, probe_name);
+        let facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+        let facade = Arc::new(tokio::sync::RwLock::new(facade));
+
+        let outcome = reindex_locked(&facade, None, true, None, None, None)
+            .await
+            .expect("relative root must resolve against the workspace anchor");
+
+        assert_eq!(outcome.indexed_dirs, vec![probe]);
+        let indexer = facade.read().await;
+        assert!(
+            !indexer
+                .find_symbols_by_name("anchored_probe_symbol", None)
+                .is_empty(),
+            "symbol under the anchored relative root must be indexed"
+        );
+    }
+
+    #[test]
+    fn generation_roots_are_not_stale_for_dot_root_anchored_at_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().canonicalize().unwrap();
+
+        let settings = load_settings_anchored_at(&tmp, ".");
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+        facade.set_indexed_paths(vec![tmp]);
+
+        assert!(
+            !generation_roots_are_stale(&facade),
+            "'.' resolves to the workspace anchor, so the recorded root is still configured"
         );
     }
 

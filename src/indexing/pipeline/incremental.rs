@@ -358,13 +358,13 @@ impl Pipeline {
     ) -> PipelineResult<IncrementalStats> {
         // Callers of this entry point always process exactly one root per
         // call and, for force mode, either walk every registered root
-        // (`indexed_paths.len() == 1` implies this is the only one) or a
+        // (`resolved_indexed_paths().len() == 1` implies this is the only one) or a
         // single new directory being folded into an existing single-root
         // workspace. Batches that force-reindex several explicit
         // sub-paths of one registered root in the same call must use
         // `index_incremental_scoped` instead, or the fast path wrongly
         // scopes symbol resolution to just this walk.
-        let single_root_batch = self.settings.indexing.indexed_paths.len() <= 1;
+        let single_root_batch = self.settings.resolved_indexed_paths().len() <= 1;
         self.index_incremental_with_progress(
             root,
             index,

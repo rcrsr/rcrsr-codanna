@@ -116,10 +116,26 @@ impl Settings {
     }
 
     /// Get the verbatim configured `indexed_paths` entries (unresolved, as written in
-    /// settings); use `indexed_paths_cache` for anchor-resolved absolute roots.
+    /// settings); use [`Settings::resolved_indexed_paths`] for anchor-resolved absolute roots.
     /// Returns empty vector if none are configured (maintains backward compatibility)
     pub fn get_indexed_paths(&self) -> Vec<PathBuf> {
         self.indexing.indexed_paths.clone()
+    }
+
+    /// Indexed roots as consumers should read them: the anchor-resolved, canonical
+    /// cache when filled, otherwise the raw configured list.
+    ///
+    /// This is the read surface for all server-side and CLI-reachable consumers of
+    /// indexed roots. Every `Settings::load`/`load_from` fills the cache, so in a real
+    /// process the raw fallback is never taken with a non-empty raw list; it exists for
+    /// hand-built `Settings` (tests, `Settings::default()`), where relative entries
+    /// still resolve against the cwd as before.
+    pub fn resolved_indexed_paths(&self) -> &[PathBuf] {
+        if self.indexed_paths_cache.is_empty() {
+            &self.indexing.indexed_paths
+        } else {
+            &self.indexed_paths_cache
+        }
     }
 }
 
@@ -158,6 +174,42 @@ mod tests {
             .canonicalize()
             .expect("canonicalize cwd");
         assert_eq!(settings.indexed_paths_cache, vec![cwd]);
+    }
+
+    #[test]
+    fn resolved_indexed_paths_uses_workspace_anchor_not_cwd_after_load() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("canonicalize");
+        let config_dir = root.join(crate::init::local_dir_name());
+        std::fs::create_dir_all(&config_dir).expect("create config dir");
+        let config = config_dir.join("settings.toml");
+        std::fs::write(&config, "[indexing]\nindexed_paths = [\".\"]\n").expect("write");
+
+        let settings = Settings::load_from(&config).expect("load");
+
+        assert_eq!(
+            settings.resolved_indexed_paths(),
+            std::slice::from_ref(&root)
+        );
+        assert_ne!(
+            root,
+            std::env::current_dir()
+                .expect("cwd")
+                .canonicalize()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn resolved_indexed_paths_falls_back_to_raw_list_for_hand_built_settings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut settings = Settings::default();
+        settings.indexing.indexed_paths = vec![dir.path().to_path_buf()];
+
+        assert_eq!(
+            settings.resolved_indexed_paths(),
+            [dir.path().to_path_buf()]
+        );
     }
 
     #[test]

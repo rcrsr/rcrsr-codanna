@@ -539,11 +539,13 @@ Two separate stores track directory roots, and they are pruned differently:
   absolute joined form, so it is skipped with a "not found" warning rather
   than re-resolved against a different directory.
   `--prune-indexed-paths` falls back to ghost-only pruning (with a warning)
-  if the resolved list is unavailable. Known limit: server-side reindex
-  paths that read the raw list (`reindex` / `codanna mcp reindex` with no
-  `paths`, the stale-generation check) still resolve relative entries
-  against the process directory, so prefer absolute entries if you start
-  `serve` from a subdirectory.
+  if the resolved list is unavailable. The `reindex` tool,
+  `codanna mcp reindex` with no `paths`, the stale-generation check, and the
+  path-emission bases read the resolved list too, so they work from any
+  directory. Known limit: a running server freezes its settings at startup,
+  so a root added to `indexed_paths` while it runs is indexed but dropped by
+  the next catch-up rebuild. Restart the server after editing
+  `indexed_paths`.
 - **Each generation's `index.meta`** — the directory roots that generation
   was actually built from. Its own ghost (no longer a directory on disk) and
   stray (outside `workspace_root` *and* not listed under
