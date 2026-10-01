@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0+rcrsr.11] - 2026-09-30
+
 ### Fixed
 
 - **`serve --proxy` blocked the MCP client while the backing server spawned:** the proxy dialed (and possibly spawned) the backing server before answering `initialize`, so a cold start could exceed the client's handshake timeout. The proxy now dials in the background, answers the handshake and `tools/list` immediately, and tool calls return a not-ready `isError` result until the backend is up. ([#108](https://github.com/rcrsr/rcrsr-codanna/issues/108)) ([#109](https://github.com/rcrsr/rcrsr-codanna/pull/109))
