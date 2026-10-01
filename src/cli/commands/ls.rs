@@ -329,8 +329,8 @@ fn registered_row(entry: &RegistryEntry, kind: RowKind) -> Row {
 
 /// Like `registered_row`, but optionally overrides the displayed status
 /// instead of trusting `entry.status` verbatim. Used for unattached proxy
-/// rows: `entry.status` is stale write-once data recorded by
-/// `src/mcp/proxy.rs` at spawn time and never rewritten, so an unattached
+/// rows: `entry.status` is always `healthy`, written by
+/// `src/mcp/proxy.rs` at startup and refreshed after each dial, so an unattached
 /// proxy (its backing server is gone, dead, or itself unknown/stale) would
 /// otherwise keep displaying "healthy" long after it stopped being true.
 fn registered_row_with_status_override(
@@ -403,8 +403,8 @@ fn build_rows() -> Vec<Row> {
         }
     }
 
-    // An unattached proxy's `entry.status` is stale write-once data from
-    // spawn time (`src/mcp/proxy.rs` never rewrites it), so displaying it
+    // An unattached proxy's `entry.status` is always `healthy` (written at
+    // startup and refreshed after each dial by `src/mcp/proxy.rs`), so displaying it
     // verbatim as "healthy" would be misleading once its backing server is
     // gone -- override the displayed status to "detached" instead.
     for proxy in &proxies {

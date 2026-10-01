@@ -37,14 +37,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, ClientRequest, CompleteRequestParams, CompleteResult,
-    CustomNotification, CustomRequest, CustomResult, ErrorData as McpError, GetPromptRequestParams,
-    GetPromptResponse, Implementation, InitializeRequestParams, InitializeResult,
-    ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
-    LoggingMessageNotificationParam, PaginatedRequestParams, ProgressNotificationParam,
-    ReadResourceRequestParams, ReadResourceResponse, ResourceUpdatedNotificationParam, ResultType,
-    ServerCapabilities, ServerInfo, ServerNotification, ServerResult, SetLevelRequestParams,
-    SubscribeRequestParams, UnsubscribeRequestParams,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ClientRequest, CompleteRequestParams,
+    CompleteResult, ContentBlock, CustomNotification, CustomRequest, CustomResult,
+    ErrorData as McpError, GetPromptRequestParams, GetPromptResponse, InitializeRequestParams,
+    InitializeResult, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult,
+    ListToolsResult, LoggingMessageNotificationParam, PaginatedRequestParams,
+    ProgressNotificationParam, ReadResourceRequestParams, ReadResourceResponse,
+    ResourceUpdatedNotificationParam, ResultType, ServerInfo, ServerNotification, ServerResult,
+    SetLevelRequestParams, SubscribeRequestParams, Tool, UnsubscribeRequestParams,
 };
 use rmcp::service::{
     NotificationContext, Peer, RequestContext, RoleClient, RoleServer, RunningService, ServiceError,
@@ -57,6 +57,7 @@ use tokio::sync::Mutex;
 
 use crate::config::Settings;
 use crate::mcp::DUMMY_BEARER_TOKEN;
+use crate::mcp::server::{CodeIntelligenceServer, codanna_server_info, list_tools_result};
 use crate::serve_discovery::{self, DiscoveryError, ServeScheme};
 use crate::serve_registry;
 use crate::serve_tls;
@@ -313,11 +314,10 @@ impl ClientHandler for NotificationRelay {
     }
 }
 
-/// Dials the backing HTTP MCP server: the single site both `serve_proxy`'s
-/// initial connection and [`UpstreamHandle::revive`]'s reconnect go through,
-/// so the HTTPS cert-pinning branch (and any future scheme handling) exists
-/// exactly once (`connect()` is invoked from two call sites, but is one
-/// dial implementation).
+/// Dials the backing HTTP MCP server: the single dial site. Its only caller
+/// is [`UpstreamHandle::revive`], which both the initial background dial and
+/// every request-triggered retry go through, so the HTTPS cert-pinning branch
+/// (and any future scheme handling) exists exactly once.
 ///
 /// Re-runs `discover_or_spawn` (and therefore re-reads a fresh
 /// [`serve_discovery::ServeRecord`]) on every call, so a backing server that
@@ -332,14 +332,41 @@ struct Dialer {
     /// [`NotificationRelay`] forwards to the same downstream peer -- see the
     /// "HIGHEST-RISK SILENT FAILURE" note on [`Dialer::connect`].
     state: Arc<Mutex<DownstreamState>>,
-    /// The scheme (`http`/`https`) [`Dialer::connect`] most recently
-    /// connected the backing server with, updated on every dial (initial
-    /// connect and every later revive alike). `serve_proxy` reads this after
-    /// the initial `connect()` to record the proxy's OWN registry entry with
-    /// the scheme actually in use, rather than a hard-coded default -- since
-    /// `connect()` can dial either an HTTP or an HTTPS backing server
-    /// depending on what `discover_or_spawn` returns.
-    connected_scheme: std::sync::Mutex<ServeScheme>,
+}
+
+/// Builds the proxy's OWN registry entry. The single builder shared by
+/// `serve_proxy` (initial write, default scheme) and [`Dialer::connect`]
+/// (refresh with the dialed scheme). The status is always `Healthy`, never
+/// `Spawning`: the discovery guards treat a `Spawning` entry as a backing
+/// server still starting, which a proxy entry must never look like.
+fn proxy_registry_entry(
+    workspace_root: &std::path::Path,
+    scheme: ServeScheme,
+) -> serve_registry::RegistryEntry {
+    serve_registry::RegistryEntry {
+        pid: std::process::id(),
+        port: 0,
+        scheme,
+        workspace_root: workspace_root.to_path_buf(),
+        start_time: unix_now_secs(),
+        status: serve_registry::ServerStatus::Healthy,
+        role: serve_registry::ServerRole::Proxy,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    }
+}
+
+/// Best-effort write of the proxy's registry entry: it exists only so
+/// `codanna serve --list` can attribute this pid to the workspace it proxies
+/// for, so a failed write is logged and never fails the proxy.
+fn write_proxy_entry(workspace_root: &std::path::Path, scheme: ServeScheme) {
+    let entry = proxy_registry_entry(workspace_root, scheme);
+    if let Err(e) = serve_registry::write_entry(&entry) {
+        tracing::warn!(
+            target: "proxy",
+            "failed to write registry entry for proxy pid {}: {e}",
+            entry.pid
+        );
+    }
 }
 
 impl Dialer {
@@ -393,11 +420,6 @@ impl Dialer {
         ))
         .auth_header(DUMMY_BEARER_TOKEN);
 
-        *self
-            .connected_scheme
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = record.scheme;
-
         let relay = self.relay();
 
         let service = match record.scheme {
@@ -429,22 +451,97 @@ impl Dialer {
             }
         };
 
+        // Refresh the proxy's registry entry with the scheme actually dialed.
+        write_proxy_entry(&self.workspace_root, record.scheme);
+
         Ok(Arc::new(service))
     }
 }
 
-/// The current upstream connection plus a generation counter bumped on every
-/// COMPLETED revive round -- success or failure alike -- so a caller that
-/// observed generation `g` before a call failed can tell -- after taking the
-/// reconnect gate -- whether someone else already ran a round in the meantime
-/// (generation moved past `g`) or it must dial itself. On a failed round
-/// `service` is left unchanged (there is no new connection to install); only
-/// `generation` advances, paired with the cached failure in
-/// [`UpstreamHandle::last_failure`] that [`single_flight_revive`]'s
-/// `read_current` closure also returns.
-struct UpstreamSlot {
-    service: Arc<RunningService<RoleClient, NotificationRelay>>,
+/// Production upstream service type.
+type UpstreamService = Arc<RunningService<RoleClient, NotificationRelay>>;
+
+/// Readiness of the upstream connection. `S` is the live service type
+/// ([`UpstreamService`] in production); it is generic so the state machine is
+/// unit-tested without a real `RunningService`.
+#[derive(Clone)]
+enum UpstreamConn<S> {
+    /// A dial is in flight (or about to start); nothing to delegate to yet.
+    Connecting,
+    /// Connected; requests are delegated to `S`.
+    Ready(S),
+    /// The last dial round failed; the next request flips the slot back to
+    /// `Connecting` and starts one retry dial.
+    Failed(McpError),
+}
+
+/// The current upstream connection state plus a generation counter bumped on
+/// every COMPLETED dial round -- success or failure alike -- so a caller that
+/// observed generation `g` can tell, after taking the reconnect gate, whether
+/// someone else already ran a round in the meantime. Flips between `Ready`/
+/// `Failed` and `Connecting` keep the generation, so only the caller that
+/// observed `g` wins the flip.
+struct UpstreamSlot<S> {
+    conn: UpstreamConn<S>,
     generation: u64,
+}
+
+/// Flips `Ready`/`Failed` at `seen_generation` to `Connecting`, keeping the
+/// generation. Returns `true` only for the single caller that performed the
+/// flip (and therefore owes the background dial); `false` if the generation
+/// moved on or the slot is already `Connecting`. The generation compare and
+/// the flip happen under one write lock.
+fn flip_to_connecting<S>(slot: &std::sync::RwLock<UpstreamSlot<S>>, seen_generation: u64) -> bool {
+    // Critical section is a compare and an assignment; a poisoned lock still
+    // holds a fully-valid slot, so recovering the inner value is safe.
+    let mut slot = slot
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if slot.generation != seen_generation {
+        return false;
+    }
+    match slot.conn {
+        UpstreamConn::Connecting => false,
+        UpstreamConn::Ready(_) | UpstreamConn::Failed(_) => {
+            slot.conn = UpstreamConn::Connecting;
+            true
+        }
+    }
+}
+
+/// `read_current` for [`single_flight_revive`] over a slot: the current
+/// state, its generation, and the round's error if that round failed.
+fn read_round<S: Clone>(
+    slot: &std::sync::RwLock<UpstreamSlot<S>>,
+) -> (UpstreamConn<S>, u64, Option<McpError>) {
+    let slot = slot
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let failure = match &slot.conn {
+        UpstreamConn::Failed(err) => Some(err.clone()),
+        _ => None,
+    };
+    (slot.conn.clone(), slot.generation, failure)
+}
+
+/// `store` for [`single_flight_revive`] over a slot: a failed round stores
+/// `Failed(err)`, a successful one the dialed `Ready(..)` value, both at the
+/// new generation. The previous service is simply dropped on success; rmcp's
+/// `Drop for RunningService` closes the old connection once the last clone
+/// goes away.
+fn commit_round<S>(
+    slot: &std::sync::RwLock<UpstreamSlot<S>>,
+    value: UpstreamConn<S>,
+    generation: u64,
+    failure: Option<McpError>,
+) {
+    let conn = match failure {
+        Some(err) => UpstreamConn::Failed(err),
+        None => value,
+    };
+    *slot
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = UpstreamSlot { conn, generation };
 }
 
 /// Generation-gated single-flight reconnect, generic over the async `dial`
@@ -513,127 +610,159 @@ where
     }
 }
 
-/// Owns the live upstream connection behind a lock that is read
-/// synchronously (from [`ServerHandler::get_info`], which is NOT `async`) and
-/// revived on demand when a delegated call observes a dead transport.
+/// Owns the upstream connection state behind a lock that is only ever held
+/// for a clone, a compare or an assignment -- never across an `.await` -- so a
+/// `std::sync` guard cannot block the async runtime.
 ///
-/// `slot` is `std::sync::RwLock`, not `tokio::sync::RwLock`: `get_info` must
-/// read the current service to call `peer_info()` and cannot itself be
-/// `async`, so the lock it reads through must be a synchronous one. Every
-/// critical section under `slot` is a single `Arc` clone or a single
-/// assignment -- it never spans an `.await` -- so holding a `std::sync`
-/// guard across it can never block the async runtime.
+/// Dials happen only in background tasks ([`UpstreamHandle::start_background_dial`]);
+/// request handlers read the state and never wait for a dial.
 struct UpstreamHandle {
-    slot: std::sync::RwLock<UpstreamSlot>,
-    /// Serializes revives so concurrent delegated calls that all observed the
-    /// same dead generation dial exactly once between them, on both the
+    slot: std::sync::RwLock<UpstreamSlot<UpstreamService>>,
+    /// Serializes dial rounds so at most one dial is in flight, on both the
     /// success AND failure path (see [`single_flight_revive`]). Cross-process
     /// dedup for the underlying `discover_or_spawn` call is already handled
     /// by its own `O_EXCL` `.codanna/http.lock`; this mutex closes the
     /// *intra-process* gate that primitive does not cover.
     reconnect: tokio::sync::Mutex<()>,
-    /// Error from the most recently COMPLETED revive round, if that round
-    /// failed; `None` if the round at the current `slot.generation` succeeded
-    /// (or no revive has run yet). Cleared back to `None` on every successful
-    /// round so a stale failure from an earlier generation is never confused
-    /// with the current one. Read/written only under `reconnect`'s gate (via
-    /// [`single_flight_revive`]'s `read_current`/`store` closures below), so
-    /// a plain `std::sync::Mutex` -- never awaited across -- suffices; it does
-    /// not need to be part of `slot` because a failed round never touches
-    /// `slot.service`.
-    last_failure: std::sync::Mutex<Option<McpError>>,
     dial: Dialer,
+    /// The single in-flight (or last) background dial supervisor, kept so
+    /// shutdown can abort it.
+    dial_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl UpstreamHandle {
-    /// Returns the current upstream connection and its generation. Reads
-    /// through `slot`'s synchronous lock and clones the `Arc`; never awaits,
-    /// so it is safe to call from synchronous code such as `get_info`.
-    fn current(&self) -> (Arc<RunningService<RoleClient, NotificationRelay>>, u64) {
-        // The critical section is a single `Arc` clone and cannot panic, so a
-        // poisoned lock (left by an unrelated panic elsewhere while holding
-        // it) still carries a fully-valid `UpstreamSlot`; recovering the
-        // inner value is safe rather than propagating the poison.
-        let slot = self
-            .slot
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (slot.service.clone(), slot.generation)
+    /// Returns the current upstream state and its generation. Never awaits.
+    fn snapshot(&self) -> (UpstreamConn<UpstreamService>, u64) {
+        let (conn, generation, _) = read_round(&self.slot);
+        (conn, generation)
     }
 
-    /// Revives the upstream connection if `seen_generation` is still current,
-    /// otherwise returns whatever the round that already ran for that
-    /// generation produced -- the revived connection if it succeeded, or the
-    /// SAME error it failed with if it did not (rather than dialing again).
-    /// See [`single_flight_revive`] for the gating logic and
-    /// [`Dialer::connect`] for the dial itself.
+    /// Runs one dial round for `seen_generation` (see [`single_flight_revive`]):
+    /// stores `Ready(svc)` at `g + 1` on success, `Failed(err)` at `g + 1` on
+    /// failure. [`Dialer::connect`] is the only dial site and this is its only
+    /// caller.
     async fn revive(
         &self,
         seen_generation: u64,
-    ) -> Result<Arc<RunningService<RoleClient, NotificationRelay>>, McpError> {
+    ) -> Result<UpstreamConn<UpstreamService>, McpError> {
         let workspace_root = self.dial.workspace_root.clone();
         single_flight_revive(
             &self.reconnect,
             seen_generation,
-            || {
-                // Same panic-free critical section as `current` (see there).
-                let slot = self
-                    .slot
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let failure = self
-                    .last_failure
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone();
-                (slot.service.clone(), slot.generation, failure)
-            },
-            |service, generation, failure| {
-                let mut slot = self
-                    .slot
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                // The previous `Arc<RunningService<..>>` is simply dropped
-                // here on a successful round. `RunningService::cancel` takes
-                // `self` by value, which an `Arc` cannot yield while an
-                // in-flight retry on the old connection may still hold a
-                // clone, and rmcp's own `Drop for RunningService` already
-                // closes the connection asynchronously once the last clone
-                // goes away. On a FAILED round `service` is this same old
-                // connection handed back unchanged -- there is nothing new to
-                // install, only the generation and `last_failure` advance.
-                *slot = UpstreamSlot {
-                    service,
-                    generation,
-                };
-                *self
-                    .last_failure
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = failure;
-            },
+            || read_round(&self.slot),
+            |value, generation, failure| commit_round(&self.slot, value, generation, failure),
             || async {
-                self.dial.connect().await.map_err(|err| {
-                    McpError::internal_error(
-                        format!(
-                            "failed to revive backing MCP server for workspace '{}': {err}",
-                            workspace_root.display()
-                        ),
-                        None,
-                    )
-                })
+                self.dial
+                    .connect()
+                    .await
+                    .map(UpstreamConn::Ready)
+                    .map_err(|err| {
+                        McpError::internal_error(
+                            format!(
+                                "failed to reach backing MCP server for workspace '{}': {err}",
+                                workspace_root.display()
+                            ),
+                            None,
+                        )
+                    })
             },
         )
         .await
     }
+
+    /// Spawns a supervised task running one dial round for `seen_generation`
+    /// and records it as the single in-flight dial (see [`Self::shutdown_dial`]).
+    /// A failed round is cached as `Failed` in the slot and reported on
+    /// stderr; it never exits the process. If the dial itself panics, the
+    /// supervisor commits `Failed` and reports it, so the slot never stays
+    /// `Connecting` forever.
+    fn start_background_dial(self: &Arc<Self>, seen_generation: u64) {
+        let this = Arc::clone(self);
+        let supervisor = tokio::spawn(async move {
+            let dialer = Arc::clone(&this);
+            let inner = tokio::spawn(async move {
+                if let Err(err) = dialer.revive(seen_generation).await {
+                    eprintln!("Proxy: backing MCP server unavailable: {err}");
+                }
+            });
+            // Aborting the supervisor (shutdown) drops this guard, which
+            // aborts the inner dial too.
+            let _abort_inner = AbortOnDrop(inner.abort_handle());
+            if let Err(e) = inner.await
+                && !e.is_cancelled()
+            {
+                eprintln!("Proxy: background dial task failed: {e}");
+                this.fail_if_connecting(
+                    seen_generation,
+                    McpError::internal_error(format!("background dial task failed: {e}"), None),
+                );
+            }
+        });
+        *self
+            .dial_task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(supervisor);
+    }
+
+    /// Commits `Failed(err)` at `seen_generation + 1` if the slot is still the
+    /// `Connecting` state of that round (a panicked dial never committed).
+    fn fail_if_connecting(&self, seen_generation: u64, err: McpError) {
+        let mut slot = self
+            .slot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.generation == seen_generation && matches!(slot.conn, UpstreamConn::Connecting) {
+            *slot = UpstreamSlot {
+                conn: UpstreamConn::Failed(err),
+                generation: seen_generation + 1,
+            };
+        }
+    }
+
+    /// Flips the slot at `seen_generation` to `Connecting` and, for the one
+    /// caller that wins the flip, starts the background dial.
+    fn begin_redial(self: &Arc<Self>, seen_generation: u64) {
+        if flip_to_connecting(&self.slot, seen_generation) {
+            self.start_background_dial(seen_generation);
+        }
+    }
+
+    /// Aborts the in-flight dial, if any, and waits for it to stop. Used at
+    /// shutdown; an unfinished dial is not waited for.
+    async fn shutdown_dial(&self) {
+        let task = self
+            .dial_task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(task) = task {
+            task.abort();
+            if let Err(e) = task.await
+                && !e.is_cancelled()
+            {
+                eprintln!("Proxy: background dial task failed: {e}");
+            }
+        }
+    }
 }
 
-/// `ServerHandler` facing the stdio client. Every request is delegated to the
-/// upstream HTTP MCP server; this process holds no `IndexFacade` and no
-/// index state of its own.
+/// Aborts the wrapped task when dropped.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// `ServerHandler` facing the stdio client. `initialize`, `get_info` and
+/// `tools/list` are answered locally from the in-binary tool router and server
+/// info; every other request is delegated to the upstream HTTP MCP server once
+/// it is ready. This process holds no `IndexFacade` and no index state.
 #[derive(Clone)]
 struct DelegatingProxyHandler {
     /// `Arc<UpstreamHandle>` keeps `#[derive(Clone)]` on this handler cheap
-    /// (one `Arc` clone) while still sharing the single live connection,
+    /// (one `Arc` clone) while still sharing the single connection state,
     /// generation counter, and reconnect gate across every clone of the
     /// handler.
     upstream: Arc<UpstreamHandle>,
@@ -642,15 +771,25 @@ struct DelegatingProxyHandler {
     /// buffered in `state.pending` and drained atomically with setting
     /// `state.downstream` in `initialize` (see [`DownstreamState`]).
     state: Arc<Mutex<DownstreamState>>,
+    /// Tool list served locally, computed once per proxy.
+    tools: Arc<Vec<Tool>>,
 }
 
-/// Maximum time to wait for a single delegated upstream call, applied
-/// per-attempt: a revive-then-retry after a dead-transport failure gets a
-/// fresh budget for its one retry, rather than sharing the first attempt's
-/// timeout. A hung upstream must not leave the stdio client's request
-/// pending forever; this is a fixed budget rather than a new config knob,
-/// kept minimal per scope.
+/// Maximum time to wait for a single delegated upstream call. A hung upstream
+/// must not leave the stdio client's request pending forever; this is a fixed
+/// budget rather than a new config knob, kept minimal per scope.
 const UPSTREAM_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Text returned while the backing server is being dialed.
+const NOT_READY: &str =
+    "codanna index not available yet \u{2014} backend starting, check back shortly";
+
+/// Stable prefix of the text returned after a failed dial round.
+const FAILED_PREFIX: &str = "codanna backend unavailable:";
+
+fn failed_text(err: &McpError) -> String {
+    format!("{FAILED_PREFIX} {} (the next call retries)", err.message)
+}
 
 fn upstream_timeout_error() -> McpError {
     McpError::internal_error(
@@ -662,41 +801,81 @@ fn upstream_timeout_error() -> McpError {
     )
 }
 
+/// Outcome of [`DelegatingProxyHandler::delegate`]: the upstream value, or the
+/// text explaining why no upstream was available. An outcome type, not an
+/// error: `call_tool` renders `Unavailable` as an `isError` tool result while
+/// every other method renders it as a protocol error.
+enum Delegated<T> {
+    Value(T),
+    Unavailable(String),
+}
+
+impl<T> Delegated<T> {
+    fn or_protocol_error(self) -> Result<T, McpError> {
+        match self {
+            Self::Value(value) => Ok(value),
+            Self::Unavailable(text) => Err(McpError::internal_error(text, None)),
+        }
+    }
+}
+
+/// A complete `isError` tool result carrying `text`.
+fn unavailable_tool_response(text: String) -> CallToolResponse {
+    CallToolResponse::Complete(CallToolResult::error(vec![ContentBlock::text(text)]))
+        .mark_complete()
+}
+
 impl DelegatingProxyHandler {
-    /// Delegates one inbound request to the upstream server, with exactly one
-    /// revive-and-retry on a dead-transport failure and no more: a second
-    /// dead-transport error means the backing server is not coming back up,
-    /// and that mapped error is returned rather than looping or backing off.
+    /// Delegates one inbound request to the upstream server without ever
+    /// waiting for a dial:
     ///
-    /// `op` is `Fn`, not `FnOnce`, because it may be invoked up to twice (the
-    /// original attempt and, only on a dead transport, the retry against the
-    /// revived connection) -- every call site below clones its request params
-    /// into the closure body per invocation rather than moving them in once.
-    /// [`UPSTREAM_CALL_TIMEOUT`] is applied to each attempt independently.
-    async fn delegate<T, F, Fut>(&self, op: F) -> Result<T, McpError>
+    /// - `Connecting`: `Unavailable(NOT_READY)`.
+    /// - `Failed`: `Unavailable(failed text)`, and the caller that flips the
+    ///   slot back to `Connecting` starts one retry dial.
+    /// - `Ready`: runs `op`. A dead transport flips the slot to `Connecting`
+    ///   (single winner), starts the background dial, and returns
+    ///   `Unavailable(NOT_READY)` immediately; any other upstream error passes
+    ///   through unchanged.
+    ///
+    /// [`UPSTREAM_CALL_TIMEOUT`] bounds the one attempt.
+    async fn delegate<T, F, Fut>(&self, op: F) -> Result<Delegated<T>, McpError>
     where
-        F: Fn(Arc<RunningService<RoleClient, NotificationRelay>>) -> Fut,
+        F: FnOnce(UpstreamService) -> Fut,
         Fut: Future<Output = Result<T, ServiceError>>,
     {
-        let (service, generation) = self.upstream.current();
-        match tokio::time::timeout(UPSTREAM_CALL_TIMEOUT, op(service)).await {
-            Ok(Ok(value)) => return Ok(value),
-            // A healthy server's own protocol error (or any non-transport
-            // failure) passes through unchanged -- no revive.
-            Ok(Err(err)) if !is_dead_transport(&err) => return Err(map_service_err(err)),
-            // Dead transport: fall through to the single revive-and-retry
-            // below.
-            Ok(Err(_)) => {}
-            // The proxy's own timeout, not a `ServiceError` -- never
-            // triggers a revive (see `is_dead_transport`'s doc comment).
-            Err(_) => return Err(upstream_timeout_error()),
+        let (conn, generation) = self.upstream.snapshot();
+        match conn {
+            UpstreamConn::Connecting => Ok(Delegated::Unavailable(NOT_READY.to_string())),
+            UpstreamConn::Failed(err) => {
+                self.upstream.begin_redial(generation);
+                Ok(Delegated::Unavailable(failed_text(&err)))
+            }
+            UpstreamConn::Ready(service) => {
+                match tokio::time::timeout(UPSTREAM_CALL_TIMEOUT, op(service)).await {
+                    Ok(Ok(value)) => Ok(Delegated::Value(value)),
+                    // A healthy server's own protocol error (or any
+                    // non-transport failure) passes through unchanged.
+                    Ok(Err(err)) if !is_dead_transport(&err) => Err(map_service_err(err)),
+                    Ok(Err(_)) => {
+                        self.upstream.begin_redial(generation);
+                        Ok(Delegated::Unavailable(NOT_READY.to_string()))
+                    }
+                    // The proxy's own timeout, not a `ServiceError` -- never
+                    // triggers a redial (see `is_dead_transport`'s doc).
+                    Err(_) => Err(upstream_timeout_error()),
+                }
+            }
         }
+    }
 
-        let revived = self.upstream.revive(generation).await?;
-        match tokio::time::timeout(UPSTREAM_CALL_TIMEOUT, op(revived)).await {
-            Ok(result) => result.map_err(map_service_err),
-            Err(_) => Err(upstream_timeout_error()),
-        }
+    /// [`Self::delegate`] for methods that have no tool-result channel:
+    /// unavailability becomes a protocol error.
+    async fn delegate_or_error<T, F, Fut>(&self, op: F) -> Result<T, McpError>
+    where
+        F: FnOnce(UpstreamService) -> Fut,
+        Fut: Future<Output = Result<T, ServiceError>>,
+    {
+        self.delegate(op).await?.or_protocol_error()
     }
 }
 
@@ -766,52 +945,32 @@ impl MarkComplete for GetPromptResponse {
     }
 }
 
+/// The server info the proxy advertises, identical to the backing server's
+/// (built from the same in-binary source) minus `resources.subscribe`.
+///
+/// `resources.subscribe = true` advertises support for the 2026-07-28
+/// `subscriptions/listen` request, which this handler cannot honor: it
+/// overrides neither `accepted_subscription_filter` nor `listen`, so the SDK's
+/// default implementation rejects every such request with `method_not_found`.
+/// Strip the flag so advertised capabilities never promise more than the proxy
+/// actually serves; the legacy `resources/subscribe`/`unsubscribe` RPCs
+/// (forwarded in `subscribe`/`unsubscribe`) are unaffected and keep working.
+fn local_server_info() -> ServerInfo {
+    let mut info = codanna_server_info(None);
+    if let Some(resources) = info.capabilities.resources.as_mut() {
+        resources.subscribe = None;
+    }
+    info
+}
+
+/// The full tool list, from the same router the backing server registers.
+fn local_tools() -> Vec<Tool> {
+    CodeIntelligenceServer::full_tool_router().list_all()
+}
+
 impl ServerHandler for DelegatingProxyHandler {
     fn get_info(&self) -> ServerInfo {
-        // Reflect the upstream server's negotiated capabilities/info when
-        // available (set during the upstream `initialize` handshake that
-        // already completed by the time this proxy starts serving stdio);
-        // fall back to a minimal description if it is somehow unset. Reads
-        // the current connection synchronously via `UpstreamHandle::current`
-        // -- this method is NOT `async` and cannot await a revive, so it
-        // always reflects whatever connection is live right now.
-        // rmcp 3.x exposes the negotiated backing-server info as
-        // `ServerPeerInfo`, a distinct type from `InitializeResult`
-        // (`ServerInfo`), so its fields are copied across into a fresh
-        // `ServerInfo` rather than cloned wholesale.
-        match self.upstream.current().0.peer_info() {
-            Some(peer) => {
-                // `resources.subscribe = true` advertises support for the
-                // 2026-07-28 `subscriptions/listen` request, which this
-                // handler cannot honor: it overrides neither
-                // `accepted_subscription_filter` nor `listen`, so the SDK's
-                // default implementation rejects every such request with
-                // `method_not_found` regardless of what capabilities claim.
-                // Strip the flag so advertised capabilities never promise
-                // more than the proxy actually serves; the legacy
-                // `resources/subscribe`/`unsubscribe` RPCs (forwarded above
-                // in `subscribe`/`unsubscribe`) are unaffected by this field
-                // and keep working for peers that call them directly.
-                let mut capabilities = peer.capabilities.clone();
-                if let Some(resources) = capabilities.resources.as_mut() {
-                    resources.subscribe = None;
-                }
-                let info = ServerInfo::new(capabilities).with_server_info(
-                    peer.server_info.clone().unwrap_or_else(|| {
-                        Implementation::new("codanna-proxy", env!("CARGO_PKG_VERSION"))
-                    }),
-                );
-                match peer.instructions.clone() {
-                    Some(instructions) => info.with_instructions(instructions),
-                    None => info,
-                }
-            }
-            None => ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-                .with_server_info(Implementation::new(
-                    "codanna-proxy",
-                    env!("CARGO_PKG_VERSION"),
-                )),
-        }
+        local_server_info()
     }
 
     async fn initialize(
@@ -844,15 +1003,10 @@ impl ServerHandler for DelegatingProxyHandler {
 
     async fn list_tools(
         &self,
-        request: Option<PaginatedRequestParams>,
+        _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        self.delegate(|up| {
-            let request = request.clone();
-            async move { up.list_tools(request).await }
-        })
-        .await
-        .map(MarkComplete::mark_complete)
+        Ok(list_tools_result(self.tools.as_ref().clone()))
     }
 
     async fn call_tool(
@@ -860,12 +1014,13 @@ impl ServerHandler for DelegatingProxyHandler {
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
-        self.delegate(|up| {
-            let request = request.clone();
-            async move { up.call_tool_once(request).await }
+        let outcome = self
+            .delegate(|up| async move { up.call_tool_once(request).await })
+            .await?;
+        Ok(match outcome {
+            Delegated::Value(response) => response.mark_complete(),
+            Delegated::Unavailable(text) => unavailable_tool_response(text),
         })
-        .await
-        .map(MarkComplete::mark_complete)
     }
 
     async fn list_resources(
@@ -873,7 +1028,7 @@ impl ServerHandler for DelegatingProxyHandler {
         request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
-        self.delegate(|up| {
+        self.delegate_or_error(|up| {
             let request = request.clone();
             async move { up.list_resources(request).await }
         })
@@ -886,7 +1041,7 @@ impl ServerHandler for DelegatingProxyHandler {
         request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourceTemplatesResult, McpError> {
-        self.delegate(|up| {
+        self.delegate_or_error(|up| {
             let request = request.clone();
             async move { up.list_resource_templates(request).await }
         })
@@ -899,7 +1054,7 @@ impl ServerHandler for DelegatingProxyHandler {
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, McpError> {
-        self.delegate(|up| {
+        self.delegate_or_error(|up| {
             let request = request.clone();
             async move { up.read_resource_once(request).await }
         })
@@ -912,7 +1067,7 @@ impl ServerHandler for DelegatingProxyHandler {
         request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListPromptsResult, McpError> {
-        self.delegate(|up| {
+        self.delegate_or_error(|up| {
             let request = request.clone();
             async move { up.list_prompts(request).await }
         })
@@ -925,7 +1080,7 @@ impl ServerHandler for DelegatingProxyHandler {
         request: GetPromptRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<GetPromptResponse, McpError> {
-        self.delegate(|up| {
+        self.delegate_or_error(|up| {
             let request = request.clone();
             async move { up.get_prompt_once(request).await }
         })
@@ -938,7 +1093,7 @@ impl ServerHandler for DelegatingProxyHandler {
         request: CompleteRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<CompleteResult, McpError> {
-        self.delegate(|up| {
+        self.delegate_or_error(|up| {
             let request = request.clone();
             async move { up.complete(request).await }
         })
@@ -951,7 +1106,7 @@ impl ServerHandler for DelegatingProxyHandler {
         request: SetLevelRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
-        self.delegate(|up| {
+        self.delegate_or_error(|up| {
             let request = request.clone();
             async move { up.set_level(request).await }
         })
@@ -963,7 +1118,7 @@ impl ServerHandler for DelegatingProxyHandler {
         request: SubscribeRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
-        self.delegate(|up| {
+        self.delegate_or_error(|up| {
             let request = request.clone();
             async move { up.subscribe(request).await }
         })
@@ -975,7 +1130,7 @@ impl ServerHandler for DelegatingProxyHandler {
         request: UnsubscribeRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
-        self.delegate(|up| {
+        self.delegate_or_error(|up| {
             let request = request.clone();
             async move { up.unsubscribe(request).await }
         })
@@ -988,7 +1143,7 @@ impl ServerHandler for DelegatingProxyHandler {
         _context: RequestContext<RoleServer>,
     ) -> Result<CustomResult, McpError> {
         let result = self
-            .delegate(|up| {
+            .delegate_or_error(|up| {
                 let request = request.clone();
                 async move {
                     up.peer()
@@ -1012,7 +1167,12 @@ impl ServerHandler for DelegatingProxyHandler {
 ///
 /// No `IndexFacade` is constructed in this process: discovery/spawn of the
 /// backing HTTP server (and all index state) lives entirely in the process
-/// `serve_discovery::discover_or_spawn` finds or launches.
+/// `serve_discovery::discover_or_spawn` finds or launches. That dial runs in a
+/// background task started before stdio is served, so the proxy answers
+/// `initialize` and `tools/list` immediately; delegated calls report "not
+/// ready" until the dial completes. A failed dial is reported on stderr and
+/// cached; the next delegated call retries it. Only `NoWorkspaceRoot` and
+/// stdio errors make this return `Err`.
 pub async fn serve_proxy(
     config: Settings,
     config_path: Option<std::path::PathBuf>,
@@ -1036,63 +1196,33 @@ pub async fn serve_proxy(
     );
 
     let state: Arc<Mutex<DownstreamState>> = Arc::new(Mutex::new(DownstreamState::default()));
-    // Captured before `workspace_root` is moved into `Dialer` below: this is
-    // the proxy's own stable workspace root, known before the backing
-    // server is ever dialed, and must never be confused with anything the
-    // backing server later reports about itself.
     let proxy_workspace_root = workspace_root.clone();
-    let dial = Dialer {
-        workspace_root,
-        config,
-        config_path,
-        state: state.clone(),
-        connected_scheme: std::sync::Mutex::new(ServeScheme::default()),
-    };
+    let upstream = Arc::new(UpstreamHandle {
+        slot: std::sync::RwLock::new(UpstreamSlot {
+            conn: UpstreamConn::Connecting,
+            generation: 0,
+        }),
+        reconnect: tokio::sync::Mutex::new(()),
+        dial: Dialer {
+            workspace_root,
+            config,
+            config_path,
+            state: state.clone(),
+        },
+        dial_task: std::sync::Mutex::new(None),
+    });
 
-    // `Dialer::connect` is the single dial site: this initial connection and
-    // every later revive (`UpstreamHandle::revive`) both go through it, so
-    // there is exactly one HTTPS-pinning branch, not two.
-    let upstream = dial.connect().await?;
-    let connected_scheme = *dial
-        .connected_scheme
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-    // Best-effort registry entry for this proxy process itself, mirroring
-    // the discipline used for the `Spawning` entry write in
-    // `serve_discovery::discover_or_spawn`: this entry exists only so
-    // `codanna serve --list` can attribute this pid to the workspace it
-    // proxies for. A failed write must never block or fail the proxy --
-    // only `ls`'s proxy-attribution display degrades.
+    // Register this proxy before dialing so `codanna serve --list` can
+    // attribute the pid; `Dialer::connect` refreshes the scheme once dialed.
+    write_proxy_entry(&proxy_workspace_root, ServeScheme::default());
     let proxy_pid = std::process::id();
-    let proxy_entry = serve_registry::RegistryEntry {
-        pid: proxy_pid,
-        port: 0,
-        scheme: connected_scheme,
-        workspace_root: proxy_workspace_root,
-        start_time: unix_now_secs(),
-        status: serve_registry::ServerStatus::Healthy,
-        role: serve_registry::ServerRole::Proxy,
-        version: env!("CARGO_PKG_VERSION").to_string(),
-    };
-    if let Err(e) = serve_registry::write_entry(&proxy_entry) {
-        tracing::warn!(
-            target: "proxy",
-            "failed to write registry entry for proxy pid {proxy_pid}: {e}"
-        );
-    }
+
+    upstream.start_background_dial(0);
 
     let handler = DelegatingProxyHandler {
-        upstream: Arc::new(UpstreamHandle {
-            slot: std::sync::RwLock::new(UpstreamSlot {
-                service: upstream,
-                generation: 0,
-            }),
-            reconnect: tokio::sync::Mutex::new(()),
-            last_failure: std::sync::Mutex::new(None),
-            dial,
-        }),
+        upstream: Arc::clone(&upstream),
         state,
+        tools: Arc::new(local_tools()),
     };
 
     let discover_result = serde_json::to_value(rmcp::model::DiscoverResult::from_server_info(
@@ -1100,26 +1230,32 @@ pub async fn serve_proxy(
         handler.get_info(),
     ))
     .expect("DiscoverResult serializes: closed struct of strings and maps");
-    let service = handler
+    let served = handler
         .serve(crate::mcp::probe_tolerant_stdio(discover_result))
-        .await
-        .map_err(|e| ProxyError::Stdio(e.to_string()))?;
-
-    let wait_result = service
-        .waiting()
         .await
         .map_err(|e| ProxyError::Stdio(e.to_string()));
 
-    // Graceful shutdown: remove this proxy's own registry entry regardless
-    // of whether `waiting()` returned an error, so a clean exit never leaves
-    // a stale row behind for `ls` to display. A crash/kill instead leaves
-    // this entry in place; the existing `entry_is_stale`/`--reap` machinery
-    // already prunes that case, so no new cleanup path is added here.
+    let wait_result = match served {
+        Ok(service) => service
+            .waiting()
+            .await
+            .map(|_| ())
+            .map_err(|e| ProxyError::Stdio(e.to_string())),
+        Err(e) => Err(e),
+    };
+
+    // Graceful shutdown: do not wait for an unfinished dial. Dropping a
+    // mid-flight `discover_or_spawn` is safe (the lock guard's Drop removes
+    // `http.lock`; a detached backend child and its `Spawning` entry survive).
+    upstream.shutdown_dial().await;
+
+    // Remove this proxy's own registry entry regardless of whether stdio
+    // returned an error, so a clean exit never leaves a stale row behind for
+    // `ls`. A crash/kill leaves it for the existing `entry_is_stale`/`--reap`
+    // machinery.
     serve_registry::remove_entry(proxy_pid);
 
-    wait_result?;
-
-    Ok(())
+    wait_result
 }
 
 // A live `NotificationRelay::on_custom_notification` / `initialize`-time
@@ -1561,7 +1697,6 @@ mod tests {
             config: Settings::default(),
             config_path: None,
             state: state.clone(),
-            connected_scheme: std::sync::Mutex::new(ServeScheme::default()),
         };
 
         // Build the relay exactly as the initial dial does, then again as a
@@ -1588,5 +1723,157 @@ mod tests {
             ),
             "initial connect and later revive must observe pointer-identical state"
         );
+    }
+
+    #[test]
+    fn local_tool_list_matches_router_with_cache_hints() {
+        let router_names: Vec<String> = CodeIntelligenceServer::full_tool_router()
+            .list_all()
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        let result = list_tools_result(local_tools());
+
+        let names: Vec<String> = result.tools.iter().map(|t| t.name.to_string()).collect();
+        assert_eq!(names, router_names);
+        assert!(!names.is_empty());
+        assert_eq!(result.result_type, Some(ResultType::COMPLETE));
+        assert!(result.ttl_ms.is_some(), "ttl hint must be present");
+        assert!(result.cache_scope.is_some(), "cache scope must be present");
+    }
+
+    #[test]
+    fn local_server_info_is_codanna_without_resource_subscribe() {
+        let info = local_server_info();
+
+        assert_eq!(info.server_info.name, "codanna");
+        let resources = info
+            .capabilities
+            .resources
+            .as_ref()
+            .expect("resources capability is advertised");
+        assert_eq!(resources.subscribe, None);
+        assert!(info.instructions.is_some());
+    }
+
+    fn slot_with(conn: UpstreamConn<u64>, generation: u64) -> std::sync::RwLock<UpstreamSlot<u64>> {
+        std::sync::RwLock::new(UpstreamSlot { conn, generation })
+    }
+
+    fn read_slot(slot: &std::sync::RwLock<UpstreamSlot<u64>>) -> (&'static str, u64) {
+        let guard = slot
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tag = match guard.conn {
+            UpstreamConn::Connecting => "connecting",
+            UpstreamConn::Ready(_) => "ready",
+            UpstreamConn::Failed(_) => "failed",
+        };
+        (tag, guard.generation)
+    }
+
+    fn count_concurrent_flips(slot: Arc<std::sync::RwLock<UpstreamSlot<u64>>>, seen: u64) -> usize {
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let slot = slot.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    flip_to_connecting(&slot, seen)
+                })
+            })
+            .collect();
+        threads
+            .into_iter()
+            .map(|t| t.join().expect("flip thread should not panic"))
+            .filter(|won| *won)
+            .count()
+    }
+
+    #[test]
+    fn failed_slot_flips_to_connecting_with_exactly_one_winner() {
+        let slot = Arc::new(slot_with(
+            UpstreamConn::Failed(McpError::internal_error("boom", None)),
+            3,
+        ));
+
+        assert_eq!(count_concurrent_flips(slot.clone(), 3), 1);
+        assert_eq!(read_slot(&slot), ("connecting", 3));
+    }
+
+    #[test]
+    fn ready_slot_dead_transport_flip_has_exactly_one_winner() {
+        let slot = Arc::new(slot_with(UpstreamConn::Ready(7), 2));
+
+        assert_eq!(count_concurrent_flips(slot.clone(), 2), 1);
+        assert_eq!(read_slot(&slot), ("connecting", 2));
+    }
+
+    #[test]
+    fn connecting_and_stale_generation_never_flip() {
+        let connecting = slot_with(UpstreamConn::Connecting, 0);
+        assert!(!flip_to_connecting(&connecting, 0));
+        assert_eq!(read_slot(&connecting), ("connecting", 0));
+
+        let stale_failed = slot_with(UpstreamConn::Failed(McpError::internal_error("x", None)), 5);
+        assert!(!flip_to_connecting(&stale_failed, 4));
+        assert_eq!(read_slot(&stale_failed), ("failed", 5));
+
+        let stale_ready = slot_with(UpstreamConn::Ready(1), 5);
+        assert!(!flip_to_connecting(&stale_ready, 4));
+        assert_eq!(read_slot(&stale_ready), ("ready", 5));
+    }
+
+    #[tokio::test]
+    async fn revive_round_stores_failed_or_ready_at_next_generation() {
+        let reconnect = tokio::sync::Mutex::new(());
+
+        let failing = slot_with(UpstreamConn::Connecting, 0);
+        let result = single_flight_revive(
+            &reconnect,
+            0,
+            || read_round(&failing),
+            |v, g, f| commit_round(&failing, v, g, f),
+            || async { Err::<UpstreamConn<u64>, McpError>(McpError::internal_error("down", None)) },
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(read_slot(&failing), ("failed", 1));
+
+        let succeeding = slot_with(UpstreamConn::Connecting, 0);
+        let result = single_flight_revive(
+            &reconnect,
+            0,
+            || read_round(&succeeding),
+            |v, g, f| commit_round(&succeeding, v, g, f),
+            || async { Ok::<UpstreamConn<u64>, McpError>(UpstreamConn::Ready(9)) },
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(read_slot(&succeeding), ("ready", 1));
+    }
+
+    #[test]
+    fn unavailable_responses_are_complete_tool_errors_with_pinned_text() {
+        let not_ready = unavailable_tool_response(NOT_READY.to_string());
+        let inner = McpError::internal_error("failed to reach backing MCP server: refused", None);
+        let failed = unavailable_tool_response(failed_text(&inner));
+
+        for (response, needle) in [
+            (not_ready, "codanna index not available yet"),
+            (failed, "codanna backend unavailable:"),
+        ] {
+            match response {
+                CallToolResponse::Complete(r) => {
+                    assert_eq!(r.is_error, Some(true));
+                    assert_eq!(r.result_type, Some(ResultType::COMPLETE));
+                    let text = serde_json::to_string(&r.content).expect("content serializes");
+                    assert!(text.contains(needle), "{text} should contain {needle}");
+                }
+                other => panic!("expected a complete result: {other:?}"),
+            }
+        }
+        assert!(failed_text(&inner).contains("refused"));
     }
 }

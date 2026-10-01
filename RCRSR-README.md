@@ -159,9 +159,10 @@ with the fork's caveats:
   `codanna index` as the fix; it still exits with code 7 after the session, and
   a terminal still prints `index emission semantics changed`. **Fork note:**
   proxy mode is exempt because a proxy holds no index. If a proxy has to spawn
-  a *fresh* backing server against a stale index you get a readiness timeout
-  (`backing 'codanna serve --http' did not become healthy within …ms`) rather
-  than the stale-index explanation; run `codanna index` to heal it.
+  a *fresh* backing server against a stale index, tool calls report a
+  readiness timeout (`backing 'codanna serve --http' did not become healthy
+  within …ms`) rather than the stale-index explanation; run `codanna index`
+  to heal it.
 - **`--fields` rejects unknown field names** (v0.11.1) with a JSON error
   envelope, `code: INVALID_QUERY`, exit code 2, and a hint listing the fields
   the tool actually returns (they differ per tool). Dotted paths are now
@@ -220,6 +221,23 @@ hours idle by default (see [Idle shutdown](#idle-shutdown)). Both `--http` and
 `--https` backing servers are supported; with `--https` the connection is
 verified against codanna's own certificate.
 
+The proxy never blocks the client on the backing server. It dials in the
+background as soon as it starts and answers the MCP handshake (`initialize`)
+and `tools/list` itself, immediately, from the same tool definitions the
+backing server uses. While the backing server is unavailable, a tool call
+returns an `isError` result instead of hanging or killing the proxy:
+
+- Still starting (initial dial, or a redial after the backing server died):
+  `codanna index not available yet — backend starting, check back shortly`.
+- Last dial failed: `codanna backend unavailable:` followed by the workspace
+  root, the underlying error, and a note that the next call retries. That
+  call starts one new background dial; there is no autonomous retry loop.
+
+Non-tool requests (resources, prompts, completion, log level, subscriptions)
+get the same two messages as a JSON-RPC internal error. A dial failure is
+also logged to stderr as `Proxy: backing MCP server unavailable: <error>`; the
+proxy process exits only on a missing workspace root or a stdio failure.
+
 ### Idle shutdown
 
 A backing server (`--http` or `--https`) exits cleanly after
@@ -237,25 +255,27 @@ finds no live server and auto-spawns a fresh one, paying only startup latency
 
 A connected `codanna serve --proxy` does not need restarting when its backing
 server goes away (idle shutdown, crash, manual kill). The proxy holds one
-connection to its upstream and never polls it; the *next* delegated tool call
-notices the dead connection, re-runs the same discover-or-spawn logic used at
-startup (reusing a live backing server if one exists, else spawning one), and
-retries the call exactly once before returning anything to the client.
+connection to its upstream and never polls it; the *next* delegated call
+notices the dead connection and returns the "not available yet" result
+immediately, without waiting. It also starts a background redial running the
+same discover-or-spawn logic used at startup (reusing a live backing server if
+one exists, else spawning one). The call that noticed is not retried; call
+again once the backend is up.
 
 Limits worth knowing before you rely on it:
 
-- **Exactly one retry.** If the revived connection also fails, the error is
-  returned as-is — no loop, no backoff. Two back-to-back failures mean the
-  backing server is not coming up.
+- **No inline retry, no loop.** A failed redial leaves the proxy in the
+  "backend unavailable" state; the next call returns that error and starts one
+  more background dial. There is no backoff and no autonomous retry.
 - **Single-flight per proxy, including on failure.** Concurrent requests
   hitting the dead connection share one dial; a failed dial is cached for the
-  round so waiters get the same error instead of each re-spawning (and each
+  round so callers get the same error instead of each re-spawning (and each
   paying a full spawn-and-health-check timeout).
 - **Never on a timeout.** A backing server that is merely slow (a large
   reindex, say) is not treated as dead and is not replaced; only a genuinely
   closed transport triggers revival.
 - **`auto_spawn = false` fails closed, not silently.** With no live backing
-  server and spawning disallowed, the call fails with an actionable error
+  server and spawning disallowed, the call returns an actionable error
   naming the workspace and pointing at `codanna serve --http --watch` /
   `auto_spawn = true`.
 
@@ -289,7 +309,7 @@ auto_spawn = true           # let the proxy start a backing server when none is 
                             # false = you start `codanna serve --http --watch` yourself
 spawn_timeout_ms = 8000     # how long to wait for a spawned server to become ready
 spawn_max_wait_ms = 120000  # keep waiting up to this long while that spawn is still
-                            # alive (slow cold start) instead of failing the proxy
+                            # alive (slow cold start) instead of reporting the backend unavailable
 health_poll_ms = 100        # readiness poll interval while waiting
 idle_shutdown_minutes = 240 # exit the backing server after N idle minutes (0 = never)
 ```
@@ -312,8 +332,9 @@ workspace, the registry is for lifecycle management across all of them. It
 lives at `codanna/servers/` under your state directory (`$XDG_STATE_HOME` or
 `~/.local/state` on Linux; `~/Library/Application Support` on macOS;
 `%APPDATA%` on Windows), one file per running server named by pid, so nothing
-contends. Proxies write a lightweight `role: proxy` entry on connect and remove
-it on graceful exit. Each entry records the `codanna` version that wrote it.
+contends. Proxies write a lightweight `role: proxy` entry at startup (status always
+`healthy`), refresh it with the dialed scheme after each successful connect,
+and remove it on graceful exit. Each entry records the `codanna` version that wrote it.
 
 `codanna ls` is the top-level command for listing every codanna server process
 visible to you, merging three sources into one table (PID / KIND / SOURCE /
@@ -397,10 +418,10 @@ the paths differ, so the same build installed at two locations (a mise dir vs
 
 **STATUS column.** Registered servers show their self-reported `spawning` or
 `healthy`; unknown rows show `running`. A proxy whose backing server is gone,
-dead, or itself unknown shows `detached` instead of the `healthy` it recorded at
-connect time (a proxy's entry is written once and never updated, so it would
-otherwise stay `healthy` forever). A detached proxy is still live and will
-revive a backing server on its next delegated call; stop it with
+dead, or itself unknown shows `detached` instead of the `healthy` it recorded
+(a proxy's entry status is always `healthy` and never reflects the backend, so
+it would otherwise stay `healthy` forever). A detached proxy is still live and will
+redial a backing server on its next delegated call; stop it with
 `--stop-all --include-proxies` if you don't want that.
 
 ### Hot-reload notifications through the proxy

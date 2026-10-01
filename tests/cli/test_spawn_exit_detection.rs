@@ -21,8 +21,10 @@
 //! early detection rather than merely a short timeout coinciding with a slow
 //! failure.
 
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -130,14 +132,92 @@ spawn_timeout_ms = {SPAWN_TIMEOUT_MS}
     path
 }
 
+/// A running proxy child plus a background thread collecting its stderr.
+/// The proxy exits when stdin reaches EOF, so stdin is kept open (piped) for
+/// the proxy's whole life and closed explicitly; `Drop` reaps the child.
+struct Proxy {
+    child: Child,
+    stderr: Arc<Mutex<String>>,
+    stdout_lines: Arc<Mutex<Vec<String>>>,
+}
+
+impl Proxy {
+    fn stderr_text(&self) -> String {
+        self.stderr.lock().expect("stderr lock").clone()
+    }
+
+    /// Poll collected stderr until `marker` appears; returns elapsed time
+    /// from `start`. Panics at [`DEADLINE`] instead of hanging CI.
+    fn wait_for_stderr(&self, marker: &str, start: Instant) -> Duration {
+        loop {
+            if self.stderr_text().contains(marker) {
+                return start.elapsed();
+            }
+            assert!(
+                start.elapsed() < DEADLINE,
+                "timed out waiting for stderr marker {marker:?}; stderr:\n{}",
+                self.stderr_text()
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+impl Proxy {
+    /// Wait until `marker` has appeared at least `count` times on stderr.
+    fn wait_for_stderr_count(&self, marker: &str, count: usize) {
+        let start = Instant::now();
+        while self.stderr_text().matches(marker).count() < count {
+            assert!(
+                start.elapsed() < DEADLINE,
+                "timed out waiting for {count} x {marker:?}; stderr:\n{}",
+                self.stderr_text()
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Wait for the JSON-RPC response line with `"id":<id>` on stdout.
+    fn wait_for_stdout_id(&self, id: u64) -> String {
+        let needle = format!("\"id\":{id}");
+        let start = Instant::now();
+        loop {
+            let found = self
+                .stdout_lines
+                .lock()
+                .expect("stdout lock")
+                .iter()
+                .find(|l| l.contains(&needle) && !l.contains("\"method\""))
+                .cloned();
+            if let Some(line) = found {
+                return line;
+            }
+            assert!(
+                start.elapsed() < DEADLINE,
+                "timed out waiting for response id {id}; stderr:\n{}",
+                self.stderr_text()
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+impl Drop for Proxy {
+    fn drop(&mut self) {
+        drop(self.child.stdin.take());
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// Start `codanna --config <config_path> serve --proxy` rooted at `ws`, with
 /// `CODANNA_TEST_SPAWN_FAIL_CODE` set in THIS process's own environment (not
 /// the never-execed backing server's): the hook is read by
 /// `serve_discovery::build_spawn_command` inside the proxy's own
 /// `discover_or_spawn` call, which substitutes the fast-failing `sh -c`
 /// script for the real spawn.
-fn start_proxy(ws: &Path, home: &Path, config_path: &Path, fail_code: i32) -> Child {
-    Command::new(codanna_binary())
+fn start_proxy(ws: &Path, home: &Path, config_path: &Path, fail_code: i32) -> Proxy {
+    let mut child = Command::new(codanna_binary())
         .args([
             "--config",
             config_path.to_string_lossy().as_ref(),
@@ -148,44 +228,37 @@ fn start_proxy(ws: &Path, home: &Path, config_path: &Path, fail_code: i32) -> Ch
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", home)
         .env("CODANNA_TEST_SPAWN_FAIL_CODE", fail_code.to_string())
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn codanna serve --proxy")
-}
-
-/// Deadline-bounded, tight-poll wait for `child` to exit on its own, without
-/// touching its stdout/stderr pipes. Panics (rather than hanging CI) if the
-/// child is still running at `deadline`. Mirrors
-/// `test_spawn_timeout_dedup.rs::wait_for_exit_status`.
-fn wait_for_exit_status(child: &mut Child, deadline: Duration) -> std::process::ExitStatus {
-    let start = Instant::now();
-    loop {
-        if let Some(status) = child.try_wait().expect("poll child exit status") {
-            return status;
+        .expect("spawn codanna serve --proxy");
+    let stderr = child.stderr.take().expect("proxy stderr piped");
+    let collected = Arc::new(Mutex::new(String::new()));
+    let sink = Arc::clone(&collected);
+    thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if let Ok(mut buf) = sink.lock() {
+                buf.push_str(&line);
+                buf.push('\n');
+            }
         }
-        assert!(
-            start.elapsed() < deadline,
-            "process did not exit on its own within {deadline:?}"
-        );
-        thread::sleep(Duration::from_micros(200));
+    });
+    let stdout = child.stdout.take().expect("proxy stdout piped");
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let lines_sink = Arc::clone(&lines);
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Ok(mut buf) = lines_sink.lock() {
+                buf.push(line);
+            }
+        }
+    });
+    Proxy {
+        child,
+        stderr: collected,
+        stdout_lines: lines,
     }
-}
-
-/// Read the remainder of `child`'s stdout/stderr pipes to completion. Only
-/// meaningful after `child` has already exited.
-fn drain_output(child: &mut Child) -> (String, String) {
-    use std::io::Read;
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    if let Some(mut out) = child.stdout.take() {
-        let _ = out.read_to_string(&mut stdout);
-    }
-    if let Some(mut err) = child.stderr.take() {
-        let _ = err.read_to_string(&mut stderr);
-    }
-    (stdout, stderr)
 }
 
 /// Registry directory this test's `home` resolves to, mirroring
@@ -244,16 +317,11 @@ fn spawn_exit_is_detected_before_timeout_elapses() {
     let config = write_config(workspace.path());
 
     let start = Instant::now();
-    let mut proxy = start_proxy(workspace.path(), &home, &config, FAIL_CODE);
-    let status = wait_for_exit_status(&mut proxy, DEADLINE);
-    let elapsed = start.elapsed();
-    let (_stdout, stderr) = drain_output(&mut proxy);
-
-    assert!(
-        !status.success(),
-        "proxy should exit non-zero when discover_or_spawn observes the spawned \
-         process exit before becoming healthy; stderr:\n{stderr}"
-    );
+    let proxy = start_proxy(workspace.path(), &home, &config, FAIL_CODE);
+    // The proxy stays alive (stdin open); the background dial reports the
+    // failure on stderr as soon as the reaper observes the child exit.
+    let elapsed = proxy.wait_for_stderr("backing MCP server unavailable", start);
+    let stderr = proxy.stderr_text();
 
     assert!(
         stderr.contains("codanna-test-spawn-fail-marker"),
@@ -296,4 +364,88 @@ fn spawn_exit_is_detected_before_timeout_elapses() {
             );
         }
     }
+}
+
+/// Count of registry entries for `ws` with the backing-server role.
+fn server_entry_count(home: &Path, ws: &Path) -> usize {
+    registry_entries_for_workspace(home, ws)
+        .iter()
+        .filter(|e| e.role == ServerRole::Server)
+        .count()
+}
+
+fn send_line(proxy: &mut Proxy, line: &str) {
+    use std::io::Write;
+    let stdin = proxy.child.stdin.as_mut().expect("proxy stdin open");
+    writeln!(stdin, "{line}").expect("write JSON-RPC line to proxy stdin");
+    stdin.flush().expect("flush proxy stdin");
+}
+
+/// A dial that failed is retried only when a request arrives, never on its
+/// own. One tool call in the `Failed` state triggers exactly one more spawn
+/// (Server-role registry entries 1 -> 2); with no further calls the count
+/// stays at 2 and no further failed round is reported.
+#[test]
+fn failed_dial_is_retried_only_by_a_request_and_not_autonomously() {
+    let workspace = prepare_workspace();
+    let home = workspace.path().join(".home");
+    std::fs::create_dir_all(&home).expect("create test home");
+    let config = write_config(workspace.path());
+
+    let start = Instant::now();
+    let mut proxy = start_proxy(workspace.path(), &home, &config, FAIL_CODE);
+    proxy.wait_for_stderr("backing MCP server unavailable", start);
+    assert_eq!(
+        server_entry_count(&home, workspace.path()),
+        1,
+        "the first failed dial round should leave exactly one Server-role entry"
+    );
+
+    // Minimal MCP handshake, then one tool call while the slot is Failed.
+    send_line(
+        &mut proxy,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#,
+    );
+    proxy.wait_for_stdout_id(1);
+    send_line(
+        &mut proxy,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+    );
+    send_line(
+        &mut proxy,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_index_info","arguments":{}}}"#,
+    );
+    let response = proxy.wait_for_stdout_id(2);
+    assert!(
+        response.contains("codanna backend unavailable:"),
+        "a call in the Failed state should report the failure; got: {response}"
+    );
+
+    // The request-triggered retry spawns a second failing backend.
+    let retry_start = Instant::now();
+    while server_entry_count(&home, workspace.path()) < 2 {
+        assert!(
+            retry_start.elapsed() < DEADLINE,
+            "the tool call did not trigger a retry dial; stderr:\n{}",
+            proxy.stderr_text()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    proxy.wait_for_stderr_count("backing MCP server unavailable", 2);
+
+    // No further calls: no autonomous retry may appear.
+    thread::sleep(Duration::from_millis(1500));
+    assert_eq!(
+        server_entry_count(&home, workspace.path()),
+        2,
+        "without further requests no additional dial may be started"
+    );
+    assert_eq!(
+        proxy
+            .stderr_text()
+            .matches("backing MCP server unavailable")
+            .count(),
+        2,
+        "exactly two failed rounds expected (initial + one request-triggered)"
+    );
 }

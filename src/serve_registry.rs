@@ -260,8 +260,12 @@ pub fn find_spawning_for(workspace_root: &Path) -> Option<RegistryEntry> {
 /// supply a fixed `Vec<RegistryEntry>` (including dead-pid or
 /// already-`Healthy` entries) without depending on `registry_dir()`.
 ///
-/// An entry only counts as an in-flight spawn if, beyond the `Spawning`
-/// status and workspace match, `is_live_serve(entry.pid)` holds. In
+/// Only `Server`-role entries are considered: a `Proxy`-role entry never
+/// represents a backend spawn, so it can never be mistaken for one (defense in
+/// depth for the invariant that a proxy never waits on its own pid).
+///
+/// An entry only counts as an in-flight spawn if, beyond the `Server` role,
+/// `Spawning` status and workspace match, `is_live_serve(entry.pid)` holds. In
 /// production that means both pid-alive AND cmdline-still-looks-like-codanna
 /// (see [`is_live_codanna_serve`]): a stale entry whose pid has been reused
 /// by an unrelated live process must not be mistaken for a genuine in-flight
@@ -278,7 +282,8 @@ fn find_spawning_for_in(
     entries
         .iter()
         .find(|entry| {
-            entry.status == ServerStatus::Spawning
+            entry.role == ServerRole::Server
+                && entry.status == ServerStatus::Spawning
                 && paths_match(&entry.workspace_root, workspace_root)
                 && is_live_serve(entry.pid)
         })
@@ -334,6 +339,20 @@ mod tests {
             role: ServerRole::Server,
             version: "0.0.0-test".to_string(),
         }
+    }
+
+    #[test]
+    fn find_spawning_ignores_proxy_role_entries() {
+        let workspace = Path::new("/tmp/workspace-role");
+        let mut proxy = sample_entry(1, workspace, ServerStatus::Spawning);
+        proxy.role = ServerRole::Proxy;
+        let server = sample_entry(2, workspace, ServerStatus::Spawning);
+
+        assert!(find_spawning_for_in(&[proxy.clone()], workspace, |_| true).is_none());
+
+        let found = find_spawning_for_in(&[proxy, server], workspace, |_| true)
+            .expect("server-role spawning entry must be found");
+        assert_eq!(found.pid, 2);
     }
 
     #[test]

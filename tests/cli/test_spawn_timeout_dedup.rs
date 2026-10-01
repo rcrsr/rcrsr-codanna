@@ -39,8 +39,10 @@
 //! exact mechanism the fix relies on rather than merely inferring success
 //! from the two processes' exit codes.
 
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -198,6 +200,58 @@ spawn_max_wait_ms = {SHORT_MAX_WAIT_MS}
     path
 }
 
+/// A running proxy child plus a background thread collecting its stderr.
+/// The proxy exits when stdin reaches EOF, so stdin stays open (piped) for
+/// the proxy's whole life; `Drop` closes it and reaps the child.
+struct Proxy {
+    child: Child,
+    stderr: Arc<Mutex<String>>,
+}
+
+impl Proxy {
+    fn stderr_text(&self) -> String {
+        self.stderr.lock().expect("stderr lock").clone()
+    }
+
+    /// Poll collected stderr until `marker` appears; returns elapsed time
+    /// from `start`. Panics at [`DEADLINE`] instead of hanging CI.
+    fn wait_for_stderr(&self, marker: &str, start: Instant) -> Duration {
+        loop {
+            if self.stderr_text().contains(marker) {
+                return start.elapsed();
+            }
+            assert!(
+                start.elapsed() < DEADLINE,
+                "timed out waiting for stderr marker {marker:?}; stderr:\n{}",
+                self.stderr_text()
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Close stdin (EOF makes the proxy exit) and wait for it to exit.
+    fn shutdown(&mut self) {
+        drop(self.child.stdin.take());
+        let start = Instant::now();
+        while self.child.try_wait().expect("poll child exit").is_none() {
+            assert!(
+                start.elapsed() < DEADLINE,
+                "proxy did not exit after stdin closed; stderr:\n{}",
+                self.stderr_text()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for Proxy {
+    fn drop(&mut self) {
+        drop(self.child.stdin.take());
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// Start `codanna serve --proxy` rooted at `ws`, optionally with `--config
 /// <config_path>`, sharing `home` as `HOME`/`XDG_CONFIG_HOME` so every
 /// process in this test sees the same per-user server registry. When
@@ -212,7 +266,7 @@ fn start_proxy(
     home: &Path,
     config_path: Option<&Path>,
     spawn_delay_ms: Option<u64>,
-) -> Child {
+) -> Proxy {
     let mut args: Vec<String> = Vec::new();
     if let Some(config_path) = config_path {
         args.push("--config".to_string());
@@ -226,51 +280,28 @@ fn start_proxy(
         .current_dir(ws)
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", home)
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(delay_ms) = spawn_delay_ms {
         cmd.env("CODANNA_TEST_SPAWN_DELAY_MS", delay_ms.to_string());
     }
-    cmd.spawn().expect("spawn codanna serve --proxy")
-}
-
-/// Deadline-bounded, TIGHT-poll wait for `child` to exit on its own, without
-/// touching its stdout/stderr pipes. Split out from output-draining
-/// (`drain_output` below) so the caller can spawn proxy #2 the INSTANT
-/// proxy #1 exits, rather than after the extra latency of reading its pipes
-/// first -- that gap is exactly the window the race this test drives depends
-/// on being as small as possible (the backing server's real cold-start time
-/// is only ~tens of milliseconds longer than the deliberately tiny
-/// `spawn_timeout_ms` proxy #1 uses). Panics (rather than hanging CI) if the
-/// child is still running at `deadline`.
-fn wait_for_exit_status(child: &mut Child, deadline: Duration) -> std::process::ExitStatus {
-    let start = Instant::now();
-    loop {
-        if let Some(status) = child.try_wait().expect("poll child exit status") {
-            return status;
+    let mut child = cmd.spawn().expect("spawn codanna serve --proxy");
+    let stderr = child.stderr.take().expect("proxy stderr piped");
+    let collected = Arc::new(Mutex::new(String::new()));
+    let sink = Arc::clone(&collected);
+    thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if let Ok(mut buf) = sink.lock() {
+                buf.push_str(&line);
+                buf.push('\n');
+            }
         }
-        assert!(
-            start.elapsed() < deadline,
-            "process did not exit on its own within {deadline:?}"
-        );
-        thread::sleep(Duration::from_micros(200));
+    });
+    Proxy {
+        child,
+        stderr: collected,
     }
-}
-
-/// Read the remainder of `child`'s stdout/stderr pipes to completion. Only
-/// meaningful after `child` has already exited (see `wait_for_exit_status`).
-fn drain_output(child: &mut Child) -> (String, String) {
-    use std::io::Read;
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    if let Some(mut out) = child.stdout.take() {
-        let _ = out.read_to_string(&mut stdout);
-    }
-    if let Some(mut err) = child.stderr.take() {
-        let _ = err.read_to_string(&mut stderr);
-    }
-    (stdout, stderr)
 }
 
 /// Registry directory this test's `home` resolves to, mirroring
@@ -387,25 +418,11 @@ fn second_proxy_waits_on_spawning_entry_instead_of_duplicating() {
         Some(&short_config),
         Some(SPAWN_DELAY_MS),
     );
-    let status1 = wait_for_exit_status(&mut proxy1, DEADLINE);
-
-    // Proxy #2 is spawned THE INSTANT proxy #1's exit is observed -- before
-    // draining proxy #1's pipes or making any assertions on it -- to keep the
-    // race window (the real backing server's cold-start time minus proxy
-    // #1's own deliberately tiny `spawn_timeout_ms`) as tight as possible.
-    // Uses the workspace's DEFAULT (generous) spawn_timeout_ms, no --config
-    // override: if the backing server has not yet published its Healthy
-    // registry entry, this exercises the `find_spawning_for` wait path
-    // (Guard 3 in `discover_or_spawn`); either way, no second
-    // `spawn_detached` must occur.
+    // Proxy #1 stays alive (stdin open); its background dial reports the
+    // SpawnTimeout on stderr. Proxy #2 starts the instant that is seen.
+    proxy1.wait_for_stderr("did not become healthy", Instant::now());
     let mut proxy2 = start_proxy(workspace.path(), &home, None, None);
-
-    let (_stdout1, stderr1) = drain_output(&mut proxy1);
-    assert!(
-        !status1.success(),
-        "proxy #1 should exit non-zero after its own discover_or_spawn call times out \
-         waiting for the backing server to become healthy; stderr:\n{stderr1}"
-    );
+    let stderr1 = proxy1.stderr_text();
     assert!(
         stderr1.contains("did not become healthy"),
         "proxy #1 should report the SpawnTimeout error from discover_or_spawn, got stderr:\n{stderr1}"
@@ -415,7 +432,12 @@ fn second_proxy_waits_on_spawning_entry_instead_of_duplicating() {
     // proxy #1 published before waiting must be on disk, naming a
     // still-alive pid -- NOT killed just because proxy #1's own wait timed
     // out.
-    let entries_after_timeout = registry_entries_for_workspace(&home, workspace.path());
+    // Proxy #1's own Proxy-role entry exists from startup, so scope to Server.
+    let entries_after_timeout: Vec<RegistryEntry> =
+        registry_entries_for_workspace(&home, workspace.path())
+            .into_iter()
+            .filter(|e| e.role == ServerRole::Server)
+            .collect();
     assert_eq!(
         entries_after_timeout.len(),
         1,
@@ -429,17 +451,10 @@ fn second_proxy_waits_on_spawning_entry_instead_of_duplicating() {
          legitimately slow cold start is not a failure to correct by killing"
     );
 
-    let status2 = wait_for_exit_status(&mut proxy2, DEADLINE);
-    let (_stdout2, stderr2) = drain_output(&mut proxy2);
-
     // Proxy #2 must reach a live backing server without erroring -- proving
     // it actually waited on (and observed) the promotion to Healthy, rather
     // than also timing out or refusing to proceed.
-    assert!(
-        status2.success() || stderr2.contains("delegating to backing MCP server"),
-        "proxy #2 should successfully discover the backing server proxy #1 spawned; \
-         stderr:\n{stderr2}"
-    );
+    proxy2.wait_for_stderr("delegating to backing MCP server", Instant::now());
 
     // The registry must still show exactly ONE entry for this workspace,
     // naming the SAME pid proxy #1's spawn produced -- the central
@@ -499,6 +514,9 @@ fn second_proxy_waits_on_spawning_entry_instead_of_duplicating() {
         !codanna_dir.join("http.lock").exists(),
         "http.lock should not exist once both proxy calls have settled"
     );
+
+    proxy1.shutdown();
+    proxy2.shutdown();
 }
 
 /// A spawn still alive when `spawn_timeout_ms` runs out is waited on (up to
@@ -523,16 +541,12 @@ fn proxy_keeps_waiting_on_live_spawn_past_spawn_timeout() {
         Some(&short_config),
         Some(SPAWN_DELAY_MS),
     );
-    let status = wait_for_exit_status(&mut proxy, DEADLINE);
-    let (_stdout, stderr) = drain_output(&mut proxy);
+    proxy.wait_for_stderr("delegating to backing MCP server", Instant::now());
+    let stderr = proxy.stderr_text();
 
     assert!(
         !stderr.contains("did not become healthy"),
         "the proxy must not time out while its spawn is alive; stderr:\n{stderr}"
-    );
-    assert!(
-        status.success() || stderr.contains("delegating to backing MCP server"),
-        "the proxy should attach to the slow-starting server it spawned; stderr:\n{stderr}"
     );
 
     let servers: Vec<RegistryEntry> = registry_entries_for_workspace(&home, workspace.path())
@@ -545,6 +559,8 @@ fn proxy_keeps_waiting_on_live_spawn_past_spawn_timeout() {
         "exactly one backing server should exist; got: {servers:?}"
     );
     assert_eq!(servers[0].status, ServerStatus::Healthy);
+
+    proxy.shutdown();
 }
 
 /// `spawn_max_wait_ms` is documented as the hard ceiling on this wait
@@ -569,15 +585,9 @@ fn proxy_wait_is_capped_by_max_wait_even_when_timeout_is_larger() {
 
     let start = Instant::now();
     let mut proxy = start_proxy(workspace.path(), &home, Some(&config), Some(SPAWN_DELAY_MS));
-    let status = wait_for_exit_status(&mut proxy, DEADLINE);
-    let elapsed = start.elapsed();
-    let (_stdout, stderr) = drain_output(&mut proxy);
+    let elapsed = proxy.wait_for_stderr("did not become healthy", start);
+    let stderr = proxy.stderr_text();
 
-    assert!(
-        !status.success(),
-        "the proxy should time out once spawn_max_wait_ms elapses, even though \
-         spawn_timeout_ms is larger and the spawn is still alive; stderr:\n{stderr}"
-    );
     assert!(
         stderr.contains("did not become healthy"),
         "the proxy should report a SpawnTimeout error, got stderr:\n{stderr}"
@@ -588,4 +598,6 @@ fn proxy_wait_is_capped_by_max_wait_even_when_timeout_is_larger() {
          spawn_timeout_ms ({LONG_SPAWN_TIMEOUT_MS}ms) or the backing server's cold-start \
          delay ({SPAWN_DELAY_MS}ms); took {elapsed:?}"
     );
+
+    proxy.shutdown();
 }
