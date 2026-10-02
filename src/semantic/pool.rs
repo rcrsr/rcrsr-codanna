@@ -238,6 +238,7 @@ impl EmbeddingPool {
             (0..pool_size).map(|_| AtomicUsize::new(0)).collect();
         let mut models = Vec::with_capacity(pool_size);
 
+        super::init_onnx_runtime();
         for i in 0..pool_size {
             let mut text_model = TextEmbedding::try_new(
                 InitOptions::new(model.clone())
@@ -356,7 +357,8 @@ impl EmbeddingPool {
 
     /// Generate embeddings for multiple items in parallel using rayon.
     ///
-    /// Uses batched embedding (64 docs per model call) for throughput.
+    /// Uses length-sorted batches of 8 docs per model call: measured faster
+    /// and far smaller in peak memory than larger padded batches.
     /// Failed embeddings are logged and skipped.
     pub fn embed_parallel(
         &self,
@@ -364,12 +366,17 @@ impl EmbeddingPool {
     ) -> Result<Vec<(SymbolId, Vec<f32>, String)>, SemanticSearchError> {
         use rayon::prelude::*;
 
-        const BATCH_SIZE: usize = 64;
+        const BATCH_SIZE: usize = 8;
 
-        let valid_items: Vec<_> = items
+        let mut valid_items: Vec<_> = items
             .iter()
             .filter(|(_, doc, _)| !doc.trim().is_empty())
             .collect();
+        // fastembed pads every text in a call to the longest one, so mixed
+        // lengths waste most of a batch's compute and attention memory.
+        // Grouping by length keeps batches near-uniform; results carry their
+        // SymbolId, so order does not matter.
+        valid_items.sort_unstable_by_key(|(_, doc, _)| doc.len());
 
         if valid_items.is_empty() {
             return Ok(Vec::new());

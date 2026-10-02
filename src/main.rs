@@ -521,6 +521,11 @@ async fn main() {
         config.indexing.parallelism = *t;
     }
 
+    // Cap ONNX Runtime threads for every embedding session this process
+    // creates; without it each fastembed session spins ncpu threads
+    // (src/semantic/onnx.rs).
+    codanna::semantic::set_onnx_thread_cap(config.semantic_search.embedding_threads);
+
     // Set up persistence based on config
     // Use global path resolution that handles --config properly
     let index_path = codanna::init::resolve_index_path(&config, cli.config.as_deref());

@@ -4,12 +4,15 @@
 //! designed to integrate with the existing indexing system.
 
 mod metadata;
+mod onnx;
 mod pool;
 pub(crate) mod remote;
 mod simple;
 mod storage;
 
 pub use metadata::{EmbeddingBackendKind, SemanticMetadata};
+pub(crate) use onnx::init_onnx_runtime;
+pub use onnx::set_onnx_thread_cap;
 pub use pool::{EmbeddingBackend, EmbeddingPool};
 pub use remote::RemoteEmbedder;
 pub use simple::{SemanticSearchError, SimpleSemanticSearch};
