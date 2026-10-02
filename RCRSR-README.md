@@ -759,6 +759,21 @@ mostly padding. On a 16-core / 32-thread host this cut a full index from 1165s o
 12 GB peak RSS to 46s and 1.4 GB, and it ran faster in wall time.
 `embedding_threads` is now the knob for how much CPU embedding may use.
 
+The length-sort and batch-of-8 step first covered only the semantic pool's
+`embed_parallel`. The default indexing path (`EmbedStage`), document
+embedding (`src/documents/store.rs`), and any other `EmbeddingGenerator`
+caller bypassed it and embedded in fastembed's default batch of 256, so one
+long text padded a whole batch. All of them now go through
+`FastEmbedGenerator::generate_embeddings`,
+which sorts texts longest-first, embeds in batches of 8
+(`EMBED_BATCH_SIZE`), and returns results in input order. Measured on 256
+mixed-length texts (about 20 to 4000 chars, AllMiniLML6V2, release build,
+fresh process, two runs each): wall time fell from 9.75s / 9.60s to
+5.86s / 5.90s, and peak RSS from about 7.6 GiB to about 580 MiB (model-load
+baseline is about 195 MB). Reproduce with the ignored test
+`vector::embedding::tests::bench_mixed_length_batch`; set
+`EMBED_BENCH_MODE=baseline` for the old unsorted call.
+
 `embedding_threads` sets both the number of model instances and the size of
 that shared pool, which also serves document embedding. At `1`, inference is
 effectively serial. The value is clamped to `1..=` the host's logical CPU
