@@ -145,7 +145,7 @@
 //! 5. **Clean Separation**: Vector logic isolated in vector module
 
 use crate::vector::{VectorDimension, VectorError};
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use fastembed::{EmbeddingModel, InitOptions, QuantizationMode, TextEmbedding};
 use std::sync::Mutex;
 
 /// Parse a model name string into an EmbeddingModel enum.
@@ -281,7 +281,8 @@ pub trait EmbeddingGenerator: Send + Sync {
     /// * `texts` - Slice of text strings to generate embeddings for
     ///
     /// # Returns
-    /// A vector of embeddings, one for each input text, or an error
+    /// A vector of embeddings, one for each input text, in the same order as
+    /// `texts`, or an error
     fn generate_embeddings(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, VectorError>;
 
     /// Get the dimension of embeddings produced by this generator.
@@ -303,6 +304,8 @@ pub struct FastEmbedGenerator {
     model: Mutex<TextEmbedding>,
     dimension: VectorDimension,
     model_name: String,
+    /// Batch size passed to fastembed; `None` for dynamically quantized models.
+    batch_size: Option<usize>,
 }
 
 impl FastEmbedGenerator {
@@ -332,6 +335,7 @@ impl FastEmbedGenerator {
     /// Returns an error if the model fails to initialize or download.
     pub fn with_model(model: EmbeddingModel, show_progress: bool) -> Result<Self, VectorError> {
         let model_name = model_to_string(&model);
+        let batch_size = model_batch_size(&model);
 
         crate::semantic::init_onnx_runtime();
         let mut text_model = TextEmbedding::try_new(
@@ -357,6 +361,7 @@ impl FastEmbedGenerator {
             model: Mutex::new(text_model),
             dimension,
             model_name,
+            batch_size,
         })
     }
 
@@ -386,9 +391,24 @@ impl FastEmbedGenerator {
 /// fastembed pads every text in a batch to the longest one, so the default
 /// batch of 256 over mixed-length input inflates compute and attention memory
 /// (peak RSS) with padding. Eight matches the cap chosen for the parallel
-/// embedding pool; the before/after wall time and peak RSS come from
-/// `bench_mixed_length_batch` below.
-const EMBED_BATCH_SIZE: usize = 8;
+/// embedding pool, which shares this constant; the before/after wall time and
+/// peak RSS come from `bench_mixed_length_batch` below.
+///
+/// Limitation: fastembed rejects batching for dynamically quantized models
+/// (the `*Q` variants such as AllMiniLML6V2Q), because dynamic quantization
+/// fits its data range to each batch. [`model_batch_size`] returns `None` for
+/// those, so they embed each call as one batch, as before; sorting is
+/// harmless there but removes no padding.
+pub(crate) const EMBED_BATCH_SIZE: usize = 8;
+
+/// Batch size to hand fastembed for `model`: [`EMBED_BATCH_SIZE`], or `None`
+/// (one batch per call) when the model is dynamically quantized.
+fn model_batch_size(model: &EmbeddingModel) -> Option<usize> {
+    match TextEmbedding::get_quantization_mode(model) {
+        QuantizationMode::Dynamic => None,
+        _ => Some(EMBED_BATCH_SIZE),
+    }
+}
 
 /// Indices of `texts` ordered longest-first by byte length.
 ///
@@ -415,7 +435,13 @@ fn restore_input_order<T>(order: &[usize], sorted: Vec<T>) -> Result<Vec<T>, Vec
     }
     let mut restored: Vec<Option<T>> = std::iter::repeat_with(|| None).take(order.len()).collect();
     for (&original_index, item) in order.iter().zip(sorted) {
-        restored[original_index] = Some(item);
+        let slot = restored.get_mut(original_index).ok_or_else(|| {
+            VectorError::EmbeddingFailed(format!(
+                "Embedding order index {original_index} is out of range for {} results",
+                order.len()
+            ))
+        })?;
+        *slot = Some(item);
     }
     restored
         .into_iter()
@@ -450,7 +476,7 @@ impl EmbeddingGenerator for FastEmbedGenerator {
                     "Failed to acquire embedding model lock - model may be poisoned".to_string(),
                 )
             })?
-            .embed(text_strings, Some(EMBED_BATCH_SIZE))
+            .embed(text_strings, self.batch_size)
             .map_err(|e| {
                 VectorError::EmbeddingFailed(format!("Failed to generate embeddings: {e}"))
             })?;
@@ -707,6 +733,54 @@ mod tests {
     fn test_restore_input_order_rejects_non_permutation() {
         let err = restore_input_order(&[0, 0], vec![1u8, 2u8]).unwrap_err();
         assert!(matches!(err, VectorError::EmbeddingFailed(_)));
+    }
+
+    #[test]
+    fn test_restore_input_order_rejects_out_of_range_index() {
+        let err = restore_input_order(&[2, 0], vec![1u8, 2u8]).unwrap_err();
+        assert!(matches!(err, VectorError::EmbeddingFailed(_)));
+    }
+
+    #[test]
+    fn test_model_batch_size_skips_dynamic_quantization() {
+        assert_eq!(model_batch_size(&EmbeddingModel::AllMiniLML6V2Q), None);
+        assert_eq!(model_batch_size(&EmbeddingModel::NomicEmbedTextV15Q), None);
+        assert_eq!(
+            model_batch_size(&EmbeddingModel::AllMiniLML6V2),
+            Some(EMBED_BATCH_SIZE)
+        );
+    }
+
+    #[test]
+    #[ignore = "needs cached embedding model; run manually"]
+    fn test_generate_embeddings_batched_matches_individual() {
+        let generator = FastEmbedGenerator::new().unwrap();
+        let owned = [
+            "fn a()".to_string(),
+            "word ".repeat(300),
+            "struct Point { x: f32, y: f32 }".to_string(),
+            "word ".repeat(40),
+            "x".to_string(),
+            "async fn fetch_data() -> Result<Data>".to_string(),
+            "word ".repeat(120),
+            "enum Kind { A, B }".to_string(),
+            "let total = 1;".to_string(),
+            "word ".repeat(10),
+        ];
+        let texts: Vec<&str> = owned.iter().map(String::as_str).collect();
+
+        let batched = generator.generate_embeddings(&texts).unwrap();
+
+        assert_eq!(batched.len(), texts.len());
+        for (i, text) in texts.iter().enumerate() {
+            let single = generator.generate_embeddings(&[text]).unwrap();
+            let max_diff = single[0]
+                .iter()
+                .zip(&batched[i])
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(max_diff < 1e-3, "text {i} differs by {max_diff}");
+        }
     }
 
     /// Peak resident set size in KiB from `/proc/self/status` (Linux only).

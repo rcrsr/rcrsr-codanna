@@ -770,7 +770,10 @@ which sorts texts longest-first, embeds in batches of 8
 mixed-length texts (about 20 to 4000 chars, AllMiniLML6V2, release build,
 fresh process, two runs each): wall time fell from 9.75s / 9.60s to
 5.86s / 5.90s, and peak RSS from about 7.6 GiB to about 580 MiB (model-load
-baseline is about 195 MB). Reproduce with the ignored test
+baseline is about 195 MB). Dynamically quantized models (the `*Q` variants,
+for example `AllMiniLML6V2Q`) are exempt: fastembed rejects batching for
+them, so they embed each call as a single batch and see no padding
+reduction. Reproduce with the ignored test
 `vector::embedding::tests::bench_mixed_length_batch`; set
 `EMBED_BENCH_MODE=baseline` for the old unsorted call.
 
