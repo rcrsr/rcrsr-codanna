@@ -24,6 +24,7 @@ mod types;
 pub use clustering::{
     ClusteringError, KMeansResult, assign_to_nearest_centroid, cosine_similarity, kmeans_clustering,
 };
+pub(crate) use embedding::EMBED_BATCH_SIZE;
 #[cfg(test)]
 pub use embedding::MockEmbeddingGenerator;
 pub use embedding::{

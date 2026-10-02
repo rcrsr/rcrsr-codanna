@@ -366,8 +366,6 @@ impl EmbeddingPool {
     ) -> Result<Vec<(SymbolId, Vec<f32>, String)>, SemanticSearchError> {
         use rayon::prelude::*;
 
-        const BATCH_SIZE: usize = 8;
-
         let valid_items = sorted_valid_items(items);
 
         if valid_items.is_empty() {
@@ -377,7 +375,7 @@ impl EmbeddingPool {
         // Failed batches warn and skip; pool exhaustion aborts the whole call.
         let results: Result<Vec<Vec<_>>, SemanticSearchError> = self.embed_workers.install(|| {
             valid_items
-                .chunks(BATCH_SIZE)
+                .chunks(crate::vector::EMBED_BATCH_SIZE)
                 .par_bridge()
                 .map(|batch| {
                     let texts: Vec<&str> = batch.iter().map(|(_, doc, _)| *doc).collect();

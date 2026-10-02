@@ -14,7 +14,7 @@ use crate::vector::{EmbeddingGenerator, VectorError, VectorId, VectorSearchEngin
 
 /// Batch size for embedding generation.
 /// Balances memory usage with batch efficiency.
-const EMBED_BATCH_SIZE: usize = 256;
+const EMBED_STAGE_CHUNK: usize = 256;
 
 /// Embed stage for vector embedding generation.
 pub struct EmbedStage<G: EmbeddingGenerator> {
@@ -63,7 +63,7 @@ impl<G: EmbeddingGenerator> EmbedStage<G> {
         let mut stats = EmbedStats::default();
 
         // Process in batches to manage memory
-        for chunk in symbols.chunks(EMBED_BATCH_SIZE) {
+        for chunk in symbols.chunks(EMBED_STAGE_CHUNK) {
             // Extract texts for embedding
             let texts: Vec<&str> = chunk.iter().map(|(_, text)| text.as_str()).collect();
 
@@ -303,7 +303,7 @@ mod tests {
     #[test]
     fn test_batch_chunking_logic() {
         // Test that symbols would be correctly split into batches
-        let count = EMBED_BATCH_SIZE + 100;
+        let count = EMBED_STAGE_CHUNK + 100;
         let symbols: Vec<(SymbolId, String)> = (1..=count as u32)
             .map(|i| {
                 let id = SymbolId::new(i).unwrap();
@@ -313,9 +313,9 @@ mod tests {
             .collect();
 
         // Verify chunking produces expected number of batches
-        let chunks: Vec<_> = symbols.chunks(EMBED_BATCH_SIZE).collect();
+        let chunks: Vec<_> = symbols.chunks(EMBED_STAGE_CHUNK).collect();
         assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0].len(), EMBED_BATCH_SIZE);
+        assert_eq!(chunks[0].len(), EMBED_STAGE_CHUNK);
         assert_eq!(chunks[1].len(), 100);
     }
 
