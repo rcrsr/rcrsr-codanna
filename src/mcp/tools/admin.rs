@@ -35,6 +35,12 @@ impl CodeIntelligenceServer {
             "Reindexed {} files, {} symbols in {}ms",
             outcome.reindexed, outcome.symbols, outcome.duration_ms
         )];
+        if outcome.files_failed > 0 || outcome.paths_failed > 0 {
+            lines.push(format!(
+                "Failures: {} file(s) and {} path(s) failed to reindex; see the server log for details",
+                outcome.files_failed, outcome.paths_failed
+            ));
+        }
         if let Some(doc_totals) = outcome.documents {
             lines.push(format!(
                 "Reindexed {} document collection(s): {} files processed, {} chunks created, {} chunks removed",

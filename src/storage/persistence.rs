@@ -804,6 +804,43 @@ mod tests {
     }
 
     #[test]
+    fn open_build_over_stale_schema_generation_fails_only_when_cloning() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = IndexPersistence::new(temp_dir.path().to_path_buf());
+        let settings = remote_settings_for(&temp_dir);
+
+        let facade = IndexFacade::new(settings.clone()).unwrap();
+        persistence.save_facade(&facade).unwrap();
+        let tantivy_dir = facade.generation_dir().join("tantivy");
+        drop(facade);
+
+        // Replace the current generation's index with a stale-schema one.
+        std::fs::remove_dir_all(&tantivy_dir).unwrap();
+        std::fs::create_dir_all(&tantivy_dir).unwrap();
+        let mut builder = tantivy::schema::SchemaBuilder::default();
+        builder.add_text_field("doc_type", tantivy::schema::STORED);
+        tantivy::Index::create_in_dir(&tantivy_dir, builder.build()).unwrap();
+
+        assert!(
+            persistence
+                .open_build(settings.clone(), BuildMode::Fresh)
+                .is_ok(),
+            "a fresh build never opens the stale parent index"
+        );
+
+        let Err(err) = persistence.open_build(settings, BuildMode::CloneCurrent) else {
+            panic!("cloning a stale-schema generation must fail");
+        };
+        assert!(
+            matches!(
+                err,
+                IndexError::Storage(crate::storage::StorageError::SchemaMismatch { .. })
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn open_build_clone_current_over_no_index_falls_back_to_fresh() {
         let temp_dir = TempDir::new().unwrap();
         let persistence = IndexPersistence::new(temp_dir.path().to_path_buf());

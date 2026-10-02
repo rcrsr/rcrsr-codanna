@@ -141,22 +141,22 @@ impl CodeIntelligenceClient {
             Ok(rmcp::model::ServerResult::CustomResult(custom)) => {
                 println!("Response: {}", serde_json::to_string_pretty(&custom.0)?);
             }
-            Ok(other) => println!("Unexpected response type: {other:?}"),
-            Err(e) => println!("Request failed: {e}"),
+            Ok(other) => return Err(anyhow!("Unexpected response type: {other:?}")),
+            Err(e) => return Err(anyhow!("Request failed: {e}")),
         }
 
-        // Test force-reindex custom request (with a small path)
+        // Test force-reindex custom request (empty path list: nothing to reindex)
         println!("\nSending custom request: requests/codanna/force-reindex");
         let reindex_request = ClientRequest::CustomRequest(CustomRequest::new(
             "requests/codanna/force-reindex",
-            Some(serde_json::json!({"paths": ["src/mcp/client.rs"]})),
+            Some(serde_json::json!({"paths": []})),
         ));
         match client.peer().send_request(reindex_request).await {
             Ok(rmcp::model::ServerResult::CustomResult(custom)) => {
                 println!("Response: {}", serde_json::to_string_pretty(&custom.0)?);
             }
-            Ok(other) => println!("Unexpected response type: {other:?}"),
-            Err(e) => println!("Request failed: {e}"),
+            Ok(other) => return Err(anyhow!("Unexpected response type: {other:?}")),
+            Err(e) => return Err(anyhow!("Request failed: {e}")),
         }
 
         println!("\n--- Custom Request Tests Complete ---");
@@ -186,7 +186,7 @@ impl CodeIntelligenceClient {
         }
 
         if result.is_error.unwrap_or(false) {
-            println!("Tool returned an error status");
+            return Err(anyhow!("Tool returned an error status"));
         }
 
         Ok(())

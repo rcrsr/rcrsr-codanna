@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use tantivy::directory::error::OpenDirectoryError;
 use tantivy::{TantivyError, query::QueryParserError};
 use thiserror::Error;
@@ -21,6 +22,13 @@ pub enum StorageError {
 
     #[error("Schema error: {0}")]
     SchemaError(String),
+
+    /// The on-disk Tantivy schema differs from the schema this build expects.
+    #[error(
+        "Index schema at {path} does not match this build: {detail}. \
+         Run `codanna index --force` to rebuild the index"
+    )]
+    SchemaMismatch { path: PathBuf, detail: String },
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),

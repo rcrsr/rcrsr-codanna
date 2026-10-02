@@ -9,6 +9,7 @@
 pub mod chunker;
 pub mod config;
 pub mod schema;
+pub mod slot;
 pub mod store;
 pub mod types;
 
@@ -17,6 +18,7 @@ pub use config::{
     ChunkingConfig, ChunkingStrategy, CollectionConfig, DocumentsConfig, PreviewMode, SearchConfig,
 };
 pub use schema::DocumentSchema;
+pub use slot::DocumentStoreSlot;
 pub use store::{CollectionStats, DocumentStore, IndexProgress, SearchQuery, SearchResult};
 pub use types::{ChunkId, CollectionId, DocumentChunk, FileState};
 

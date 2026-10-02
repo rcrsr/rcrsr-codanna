@@ -444,6 +444,11 @@ during the watcher's catch-up after downtime. Upstream rebuilds in place: it
 clears the live index first and repopulates it, and every query issued in
 between sees whatever has been written so far.
 
+An index whose on-disk schema is incompatible with the running build (different
+field count, or a different field name or type at some position) is refused at
+open with a `SchemaMismatch` error rather than read with mismapped fields. The
+fix is `codanna index --force`.
+
 ### Layout
 
 ```
@@ -614,7 +619,9 @@ server. It is also reachable as `codanna mcp reindex`.
 
 The call returns files reindexed, symbols, and elapsed milliseconds (plus
 per-collection totals with `documents: true`); `output_format: "json"` gives a
-structured envelope.
+structured envelope. The JSON result also carries `files_failed` (files that
+failed to read, parse, or index) and `paths_failed` (paths that failed
+outright); both are additive and `0` on a clean run.
 
 ### Concurrency contract
 
@@ -829,6 +836,11 @@ Additions to `search_documents` and `codanna documents search`:
   from code symbols) and `search_documents` (indexed markdown collections) now
   each say which corpus they search and point at the other, so an agent picks
   the right one from `list_tools` alone.
+
+- **Collections indexed after server start are visible without a restart.**
+  `search_documents` loads the document store on demand, so running
+  `codanna documents index` against a live server works on the next call. The
+  watcher does not track a late-loaded store; the per-search auto-sync covers it.
 
 Known follow-ups: `codanna documents search --json` still emits highlighted
 previews, and KWIC highlighting matches substrings rather than whole words.

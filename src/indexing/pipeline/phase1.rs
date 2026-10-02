@@ -558,7 +558,7 @@ impl Pipeline {
 
         // Update stats with timing and error counts
         stats.elapsed = start.elapsed();
-        stats.files_failed = read_errors + parse_errors;
+        stats.files_failed += read_errors + parse_errors;
 
         // Finalize metrics but don't log (caller logs after StatusLine drop)
         if let Some(ref m) = metrics {

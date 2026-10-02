@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::Settings;
-use crate::documents::DocumentStore;
+use crate::documents::{DocumentStore, DocumentStoreSlot};
 use crate::indexing::facade::IndexFacade;
 
 /// Serializes every test in the crate that drives a real
@@ -75,7 +75,9 @@ pub fn format_relative_time(timestamp: u64) -> String {
 #[derive(Clone)]
 pub struct CodeIntelligenceServer {
     pub facade: Arc<RwLock<IndexFacade>>,
-    pub document_store: Option<Arc<RwLock<DocumentStore>>>,
+    /// Lazily filled; shared across sessions when built via
+    /// [`Self::with_document_store_slot`].
+    pub document_store: Arc<DocumentStoreSlot>,
     tool_router: ToolRouter<Self>,
     pub(super) peer: Arc<Mutex<Option<Peer<RoleServer>>>>,
     broadcaster: Option<Arc<crate::mcp::notifications::NotificationBroadcaster>>,
@@ -97,7 +99,7 @@ impl CodeIntelligenceServer {
     pub fn new(facade: IndexFacade) -> Self {
         Self {
             facade: Arc::new(RwLock::new(facade)),
-            document_store: None,
+            document_store: Arc::new(DocumentStoreSlot::new()),
             tool_router: Self::full_tool_router(),
             peer: Arc::new(Mutex::new(None)),
             broadcaster: None,
@@ -109,7 +111,7 @@ impl CodeIntelligenceServer {
     pub fn from_facade(facade: Arc<RwLock<IndexFacade>>) -> Self {
         Self {
             facade,
-            document_store: None,
+            document_store: Arc::new(DocumentStoreSlot::new()),
             tool_router: Self::full_tool_router(),
             peer: Arc::new(Mutex::new(None)),
             broadcaster: None,
@@ -121,7 +123,7 @@ impl CodeIntelligenceServer {
     pub fn new_with_facade(facade: Arc<RwLock<IndexFacade>>, _settings: Arc<Settings>) -> Self {
         Self {
             facade,
-            document_store: None,
+            document_store: Arc::new(DocumentStoreSlot::new()),
             tool_router: Self::full_tool_router(),
             peer: Arc::new(Mutex::new(None)),
             broadcaster: None,
@@ -157,13 +159,20 @@ impl CodeIntelligenceServer {
 
     /// Add document store for document search capability
     pub fn with_document_store(mut self, store: DocumentStore) -> Self {
-        self.document_store = Some(Arc::new(RwLock::new(store)));
+        self.document_store = Arc::new(DocumentStoreSlot::filled(Arc::new(RwLock::new(store))));
         self
     }
 
     /// Add document store from existing Arc (for sharing with watcher)
     pub fn with_document_store_arc(mut self, store: Arc<RwLock<DocumentStore>>) -> Self {
-        self.document_store = Some(store);
+        self.document_store = Arc::new(DocumentStoreSlot::filled(store));
+        self
+    }
+
+    /// Share a document-store slot (e.g. one slot across HTTP sessions) so a
+    /// store that appears after startup is picked up by every session.
+    pub fn with_document_store_slot(mut self, slot: Arc<DocumentStoreSlot>) -> Self {
+        self.document_store = slot;
         self
     }
 
@@ -356,6 +365,8 @@ impl ServerHandler for CodeIntelligenceServer {
 pub(crate) struct ReindexRunOutcome {
     pub reindexed: usize,
     pub symbols: usize,
+    pub files_failed: usize,
+    pub paths_failed: usize,
     pub duration_ms: u128,
     pub documents: Option<DocReindexTotals>,
 }
@@ -391,6 +402,8 @@ impl CodeIntelligenceServer {
         Ok(CustomResult(serde_json::json!({
             "reindexed": outcome.reindexed,
             "symbols": outcome.symbols,
+            "files_failed": outcome.files_failed,
+            "paths_failed": outcome.paths_failed,
             "duration_ms": outcome.duration_ms,
             "documents": outcome.documents
         })))
@@ -583,6 +596,8 @@ impl CodeIntelligenceServer {
         Ok(ReindexRunOutcome {
             reindexed: outcome.reindexed,
             symbols: outcome.symbol_count,
+            files_failed: outcome.files_failed,
+            paths_failed: outcome.paths_failed,
             duration_ms: start.elapsed().as_millis(),
             documents,
         })
@@ -595,27 +610,33 @@ impl CodeIntelligenceServer {
     /// [`crate::documents::IndexStats`] into a single [`DocReindexTotals`].
     ///
     /// Requires a document store to already be configured on this server
-    /// (`self.document_store`, populated from `settings.documents` at server
-    /// construction -- see `crate::documents::load_from_settings`). A
+    /// (`self.document_store`, loaded lazily from `settings.documents` -- see
+    /// `crate::documents::load_from_settings`). A
     /// collection sync failure is surfaced as an error naming the failing
     /// collection rather than logged and skipped: silently dropping a
     /// document-sync failure would let a `reindex documents:true` caller
     /// believe every collection is up to date when one silently isn't.
     async fn run_document_reindex(&self) -> Result<DocReindexTotals, McpError> {
-        let Some(store_arc) = &self.document_store else {
-            return Err(McpError::new(
-                ErrorCode::INVALID_PARAMS,
-                "Document reindex requested but no document store is configured. \
-                Enable `[documents] enabled = true` and configure a collection, \
-                then restart the MCP server."
-                    .to_string(),
-                None,
-            ));
-        };
-
         let settings = {
             let indexer = self.facade.read().await;
             std::sync::Arc::clone(indexer.settings())
+        };
+
+        let documents_enabled = settings.documents.enabled;
+        let Some(store_arc) = self.document_store.resolve(settings.clone()).await else {
+            let message = if documents_enabled {
+                "Document reindex requested but no document collections are indexed yet. \
+                Run 'codanna documents index'; the running server picks it up on the next call."
+            } else {
+                "Document reindex requested but documents are disabled. \
+                Enable `[documents] enabled = true` and configure a collection, \
+                then restart the MCP server."
+            };
+            return Err(McpError::new(
+                ErrorCode::INVALID_PARAMS,
+                message.to_string(),
+                None,
+            ));
         };
 
         let mut totals = DocReindexTotals {
@@ -638,7 +659,7 @@ impl CodeIntelligenceServer {
             // into `spawn_blocking` (mirroring `reindex_locked` in
             // `indexing/facade.rs`) rather than doing that work directly on
             // the async worker while the write lock is held.
-            let owned_guard = Arc::clone(store_arc).write_owned().await;
+            let owned_guard = Arc::clone(&store_arc).write_owned().await;
             let config = config.clone();
             let defaults = settings.documents.defaults.clone();
             let name_owned = name.clone();
@@ -1041,6 +1062,46 @@ mod tests {
             ErrorCode::INVALID_PARAMS,
             "expected INVALID_PARAMS for a nonexistent reindex path, got: {nonexistent_err:?}"
         );
+    }
+
+    /// A reindex over an unreadable explicit file reports it in
+    /// `files_failed` while still returning success.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_reindex_reports_unreadable_file_as_failed() {
+        use std::os::unix::fs::PermissionsExt;
+        let _serial_guard = REINDEX_TEST_SERIAL.lock().await;
+        let temp = tempfile::tempdir().expect("create temp root");
+        let workspace_root = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace root dir");
+        let bad = workspace_root.join("unreadable.py");
+        std::fs::write(&bad, "def hidden():\n    pass\n").expect("write fixture");
+        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod fixture");
+        if std::fs::File::open(&bad).is_ok() {
+            // Running as root: permissions are not enforced.
+            return;
+        }
+
+        let settings = Settings {
+            index_path: temp.path().join("index"),
+            workspace_root: Some(workspace_root),
+            ..Default::default()
+        };
+        let facade =
+            IndexFacade::new(Arc::new(settings)).expect("create facade over temp index dir");
+        let server = CodeIntelligenceServer::new(facade);
+
+        let outcome = server
+            .run_reindex(
+                Some(vec![bad.to_str().expect("utf8 path").to_string()]),
+                false,
+                false,
+            )
+            .await
+            .expect("per-file failures must not fail the reindex");
+        assert_eq!(outcome.files_failed, 1);
+        assert_eq!(outcome.reindexed, 0);
     }
 
     /// Writes `file_count` small Python source files (each with a couple of
@@ -1549,6 +1610,31 @@ mod tests {
                 .iter()
                 .all(|(_, state, _, _)| *state != crate::storage::GenerationState::Orphan),
             "no orphan generation must remain after gc, got: {generations_after_gc:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_document_reindex_on_empty_slot_errors_without_restart_wording() {
+        let temp = tempfile::tempdir().expect("create temp root");
+        let mut settings = Settings {
+            index_path: temp.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.documents.enabled = true;
+        let facade = IndexFacade::new(Arc::new(settings)).expect("create facade");
+        let server = CodeIntelligenceServer::new(facade);
+
+        let err = server
+            .run_document_reindex()
+            .await
+            .expect_err("empty slot with no document index must error");
+
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+        assert!(
+            !err.message.to_lowercase().contains("restart"),
+            "message must not demand a restart: {}",
+            err.message
         );
     }
 }

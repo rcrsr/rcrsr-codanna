@@ -1019,29 +1019,6 @@ impl CodeIntelligenceServer {
         output_format: OutputFormat,
         search_phase_started: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Result<CallToolResult, McpError> {
-        let store = match &self.document_store {
-            Some(s) => s,
-            None => {
-                if output_format == OutputFormat::Json {
-                    let envelope: Envelope<()> = Envelope::error(
-                        ResultCode::IndexError,
-                        "Document search not available. No document collections are indexed.",
-                    )
-                    .with_entity_type(EntityType::Document)
-                    .with_query(&query)
-                    .with_hint("Run 'codanna documents index' to create the index");
-                    return Ok(json_result(envelope));
-                }
-                return Ok(CallToolResult::error(vec![ContentBlock::text(
-                    "Document search not available. No document collections are indexed.\n\n\
-                    To enable:\n\
-                    1. Add a collection: codanna documents add-collection docs docs/\n\
-                    2. Index it: codanna documents index\n\
-                    3. Restart the MCP server",
-                )]));
-            }
-        };
-
         // Only `Arc<Settings>` is needed for auto-sync and search below, so
         // clone it and drop the facade read guard immediately rather than
         // holding it across the auto-sync loop's `spawn_blocking` awaits.
@@ -1051,6 +1028,38 @@ impl CodeIntelligenceServer {
         let settings = {
             let indexer = self.facade.read().await;
             std::sync::Arc::clone(indexer.settings())
+        };
+
+        let documents_enabled = settings.documents.enabled;
+        let store = match self.document_store.resolve(settings.clone()).await {
+            Some(s) => s,
+            None => {
+                let (summary, hint) = if documents_enabled {
+                    (
+                        "Document search not available. No document collections are indexed yet. \
+                        Run 'codanna documents index'; the running server picks it up on the next call.",
+                        "Run 'codanna documents index'; the running server picks it up on the next call",
+                    )
+                } else {
+                    (
+                        "Document search not available. Documents are disabled.\n\n\
+                        To enable:\n\
+                        1. Set `[documents] enabled = true` in settings.toml\n\
+                        2. Add a collection: codanna documents add-collection docs docs/\n\
+                        3. Index it: codanna documents index\n\
+                        4. Restart the MCP server",
+                        "Enable documents in settings.toml, then restart the MCP server",
+                    )
+                };
+                if output_format == OutputFormat::Json {
+                    let envelope: Envelope<()> = Envelope::error(ResultCode::IndexError, summary)
+                        .with_entity_type(EntityType::Document)
+                        .with_query(&query)
+                        .with_hint(hint);
+                    return Ok(json_result(envelope));
+                }
+                return Ok(CallToolResult::error(vec![ContentBlock::text(summary)]));
+            }
         };
 
         // Validate caller-supplied inputs (unknown collection names,
@@ -1092,7 +1101,7 @@ impl CodeIntelligenceServer {
                 // `reindex_locked` in `indexing/facade.rs`) rather than
                 // doing that work directly on the async worker while the
                 // write lock is held.
-                let owned_guard = std::sync::Arc::clone(store).write_owned().await;
+                let owned_guard = std::sync::Arc::clone(&store).write_owned().await;
                 let config = config.clone();
                 let defaults = settings.documents.defaults.clone();
                 let name_owned = name.clone();
@@ -1168,7 +1177,7 @@ impl CodeIntelligenceServer {
         // `indexing/facade.rs`), letting concurrent `search_documents`
         // calls still make progress against each other via the shared
         // read lock while this one runs on a blocking thread.
-        let owned_guard = std::sync::Arc::clone(store).read_owned().await;
+        let owned_guard = std::sync::Arc::clone(&store).read_owned().await;
         let join_result =
             tokio::task::spawn_blocking(move || owned_guard.search(search_query)).await;
 
@@ -1956,7 +1965,7 @@ mod search_documents_concurrency_tests {
         async fn run_sample_experiment(server: &CodeIntelligenceServer) -> SampleOutcome {
             let store_arc = server
                 .document_store
-                .clone()
+                .get()
                 .expect("server must have a document store configured");
 
             let (search_phase_started_tx, search_phase_started_rx) =
@@ -2459,5 +2468,59 @@ mod search_documents_concurrency_tests {
             "empty/whitespace-only collection tokens must not count as an explicit \
              selection, so 'hidden' (default: false) must still be excluded, got: {text}"
         );
+    }
+
+    fn lazy_slot_request(output_format: OutputFormat) -> Parameters<SearchDocumentsRequest> {
+        Parameters(SearchDocumentsRequest {
+            query: "lorem".to_string(),
+            collection: None,
+            exclude_collections: None,
+            limit: 10,
+            threshold: None,
+            output_format,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_search_documents_picks_up_store_filled_after_server_start() {
+        let (mut settings, _temp) = fixture_settings(2, 3);
+        settings.documents.enabled = true;
+        let index_path = settings.index_path.clone();
+        let collection_config = settings.documents.collections["docs"].clone();
+        let chunking_defaults = settings.documents.defaults.clone();
+        let facade = IndexFacade::new(Arc::new(settings)).expect("create facade over temp index");
+
+        let slot = Arc::new(crate::documents::DocumentStoreSlot::new());
+        let server = CodeIntelligenceServer::new(facade).with_document_store_slot(slot.clone());
+
+        let result = server
+            .search_documents(lazy_slot_request(OutputFormat::Text))
+            .await
+            .expect("transport-level success");
+        let text = text_of(&result);
+        assert_eq!(result.is_error, Some(true));
+        assert!(text.contains("not available"), "got: {text}");
+        assert!(!text.to_lowercase().contains("restart"), "got: {text}");
+
+        let mut store = DocumentStore::new(
+            index_path.join("documents"),
+            VectorDimension::dimension_384(),
+        )
+        .expect("create document store");
+        store
+            .index_collection("docs", &collection_config, &chunking_defaults)
+            .expect("pre-sync docs collection");
+        let filled = slot
+            .resolve_with(move || Some(Arc::new(tokio::sync::RwLock::new(store))))
+            .await;
+        assert!(filled.is_some());
+
+        let result = server
+            .search_documents(lazy_slot_request(OutputFormat::Text))
+            .await
+            .expect("transport-level success");
+        let text = text_of(&result);
+        assert_ne!(result.is_error, Some(true), "got: {text}");
+        assert!(text.contains("lorem"), "expected hits, got: {text}");
     }
 }

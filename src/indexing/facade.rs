@@ -2154,6 +2154,11 @@ pub struct ReindexOutcome {
     pub reindexed: usize,
     pub symbol_count: usize,
     pub indexed_dirs: Vec<PathBuf>,
+    /// Files that failed to read, parse, or index (directory walks), plus
+    /// explicit files whose reindex failed.
+    pub files_failed: usize,
+    /// Directory walks that failed outright.
+    pub paths_failed: usize,
 }
 
 impl ReindexHandles {
@@ -2214,6 +2219,8 @@ impl ReindexHandles {
         crate::indexing::walk_config::validate_ignore_patterns(pipeline.settings())?;
 
         let mut indexed_dirs = Vec::new();
+        let mut files_failed = 0usize;
+        let mut paths_failed = 0usize;
 
         let reindexed = if let Some(paths) = paths {
             // The single-root symbol-cache fast path in `index_full` is
@@ -2271,6 +2278,7 @@ impl ReindexHandles {
                             total_reindexed += 1;
                         }
                         Err(e) => {
+                            files_failed += 1;
                             tracing::warn!("Failed to reindex {}: {e}", path.display());
                         }
                     }
@@ -2285,9 +2293,11 @@ impl ReindexHandles {
                     ) {
                         Ok(stats) => {
                             total_reindexed += stats.new_files + stats.modified_files;
+                            files_failed += stats.index_stats.files_failed;
                             indexed_dirs.push(path.to_path_buf());
                         }
                         Err(e) => {
+                            paths_failed += 1;
                             tracing::warn!("Failed to reindex {}: {e}", path.display());
                         }
                     }
@@ -2308,9 +2318,11 @@ impl ReindexHandles {
                     ) {
                         Ok(stats) => {
                             total_reindexed += stats.new_files + stats.modified_files;
+                            files_failed += stats.index_stats.files_failed;
                             indexed_dirs.push(path.clone());
                         }
                         Err(e) => {
+                            paths_failed += 1;
                             tracing::warn!("Failed to reindex {}: {e}", path.display());
                         }
                     }
@@ -2346,6 +2358,8 @@ impl ReindexHandles {
             reindexed,
             symbol_count,
             indexed_dirs,
+            files_failed,
+            paths_failed,
         })
     }
 }
@@ -2659,6 +2673,8 @@ pub(crate) async fn reindex_locked(
                 reindexed: 0,
                 symbol_count,
                 indexed_dirs: Vec::new(),
+                files_failed: 0,
+                paths_failed: 0,
             });
         }
     }
@@ -6717,6 +6733,31 @@ mod tests {
                 .is_empty(),
             "explicit path must still be indexed"
         );
+    }
+
+    // An explicit file that cannot be read is surfaced as a per-file failure
+    // rather than silently dropped; the reindex itself still succeeds.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reindex_with_unreadable_explicit_file_reports_files_failed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("unreadable.rs");
+        std::fs::write(&bad, "pub fn hidden_symbol() {}\n").unwrap();
+        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&bad).is_ok() {
+            // Running as root: permissions are not enforced.
+            return;
+        }
+
+        let facade = Arc::new(tokio::sync::RwLock::new(test_facade(&dir)));
+        let bad_str = bad.to_string_lossy().into_owned();
+        let outcome = reindex_locked(&facade, Some(vec![bad_str]), false, None, None, None)
+            .await
+            .expect("a reindex with per-file failures is still a success");
+        assert_eq!(outcome.files_failed, 1);
+        assert_eq!(outcome.paths_failed, 0);
+        assert_eq!(outcome.reindexed, 0);
     }
 
     // Verifies the low-level failure-injection primitive itself: arming it

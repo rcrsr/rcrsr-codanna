@@ -106,7 +106,9 @@ impl DocumentIndex {
 
         // Create or open the index
         let index = if index_path.join("meta.json").exists() {
-            Index::open_in_dir(&index_path)?
+            let index = Index::open_in_dir(&index_path)?;
+            IndexSchema::check_compatible(&index.schema(), &index_path)?;
+            index
         } else {
             let dir = MmapDirectory::open(&index_path)?;
             Index::create(dir, schema, IndexSettings::default())?
@@ -230,6 +232,80 @@ mod tests {
         let settings = crate::config::Settings::default();
         let index = DocumentIndex::new(temp_dir.path(), &settings).unwrap();
 
+        assert_eq!(index.document_count().unwrap(), 0);
+    }
+
+    /// Create a tantivy index on disk whose schema is `IndexSchema::build()`
+    /// transformed by `mutate` (receives the field entries in order).
+    fn create_index_with_fields(
+        path: &Path,
+        mutate: impl FnOnce(Vec<tantivy::schema::FieldEntry>) -> Vec<tantivy::schema::FieldEntry>,
+    ) {
+        let (expected, _) = IndexSchema::build();
+        let entries: Vec<_> = expected.fields().map(|(_, e)| e.clone()).collect();
+        let mut builder = tantivy::schema::SchemaBuilder::default();
+        for entry in mutate(entries) {
+            builder.add_field(entry);
+        }
+        Index::create_in_dir(path, builder.build()).unwrap();
+    }
+
+    #[test]
+    fn test_reopen_current_schema_index_succeeds() {
+        let temp_dir = TempDir::new().unwrap();
+        let settings = crate::config::Settings::default();
+        drop(DocumentIndex::new(temp_dir.path(), &settings).unwrap());
+
+        let reopened = DocumentIndex::new(temp_dir.path(), &settings);
+
+        assert!(reopened.is_ok());
+    }
+
+    #[test]
+    fn test_swapped_fields_report_schema_mismatch() {
+        let temp_dir = TempDir::new().unwrap();
+        create_index_with_fields(temp_dir.path(), |mut entries| {
+            entries.swap(0, 1);
+            entries
+        });
+        let settings = crate::config::Settings::default();
+
+        let err = DocumentIndex::new(temp_dir.path(), &settings).unwrap_err();
+
+        assert!(matches!(
+            err,
+            crate::storage::StorageError::SchemaMismatch { .. }
+        ));
+        assert!(err.to_string().contains("codanna index --force"));
+    }
+
+    #[test]
+    fn test_missing_last_field_reports_schema_mismatch() {
+        let temp_dir = TempDir::new().unwrap();
+        create_index_with_fields(temp_dir.path(), |mut entries| {
+            entries.pop();
+            entries
+        });
+        let settings = crate::config::Settings::default();
+
+        let err = DocumentIndex::new(temp_dir.path(), &settings).unwrap_err();
+
+        assert!(matches!(
+            err,
+            crate::storage::StorageError::SchemaMismatch { .. }
+        ));
+        assert!(err.to_string().contains("codanna index --force"));
+    }
+
+    #[test]
+    fn test_empty_dir_is_created_as_fresh_index() {
+        let temp_dir = TempDir::new().unwrap();
+        let nested = temp_dir.path().join("fresh");
+        let settings = crate::config::Settings::default();
+
+        let index = DocumentIndex::new(&nested, &settings).unwrap();
+
+        assert!(nested.join("meta.json").exists());
         assert_eq!(index.document_count().unwrap(), 0);
     }
 

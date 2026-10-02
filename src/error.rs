@@ -322,6 +322,9 @@ impl IndexError {
             Self::InvalidGenerationId { .. } => {
                 vec!["Run 'codanna index --status' to list valid generation ids"]
             }
+            Self::Storage(crate::storage::StorageError::SchemaMismatch { .. }) => {
+                vec!["Run 'codanna index --force' to rebuild the index with the current schema"]
+            }
             _ => vec![],
         }
     }
