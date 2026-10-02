@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Embedding during indexing pinned every core and used gigabytes of memory regardless of `indexing.parallelism`:** fastembed gives each of the `semantic_search.embedding_threads` model instances its own ONNX Runtime thread pool sized to every CPU, with spin-waiting on, so a full or catch-up reindex kept `embedding_threads × ncpu` threads busy (84 on a host with 28 logical CPUs, enough to wedge it). Batches of 64 texts were also padded to their longest text, so most of each model call was spent on padding, and ONNX Runtime kept the resulting peak memory for the life of the process. All embedding sessions now share one process-wide ONNX Runtime pool capped at `embedding_threads` threads with spin-waiting off. Texts are sorted by length and embedded in batches of 8. Measured on a full index of 9.5k symbols on a 16-core / 32-thread host: CPU time fell from 1165s to 46s, wall time from 41s to 10s, and peak RSS from 12 GB to 1.4 GB. Incremental reindexes use the same path and benefit equally. ([bartolli/codanna#138](https://github.com/bartolli/codanna/issues/138)) ([#111](https://github.com/rcrsr/rcrsr-codanna/pull/111))
+
 ## [0.16.0+rcrsr.11] - 2026-09-30
 
 ### Fixed

@@ -238,6 +238,7 @@ impl EmbeddingPool {
             (0..pool_size).map(|_| AtomicUsize::new(0)).collect();
         let mut models = Vec::with_capacity(pool_size);
 
+        super::init_onnx_runtime();
         for i in 0..pool_size {
             let mut text_model = TextEmbedding::try_new(
                 InitOptions::new(model.clone())
@@ -356,7 +357,8 @@ impl EmbeddingPool {
 
     /// Generate embeddings for multiple items in parallel using rayon.
     ///
-    /// Uses batched embedding (64 docs per model call) for throughput.
+    /// Uses length-sorted batches of 8 docs per model call: measured faster
+    /// and far smaller in peak memory than larger padded batches.
     /// Failed embeddings are logged and skipped.
     pub fn embed_parallel(
         &self,
@@ -364,12 +366,9 @@ impl EmbeddingPool {
     ) -> Result<Vec<(SymbolId, Vec<f32>, String)>, SemanticSearchError> {
         use rayon::prelude::*;
 
-        const BATCH_SIZE: usize = 64;
+        const BATCH_SIZE: usize = 8;
 
-        let valid_items: Vec<_> = items
-            .iter()
-            .filter(|(_, doc, _)| !doc.trim().is_empty())
-            .collect();
+        let valid_items = sorted_valid_items(items);
 
         if valid_items.is_empty() {
             return Ok(Vec::new());
@@ -421,10 +420,46 @@ impl EmbeddingPool {
     }
 }
 
+/// Drop blank docs and order the rest longest-first.
+///
+/// fastembed pads every text in a call to the longest one, so mixed lengths
+/// waste most of a batch's compute and attention memory; grouping by length
+/// keeps batches near-uniform. Longest-first also schedules the slowest
+/// batches earliest, avoiding a tail of big batches. Results carry their
+/// SymbolId, so order does not matter.
+fn sorted_valid_items<'a>(
+    items: &'a [(SymbolId, &'a str, &'a str)],
+) -> Vec<&'a (SymbolId, &'a str, &'a str)> {
+    let mut valid_items: Vec<_> = items
+        .iter()
+        .filter(|(_, doc, _)| !doc.trim().is_empty())
+        .collect();
+    valid_items.sort_unstable_by_key(|(_, doc, _)| std::cmp::Reverse(doc.len()));
+    valid_items
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn test_sorted_valid_items_orders_longest_first_and_keeps_ids_with_text() {
+        let a = SymbolId::new(1).unwrap();
+        let b = SymbolId::new(2).unwrap();
+        let c = SymbolId::new(3).unwrap();
+        let items = [
+            (a, "short", "rust"),
+            (b, "   ", "rust"),
+            (c, "a much longer document", "go"),
+        ];
+
+        let sorted = sorted_valid_items(&items);
+
+        assert_eq!(sorted.len(), 2);
+        assert_eq!(*sorted[0], (c, "a much longer document", "go"));
+        assert_eq!(*sorted[1], (a, "short", "rust"));
+    }
 
     #[test]
     fn test_acquire_times_out_when_all_instances_checked_out() {

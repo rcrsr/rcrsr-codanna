@@ -123,6 +123,7 @@ impl SimpleSemanticSearch {
             eprintln!("Downloading embedding model '{model_name}' (first time only)...");
         }
 
+        super::init_onnx_runtime();
         let mut text_model = TextEmbedding::try_new(
             InitOptions::new(model)
                 .with_cache_dir(cache_dir)
@@ -753,6 +754,7 @@ impl SimpleSemanticSearch {
         }
 
         // Create new instance with model from metadata
+        super::init_onnx_runtime();
         let text_model = TextEmbedding::try_new(
             InitOptions::new(model)
                 .with_cache_dir(crate::init::models_dir())

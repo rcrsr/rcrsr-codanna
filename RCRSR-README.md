@@ -746,6 +746,27 @@ The four patterns codanna used to hard-code (`target/**`, `node_modules/**`,
 silently ignores `ignore_patterns`; move those patterns to `.codannaignore` if
 you need identical behavior on both.
 
+## Embedding stays within `embedding_threads`
+
+Upstream's fastembed gives every embedding model instance its own ONNX Runtime
+thread pool sized to all CPUs, with busy-waiting on. With the default three
+instances, a reindex kept `3 × ncpu` threads spinning, whatever
+`indexing.parallelism` was set to. The fork commits one process-wide ONNX
+Runtime pool before any model loads. It is capped at
+`semantic_search.embedding_threads` threads and does not spin. Embedding inputs
+are also sorted by length and sent in batches of 8, so batches are no longer
+mostly padding. On a 16-core / 32-thread host this cut a full index from 1165s of CPU and
+12 GB peak RSS to 46s and 1.4 GB, and it ran faster in wall time.
+`embedding_threads` is now the knob for how much CPU embedding may use.
+
+`embedding_threads` sets both the number of model instances and the size of
+that shared pool, which also serves document embedding. At `1`, inference is
+effectively serial. The value is clamped to `1..=` the host's logical CPU
+count, with a warning when it is changed. The pool is committed once, at first
+embedding use, so editing the setting under `serve --watch` takes effect only
+after a restart. Library users get the same cap: it is applied when the
+facade builds its embedding backend, not only in the CLI.
+
 ## Indexing no longer depends on the working directory
 
 Two read paths (batch READ and single-file watch reindex) opened
