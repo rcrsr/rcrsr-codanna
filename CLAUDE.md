@@ -8,6 +8,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ### Fork discipline (read before touching version or CI)
 
+<!-- rule-level: operational -->
+
 - Version format is `<upstream>+rcrsr.N` (e.g. `0.9.23+rcrsr.1`) — see the header comment in `Cargo.toml`. `+rcrsr.N` is **semver build metadata**: it compares *equal* to the bare upstream version and is not orderable. Bump the upstream base only when rebasing onto a new upstream release; moving the base does **not** touch `N`. `N` counts private additions across the fork's whole life and is **monotonic** — it only ever increments, never resets. Rebasing onto a new upstream base does not touch `N`; only new fork-private additions do.
 - **CHANGELOG ordering.** Entries are **version-descending**, and because `+rcrsr.N` compares *equal* to (not above) its bare upstream base, a fork entry sorts **directly above the bare upstream entry it is built on** — not at the top. So the order is: `## [Unreleased]` first, then newer upstream bases (e.g. `0.13.1`, `0.13.0`), then the fork entries on an older base (`0.12.0+rcrsr.2`, `0.12.0+rcrsr.1`) grouped immediately above that base's bare upstream entry (`0.12.0`), then older upstream versions. When rebasing onto a new upstream release, copy that release's changelog section(s) **verbatim from the upstream original** (`git show v<ver>:CHANGELOG.md`) and place them above the fork's entries on the previous base. Keep the work-in-progress under `## [Unreleased]` — it represents the next fork version — and only rename it to `## [<full version>] - <date>` at release time (see RCRSR-README.md § Cutting a release).
 - `publish = false` — the `codanna` crate name is owned by upstream. Distribution is via GitHub Releases + `cargo binstall --git`, not crates.io. Do not `cargo publish`.
@@ -21,6 +23,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   - **Verify coverage, not names, before abandoning.** "The base has a solution" is judged by *behavior*, not by a matching function name or changelog sentence. A lookalike that misses the exact case a fork fix targets (e.g. an upstream writer-retry that classifies transient errors but never matches `LockError::LockBusy`, the case the fork's retry exists to survive) is **not** convergence — keep the fork's. Reintroducing the base's weaker version would regress the bug the fork fixed.
 
 ## Common commands
+
+<!-- rule-level: operational -->
 
 Build requires `--all-features` for the full feature set (proxy/HTTPS live behind features):
 
@@ -55,7 +59,7 @@ cargo test test_name                        # a single test by name substring
 cargo test --test integration_tests -- --nocapture   # see println/logging output
 ```
 
-Integration tests live in `tests/*.rs` (each `*_tests.rs` file is a separate crate); shared helpers are in `tests/common/` and fixtures in `tests/fixtures/`. New tests should cover error paths, not just happy paths.
+Integration tests live in `tests/*.rs` (each `*_tests.rs` file is a separate crate); shared helpers are in `tests/common/` and fixtures in `tests/fixtures/`. Name tests `test_*`; unit tests stay in the file under test, and new tests cover error paths, not just happy paths. See `conduct/policies/policy-artifact-rust.md` §RS.7.
 
 ### Trying the binary against this repo
 
@@ -71,9 +75,9 @@ codanna serve --watch                                 # stdio MCP server that re
 
 The pipeline is: **source files → tree-sitter parse → symbol graph + vector embeddings → Tantivy index on disk → retrieval → MCP/CLI surface.**
 
-- **`src/parsing/`** — one subdirectory per language (rust, python, typescript, go, java, kotlin, php, c, cpp, csharp, swift, lua, clojure, gdscript). Each language implements the `LanguageBehavior`/parser traits and is wired up through `factory.rs` + `registry.rs`. **Architectural boundary that matters:** universal concepts (qualified names, visibility, import resolution, scope levels) belong in the base traits (`language_behavior.rs`, `resolution.rs`); language-specific concepts (separator syntax, resolution order, unique features) belong in the per-language impls. See `contributing/development/guidelines.md` and `contributing/development/language-support.md` before adding a language. Registering a language means updating three hand-maintained touch points, or it silently never loads (no compile error) — see `conduct/policies/policy-domain-cdna.md` §CDNA.2.
+- **`src/parsing/`** — one subdirectory per language (rust, python, typescript, go, java, kotlin, php, c, cpp, csharp, swift, lua, clojure, gdscript). Each language implements the `LanguageBehavior`/parser traits and is wired up through `factory.rs` + `registry.rs`. **Architectural boundary that matters:** universal concepts (qualified names, visibility, import resolution, scope levels) belong in the base traits (`language_behavior.rs`, `resolution.rs`); language-specific concepts (separator syntax, resolution order, unique features) belong in the per-language impls (`conduct/policies/policy-domain-cdna.md` §CDNA.2). See `contributing/development/guidelines.md` and `contributing/development/language-support.md` before adding a language. Registering a language means updating the hand-maintained touch points (`<lang>/mod.rs`, `parsing/mod.rs`, `parsing/registry.rs`), or it silently never loads (no compile error) — see `conduct/policies/policy-domain-cdna.md` §CDNA.2.
 - **`src/indexing/`** — the walker + pipeline that drives parsing and persistence (`facade.rs` is the `IndexFacade` entry point most commands go through).
-- **`src/storage/`** + **`src/vector/`** + **`src/semantic/`** — Tantivy full-text index, the vector store, and embedding/semantic-search layer (embeddings via `fastembed`, pinned — see the `Cargo.toml` comment). The on-disk index lives under `.codanna/index/` as **generations**: `gen/<id>/` holds one build (`tantivy/`, `semantic/`, `index.meta`, lifecycle markers) and a `current` file names the one being served; `src/storage/generation/` (`layout.rs`, `markers.rs`, `gc.rs`, `id.rs`) owns that layout, and `IndexPersistence::open_build`/`publish` + `IndexFacade::swap_in` are the only write/swap seams — full rebuilds never mutate the served generation in place (fork-private; see RCRSR-README.md § Index generations).
+- **`src/storage/`** + **`src/vector/`** + **`src/semantic/`** — Tantivy full-text index, the vector store, and embedding/semantic-search layer (embeddings via `fastembed`, pinned — see the `Cargo.toml` comment). The on-disk index lives under `.codanna/index/` as **generations**: `gen/<id>/` holds one build (`tantivy/`, `semantic/`, `index.meta`, lifecycle markers) and a `current` file names the one being served. Full rebuilds go through `IndexPersistence::open_build`/`publish` + `IndexFacade::swap_in`, never in-place mutation of the served generation (fork-private; see RCRSR-README.md § Index generations and `conduct/policies/policy-domain-cdna.md` §CDNA.4). New symbol/relationship/import/file fields go in `schema.rs` + `query.rs` + `writer.rs` under `src/storage/tantivy/`, never in `IndexFacade` or a pipeline stage.
 - **`src/mcp/`** — the MCP server (built on `rmcp`). `server.rs`/`service.rs` register tools; `tools/` holds tool implementations (`search.rs`, `symbols.rs`, `admin.rs`). `http_server.rs`/`https_server.rs`/`proxy.rs` are the transport variants. A new MCP tool must join a `#[tool_router]` block and be composed in `full_tool_router()` (the single place routers are combined) (+ `KNOWN_TOOLS`/CLI match for `codanna mcp <tool>`), or it silently won't appear in `list_tools` — see `conduct/policies/policy-domain-cdna.md` §CDNA.5.
 - **`src/cli/commands/`** — one file per subcommand (`index`, `retrieve`, `serve`, `mcp`, `documents`, `profile`, `plugin`, …). `main.rs` dispatches; args are defined in `src/cli/args.rs`.
 - **`src/watcher/`** — file-watch + hot-reload for `serve --watch`, including the fork's overflow catch-up logic.
@@ -82,7 +86,7 @@ The pipeline is: **source files → tree-sitter parse → symbol graph + vector 
 
 ### Serve modes (`src/cli/commands/serve.rs`)
 
-`codanna serve` resolves one of four modes via `resolve_server_mode(https, http, proxy, config_mode)` — precedence: `--https` > `--http` > `--proxy`/`config.mode == "proxy"` > default stdio. Proxy mode holds **no index** (its `IndexFacade` is `None`); it is a stdio↔HTTP delegate that discovers or auto-spawns a single backing server per workspace on a random loopback port. HTTPS uses a cert-pinned reqwest client (`serve_tls::pinned_client`).
+`codanna serve` resolves its mode via `resolve_server_mode(https, http, proxy, config_mode)` — precedence: `--https` > `--http` > `--proxy`/`config.mode == "proxy"` > default stdio. Proxy mode holds **no index** (its `IndexFacade` is `None`); it is a stdio↔HTTP delegate that discovers or auto-spawns a single backing server per workspace on a random loopback port. HTTPS uses a cert-pinned reqwest client (`serve_tls::pinned_client`).
 
 **rustls crypto-provider gotcha:** `reqwest` 0.13 (aliased as `rmcp_reqwest`) and the pinned `rustls` (ring-only) must not both install a default `CryptoProvider`. The `https-server` feature deliberately uses `rmcp_reqwest/rustls-no-provider`, and `main.rs` installs `ring` as the sole provider once before command dispatch. Read the long comments in `Cargo.toml`'s `[features]` before changing any TLS/reqwest feature — getting it wrong is a runtime panic ("No rustls crypto provider is configured"), not a compile error.
 
@@ -90,13 +94,18 @@ The pipeline is: **source files → tree-sitter parse → symbol graph + vector 
 
 Full detail in `contributing/development/guidelines.md`. Highlights that shape reviews here:
 
-- **Zero-cost signatures:** borrow (`&str`, `&[T]`, `impl Trait`) over owned/`Box<dyn>` on hot paths; return `Vec<T>` when callers always collect.
+- **Zero-cost signatures:** borrow over owned/`Box<dyn>` on hot paths, and justify hot-path allocations with measurement. See `conduct/policies/policy-artifact-rust.md` §RS.9.
 - **Newtypes over primitives** for IDs, validated in constructors. ID newtypes wrap `u32` with a `new() -> Option<Self>` that rejects 0 (not `NonZeroU32`). See `conduct/policies/policy-artifact-rust.md` §RS.4.1.
-- **Errors:** `thiserror` with actionable messages; `anyhow` only at the binary level. Avoid `panic!`/`unwrap()` in non-test code; `expect()` only for provably-impossible states. All error types live centrally in `src/error.rs` as per-subsystem enums (`IndexError`, `ParseError`, `StorageError`, `McpError`) — see `conduct/policies/policy-artifact-rust.md` §RS.3.
-- Performance targets are real: indexing 10k+ files/s, semantic search <10ms, ~100 bytes/symbol. Justify allocations on hot paths with measurement.
+- **Errors:** `thiserror` with actionable messages; `anyhow` only at the binary level. Avoid `panic!`/`unwrap()` in non-test code; `expect()` only for provably-impossible states. One `thiserror` enum per failure domain: add variants to the owning subsystem's error enum or module, otherwise to `src/error.rs` — see `conduct/policies/policy-artifact-rust.md` §RS.3.
+- Performance targets are real: indexing 10k+ files/s, semantic search <10ms, ~100 bytes/symbol.
+- `mod.rs` re-exports enumerate names (`pub use foo::{A, B}`), never `pub use foo::*`; use `pub(crate) use` for internal-only items. See `conduct/policies/policy-artifact-rust.md` §RS.1.1, §RS.1.3.
+- Return the subsystem alias (`IndexResult<T>`, `StorageResult<T>`), not `Result<T, IndexError>`. See §RS.3.4.
+- New `.rs` files open with a `//!` module summary. See §RS.2.
 - `clippy.toml` raises some thresholds (too-many-arguments = 12, cognitive-complexity = 30) and allows `unwrap`/`expect`/`dbg` in tests only.
 
 ## Notes
+
+<!-- rule-level: operational -->
 
 - Embedding model (~150MB) downloads on first semantic-search use; `.fastembed_cache` here is symlinked to `~/.codanna/models`.
 - `CLAUDE.md.example` is not project config — it's a user-facing template documenting the codanna search workflow for end users' own repos. Don't confuse it with this file.
