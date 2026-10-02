@@ -1598,7 +1598,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reindex_envelope_serializes_failure_counts() {
+    fn test_reindex_envelope_serializes_failure_counts() {
         let outcome = crate::mcp::server::ReindexRunOutcome {
             reindexed: 1,
             symbols: 2,

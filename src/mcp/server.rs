@@ -580,6 +580,18 @@ impl CodeIntelligenceServer {
                 format!("{e}. {}.", e.recovery_suggestions().join(". ")),
                 None,
             ),
+            // An unseeded build refused to publish because a root walk
+            // failed. Changing the request cannot fix this, so it stays
+            // INTERNAL_ERROR, but the recovery steps are folded in so an
+            // agent learns the served index is intact and what to check.
+            crate::IndexError::ReindexWalkFailed { .. } => McpError::new(
+                ErrorCode::INTERNAL_ERROR,
+                format!(
+                    "Reindex failed: {e}. {}.",
+                    e.recovery_suggestions().join(". ")
+                ),
+                None,
+            ),
             other => McpError::new(
                 ErrorCode::INTERNAL_ERROR,
                 format!("Reindex failed: {other}"),
@@ -625,7 +637,7 @@ impl CodeIntelligenceServer {
         let documents_enabled = settings.documents.enabled;
         let Some(store_arc) = self.document_store.resolve(settings.clone()).await else {
             let message = if documents_enabled {
-                "Document reindex requested but no document collections are indexed yet. \
+                "Document reindex not available (no indexed collections, or the store failed to load; see server log). \
                 Run 'codanna documents index'; the running server picks it up on the next call."
             } else {
                 "Document reindex requested but documents are disabled. \
@@ -1068,7 +1080,7 @@ mod tests {
     /// `files_failed` while still returning success.
     #[cfg(unix)]
     #[tokio::test]
-    async fn run_reindex_reports_unreadable_file_as_failed() {
+    async fn test_run_reindex_reports_unreadable_file_as_failed() {
         use std::os::unix::fs::PermissionsExt;
         let _serial_guard = REINDEX_TEST_SERIAL.lock().await;
         let temp = tempfile::tempdir().expect("create temp root");
@@ -1080,6 +1092,7 @@ mod tests {
             .expect("chmod fixture");
         if std::fs::File::open(&bad).is_ok() {
             // Running as root: permissions are not enforced.
+            eprintln!("SKIPPED: file permissions are not enforced (running as root)");
             return;
         }
 
@@ -1321,6 +1334,53 @@ mod tests {
         assert!(
             err.message.contains("codanna index"),
             "expected the recovery suggestion naming 'codanna index <path>' in the message: {err:?}"
+        );
+    }
+
+    /// Pins the `IndexError::ReindexWalkFailed` -> `McpError` mapping: a
+    /// force reindex whose root walk fails must surface as
+    /// `INTERNAL_ERROR` (the request cannot fix it) with the recovery
+    /// suggestions folded into the message.
+    #[tokio::test]
+    async fn test_run_reindex_maps_walk_failed_to_internal_error() {
+        let _serial_guard = REINDEX_TEST_SERIAL.lock().await;
+        let temp = tempfile::tempdir().expect("create temp root");
+        let root_a = temp.path().join("root_a");
+        let root_b = temp.path().join("root_b");
+        std::fs::create_dir_all(&root_a).expect("create root a");
+        std::fs::create_dir_all(&root_b).expect("create root b");
+        write_symbol_fixture(&root_a, 2);
+        write_symbol_fixture(&root_b, 2);
+
+        let mut settings = Settings {
+            index_path: temp.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.indexing.indexed_paths = vec![root_a.clone(), root_b.clone()];
+
+        let facade =
+            IndexFacade::new(Arc::new(settings)).expect("create facade over temp index dir");
+        let server = CodeIntelligenceServer::new(facade);
+
+        crate::indexing::facade::arm_fail_root_walk_for_test(&root_b);
+        let err = server
+            .run_reindex(None, true, false)
+            .await
+            .expect_err("force reindex with a failed root walk must be refused");
+
+        assert_eq!(
+            err.code,
+            ErrorCode::INTERNAL_ERROR,
+            "expected INTERNAL_ERROR for a failed root walk, got: {err:?}"
+        );
+        assert!(
+            err.message.contains("served index is unchanged"),
+            "expected the message to state the served index is unchanged: {err:?}"
+        );
+        assert!(
+            err.message.contains("remove-dir"),
+            "expected the recovery suggestion naming 'remove-dir' in the message: {err:?}"
         );
     }
 

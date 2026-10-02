@@ -145,11 +145,14 @@ impl CodeIntelligenceClient {
             Err(e) => return Err(anyhow!("Request failed: {e}")),
         }
 
-        // Test force-reindex custom request (empty path list: nothing to reindex)
+        // Test force-reindex custom request against a real file in the
+        // workspace the client runs in (the server rejects paths that do
+        // not exist or lie outside its workspace root).
+        let reindex_path = Self::reindex_demo_path()?;
         println!("\nSending custom request: requests/codanna/force-reindex");
         let reindex_request = ClientRequest::CustomRequest(CustomRequest::new(
             "requests/codanna/force-reindex",
-            Some(serde_json::json!({"paths": []})),
+            Some(serde_json::json!({"paths": [reindex_path]})),
         ));
         match client.peer().send_request(reindex_request).await {
             Ok(rmcp::model::ServerResult::CustomResult(custom)) => {
@@ -166,6 +169,21 @@ impl CodeIntelligenceClient {
         client.cancel().await?;
 
         Ok(())
+    }
+
+    /// Absolute path of the first file (by name) directly under `./src`,
+    /// or `./src` itself when it holds no file. The smoke run's workspace
+    /// is the client's current directory.
+    fn reindex_demo_path() -> Result<String> {
+        let src = std::env::current_dir()?.join("src");
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&src)
+            .map_err(|e| anyhow!("cannot read {} for the reindex demo: {e}", src.display()))?
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|p| p.is_file())
+            .collect();
+        files.sort();
+        let chosen = files.into_iter().next().unwrap_or(src);
+        Ok(chosen.to_string_lossy().into_owned())
     }
 
     fn print_tool_output(result: &rmcp::model::CallToolResult) -> Result<()> {

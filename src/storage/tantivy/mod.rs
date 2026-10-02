@@ -107,7 +107,13 @@ impl DocumentIndex {
         // Create or open the index
         let index = if index_path.join("meta.json").exists() {
             let index = Index::open_in_dir(&index_path)?;
-            IndexSchema::check_compatible(&index.schema(), &index_path)?;
+            IndexSchema::check_compatible(&index.schema(), &index_path).inspect_err(|e| {
+                tracing::error!(
+                    target: "storage",
+                    "index schema at {} is incompatible: {e}",
+                    index_path.display()
+                );
+            })?;
             index
         } else {
             let dir = MmapDirectory::open(&index_path)?;
@@ -276,7 +282,10 @@ mod tests {
             err,
             crate::storage::StorageError::SchemaMismatch { .. }
         ));
-        assert!(err.to_string().contains("codanna index --force"));
+        assert!(
+            !err.to_string()
+                .contains(&temp_dir.path().display().to_string())
+        );
     }
 
     #[test]
@@ -294,11 +303,14 @@ mod tests {
             err,
             crate::storage::StorageError::SchemaMismatch { .. }
         ));
-        assert!(err.to_string().contains("codanna index --force"));
+        assert!(
+            !err.to_string()
+                .contains(&temp_dir.path().display().to_string())
+        );
     }
 
     #[test]
-    fn test_empty_dir_is_created_as_fresh_index() {
+    fn test_nonexistent_dir_is_created_as_fresh_index() {
         let temp_dir = TempDir::new().unwrap();
         let nested = temp_dir.path().join("fresh");
         let settings = crate::config::Settings::default();

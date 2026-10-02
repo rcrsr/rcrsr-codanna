@@ -1036,7 +1036,7 @@ impl CodeIntelligenceServer {
             None => {
                 let (summary, hint) = if documents_enabled {
                     (
-                        "Document search not available. No document collections are indexed yet. \
+                        "Document search not available (no indexed collections, or the store failed to load; see server log). \
                         Run 'codanna documents index'; the running server picks it up on the next call.",
                         "Run 'codanna documents index'; the running server picks it up on the next call",
                     )

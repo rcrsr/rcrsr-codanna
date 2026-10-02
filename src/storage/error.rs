@@ -24,10 +24,10 @@ pub enum StorageError {
     SchemaError(String),
 
     /// The on-disk Tantivy schema differs from the schema this build expects.
-    #[error(
-        "Index schema at {path} does not match this build: {detail}. \
-         Run `codanna index --force` to rebuild the index"
-    )]
+    ///
+    /// Display is path-free because it reaches remote MCP clients; the path is
+    /// logged where the check runs. The remedy lives in `recovery_suggestions`.
+    #[error("Index schema does not match this build: {detail}")]
     SchemaMismatch { path: PathBuf, detail: String },
 
     #[error("IO error: {0}")]

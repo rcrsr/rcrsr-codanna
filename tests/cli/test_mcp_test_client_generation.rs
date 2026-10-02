@@ -71,14 +71,9 @@ pub fn client_target() -> i32 {
 "#,
     )
     .expect("write fixture");
-
-    // The `codanna mcp-test` client runs a scoped force-reindex demo against
-    // `src/mcp/client.rs` (see src/mcp/client.rs). Seed an empty file at that
-    // path so the reindex resolves; empty means 0 symbols, so the
-    // "Index contains 1 symbols" assertion is unaffected.
-    let mcp_dir = src.join("mcp");
-    std::fs::create_dir_all(&mcp_dir).expect("create src/mcp dir");
-    std::fs::write(mcp_dir.join("client.rs"), "").expect("write client.rs fixture");
+    // The `codanna mcp-test` client force-reindexes the first file under
+    // `src` (here `alpha.rs`) as its reindex demo, so this fixture file
+    // must exist and stay the only symbol source.
 }
 
 fn write_settings(workspace: &Path) {

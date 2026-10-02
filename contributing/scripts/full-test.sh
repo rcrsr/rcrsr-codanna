@@ -105,7 +105,7 @@ mcp_ok=1
 # Allowlisted: "current pointer is missing or torn" is logged by the first
 # `index` run on a fresh scratch workspace that has no generation pointer yet;
 # it is expected and benign there.
-mcp_bad_lines=$(sed 's/\x1b\[[0-9;]*m//g' "$mcp_log" \
+mcp_bad_lines=$(sed "s/$(printf '\033')\[[0-9;]*m//g" "$mcp_log" \
     | grep -E '(^|[[:space:]])(WARN|ERROR)([[:space:]]|:)' \
     | grep -v 'current pointer is missing or torn' || true)
 if [ -n "$mcp_bad_lines" ]; then

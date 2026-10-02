@@ -72,3 +72,32 @@ pub fn load_from_settings(settings: &Settings) -> Option<Arc<RwLock<DocumentStor
     tracing::info!(target: "documents", "loaded document store from {}", crate::parsing::paths::render_absolute_path(&doc_path).display());
     Some(Arc::new(RwLock::new(store_with_emb)))
 }
+
+#[cfg(test)]
+mod load_tests {
+    use super::*;
+
+    fn settings_in(dir: &tempfile::TempDir, enabled: bool) -> Settings {
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            ..Default::default()
+        };
+        settings.documents.enabled = enabled;
+        settings
+    }
+
+    #[test]
+    fn test_load_from_settings_returns_none_when_documents_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("index/documents")).unwrap();
+
+        assert!(load_from_settings(&settings_in(&dir, false)).is_none());
+    }
+
+    #[test]
+    fn test_load_from_settings_returns_none_when_no_store_exists_yet() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert!(load_from_settings(&settings_in(&dir, true)).is_none());
+    }
+}

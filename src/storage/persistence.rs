@@ -298,14 +298,32 @@ impl IndexPersistence {
 
         let seeded_from_parent = matches!(mode, BuildMode::CloneCurrent) && parent.is_some();
 
-        // (6) Seed the new generation from its parent, `CloneCurrent` only.
-        if seeded_from_parent {
-            let parent_id = parent.as_ref().expect("checked by seeded_from_parent");
-            clone_generation(&self.layout, parent_id, &id)?;
-        }
-
-        // (7) Open the facade onto the (possibly seeded) generation.
-        let mut facade = IndexFacade::open(settings, self.layout.clone(), id.clone())?;
+        // (6) Seed the new generation from its parent, `CloneCurrent` only,
+        // then (7) open the facade onto the (possibly seeded) generation. A
+        // failure in either step (e.g. a stale-schema parent) removes the
+        // half-built directory, as `discard` does, instead of leaving a
+        // hardlinked orphan for every retry.
+        let opened = (|| -> IndexResult<IndexFacade> {
+            if seeded_from_parent {
+                let parent_id = parent.as_ref().expect("checked by seeded_from_parent");
+                clone_generation(&self.layout, parent_id, &id)?;
+            }
+            IndexFacade::open(settings, self.layout.clone(), id.clone())
+        })();
+        let mut facade = match opened {
+            Ok(facade) => facade,
+            Err(e) => {
+                drop(guard);
+                if let Err(rm) = std::fs::remove_dir_all(self.layout.gen_dir(&id))
+                    && rm.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::debug!(
+                        "[persistence] could not remove failed build {id} ({rm}); left for gc"
+                    );
+                }
+                return Err(e);
+            }
+        };
 
         // (8) `CloneCurrent` only: replicate `load_facade_impl`'s post-open
         // steps exactly, so a cloned build starts with the same semantic
@@ -804,7 +822,7 @@ mod tests {
     }
 
     #[test]
-    fn open_build_over_stale_schema_generation_fails_only_when_cloning() {
+    fn test_open_build_over_stale_schema_generation_fails_only_when_cloning() {
         let temp_dir = TempDir::new().unwrap();
         let persistence = IndexPersistence::new(temp_dir.path().to_path_buf());
         let settings = remote_settings_for(&temp_dir);
@@ -828,9 +846,25 @@ mod tests {
             "a fresh build never opens the stale parent index"
         );
 
+        let ids = || -> Vec<GenerationId> {
+            crate::storage::generation::layout::list_generations(&persistence.layout)
+                .unwrap()
+                .into_iter()
+                .map(|(id, ..)| id)
+                .collect()
+        };
+        let before = ids();
         let Err(err) = persistence.open_build(settings, BuildMode::CloneCurrent) else {
             panic!("cloning a stale-schema generation must fail");
         };
+        let orphans: Vec<_> = ids()
+            .into_iter()
+            .filter(|id| !before.contains(id))
+            .collect();
+        assert!(
+            orphans.is_empty(),
+            "failed clone build must leave no new generation: {orphans:?}"
+        );
         assert!(
             matches!(
                 err,

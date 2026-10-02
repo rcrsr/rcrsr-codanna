@@ -74,12 +74,11 @@ impl ExitCode {
                 ExitCode::NotFound
             }
 
-            // Index corruption is a blocking error
-            IndexError::IndexCorrupted { .. } => ExitCode::BlockingError,
-
-            // A stale on-disk schema needs a rebuild, like corruption
-            IndexError::Storage(crate::storage::StorageError::SchemaMismatch { .. }) => {
-                ExitCode::IndexCorrupted
+            // Index corruption is a blocking error; a stale on-disk schema
+            // needs the same rebuild, so it shares the code
+            IndexError::IndexCorrupted { .. }
+            | IndexError::Storage(crate::storage::StorageError::SchemaMismatch { .. }) => {
+                ExitCode::BlockingError
             }
 
             // Specific recoverable errors
@@ -168,11 +167,18 @@ mod tests {
     }
 
     #[test]
-    fn test_schema_mismatch_maps_to_index_corrupted() {
+    fn test_schema_mismatch_maps_to_same_code_as_index_corrupted() {
         let error = IndexError::Storage(crate::storage::StorageError::SchemaMismatch {
             path: std::path::PathBuf::from("idx"),
             detail: "field count is 1, expected 2".to_string(),
         });
-        assert_eq!(ExitCode::from_error(&error), ExitCode::IndexCorrupted);
+        let corrupted = IndexError::IndexCorrupted {
+            reason: "bad".to_string(),
+        };
+        assert_eq!(ExitCode::from_error(&error), ExitCode::BlockingError);
+        assert_eq!(
+            ExitCode::from_error(&error),
+            ExitCode::from_error(&corrupted)
+        );
     }
 }
