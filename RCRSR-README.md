@@ -759,6 +759,14 @@ mostly padding. On a 16-core / 32-thread host this cut a full index from 1165s o
 12 GB peak RSS to 46s and 1.4 GB, and it ran faster in wall time.
 `embedding_threads` is now the knob for how much CPU embedding may use.
 
+`embedding_threads` sets both the number of model instances and the size of
+that shared pool, which also serves document embedding. At `1`, inference is
+effectively serial. The value is clamped to `1..=` the host's logical CPU
+count, with a warning when it is changed. The pool is committed once, at first
+embedding use, so editing the setting under `serve --watch` takes effect only
+after a restart. Library users get the same cap: it is applied when the
+facade builds its embedding backend, not only in the CLI.
+
 ## Indexing no longer depends on the working directory
 
 Two read paths (batch READ and single-file watch reindex) opened

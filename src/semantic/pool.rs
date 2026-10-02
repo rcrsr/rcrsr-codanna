@@ -368,15 +368,7 @@ impl EmbeddingPool {
 
         const BATCH_SIZE: usize = 8;
 
-        let mut valid_items: Vec<_> = items
-            .iter()
-            .filter(|(_, doc, _)| !doc.trim().is_empty())
-            .collect();
-        // fastembed pads every text in a call to the longest one, so mixed
-        // lengths waste most of a batch's compute and attention memory.
-        // Grouping by length keeps batches near-uniform; results carry their
-        // SymbolId, so order does not matter.
-        valid_items.sort_unstable_by_key(|(_, doc, _)| doc.len());
+        let valid_items = sorted_valid_items(items);
 
         if valid_items.is_empty() {
             return Ok(Vec::new());
@@ -428,10 +420,46 @@ impl EmbeddingPool {
     }
 }
 
+/// Drop blank docs and order the rest longest-first.
+///
+/// fastembed pads every text in a call to the longest one, so mixed lengths
+/// waste most of a batch's compute and attention memory; grouping by length
+/// keeps batches near-uniform. Longest-first also schedules the slowest
+/// batches earliest, avoiding a tail of big batches. Results carry their
+/// SymbolId, so order does not matter.
+fn sorted_valid_items<'a>(
+    items: &'a [(SymbolId, &'a str, &'a str)],
+) -> Vec<&'a (SymbolId, &'a str, &'a str)> {
+    let mut valid_items: Vec<_> = items
+        .iter()
+        .filter(|(_, doc, _)| !doc.trim().is_empty())
+        .collect();
+    valid_items.sort_unstable_by_key(|(_, doc, _)| std::cmp::Reverse(doc.len()));
+    valid_items
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn test_sorted_valid_items_orders_longest_first_and_keeps_ids_with_text() {
+        let a = SymbolId::new(1).unwrap();
+        let b = SymbolId::new(2).unwrap();
+        let c = SymbolId::new(3).unwrap();
+        let items = [
+            (a, "short", "rust"),
+            (b, "   ", "rust"),
+            (c, "a much longer document", "go"),
+        ];
+
+        let sorted = sorted_valid_items(&items);
+
+        assert_eq!(sorted.len(), 2);
+        assert_eq!(*sorted[0], (c, "a much longer document", "go"));
+        assert_eq!(*sorted[1], (a, "short", "rust"));
+    }
 
     #[test]
     fn test_acquire_times_out_when_all_instances_checked_out() {

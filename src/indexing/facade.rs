@@ -3048,7 +3048,11 @@ pub fn build_embedding_backend(
     }
 
     // Local fastembed pool
-    let pool_size = cfg.embedding_threads;
+    // Library callers reach model loading without going through `main`, so the
+    // ORT thread cap is recorded here, before any session exists. The value is
+    // fixed once the first session is created; later calls have no effect.
+    crate::semantic::set_onnx_thread_cap(cfg.embedding_threads);
+    let pool_size = crate::semantic::clamp_embedding_threads(cfg.embedding_threads);
     let embedding_model = crate::vector::parse_embedding_model(&cfg.model)
         .map_err(|e| IndexError::General(format!("Failed to parse embedding model: {e}")))?;
     let pool = EmbeddingPool::new(pool_size, embedding_model)
