@@ -1567,6 +1567,8 @@ pub fn index_info_envelope(facade: &IndexFacade, file_watch: Option<bool>) -> En
 pub struct ReindexInfo {
     pub reindexed: usize,
     pub symbols: usize,
+    pub files_failed: usize,
+    pub paths_failed: usize,
     pub duration_ms: u128,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub documents: Option<crate::mcp::server::DocReindexTotals>,
@@ -1577,6 +1579,8 @@ pub(crate) fn reindex_info_data(outcome: &crate::mcp::server::ReindexRunOutcome)
     ReindexInfo {
         reindexed: outcome.reindexed,
         symbols: outcome.symbols,
+        files_failed: outcome.files_failed,
+        paths_failed: outcome.paths_failed,
         duration_ms: outcome.duration_ms,
         documents: outcome.documents,
     }
@@ -1592,6 +1596,21 @@ pub(crate) fn reindex_envelope(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_reindex_envelope_serializes_failure_counts() {
+        let outcome = crate::mcp::server::ReindexRunOutcome {
+            reindexed: 1,
+            symbols: 2,
+            files_failed: 3,
+            paths_failed: 0,
+            duration_ms: 4,
+            documents: None,
+        };
+        let json = serde_json::to_value(reindex_envelope(&outcome)).unwrap();
+        assert_eq!(json["data"]["files_failed"], 3);
+        assert_eq!(json["data"]["paths_failed"], 0);
+    }
 
     #[test]
     fn receiver_context_parses_both_forms() {

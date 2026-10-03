@@ -539,6 +539,13 @@ impl UnifiedWatcher {
             outcome.reindexed,
             outcome.symbol_count
         );
+        if outcome.files_failed > 0 || outcome.paths_failed > 0 {
+            tracing::warn!(
+                "[watcher] catch-up reindex had failures: {} file(s), {} path(s) failed; see earlier log lines",
+                outcome.files_failed,
+                outcome.paths_failed
+            );
+        }
         self.broadcaster.send(FileChangeEvent::IndexReloaded);
         self.catch_up_attempts = 0;
         self.reset_contention_streak();
@@ -3058,6 +3065,8 @@ mod tests {
             reindexed: 1,
             symbol_count: 1,
             indexed_dirs: Vec::new(),
+            files_failed: 0,
+            paths_failed: 0,
         }
     }
 
@@ -3277,6 +3286,8 @@ mod tests {
             reindexed: 1,
             symbol_count: 1,
             indexed_dirs: Vec::new(),
+            files_failed: 0,
+            paths_failed: 0,
         };
         watcher.handle_catch_up_success(outcome, Instant::now());
 
@@ -4133,6 +4144,8 @@ mod tests {
                 reindexed: 0,
                 symbol_count: 0,
                 indexed_dirs: Vec::new(),
+                files_failed: 0,
+                paths_failed: 0,
             })
         });
         // Kept separately (not consumed) so this test can observe the

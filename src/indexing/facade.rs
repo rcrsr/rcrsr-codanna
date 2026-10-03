@@ -2154,6 +2154,11 @@ pub struct ReindexOutcome {
     pub reindexed: usize,
     pub symbol_count: usize,
     pub indexed_dirs: Vec<PathBuf>,
+    /// Files that failed to read, parse, or index (directory walks), plus
+    /// explicit files whose reindex failed.
+    pub files_failed: usize,
+    /// Directory walks that failed outright.
+    pub paths_failed: usize,
 }
 
 impl ReindexHandles {
@@ -2214,6 +2219,8 @@ impl ReindexHandles {
         crate::indexing::walk_config::validate_ignore_patterns(pipeline.settings())?;
 
         let mut indexed_dirs = Vec::new();
+        let mut files_failed = 0usize;
+        let mut paths_failed = 0usize;
 
         let reindexed = if let Some(paths) = paths {
             // The single-root symbol-cache fast path in `index_full` is
@@ -2271,6 +2278,7 @@ impl ReindexHandles {
                             total_reindexed += 1;
                         }
                         Err(e) => {
+                            files_failed += 1;
                             tracing::warn!("Failed to reindex {}: {e}", path.display());
                         }
                     }
@@ -2285,9 +2293,11 @@ impl ReindexHandles {
                     ) {
                         Ok(stats) => {
                             total_reindexed += stats.new_files + stats.modified_files;
+                            files_failed += stats.index_stats.files_failed;
                             indexed_dirs.push(path.to_path_buf());
                         }
                         Err(e) => {
+                            paths_failed += 1;
                             tracing::warn!("Failed to reindex {}: {e}", path.display());
                         }
                     }
@@ -2299,6 +2309,17 @@ impl ReindexHandles {
             let mut total_reindexed = 0;
             for path in &indexed_paths {
                 if path.is_dir() {
+                    // Test-only: simulate this root's walk failing without
+                    // touching the pipeline. Compiled out of production builds.
+                    #[cfg(test)]
+                    if take_fail_root_walk_for_test(path) {
+                        paths_failed += 1;
+                        tracing::warn!(
+                            "Failed to reindex {}: test-injected root walk failure",
+                            path.display()
+                        );
+                        continue;
+                    }
                     match pipeline.index_incremental(
                         path,
                         Arc::clone(&document_index),
@@ -2308,9 +2329,11 @@ impl ReindexHandles {
                     ) {
                         Ok(stats) => {
                             total_reindexed += stats.new_files + stats.modified_files;
+                            files_failed += stats.index_stats.files_failed;
                             indexed_dirs.push(path.clone());
                         }
                         Err(e) => {
+                            paths_failed += 1;
                             tracing::warn!("Failed to reindex {}: {e}", path.display());
                         }
                     }
@@ -2346,6 +2369,8 @@ impl ReindexHandles {
             reindexed,
             symbol_count,
             indexed_dirs,
+            files_failed,
+            paths_failed,
         })
     }
 }
@@ -2386,6 +2411,41 @@ fn take_fail_after_walk_for_test(semantic_dir: &Path) -> bool {
     } else {
         false
     }
+}
+
+/// Test-only failure injection for [`ReindexHandles::run`]: the indexed root
+/// whose next `paths: None` walk must report a root failure
+/// (`paths_failed += 1`) without walking it. Process-global for the same
+/// reason as `FAIL_AFTER_WALK_ROOT`; keyed by root path so an unrelated
+/// test's walk can neither consume it nor fail on it.
+#[cfg(test)]
+static FAIL_ROOT_WALK_FOR_TEST: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Arms the root-walk failure injection for the next walk of `root`.
+/// One-shot: consumed by the first matching walk. Test-only.
+#[cfg(test)]
+pub(crate) fn arm_fail_root_walk_for_test(root: &Path) {
+    let mut armed = FAIL_ROOT_WALK_FOR_TEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *armed = Some(root.to_path_buf());
+}
+
+/// Consumes the armed injection if `path` is the armed root. Both sides are
+/// canonicalized so symlinked temp dirs still match.
+#[cfg(test)]
+fn take_fail_root_walk_for_test(path: &Path) -> bool {
+    let mut armed = FAIL_ROOT_WALK_FOR_TEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let matches = armed.as_ref().is_some_and(|root| {
+        root.canonicalize().unwrap_or_else(|_| root.clone())
+            == path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+    });
+    if matches {
+        *armed = None;
+    }
+    matches
 }
 
 /// Test-only mid-walk barrier for [`ReindexHandles::run`]: the index root
@@ -2512,6 +2572,16 @@ fn wait_at_mid_walk_barrier_for_test(semantic_dir: &Path) {
 /// publish a new served generation after the awaiting continuation
 /// (`IndexFacade::swap_in`) has stopped being polled. Every other call site
 /// passes `None`.
+///
+/// An unseeded build (`BuildFacade::parent()` is `None`: a force reindex, the
+/// stale-root fallback, or a `CloneCurrent` build that fell back to fresh
+/// because no generation was current) starts empty, so a root whose walk
+/// failed (`paths_failed > 0`) would leave a missing or partial generation
+/// that publishing would serve. Phase 3 refuses instead: it discards the
+/// build's generation directory, never touches `current`, and returns
+/// [`IndexError::ReindexWalkFailed`]. A seeded `CloneCurrent` build still
+/// carries the parent's rows for the failed root, so it publishes; per-file
+/// failures (`files_failed`) alone never block a publish.
 ///
 /// `phase2_started`, when provided, is signaled the instant phase 1's write
 /// guard has been dropped and before the off-lock walk begins; this exists
@@ -2659,6 +2729,8 @@ pub(crate) async fn reindex_locked(
                 reindexed: 0,
                 symbol_count,
                 indexed_dirs: Vec::new(),
+                files_failed: 0,
+                paths_failed: 0,
             });
         }
     }
@@ -2805,6 +2877,28 @@ pub(crate) async fn reindex_locked(
     // Phase 3 branches the same way phase 1 did.
     match build {
         Some(mut build) => {
+            // An unseeded build has no parent rows to fall back on, so a
+            // failed root walk means the generation is missing that root's
+            // symbols. Refuse to publish it; discard the build so no orphan
+            // lingers. (The `outcome_result?` error above deliberately
+            // orphans instead.)
+            if build.parent().is_none() && outcome.paths_failed > 0 {
+                let persistence = IndexPersistence::new(build.index_layout().root().to_path_buf());
+                tokio::task::spawn_blocking(move || persistence.discard(build))
+                    .await
+                    .map_err(map_reindex_join_error)?;
+                tracing::error!(
+                    "Refusing to publish unseeded reindex build: {} root walk(s) failed \
+                     ({} file(s) failed); the served generation is unchanged",
+                    outcome.paths_failed,
+                    outcome.files_failed
+                );
+                return Err(IndexError::ReindexWalkFailed {
+                    paths_failed: outcome.paths_failed,
+                    files_failed: outcome.files_failed,
+                });
+            }
+
             // Record newly indexed directories on the build facade (not the
             // live one -- the live facade is never touched in this branch).
             for dir in &outcome.indexed_dirs {
@@ -6719,6 +6813,32 @@ mod tests {
         );
     }
 
+    // An explicit file that cannot be read is surfaced as a per-file failure
+    // rather than silently dropped; the reindex itself still succeeds.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_reindex_with_unreadable_explicit_file_reports_files_failed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("unreadable.rs");
+        std::fs::write(&bad, "pub fn hidden_symbol() {}\n").unwrap();
+        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&bad).is_ok() {
+            // Running as root: permissions are not enforced.
+            eprintln!("SKIPPED: file permissions are not enforced (running as root)");
+            return;
+        }
+
+        let facade = Arc::new(tokio::sync::RwLock::new(test_facade(&dir)));
+        let bad_str = bad.to_string_lossy().into_owned();
+        let outcome = reindex_locked(&facade, Some(vec![bad_str]), false, None, None, None)
+            .await
+            .expect("a reindex with per-file failures is still a success");
+        assert_eq!(outcome.files_failed, 1);
+        assert_eq!(outcome.paths_failed, 0);
+        assert_eq!(outcome.reindexed, 0);
+    }
+
     // Verifies the low-level failure-injection primitive itself: arming it
     // makes the very next `ReindexHandles::run` fail after the walk has
     // already completed (so `indexed_dirs`/`symbol_count` were computed,
@@ -6966,6 +7086,226 @@ mod tests {
         assert!(
             summary.removed.contains(&build_id),
             "gc must reclaim the orphaned build generation left behind by cancellation"
+        );
+    }
+
+    /// Two-root fixture for the walk-failure publish gate: roots `a` and `b`
+    /// each hold one uniquely named Python symbol. Both are indexed into the
+    /// bootstrap generation, which is then published as `current`. When
+    /// `config_roots` is `OnlyA`, `b` is indexed (so the facade records it)
+    /// but absent from the live config, which makes the roots stale.
+    enum ConfigRoots {
+        Both,
+        OnlyA,
+    }
+
+    struct WalkFailureFixture {
+        facade: Arc<tokio::sync::RwLock<IndexFacade>>,
+        layout: IndexLayout,
+        root_a: PathBuf,
+        root_b: PathBuf,
+        generation_before: crate::storage::GenerationId,
+        symbols_before: usize,
+    }
+
+    async fn walk_failure_fixture(
+        dir: &tempfile::TempDir,
+        config_roots: ConfigRoots,
+    ) -> WalkFailureFixture {
+        let root_a = dir.path().join("root_a").canonicalize_or_create();
+        let root_b = dir.path().join("root_b").canonicalize_or_create();
+        std::fs::write(root_a.join("a.py"), "def alpha_symbol():\n    pass\n").unwrap();
+        std::fs::write(root_b.join("b.py"), "def beta_symbol():\n    pass\n").unwrap();
+
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(root_a.clone()).unwrap();
+        if matches!(config_roots, ConfigRoots::Both) {
+            settings.add_indexed_path(root_b.clone()).unwrap();
+        }
+        let index_root = settings.index_path.clone();
+        let mut facade = IndexFacade::new(Arc::new(settings)).unwrap();
+        facade.index_directory(&root_a, false).unwrap();
+        facade.index_directory(&root_b, false).unwrap();
+
+        // Publish the seeded rows as `current` so the reindex has a parent.
+        let persistence = IndexPersistence::new(index_root.clone());
+        let facade = Arc::new(tokio::sync::RwLock::new(facade));
+        {
+            let guard = facade.read().await;
+            persistence.save_facade(&guard).unwrap();
+        }
+
+        let layout = IndexLayout::new(index_root);
+        let (generation_before, symbols_before) = {
+            let guard = facade.read().await;
+            (guard.generation_id().clone(), guard.symbol_count())
+        };
+        assert!(symbols_before >= 2, "seed must index both roots");
+        WalkFailureFixture {
+            facade,
+            layout,
+            root_a,
+            root_b,
+            generation_before,
+            symbols_before,
+        }
+    }
+
+    trait CanonicalizeOrCreate {
+        fn canonicalize_or_create(self) -> PathBuf;
+    }
+
+    impl CanonicalizeOrCreate for PathBuf {
+        fn canonicalize_or_create(self) -> PathBuf {
+            std::fs::create_dir_all(&self).unwrap();
+            self.canonicalize().unwrap()
+        }
+    }
+
+    /// Asserts a refused reindex left the served state and the generation
+    /// directory listing exactly as seeded, and sent no reload event.
+    async fn assert_walk_failure_left_state_unchanged(
+        fixture: &WalkFailureFixture,
+        result: FacadeResult<ReindexOutcome>,
+        reload_rx: &mut tokio::sync::broadcast::Receiver<
+            crate::mcp::notifications::FileChangeEvent,
+        >,
+    ) {
+        assert!(
+            matches!(
+                result,
+                Err(IndexError::ReindexWalkFailed {
+                    paths_failed: 1,
+                    ..
+                })
+            ),
+            "expected Err(ReindexWalkFailed {{ paths_failed: 1, .. }}), got: {result:?}"
+        );
+        assert_eq!(
+            fixture.layout.read_current().unwrap().as_ref(),
+            Some(&fixture.generation_before),
+            "a refused reindex must leave `current` unchanged"
+        );
+        {
+            let guard = fixture.facade.read().await;
+            assert_eq!(guard.generation_id(), &fixture.generation_before);
+            assert_eq!(guard.symbol_count(), fixture.symbols_before);
+        }
+        let generations: Vec<_> = crate::storage::generation::list_generations(&fixture.layout)
+            .unwrap()
+            .into_iter()
+            .map(|(id, _, _, _)| id)
+            .collect();
+        assert_eq!(
+            generations,
+            vec![fixture.generation_before.clone()],
+            "the discarded build directory must be removed, not orphaned"
+        );
+        assert!(
+            matches!(
+                reload_rx.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "a refused reindex must not broadcast IndexReloaded"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_force_reindex_refuses_publish_when_a_root_walk_fails() {
+        let _serial_guard = crate::mcp::server::REINDEX_TEST_SERIAL.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = walk_failure_fixture(&dir, ConfigRoots::Both).await;
+        let broadcaster = crate::mcp::notifications::NotificationBroadcaster::new(8);
+        let mut reload_rx = broadcaster.subscribe();
+
+        arm_fail_root_walk_for_test(&fixture.root_b);
+        let result =
+            reindex_locked(&fixture.facade, None, true, Some(&broadcaster), None, None).await;
+
+        assert_walk_failure_left_state_unchanged(&fixture, result, &mut reload_rx).await;
+    }
+
+    #[tokio::test]
+    async fn test_stale_root_fallback_refuses_publish_when_a_root_walk_fails() {
+        let _serial_guard = crate::mcp::server::REINDEX_TEST_SERIAL.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = walk_failure_fixture(&dir, ConfigRoots::OnlyA).await;
+        let broadcaster = crate::mcp::notifications::NotificationBroadcaster::new(8);
+        let mut reload_rx = broadcaster.subscribe();
+        assert!(
+            generation_roots_are_stale(&*fixture.facade.read().await),
+            "fixture must record a root that the live config no longer names"
+        );
+
+        // Only root A is in the live config, so it is the only root walked.
+        arm_fail_root_walk_for_test(&fixture.root_a);
+        let result =
+            reindex_locked(&fixture.facade, None, false, Some(&broadcaster), None, None).await;
+
+        assert_walk_failure_left_state_unchanged(&fixture, result, &mut reload_rx).await;
+    }
+
+    #[tokio::test]
+    async fn test_clone_current_reindex_publishes_despite_root_walk_failure() {
+        let _serial_guard = crate::mcp::server::REINDEX_TEST_SERIAL.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = walk_failure_fixture(&dir, ConfigRoots::Both).await;
+        assert!(
+            !generation_roots_are_stale(&*fixture.facade.read().await),
+            "fixture roots must not be stale so the build is seeded from current"
+        );
+
+        arm_fail_root_walk_for_test(&fixture.root_b);
+        let outcome = reindex_locked(&fixture.facade, None, false, None, None, None)
+            .await
+            .expect("a seeded clone-current build carries the failed root's rows and publishes");
+
+        assert_eq!(outcome.paths_failed, 1);
+        let current = fixture.layout.read_current().unwrap();
+        assert_ne!(current.as_ref(), Some(&fixture.generation_before));
+        let guard = fixture.facade.read().await;
+        assert_eq!(Some(guard.generation_id()), current.as_ref());
+        assert!(
+            !guard.find_symbols_by_name("beta_symbol", None).is_empty(),
+            "the failed root's symbols must survive in the published generation"
+        );
+        assert!(!guard.find_symbols_by_name("alpha_symbol", None).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_force_reindex_with_only_file_failures_still_publishes() {
+        use std::os::unix::fs::PermissionsExt;
+        let _serial_guard = crate::mcp::server::REINDEX_TEST_SERIAL.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = walk_failure_fixture(&dir, ConfigRoots::Both).await;
+        let bad = fixture.root_b.join("unreadable.py");
+        std::fs::write(&bad, "def hidden_symbol():\n    pass\n").unwrap();
+        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&bad).is_ok() {
+            // Running as root: permissions are not enforced.
+            eprintln!("SKIPPED: file permissions are not enforced (running as root)");
+            return;
+        }
+
+        let outcome = reindex_locked(&fixture.facade, None, true, None, None, None)
+            .await
+            .expect("per-file failures alone never block a publish");
+
+        assert!(
+            outcome.files_failed > 0,
+            "fixture must produce a file failure"
+        );
+        assert_eq!(outcome.paths_failed, 0);
+        let current = fixture.layout.read_current().unwrap();
+        assert_ne!(current.as_ref(), Some(&fixture.generation_before));
+        assert_eq!(
+            Some(fixture.facade.read().await.generation_id()),
+            current.as_ref()
         );
     }
 

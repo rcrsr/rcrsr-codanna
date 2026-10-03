@@ -147,6 +147,19 @@ pub enum IndexError {
     )]
     ReindexCancelled,
 
+    /// Returned when an unseeded (fresh) reindex build had one or more indexed
+    /// roots fail to index. The build is discarded and the served generation
+    /// is untouched.
+    #[error(
+        "Reindex refused to publish a full rebuild: {paths_failed} indexed root(s) failed to \
+         index ({files_failed} file(s) also failed); the served index is unchanged. See the \
+         server log for the failing root(s), then retry"
+    )]
+    ReindexWalkFailed {
+        paths_failed: usize,
+        files_failed: usize,
+    },
+
     /// A requested index generation does not exist
     #[error(
         "Index generation '{id}' not found. Run 'codanna index --status' to list available generations"
@@ -241,6 +254,7 @@ impl IndexError {
             Self::ReindexInProgress => "REINDEX_IN_PROGRESS",
             Self::ReindexHasNothingToRebuild => "REINDEX_HAS_NOTHING_TO_REBUILD",
             Self::ReindexCancelled => "REINDEX_CANCELLED",
+            Self::ReindexWalkFailed { .. } => "REINDEX_WALK_FAILED",
             Self::GenerationNotFound { .. } => "GENERATION_NOT_FOUND",
             Self::GenerationDamaged { .. } => "GENERATION_DAMAGED",
             Self::GenerationSuperseded { .. } => "GENERATION_SUPERSEDED",
@@ -299,6 +313,11 @@ impl IndexError {
                 "Run 'codanna index --gc' to reclaim the orphaned build generation",
                 "Retry the reindex once the server has finished shutting down",
             ],
+            Self::ReindexWalkFailed { .. } => vec![
+                "No action needed to keep serving; the previously served generation is still active",
+                "Check the server log for 'Failed to reindex <path>' lines naming the failing root(s)",
+                "Fix the cause, or remove the root with 'codanna remove-dir <path>', then retry the reindex",
+            ],
             Self::GenerationNotFound { .. } => vec![
                 "Run 'codanna index --status' to list available generations",
                 "Run 'codanna index --force' to build a fresh generation",
@@ -321,6 +340,9 @@ impl IndexError {
             ],
             Self::InvalidGenerationId { .. } => {
                 vec!["Run 'codanna index --status' to list valid generation ids"]
+            }
+            Self::Storage(crate::storage::StorageError::SchemaMismatch { .. }) => {
+                vec!["Run 'codanna index --force' to rebuild the index with the current schema"]
             }
             _ => vec![],
         }
@@ -481,6 +503,19 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_reindex_walk_failed_status_code_and_recovery() {
+        let err = IndexError::ReindexWalkFailed {
+            paths_failed: 2,
+            files_failed: 5,
+        };
+        assert_eq!(err.status_code(), "REINDEX_WALK_FAILED");
+        let suggestions = err.recovery_suggestions();
+        assert!(!suggestions.is_empty());
+        assert!(suggestions.iter().all(|s| !s.ends_with('.')));
+        assert!(err.to_string().contains("served index is unchanged"));
+    }
 
     #[test]
     fn generation_not_found_status_and_recovery() {

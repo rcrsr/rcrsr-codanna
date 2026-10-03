@@ -91,12 +91,31 @@ indexed_paths = ["$mcp_scratch/src"]
 [semantic_search]
 enabled = false
 SETTINGS
-if (cd "$mcp_scratch" \
+mcp_log="$mcp_scratch/mcp-test.log"
+# Fail on a non-zero exit OR a tracing WARN/ERROR line in the output, so a
+# smoke check that logs a failure and still exits 0 cannot pass.
+# tracing colours the level with ANSI escapes even when stderr is a file, so
+# they are stripped before matching.
+# Allowlist (each entry needs a comment saying why it is benign): see the
+# `grep -v` stage in mcp_bad_lines below.
+mcp_ok=1
+(cd "$mcp_scratch" \
     && "$codanna_bin" index src --no-progress > /dev/null \
-    && "$codanna_bin" mcp-test > /dev/null); then
+    && "$codanna_bin" mcp-test) > "$mcp_log" 2>&1 || mcp_ok=0
+# Allowlisted: "current pointer is missing or torn" is logged by the first
+# `index` run on a fresh scratch workspace that has no generation pointer yet;
+# it is expected and benign there.
+mcp_bad_lines=$(sed "s/$(printf '\033')\[[0-9;]*m//g" "$mcp_log" \
+    | grep -E '(^|[[:space:]])(WARN|ERROR)([[:space:]]|:)' \
+    | grep -v 'current pointer is missing or torn' || true)
+if [ -n "$mcp_bad_lines" ]; then
+    mcp_ok=0
+fi
+if [ "$mcp_ok" -eq 1 ]; then
     echo "PASS: MCP server"
 else
-    echo "FAIL: MCP server test"
+    echo "FAIL: MCP server test (non-zero exit or WARN/ERROR in log); log follows"
+    cat "$mcp_log"
     exit 1
 fi
 

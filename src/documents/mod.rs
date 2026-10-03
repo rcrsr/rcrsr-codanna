@@ -9,6 +9,7 @@
 pub mod chunker;
 pub mod config;
 pub mod schema;
+pub mod slot;
 pub mod store;
 pub mod types;
 
@@ -17,6 +18,7 @@ pub use config::{
     ChunkingConfig, ChunkingStrategy, CollectionConfig, DocumentsConfig, PreviewMode, SearchConfig,
 };
 pub use schema::DocumentSchema;
+pub use slot::DocumentStoreSlot;
 pub use store::{CollectionStats, DocumentStore, IndexProgress, SearchQuery, SearchResult};
 pub use types::{ChunkId, CollectionId, DocumentChunk, FileState};
 
@@ -69,4 +71,48 @@ pub fn load_from_settings(settings: &Settings) -> Option<Arc<RwLock<DocumentStor
 
     tracing::info!(target: "documents", "loaded document store from {}", crate::parsing::paths::render_absolute_path(&doc_path).display());
     Some(Arc::new(RwLock::new(store_with_emb)))
+}
+
+#[cfg(test)]
+mod load_tests {
+    use super::*;
+
+    fn settings_in(dir: &tempfile::TempDir, enabled: bool) -> Settings {
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            ..Default::default()
+        };
+        settings.documents.enabled = enabled;
+        settings
+    }
+
+    #[test]
+    fn test_load_from_settings_returns_none_when_documents_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("index/documents")).unwrap();
+
+        assert!(load_from_settings(&settings_in(&dir, false)).is_none());
+    }
+
+    #[test]
+    fn test_load_from_settings_returns_none_when_no_store_exists_yet() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert!(load_from_settings(&settings_in(&dir, true)).is_none());
+    }
+
+    #[test]
+    #[ignore = "needs the embedding model (~150MB)"]
+    fn test_load_from_settings_returns_store_once_documents_store_is_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = settings_in(&dir, true);
+        assert!(load_from_settings(&settings).is_none());
+
+        let dimension = FastEmbedGenerator::from_settings(&settings.semantic_search.model, false)
+            .unwrap()
+            .dimension();
+        DocumentStore::new(settings.index_path.join("documents"), dimension).unwrap();
+
+        assert!(load_from_settings(&settings).is_some());
+    }
 }

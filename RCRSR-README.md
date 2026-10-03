@@ -444,6 +444,16 @@ during the watcher's catch-up after downtime. Upstream rebuilds in place: it
 clears the live index first and repopulates it, and every query issued in
 between sees whatever has been written so far.
 
+An index whose on-disk schema is incompatible with the running build (different
+field count, or a different field name or type at some position) is refused at
+open with a `SchemaMismatch` error rather than read with mismapped fields. The
+fix is `codanna index --force`. The CLI exits with code 2 (blocking error), the
+same code as a corrupted index. **Known gap:** the degraded zero-tool
+handshake covers only the emission-semantics gate. A `SchemaMismatch` during
+`codanna serve` over stdio exits before that lane, so the hint goes to stderr
+(discarded for client-spawned servers) and the client sees a connection
+failure. Run `codanna index --force` first.
+
 ### Layout
 
 ```
@@ -614,7 +624,22 @@ server. It is also reachable as `codanna mcp reindex`.
 
 The call returns files reindexed, symbols, and elapsed milliseconds (plus
 per-collection totals with `documents: true`); `output_format: "json"` gives a
-structured envelope.
+structured envelope. The JSON result also carries `files_failed` (files that
+failed to read, parse, or index) and `paths_failed` (paths that failed
+outright); both are additive and `0` on a clean run.
+
+With `force` or the stale-root fallback (a recorded root no longer
+configured), the build starts empty, so any `paths_failed` makes the call fail
+with `REINDEX_WALK_FAILED` (an internal error whose text includes recovery
+steps). The build is discarded, the previous generation keeps serving, and no
+reload is broadcast. Incremental runs (clone-from-current) and scoped `paths`
+runs still succeed and report the counts, since the clone keeps the failed
+root's unchanged rows and scoped runs work in place. Per-file failures never
+block a publish. The text-mode result adds a "Failures: N file(s) and M
+path(s) failed to reindex" line when either count is non-zero, and
+`files_failed` includes index-stage failures. Known limit: an unreadable root
+directory is skipped by the walker without counting as `paths_failed`, so this
+check does not catch it.
 
 ### Concurrency contract
 
@@ -661,7 +686,8 @@ catch-up reindex automatically:
 - It runs off the watcher's event loop, so events keep draining while it works.
 - A failed catch-up (transient lock/IO error) is retried on the next quiet
   window, bounded to five attempts per episode; successive catch-ups are
-  throttled by a short cooldown.
+  throttled by a short cooldown. A `REINDEX_WALK_FAILED` refusal (an indexed
+  root failed to index) counts as a failed attempt and broadcasts no reload.
 - If it loses the race to an in-flight `reindex` MCP call, that rejection is
   not counted as a failure — the index is already being brought current — and
   it simply re-fires after the cooldown. If that rejection persists for roughly
@@ -829,6 +855,11 @@ Additions to `search_documents` and `codanna documents search`:
   from code symbols) and `search_documents` (indexed markdown collections) now
   each say which corpus they search and point at the other, so an agent picks
   the right one from `list_tools` alone.
+
+- **Collections indexed after server start are visible without a restart.**
+  `search_documents` loads the document store on demand, so running
+  `codanna documents index` against a live server works on the next call. The
+  watcher does not track a late-loaded store; the per-search auto-sync covers it.
 
 Known follow-ups: `codanna documents search --json` still emits highlighted
 previews, and KWIC highlighting matches substrings rather than whole words.

@@ -1,3 +1,5 @@
+use super::super::{StorageError, StorageResult};
+use std::path::Path;
 use tantivy::schema::{
     FAST, Field, IndexRecordOption, NumericOptions, STORED, STRING, Schema, SchemaBuilder,
     TextFieldIndexing, TextOptions,
@@ -62,6 +64,45 @@ pub struct IndexSchema {
 }
 
 impl IndexSchema {
+    /// Verify an existing on-disk schema matches [`IndexSchema::build`].
+    ///
+    /// Compares field count, then per position the field name and value
+    /// type. Field option flags (indexed/stored/fast) are deliberately not
+    /// compared.
+    ///
+    /// Changing field order, names, or types requires bumping
+    /// `EMISSION_SEMANTICS_VERSION`; this open-time check is the backstop.
+    pub fn check_compatible(on_disk: &Schema, path: &Path) -> StorageResult<()> {
+        let (expected, _) = Self::build();
+        let mismatch = |detail: String| StorageError::SchemaMismatch {
+            path: path.to_path_buf(),
+            detail,
+        };
+
+        let expected_count = expected.fields().count();
+        let disk_count = on_disk.fields().count();
+        if expected_count != disk_count {
+            return Err(mismatch(format!(
+                "field count is {disk_count}, expected {expected_count}"
+            )));
+        }
+
+        for (position, ((_, disk), (_, want))) in
+            on_disk.fields().zip(expected.fields()).enumerate()
+        {
+            let disk_type = disk.field_type().value_type();
+            let want_type = want.field_type().value_type();
+            if disk.name() != want.name() || disk_type != want_type {
+                return Err(mismatch(format!(
+                    "field {position} is `{}` ({disk_type:?}), expected `{}` ({want_type:?})",
+                    disk.name(),
+                    want.name()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Create the schema for indexing code documentation
     pub fn build() -> (Schema, IndexSchema) {
         let mut builder = SchemaBuilder::default();

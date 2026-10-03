@@ -417,7 +417,12 @@ pub async fn serve_http(config: crate::Settings, watch: bool, bind: String) -> a
     let config_for_service = Arc::new(config.clone());
     let broadcaster_for_service = broadcaster.clone();
     let ct_for_service = ct.clone();
-    let document_store_for_service = document_store_arc.clone();
+    // One slot for all sessions (a server is built per session), pre-filled
+    // from the startup load so a store indexed later is shared, not reloaded.
+    let document_store_slot = Arc::new(match document_store_arc.clone() {
+        Some(store_arc) => crate::documents::DocumentStoreSlot::filled(store_arc),
+        None => crate::documents::DocumentStoreSlot::new(),
+    });
 
     let mcp_service = StreamableHttpService::new(
         move || {
@@ -427,14 +432,8 @@ pub async fn serve_http(config: crate::Settings, watch: bool, bind: String) -> a
                 config_for_service.clone(),
             )
             .with_broadcaster(broadcaster.clone())
-            .with_file_watch(unified_watcher_active);
-
-            // Attach document store if available
-            let server = if let Some(ref store_arc) = document_store_for_service {
-                server.with_document_store_arc(store_arc.clone())
-            } else {
-                server
-            };
+            .with_file_watch(unified_watcher_active)
+            .with_document_store_slot(document_store_slot.clone());
 
             // Start notification listener for this connection
             // Note: We need to wait for initialize() to be called first
