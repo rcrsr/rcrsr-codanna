@@ -100,4 +100,19 @@ mod load_tests {
 
         assert!(load_from_settings(&settings_in(&dir, true)).is_none());
     }
+
+    #[test]
+    #[ignore = "needs the embedding model (~150MB)"]
+    fn test_load_from_settings_returns_store_once_documents_store_is_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = settings_in(&dir, true);
+        assert!(load_from_settings(&settings).is_none());
+
+        let dimension = FastEmbedGenerator::from_settings(&settings.semantic_search.model, false)
+            .unwrap()
+            .dimension();
+        DocumentStore::new(settings.index_path.join("documents"), dimension).unwrap();
+
+        assert!(load_from_settings(&settings).is_some());
+    }
 }
