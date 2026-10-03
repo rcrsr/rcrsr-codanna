@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0+rcrsr.12] - 2026-10-02
+
 ### Fixed
 
 - **A stale on-disk Tantivy schema silently mismapped field handles:** opening an index whose schema differed from the build's (field count, or a field's name or value type at a position) read the wrong fields instead of failing. Opening now checks the on-disk schema and refuses with a `SchemaMismatch` error that names the index path and says to run `codanna index --force`; the CLI exits with the blocking-error code (2), the same as a corrupted index, and a clone-from-current build of a stale generation fails the same way (a fresh build never opens the stale parent). ([#42](https://github.com/rcrsr/rcrsr-codanna/issues/42)) ([#115](https://github.com/rcrsr/rcrsr-codanna/pull/115))
