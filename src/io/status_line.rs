@@ -311,6 +311,9 @@ impl Default for ProgressBarOptions {
     }
 }
 
+/// Minimum elapsed milliseconds before a rate is reported.
+const MIN_RATE_WINDOW_MS: u64 = 50;
+
 /// Minimal-allocation progress bar that can be rendered through [`StatusLine`].
 ///
 /// Uses interior atomics so it can be shared across threads without locks.
@@ -410,20 +413,25 @@ impl ProgressBar {
 
     /// Increment the main counter by one.
     pub fn inc(&self) {
-        self.current.fetch_add(1, Ordering::Relaxed);
+        // Stamp the time before the counter so a concurrent render is unlikely
+        // to pair a new count with a stale timestamp (which would spike the
+        // rate). Best effort: the atomics are Relaxed.
         self.mark_progress();
+        self.current.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Add `n` to the main counter.
     pub fn add_progress(&self, n: u64) {
-        self.current.fetch_add(n, Ordering::Relaxed);
+        // Time first, then count; see `inc`.
         self.mark_progress();
+        self.current.fetch_add(n, Ordering::Relaxed);
     }
 
     /// Set the main counter to a specific value.
     pub fn set_progress(&self, value: u64) {
-        self.current.store(value, Ordering::Relaxed);
+        // Time first, then count; see `inc`.
         self.mark_progress();
+        self.current.store(value, Ordering::Relaxed);
     }
 
     /// Record the time of the latest counter change (monotonic).
@@ -436,9 +444,15 @@ impl ProgressBar {
     ///
     /// Batched updates make `current` jump at batch boundaries; dividing by
     /// live wall-clock time would make the rate decay between batches.
+    ///
+    /// Returns 0.0 until the last change is past [`MIN_RATE_WINDOW_MS`], so an
+    /// early batch does not show an absurd figure from a near-zero window.
     fn rate(&self, current: u64) -> f64 {
-        let secs = self.last_progress_ms.load(Ordering::Relaxed).max(1) as f64 / 1000.0;
-        current as f64 / secs
+        let ms = self.last_progress_ms.load(Ordering::Relaxed);
+        if ms < MIN_RATE_WINDOW_MS {
+            return 0.0;
+        }
+        current as f64 / (ms as f64 / 1000.0)
     }
 
     /// Get the current progress value.
@@ -1011,7 +1025,7 @@ mod rate_tests {
     #[test]
     fn test_rate_holds_steady_between_batches() {
         let bar = ProgressBar::new(1000, "files");
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(60));
         bar.add_progress(100);
         let first = bar.rate(bar.current());
         std::thread::sleep(Duration::from_millis(100));
@@ -1025,12 +1039,19 @@ mod rate_tests {
     #[test]
     fn test_rate_updates_on_next_batch() {
         let bar = ProgressBar::new(1000, "files");
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(60));
         bar.add_progress(10);
         let before = bar.rate(bar.current());
         std::thread::sleep(Duration::from_millis(20));
         bar.add_progress(1000);
         assert!(bar.rate(bar.current()) > before);
+    }
+
+    #[test]
+    fn test_rate_zero_when_progress_lands_at_start() {
+        let bar = ProgressBar::new(100_000, "files");
+        bar.add_progress(100_000);
+        assert_eq!(bar.rate(bar.current()), 0.0);
     }
 
     #[test]
