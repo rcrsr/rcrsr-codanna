@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **CLI index progress rate decayed between batches:** the files/s figure on the progress bars divided the count by live wall-clock time since the bar started, but the count only advances when a batch finishes, so the rate fell continuously while a batch was running and jumped when it completed. The rate is now measured up to the last counter change, so it holds steady mid-batch and updates only when a batch lands. The elapsed time shown beside it is still live wall-clock. ([#117](https://github.com/rcrsr/rcrsr-codanna/pull/117))
+
 ## [0.16.0+rcrsr.12] - 2026-10-02
 
 ### Fixed
