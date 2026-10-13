@@ -106,13 +106,12 @@ echo "[2] Host target -> release-matrix name"
 target=$(rustc -vV | awk '/^host: /{print $2}')
 case "$target" in
   x86_64-unknown-linux-gnu) name="linux-x64" ;;
-  x86_64-apple-darwin) name="macos-x64" ;;
   aarch64-apple-darwin) name="macos-arm64" ;;
   x86_64-pc-windows-msvc) name="windows-x64" ;;
   *)
     fail "unsupported host target for the release matrix" \
       "host target: $target" \
-      "release.yml only builds: x86_64-unknown-linux-gnu, x86_64-apple-darwin, aarch64-apple-darwin, x86_64-pc-windows-msvc"
+      "release.yml only builds: x86_64-unknown-linux-gnu, aarch64-apple-darwin, x86_64-pc-windows-msvc"
     ;;
 esac
 echo "  host target: $target -> matrix name: $name"

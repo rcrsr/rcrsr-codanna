@@ -6,7 +6,7 @@ use super::{
 };
 use crate::RelationKind;
 use crate::parsing::ParserFactory;
-use crate::storage::DocumentIndex;
+use crate::storage::{DocumentIndex, StorageError};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -21,7 +21,7 @@ impl Pipeline {
     ///
     /// # Arguments
     /// * `unresolved` - Pending relationships from Phase 1
-    /// * `symbol_cache` - SymbolLookupCache populated by Phase 1
+    /// * `symbol_cache` - SymbolLookupCache seeded from the persisted index (`SymbolLookupCache::from_index`)
     /// * `index` - DocumentIndex for reading imports and writing relationships
     ///
     /// # Returns
@@ -107,7 +107,9 @@ impl Pipeline {
                 let rel_count = ctx.unresolved_rels.len() as u64;
                 let (batch, resolve_stats) = resolve_stage.resolve(&ctx);
                 stats.defines_resolved += resolve_stats.defines_resolved;
-                write_stage.write(batch);
+                write_stage
+                    .write(batch)
+                    .map_err(|e| classify_write_error(&write_stage, e))?;
 
                 // Update progress bar
                 if let Some(ref prog) = progress {
@@ -146,7 +148,9 @@ impl Pipeline {
                 let (batch, resolve_stats) = resolve_stage.resolve(&ctx);
                 stats.calls_resolved += resolve_stats.calls_resolved;
                 stats.other_resolved += resolve_stats.resolved - resolve_stats.calls_resolved;
-                write_stage.write(batch);
+                write_stage
+                    .write(batch)
+                    .map_err(|e| classify_write_error(&write_stage, e))?;
 
                 // Update progress bar
                 if let Some(ref prog) = progress {
@@ -237,6 +241,19 @@ impl Pipeline {
         drop(phase2_status);
         eprintln!("{phase2_bar}");
         Ok(stats)
+    }
+}
+
+/// A write that fails before the stage's first commit attempt left nothing
+/// durable: the batch was rolled back, the caller's pending value is intact
+/// and the call can be repeated. Once a commit has been attempted, rows may
+/// be durable even when that commit returned an error (the reader reload
+/// after a successful commit can fail), so the error carries no such claim.
+fn classify_write_error(stage: &WriteStage, source: StorageError) -> PipelineError {
+    if stage.commit_attempted() {
+        PipelineError::Storage(source)
+    } else {
+        PipelineError::WriterUnavailable { source }
     }
 }
 

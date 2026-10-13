@@ -4,6 +4,7 @@
 //! Key design principle: Parse stage produces "raw" types without IDs,
 //! Collect stage assigns IDs and produces final types.
 
+use crate::parsing::resolution::FilePresence;
 use crate::parsing::{Import, LanguageId, PipelineSymbolCache, ResolveResult};
 use crate::relationship::RelationshipMetadata;
 use crate::symbol::ScopeContext;
@@ -72,6 +73,7 @@ impl RawSymbol {
 pub struct RawImport {
     pub path: String,
     pub alias: Option<String>,
+    pub name: Option<String>,
     pub is_glob: bool,
     pub is_type_only: bool,
 }
@@ -81,6 +83,7 @@ impl RawImport {
         Self {
             path: path.into(),
             alias: None,
+            name: None,
             is_glob: false,
             is_type_only: false,
         }
@@ -88,6 +91,11 @@ impl RawImport {
 
     pub fn with_alias(mut self, alias: impl Into<String>) -> Self {
         self.alias = Some(alias.into());
+        self
+    }
+
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
         self
     }
 
@@ -107,6 +115,7 @@ impl RawImport {
             file_id,
             path: self.path,
             alias: self.alias,
+            name: self.name,
             is_glob: self.is_glob,
             is_type_only: self.is_type_only,
         }
@@ -454,6 +463,40 @@ pub struct SymbolLookupCache {
     /// Re-exported paths: "pkg.helper" -> the symbol defined at "pkg.a.helper"
     /// when pkg's namespace imports it. Populated by the Phase 2 pre-pass.
     module_aliases: dashmap::DashMap<Box<str>, crate::types::SymbolId>,
+    /// Every file row in the index, in the decoded path form symbols
+    /// carry. `Some` only for a cache built from the persisted index:
+    /// a walk-scoped cache sees its own run's files and cannot prove a
+    /// path absent.
+    indexed_files: Option<IndexedFileView>,
+}
+
+/// Every file row in the index, projected three ways for the negative
+/// evidence a dangling relative import needs: the paths themselves, the
+/// `(directory, first-dot stem)` pairs extension-substituted siblings
+/// share, and every ancestor directory.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct IndexedFileView {
+    paths: std::collections::HashSet<PathBuf>,
+    stems: std::collections::HashSet<(PathBuf, String)>,
+    dirs: std::collections::HashSet<PathBuf>,
+}
+
+impl IndexedFileView {
+    fn from_paths(files: impl IntoIterator<Item = PathBuf>) -> Self {
+        let mut view = Self::default();
+        for path in files {
+            if let Some(stem) = crate::parsing::paths::dir_and_first_dot_stem(&path) {
+                view.stems.insert(stem);
+            }
+            for dir in path.ancestors().skip(1) {
+                if !dir.as_os_str().is_empty() {
+                    view.dirs.insert(dir.to_path_buf());
+                }
+            }
+            view.paths.insert(path);
+        }
+        view
+    }
 }
 
 impl Default for SymbolLookupCache {
@@ -470,6 +513,7 @@ impl SymbolLookupCache {
             by_name: dashmap::DashMap::new(),
             by_file_id: dashmap::DashMap::new(),
             module_aliases: dashmap::DashMap::new(),
+            indexed_files: None,
         }
     }
 
@@ -480,7 +524,22 @@ impl SymbolLookupCache {
             by_name: dashmap::DashMap::with_capacity(symbols / 10), // Fewer unique names
             by_file_id: dashmap::DashMap::with_capacity(symbols / 50), // ~50 symbols/file avg
             module_aliases: dashmap::DashMap::new(),
+            indexed_files: None,
         }
+    }
+
+    /// Create an empty cache that knows the complete set of indexed file
+    /// paths, so the presence queries can answer `Absent`.
+    pub fn with_indexed_files(files: impl IntoIterator<Item = PathBuf>) -> Self {
+        let mut cache = Self::new();
+        cache.indexed_files = Some(IndexedFileView::from_paths(files));
+        cache
+    }
+
+    /// The complete file view, when this cache was built from the index.
+    #[cfg(test)]
+    pub(crate) fn indexed_files(&self) -> Option<&IndexedFileView> {
+        self.indexed_files.as_ref()
     }
 
     /// Insert a symbol into the cache.
@@ -867,25 +926,67 @@ impl PipelineSymbolCache for SymbolLookupCache {
     fn lookup_candidates(&self, name: &str) -> Vec<SymbolId> {
         SymbolLookupCache::lookup_candidates(self, name)
     }
+
+    fn file_presence(&self, path: &std::path::Path) -> FilePresence {
+        match &self.indexed_files {
+            None => FilePresence::Unknown,
+            Some(view) if view.paths.contains(path) => FilePresence::Present,
+            Some(_) => FilePresence::Absent,
+        }
+    }
+
+    fn sibling_stem_present(&self, path: &std::path::Path) -> FilePresence {
+        let Some(view) = &self.indexed_files else {
+            return FilePresence::Unknown;
+        };
+        match crate::parsing::paths::dir_and_first_dot_stem(path) {
+            Some(stem) if view.stems.contains(&stem) => FilePresence::Present,
+            _ => FilePresence::Absent,
+        }
+    }
+
+    fn directory_present(&self, path: &std::path::Path) -> FilePresence {
+        match &self.indexed_files {
+            None => FilePresence::Unknown,
+            Some(view) if view.dirs.contains(path) => FilePresence::Present,
+            Some(_) => FilePresence::Absent,
+        }
+    }
 }
 
 impl SymbolLookupCache {
     /// Build cache from all symbols in a DocumentIndex.
     ///
-    /// [PIPELINE API] Used for single-file indexing when we need a complete cache
-    /// for Phase 2 resolution but don't have symbols in memory.
+    /// [PIPELINE API] Seeds Phase 2 resolution on every index path, so the cache
+    /// reflects all registered roots and can prove a file is absent.
     ///
     /// Note: This queries Tantivy for all symbols, which is expensive for large indexes.
-    /// For bulk indexing, prefer building the cache during INDEX stage.
     pub fn from_index(index: &crate::storage::DocumentIndex) -> PipelineResult<Self> {
         // Get total count to pre-allocate
-        let count = index.document_count().unwrap_or(0) as usize;
-        let cache = Self::with_capacity(count);
+        let count = index
+            .count_symbols()
+            .map_err(|e| PipelineError::Index(crate::IndexError::Storage(e)))?;
+        let mut cache = Self::with_capacity(count);
 
-        // Load all symbols from Tantivy
-        // Use a large limit to get all symbols
+        // File rows decode through the same portable-path boundary as the
+        // symbols they are compared against. The visitor is uncapped, so
+        // the view is complete at every index size.
+        let mut files: Vec<PathBuf> = Vec::new();
+        index.for_each_file_path(|stored| -> Result<(), PipelineError> {
+            files.push(match index.to_portable_file_path(&stored) {
+                Some(portable) => PathBuf::from(portable),
+                None => PathBuf::from(stored),
+            });
+            Ok(())
+        })?;
+        cache.indexed_files = Some(IndexedFileView::from_paths(files));
+
+        if count == 0 {
+            return Ok(cache);
+        }
+
         let symbols = index
-            .get_all_symbols(1_000_000)
+            .get_all_symbols(count)
             .map_err(|e| PipelineError::Index(crate::IndexError::Storage(e)))?;
 
         for symbol in symbols {
@@ -1213,6 +1314,14 @@ pub enum PipelineError {
     /// [PIPELINE API] Uses storage::StorageError with proper `#[from]` conversion.
     #[error("Storage error: {0}")]
     Storage(#[from] crate::storage::StorageError),
+
+    /// Phase 2 could not start its first batch, so no relationship was
+    /// committed. The caller's `PendingResolution` is intact and the call
+    /// may be repeated once the writer is free.
+    #[error("index writer unavailable, nothing written: {source}")]
+    WriterUnavailable {
+        source: crate::storage::StorageError,
+    },
 }
 
 /// Result type for pipeline operations.
@@ -1297,6 +1406,7 @@ mod tests {
         batch2.imports.push(Import {
             file_id: FileId::new(1).unwrap(),
             path: "test".to_string(),
+            name: None,
             alias: None,
             is_glob: false,
             is_type_only: false,
@@ -1323,6 +1433,7 @@ mod tests {
         Import {
             file_id: FileId::new(1).unwrap(),
             path: path.to_string(),
+            name: None,
             alias: alias.map(String::from),
             is_glob: false,
             is_type_only: false,
@@ -1585,5 +1696,121 @@ mod tests {
         assert!(!segment_suffix_match("xutil", "util"));
         assert!(!segment_suffix_match("myapp.core", "app.core"));
         assert!(!segment_suffix_match("app.core.util", "app.core"));
+    }
+
+    fn index_with_generated_symbols(
+        count: u32,
+    ) -> (tempfile::TempDir, crate::storage::DocumentIndex) {
+        let dir = tempfile::tempdir().unwrap();
+        let index =
+            crate::storage::DocumentIndex::new(dir.path(), &crate::config::Settings::default())
+                .unwrap();
+        index.start_batch().unwrap();
+        for id in 1..=count {
+            let symbol = Symbol::new(
+                SymbolId::new(id).unwrap(),
+                "generated",
+                SymbolKind::Function,
+                FileId::new(1).unwrap(),
+                Range::new(id, 0, id, 1),
+            );
+            index.add_document(&symbol, "generated.rs").unwrap();
+        }
+        index.commit_batch().unwrap();
+        (dir, index)
+    }
+
+    fn assert_cache_holds_every_generated_symbol(count: u32) {
+        let (_dir, index) = index_with_generated_symbols(count);
+        let cache = SymbolLookupCache::from_index(&index).unwrap();
+        assert_eq!(cache.len(), count as usize);
+        for id in 1..=count {
+            assert!(cache.get_ref(SymbolId::new(id).unwrap()).is_some());
+        }
+    }
+
+    // Locks the zero-count early return: tantivy's `TopDocs::with_limit(0)`
+    // panics, so an empty index must not reach the load.
+    #[test]
+    fn cache_from_an_empty_index_is_empty() {
+        assert_cache_holds_every_generated_symbol(0);
+    }
+
+    // Preservation coverage below the former cap: passes with a fixed
+    // one-million limit and with the count-sized load alike.
+    #[test]
+    fn cache_contains_every_persisted_symbol() {
+        assert_cache_holds_every_generated_symbol(7);
+    }
+
+    #[test]
+    #[ignore = "writes one million synthetic symbols; run explicitly for the former cache limit"]
+    fn cache_exceeds_one_million_symbols() {
+        assert_cache_holds_every_generated_symbol(1_000_001);
+    }
+
+    // Count and load agree on the symbol filter across symbol, relationship,
+    // file-registration, and import documents, and after one file's
+    // documents are removed. Preservation coverage: it passes below one
+    // million symbols with a fixed limit too; it does not lock the cap.
+    #[test]
+    fn cache_matches_count_symbols_across_doc_types_and_deletions() {
+        let dir = tempfile::tempdir().unwrap();
+        let index =
+            crate::storage::DocumentIndex::new(dir.path(), &crate::config::Settings::default())
+                .unwrap();
+        index.start_batch().unwrap();
+        let mut live = std::collections::HashSet::new();
+        for (file, file_id, ids, kept) in [
+            ("kept.rs", FileId::new(1).unwrap(), 1..=3u32, true),
+            ("dropped.rs", FileId::new(2).unwrap(), 4..=6u32, false),
+        ] {
+            for id in ids {
+                let symbol = Symbol::new(
+                    SymbolId::new(id).unwrap(),
+                    "generated",
+                    SymbolKind::Function,
+                    file_id,
+                    Range::new(id, 0, id, 1),
+                );
+                index.add_document(&symbol, file).unwrap();
+                if kept {
+                    live.insert(symbol.id);
+                }
+            }
+            index
+                .store_file_registration(&FileRegistration {
+                    path: PathBuf::from(file),
+                    file_id,
+                    content_hash: "hash".to_string(),
+                    language_id: LanguageId::new("rust"),
+                    timestamp: 0,
+                    mtime: 0,
+                })
+                .unwrap();
+            index
+                .store_import(&Import {
+                    path: "std::fmt".to_string(),
+                    name: None,
+                    alias: None,
+                    file_id,
+                    is_glob: false,
+                    is_type_only: false,
+                })
+                .unwrap();
+        }
+        let rel = crate::Relationship::new(RelationKind::Calls);
+        index
+            .store_relationship(SymbolId::new(1).unwrap(), SymbolId::new(2).unwrap(), &rel)
+            .unwrap();
+        index.remove_file_documents("dropped.rs").unwrap();
+        index.commit_batch().unwrap();
+
+        let cache = SymbolLookupCache::from_index(&index).unwrap();
+        assert_eq!(cache.len(), index.count_symbols().unwrap());
+        assert_eq!(cache.len(), live.len());
+        for id in &live {
+            assert!(cache.get_ref(*id).is_some(), "{id:?}");
+        }
     }
 }

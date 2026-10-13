@@ -6,14 +6,13 @@
 //! - Receives IndexBatch from COLLECT stage
 //! - Writes symbols, imports, file registrations to Tantivy (parallel via RwLock)
 //! - Accumulates UnresolvedRelationships for Phase 2
-//! - Builds SymbolLookupCache for O(1) Phase 2 resolution (concurrent DashMap)
 //! - Commits every N batches for efficient I/O
 //!
 //! Note: Embedding generation moved to separate EMBED stage (parallel with INDEX).
 
 use crate::indexing::IndexStats;
 use crate::indexing::pipeline::types::{
-    IndexBatch, PipelineError, PipelineResult, SymbolLookupCache, UnresolvedRelationship,
+    IndexBatch, PipelineError, PipelineResult, UnresolvedRelationship,
 };
 use crate::io::status_line::ProgressBar;
 use crate::storage::DocumentIndex;
@@ -83,8 +82,7 @@ impl IndexStage {
 
     /// Run the index stage.
     ///
-    /// Returns (stats, accumulated_relationships, symbol_cache, input_wait) for Phase 2.
-    /// The symbol cache enables O(1) lookups during resolution instead of Tantivy queries.
+    /// Returns (stats, accumulated_relationships, bindings, barriers, input_wait) for Phase 2.
     pub fn run(
         &self,
         receiver: Receiver<IndexBatch>,
@@ -93,7 +91,6 @@ impl IndexStage {
         Vec<UnresolvedRelationship>,
         super::super::FileBindings,
         super::super::FileBarriers,
-        SymbolLookupCache,
         std::time::Duration,
     )> {
         use std::time::{Duration, Instant};
@@ -105,9 +102,6 @@ impl IndexStage {
         let mut batch_count = 0;
         let mut failed_files_total = 0usize;
         let mut input_wait = Duration::ZERO;
-
-        // Pre-allocate cache based on expected symbols (will grow if needed)
-        let symbol_cache = SymbolLookupCache::with_capacity(10_000);
 
         // Start initial batch - StorageError converts to PipelineError via #[from]
         self.index.start_batch()?;
@@ -135,7 +129,7 @@ impl IndexStage {
                 symbol_high_water = symbol_high_water.max(symbol.id.value());
             }
 
-            failed_files_total += self.process_batch(batch, &mut stats, &symbol_cache)?;
+            failed_files_total += self.process_batch(batch, &mut stats)?;
 
             batch_count += 1;
 
@@ -168,7 +162,6 @@ impl IndexStage {
             pending_relationships,
             pending_bindings,
             pending_barriers,
-            symbol_cache,
             input_wait,
         ))
     }
@@ -176,16 +169,10 @@ impl IndexStage {
     /// Process a single batch.
     ///
     /// Writes symbols, imports, and file registrations to Tantivy in parallel.
-    /// Accumulates symbols in cache for Phase 2 resolution.
     ///
     /// Returns the number of files in this batch that were left unregistered
     /// because a write failed.
-    fn process_batch(
-        &self,
-        batch: IndexBatch,
-        stats: &mut IndexStats,
-        symbol_cache: &SymbolLookupCache,
-    ) -> PipelineResult<usize> {
+    fn process_batch(&self, batch: IndexBatch, stats: &mut IndexStats) -> PipelineResult<usize> {
         // Symbols are written before file registrations: a file whose symbol
         // writes fail must not be registered with its content hash, or the
         // next incremental run treats it as up-to-date and the gap becomes
@@ -194,7 +181,6 @@ impl IndexStage {
         let failed_files: Mutex<HashSet<Box<str>>> = Mutex::new(HashSet::new());
 
         // Write symbols to Tantivy in parallel
-        // SymbolLookupCache uses DashMap which is concurrent-safe
         let symbols_in_batch = batch.symbols.len();
         batch.symbols.into_par_iter().for_each(|symbol| {
             if let Err(e) = self.index.index_symbol(&symbol, &symbol.file_path) {
@@ -207,8 +193,6 @@ impl IndexStage {
                     failed.insert(symbol.file_path.clone());
                 }
             }
-            // Insert into cache for O(1) Phase 2 resolution (DashMap is concurrent)
-            symbol_cache.insert(symbol);
         });
         stats.symbols_found += symbols_in_batch;
 
@@ -294,9 +278,8 @@ impl IndexStage {
     /// [PIPELINE API] Used by `Pipeline::index_file_single()` for watcher reindex.
     /// Caller must handle start_batch/commit_batch.
     pub fn index_batch(&self, batch: IndexBatch) -> PipelineResult<()> {
-        let symbol_cache = SymbolLookupCache::new();
         let mut stats = IndexStats::new();
-        let failed = self.process_batch(batch, &mut stats, &symbol_cache)?;
+        let failed = self.process_batch(batch, &mut stats)?;
         if failed > 0 {
             return Err(PipelineError::Parse {
                 path: PathBuf::new(),
@@ -314,7 +297,7 @@ mod tests {
     use super::*;
     use crate::SymbolKind;
     use crate::config::Settings;
-    use crate::indexing::pipeline::types::FileRegistration;
+    use crate::indexing::pipeline::types::{FileRegistration, SymbolLookupCache};
     use crate::parsing::LanguageId;
     use crate::symbol::Symbol;
     use crate::types::{FileId, Range, SymbolId};
@@ -371,10 +354,11 @@ mod tests {
         let result = stage.run(batch_rx);
 
         assert!(result.is_ok());
-        let (stats, rels, _, _, symbol_cache, _) = result.unwrap();
+        let (stats, rels, _, _, _) = result.unwrap();
+        let symbol_cache = SymbolLookupCache::from_index(&index).unwrap();
 
         println!(
-            "Indexed {} files, {} symbols, cache has {} entries",
+            "Indexed {} files, {} symbols, index-seeded cache has {} entries",
             stats.files_indexed,
             stats.symbols_found,
             symbol_cache.len()
@@ -405,10 +389,11 @@ mod tests {
         let result = stage.run(batch_rx);
 
         assert!(result.is_ok());
-        let (stats, _, _, _, symbol_cache, _) = result.unwrap();
+        let (stats, _, _, _, _) = result.unwrap();
+        let symbol_cache = SymbolLookupCache::from_index(&index).unwrap();
 
         println!(
-            "Indexed {} files, {} symbols with batches_per_commit=2, cache has {} entries",
+            "Indexed {} files, {} symbols with batches_per_commit=2, index-seeded cache has {} entries",
             stats.files_indexed,
             stats.symbols_found,
             symbol_cache.len()
@@ -499,10 +484,11 @@ mod tests {
         let result = stage.run(batch_rx);
 
         assert!(result.is_ok());
-        let (stats, rels, _, _, symbol_cache, _) = result.unwrap();
+        let (stats, rels, _, _, _) = result.unwrap();
+        let symbol_cache = SymbolLookupCache::from_index(&index).unwrap();
 
         println!(
-            "Accumulated {} relationships for Phase 2, cache has {} symbols",
+            "Accumulated {} relationships for Phase 2, index-seeded cache has {} symbols",
             rels.len(),
             symbol_cache.len()
         );
@@ -515,7 +501,7 @@ mod tests {
     }
 
     #[test]
-    fn test_symbol_cache_lookup_by_name() {
+    fn test_index_seeded_cache_lookup_by_name() {
         let temp_dir = TempDir::new().unwrap();
         let settings = Settings::default();
         let index = Arc::new(DocumentIndex::new(temp_dir.path(), &settings).unwrap());
@@ -546,7 +532,8 @@ mod tests {
         drop(batch_tx);
 
         let stage = IndexStage::new(Arc::clone(&index), 10);
-        let (_, _, _, _, symbol_cache, _) = stage.run(batch_rx).unwrap();
+        stage.run(batch_rx).unwrap();
+        let symbol_cache = SymbolLookupCache::from_index(&index).unwrap();
 
         // Verify lookup by name returns correct candidates
         let candidates = symbol_cache.lookup_candidates("process_data");

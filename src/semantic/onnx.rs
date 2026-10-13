@@ -1,30 +1,27 @@
-//! Process-wide ONNX Runtime thread cap for local fastembed models.
+//! One process-wide ONNX Runtime thread pool for local fastembed sessions.
 //!
-//! fastembed 5.6 builds every `TextEmbedding` session with
-//! `with_intra_threads(available_parallelism())` and ONNX Runtime's default
-//! spin-waiting. With `embedding_threads` pool instances that is
-//! `embedding_threads × ncpu` busy threads during embedding — on a 28-core
-//! host, three sessions kept ~84 threads running and wedged the machine
-//! regardless of `indexing.parallelism`.
+//! fastembed 5.6 sizes every `TextEmbedding` session to all logical CPUs
+//! with spin-waiting on and exposes no per-session thread setting. With
+//! `embedding_threads` pool instances that is `embedding_threads x ncpu`
+//! busy threads during embedding, whatever `indexing.parallelism` says.
 //!
-//! Committing an ort environment with a global thread pool makes every
-//! session created afterwards call `DisablePerSessionThreads` and share that
-//! one capped, non-spinning pool. The environment is one-shot per process, so
-//! the first commit wins; later calls are no-ops.
+//! ort disables per-session pools for every session created after an
+//! environment with a global pool is committed, and the environment is
+//! one-shot per process: a commit that arrives after the first session
+//! changes nothing. `new_text_embedding` is therefore the only session
+//! constructor in this crate. It commits the pool first, so a new
+//! session-creation site cannot skip the cap.
 
-use std::sync::Once;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
 
-static INIT: Once = Once::new();
+use fastembed::{TextEmbedding, TextInitOptions};
+use ort::environment::GlobalThreadPoolOptions;
 
-/// Intra-op thread cap applied at the first session creation. Defaults to the
-/// default `semantic_search.embedding_threads`; `main` overrides it from config.
-static INTRA_THREADS: AtomicUsize = AtomicUsize::new(3);
+/// The intra-op cap the environment was committed with. Set once by the
+/// first session; later callers with a different cap keep this one.
+static COMMITTED_CAP: OnceLock<usize> = OnceLock::new();
 
-/// Ceiling for `embedding_threads`: the host's logical CPU count (at least 1).
-/// ORT takes the value as a C `int`, so an unbounded setting could wrap to 0
-/// (ORT default = ncpu) and silently defeat the cap.
-fn embedding_threads_ceiling() -> usize {
+fn thread_ceiling() -> usize {
     std::thread::available_parallelism().map_or(1, |n| n.get())
 }
 
@@ -32,57 +29,79 @@ fn clamp_threads(requested: usize, ceiling: usize) -> usize {
     requested.clamp(1, ceiling.max(1))
 }
 
-/// Clamp a configured `embedding_threads` value to `1..=available_parallelism`,
-/// warning when it is changed. Used for both the shared ORT pool size and the
-/// model instance count.
+/// Clamp a configured `embedding_threads` to `1..=available_parallelism`,
+/// warning when the value changes. ORT takes the count as a C `int`, so an
+/// unbounded value could wrap to 0, which ORT reads as "all CPUs".
 pub(crate) fn clamp_embedding_threads(requested: usize) -> usize {
-    let clamped = clamp_threads(requested, embedding_threads_ceiling());
+    let ceiling = thread_ceiling();
+    let clamped = clamp_threads(requested, ceiling);
     if clamped != requested {
         tracing::warn!(
             target: "semantic",
-            "semantic_search.embedding_threads = {requested} is outside 1..={}; using {clamped}",
-            embedding_threads_ceiling()
+            "semantic_search.embedding_threads = {requested} is outside 1..={ceiling}; using {clamped}"
         );
     }
     clamped
 }
 
-/// Record the intra-op thread cap (clamped to `1..=available_parallelism`) for
-/// the ORT environment. Cheap: nothing is initialized until the first embedding
-/// session is created, so commands that never embed pay nothing. Has no
-/// effect once the first embedding session has been created. Safe to call
-/// repeatedly.
-pub fn set_onnx_thread_cap(intra_threads: usize) {
-    INTRA_THREADS.store(clamp_embedding_threads(intra_threads), Ordering::Relaxed);
+/// Create a fastembed text session inside the shared, capped ONNX pool.
+///
+/// The first call in a process commits the environment: `embedding_threads`
+/// (clamped) intra-op threads, one inter-op thread, spin-waiting off. The
+/// pool is shared by every session, so about `2N-1` threads are busy at
+/// peak: `N-1` pool threads plus the `N` workers calling into it.
+///
+/// Degrades, never fails: a commit that finds the environment already
+/// created, or that ORT rejects, is logged at warn and the session is still
+/// built with the per-session pool ORT would have given it anyway.
+pub(crate) fn new_text_embedding(
+    options: TextInitOptions,
+    embedding_threads: usize,
+) -> Result<TextEmbedding, fastembed::Error> {
+    let cap = clamp_embedding_threads(embedding_threads);
+    let committed = *COMMITTED_CAP.get_or_init(|| {
+        commit_global_pool(cap);
+        cap
+    });
+    if committed != cap {
+        tracing::debug!(
+            target: "semantic",
+            "ONNX Runtime pool already committed with {committed} threads; {cap} requested, keeping {committed}"
+        );
+    }
+    TextEmbedding::try_new(session_options(options, cap))
 }
 
-/// Commit the global ORT environment with the recorded intra-op cap and
-/// spin-waiting disabled. Idempotent; must run before the first
-/// `TextEmbedding::try_new` to take effect, so every session-creation site
-/// calls it.
-pub(crate) fn init_onnx_runtime() {
-    INIT.call_once(|| {
-        let intra_threads = INTRA_THREADS.load(Ordering::Relaxed);
-        let committed = ort::environment::GlobalThreadPoolOptions::default()
-            .with_intra_threads(intra_threads)
-            .and_then(|o| o.with_inter_threads(1))
-            .and_then(|o| o.with_spin_control(false))
-            .and_then(|opts| ort::init().with_global_thread_pool(opts).commit());
-        match committed {
-            Ok(true) => tracing::debug!(
-                target: "semantic",
-                "ONNX Runtime global thread pool: {intra_threads} intra-op threads, spinning off"
-            ),
-            Ok(false) => tracing::warn!(
-                target: "semantic",
-                "ONNX Runtime environment already initialized; embedding thread cap not applied"
-            ),
-            Err(e) => tracing::warn!(
-                target: "semantic",
-                "Failed to cap ONNX Runtime threads ({e}); sessions use per-session pools"
-            ),
-        }
-    });
+/// Per-session settings for the case the global pool did not apply (an
+/// environment committed elsewhere, or a commit ORT rejected): `cap`
+/// intra-op threads with spin-waiting off. With the global pool in place
+/// ORT disables per-session threads and these are inert.
+fn session_options(options: TextInitOptions, cap: usize) -> TextInitOptions {
+    options
+        .with_intra_threads(cap)
+        .with_session_config("session.intra_op.allow_spinning", "0")
+}
+
+fn commit_global_pool(intra_threads: usize) {
+    let committed = GlobalThreadPoolOptions::default()
+        .with_intra_threads(intra_threads)
+        .and_then(|o| o.with_inter_threads(1))
+        .and_then(|o| o.with_spin_control(false))
+        .map(|o| ort::init().with_global_thread_pool(o).commit());
+    match committed {
+        Ok(true) => tracing::debug!(
+            target: "semantic",
+            "ONNX Runtime global thread pool: {intra_threads} intra-op threads, spinning off"
+        ),
+        Ok(false) => tracing::warn!(
+            target: "semantic",
+            "ONNX Runtime environment already initialized; global pool of {intra_threads} not applied, sessions run capped per-session pools"
+        ),
+        Err(e) => tracing::warn!(
+            target: "semantic",
+            "ONNX Runtime global thread pool not committed ({e}); sessions run capped per-session pools"
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -90,23 +109,72 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_clamp_threads_raises_zero_to_one() {
+    fn session_options_carry_the_cap_and_disable_spinning() {
+        let options = session_options(
+            TextInitOptions::new(fastembed::EmbeddingModel::AllMiniLML6V2),
+            3,
+        );
+        assert_eq!(options.intra_threads, Some(3));
+        assert!(
+            options
+                .session_config
+                .iter()
+                .any(|(k, v)| k == "session.intra_op.allow_spinning" && v == "0")
+        );
+    }
+
+    #[test]
+    fn clamp_raises_zero_to_one() {
         assert_eq!(clamp_threads(0, 8), 1);
     }
 
     #[test]
-    fn test_clamp_threads_caps_wrapping_values_at_ceiling() {
-        assert_eq!(clamp_threads(1usize << 32, 8), 8);
+    fn clamp_caps_at_the_ceiling() {
+        assert_eq!(clamp_threads(9, 8), 8);
         assert_eq!(clamp_threads(usize::MAX, 8), 8);
     }
 
     #[test]
-    fn test_clamp_threads_keeps_in_range_value() {
+    fn clamp_keeps_an_in_range_value() {
         assert_eq!(clamp_threads(3, 8), 3);
     }
 
     #[test]
-    fn test_clamp_threads_tolerates_zero_ceiling() {
+    fn clamp_tolerates_a_zero_ceiling() {
         assert_eq!(clamp_threads(5, 0), 1);
+    }
+
+    // Lock for the single-constructor invariant: a session built anywhere
+    // else bypasses the cap with only a tracing warning to show for it.
+    #[test]
+    fn try_new_is_called_only_by_the_constructor() {
+        // No trailing paren: `try_new_from_user_defined` builds a session too.
+        let needle = concat!("TextEmbedding::", "try_new");
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut hits = Vec::new();
+        for entry in walkdir::WalkDir::new(&src)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "rs"))
+        {
+            let text = std::fs::read_to_string(entry.path()).unwrap();
+            for (i, line) in text.lines().enumerate() {
+                if line.contains(needle) {
+                    let rel = entry.path().strip_prefix(&src).unwrap().to_path_buf();
+                    // Forward slashes on every host: the assertion below names the path.
+                    let rel = rel.display().to_string().replace('\\', "/");
+                    hits.push(format!("{rel}:{}", i + 1));
+                }
+            }
+        }
+        assert_eq!(
+            hits.len(),
+            1,
+            "sessions must be built through new_text_embedding: {hits:?}"
+        );
+        assert!(
+            hits[0].starts_with("semantic/onnx.rs:"),
+            "the one call site must be this module's constructor: {hits:?}"
+        );
     }
 }

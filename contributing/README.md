@@ -29,17 +29,17 @@ See [CHANGELOG.md](../CHANGELOG.md) for detailed release notes and feature histo
 
 **Linux (Ubuntu/Debian):**
 ```bash
-sudo apt update && sudo apt install pkg-config libssl-dev
+sudo apt update && sudo apt install pkg-config
 ```
 
 **Linux (CentOS/RHEL):**
 ```bash
-sudo yum install pkgconfig openssl-devel
+sudo yum install pkgconfig
 ```
 
 **Linux (Fedora):**
 ```bash
-sudo dnf install pkgconfig openssl-devel
+sudo dnf install pkgconfig
 ```
 
 ### Getting Started

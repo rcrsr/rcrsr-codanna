@@ -5,7 +5,7 @@ This file lists what the fork adds or changes for you as a user, on top of its
 upstream base. Everything not listed here behaves as it does upstream; for the
 how, see the commit history.
 
-- **Upstream base:** v0.16.0 — the `codanna` release the fork is built on
+- **Upstream base:** v0.17.1 — the `codanna` release the fork is built on
 - **Fork build:** the upstream version with a `+rcrsr.N` suffix (see [Identifying the fork](#identifying-the-fork))
 
 ## Contents
@@ -47,7 +47,7 @@ how, see the commit history.
 ## Installing the fork
 
 The fork is distributed through its own [GitHub Releases](https://github.com/rcrsr/rcrsr-codanna/releases),
-not crates.io or Homebrew. CI builds Linux, macOS (x64 + arm64), and Windows
+not crates.io or Homebrew. CI builds Linux x64, macOS arm64, and Windows x64
 binaries for every `v<version>` tag.
 
 ### Quick install (recommended)
@@ -130,7 +130,7 @@ publishes a release, even against a tag.
 
 ## Upstream base
 
-The fork tracks upstream **v0.16.0**. Moving the base never touches the
+The fork tracks upstream **v0.17.1**. Moving the base never touches the
 `+rcrsr.N` counter (see [Identifying the fork](#identifying-the-fork)).
 
 Two fork-private capabilities are kept alongside upstream's newer equivalents
@@ -198,6 +198,31 @@ with the fork's caveats:
   `notifications/resources/updated`. `serve --watch` no longer livelocks on
   Linux. Known limitation carried forward: Windows path handling under-reports
   some relationships.
+- **v0.17.0 forces a one-time re-index of every existing index** (emission
+  semantics version 3 → 4: TypeScript/JavaScript `import { member as local }`
+  now records the imported member, and relative imports whose target file is
+  absent from the index no longer resolve by name to an unrelated symbol).
+  Every command except `codanna index` refuses a v3 index with exit 7, and an
+  MCP server started on one serves no tools. Run `codanna index` once per
+  workspace; semantic workspaces re-embed. **Fork note:** the rebuild runs as a
+  normal build-and-publish into a new generation, so a running server keeps
+  serving the old one until the new one is published.
+- **v0.17.0 defers newly configured roots to `codanna index`** when a command
+  that loads no embedder (`retrieve`, `dump`, `mcp`) starts, so the root is not
+  stored without embeddings. **Fork difference:** upstream skips the whole
+  startup sync in that case, so a root removed from the config in the same
+  edit lingers in the index. The fork defers only the added roots and still
+  purges removed ones.
+- **v0.17.0 caps local embedding CPU** with one ONNX Runtime pool shared by
+  every embedding session, sized from `semantic_search.embedding_threads`.
+  This is the fork's earlier fix taken upstream; the fork now uses upstream's
+  implementation (see [Embedding stays within `embedding_threads`](#embedding-stays-within-embedding_threads)).
+- **v0.17.1 moves to fastembed 7.1.1 / ONNX Runtime 1.28 over rustls.**
+  OpenSSL leaves the dependency graph, so building from source no longer needs
+  `libssl-dev`. The prebuilt ONNX Runtime binaries need glibc 2.38+ and
+  libstdc++ from GCC 13+ on Linux. **There are no Intel macOS (x86_64)
+  release binaries any more**, upstream or fork: ONNX Runtime 1.28 has no Intel
+  macOS build. Fork release assets are linux-x64, macos-arm64 and windows-x64.
 
 ## Improvements
 
@@ -774,42 +799,28 @@ you need identical behavior on both.
 
 ## Embedding stays within `embedding_threads`
 
-Upstream's fastembed gives every embedding model instance its own ONNX Runtime
-thread pool sized to all CPUs, with busy-waiting on. With the default three
-instances, a reindex kept `3 × ncpu` threads spinning, whatever
-`indexing.parallelism` was set to. The fork commits one process-wide ONNX
-Runtime pool before any model loads. It is capped at
-`semantic_search.embedding_threads` threads and does not spin. Embedding inputs
-are also sorted by length and sent in batches of 8, so batches are no longer
-mostly padding. On a 16-core / 32-thread host this cut a full index from 1165s of CPU and
-12 GB peak RSS to 46s and 1.4 GB, and it ran faster in wall time.
-`embedding_threads` is now the knob for how much CPU embedding may use.
+Since v0.17.0, upstream caps local embedding CPU itself: every embedding
+session shares one ONNX Runtime pool sized from
+`semantic_search.embedding_threads`, with spin-waiting off. The semantic pool
+and the document store also sort inputs by length and embed them in batches
+of 8. This was the fork's fix (#111), and the fork now uses upstream's version.
+The pool is committed once, at the first embedding in a process, so editing
+`embedding_threads` under `serve --watch` takes effect only after a restart.
 
-The length-sort and batch-of-8 step first covered only the semantic pool's
-`embed_parallel`. The default indexing path (`EmbedStage`), document
-embedding (`src/documents/store.rs`), and any other `EmbeddingGenerator`
-caller bypassed it and embedded in fastembed's default batch of 256, so one
-long text padded a whole batch. All of them now go through
-`FastEmbedGenerator::generate_embeddings`,
-which sorts texts longest-first, embeds in batches of 8
-(`EMBED_BATCH_SIZE`), and returns results in input order. Measured on 256
-mixed-length texts (about 20 to 4000 chars, AllMiniLML6V2, release build,
-fresh process, two runs each): wall time fell from 9.75s / 9.60s to
-5.86s / 5.90s, and peak RSS from about 7.6 GiB to about 580 MiB (model-load
-baseline is about 195 MB). Dynamically quantized models (the `*Q` variants,
-for example `AllMiniLML6V2Q`) are exempt: fastembed rejects batching for
-them, so they embed each call as a single batch and see no padding
-reduction. Reproduce with the ignored test
-`vector::embedding::tests::bench_mixed_length_batch`; set
+What the fork still adds is the same length-sort and batch-of-8 treatment on
+`FastEmbedGenerator::generate_embeddings`. Upstream still embeds that path
+unsorted in fastembed's default batch of 256. That path serves the default
+indexing stage (`EmbedStage`) and every other `EmbeddingGenerator` caller, so
+there one long text pads a whole batch. The fork sorts texts longest-first,
+embeds in batches of 8 (`EMBED_BATCH_SIZE`), and returns results in input
+order. Measured on 256 mixed-length texts (about 20 to 4000 chars,
+AllMiniLML6V2, release build, fresh process, two runs each): wall time fell
+from 9.75s / 9.60s to 5.86s / 5.90s, and peak RSS from about 7.6 GiB to about
+580 MiB (model-load baseline is about 195 MB). Dynamically quantized models
+(the `*Q` variants, for example `AllMiniLML6V2Q`) are exempt: fastembed rejects
+batching for them, so they embed each call as a single batch. Reproduce with
+the ignored test `vector::embedding::tests::bench_mixed_length_batch`; set
 `EMBED_BENCH_MODE=baseline` for the old unsorted call.
-
-`embedding_threads` sets both the number of model instances and the size of
-that shared pool, which also serves document embedding. At `1`, inference is
-effectively serial. The value is clamped to `1..=` the host's logical CPU
-count, with a warning when it is changed. The pool is committed once, at first
-embedding use, so editing the setting under `serve --watch` takes effect only
-after a restart. Library users get the same cap: it is applied when the
-facade builds its embedding backend, not only in the CLI.
 
 ## Indexing no longer depends on the working directory
 

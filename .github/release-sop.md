@@ -33,7 +33,7 @@ The version lives in **three places that must agree**, all in the repo root:
 | Location | What to set |
 |----------|-------------|
 | `Cargo.toml` → `[package] version` | `<version>` (raw, with `+`) |
-| `Cargo.toml` → `[package.metadata.binstall.overrides.*]` — four `pkg-url` filename segments and four `bin-dir` values | the **sanitized** version, `+` → `-` (e.g. `0.16.0-rcrsr.4`). The `download/v{ version }/` path segment keeps the raw `{ version }` template and must not be hand-edited. |
+| `Cargo.toml` → `[package.metadata.binstall.overrides.*]` — three `pkg-url` filename segments and three `bin-dir` values | the **sanitized** version, `+` → `-` (e.g. `0.16.0-rcrsr.4`). The `download/v{ version }/` path segment keeps the raw `{ version }` template and must not be hand-edited. |
 | `Cargo.lock` → the `codanna` package entry | regenerated, never hand-edited: run `cargo check` (or `cargo build`, optionally with `--offline`) after editing `Cargo.toml` — avoid `cargo update`, which is a dependency-upgrade command and can pull in newer transitive dependency versions beyond the version edit |
 
 `tests/binstall_metadata_tests.rs` guards the binstall literals against drift
@@ -152,7 +152,7 @@ publishes a release, even when dispatched against a tag.
 
 **Pushing the tag is the publish step.** `release.yml` triggers on
 `push: tags: v*` and, for a real tag push, runs the full test suite, builds
-all four platforms (linux-x64, macos-x64, macos-arm64, windows-x64), packages
+all three platforms (linux-x64, macos-arm64, windows-x64), packages
 archives + sha256/sha512 checksums + `dist-manifest.json`, and creates the
 GitHub Release itself via `softprops/action-gh-release` with the body taken
 from the matching `CHANGELOG.md` section. It does **not** deploy anywhere.
@@ -173,7 +173,7 @@ git push origin v<version>
 - Watch the run: `gh run watch` or `gh run list --workflow=release.yml`.
   Expect ~20–30 minutes. When it finishes, confirm with
   `gh release view v<version>` that the release is published (not draft)
-  and lists `dist-manifest.json`, four archives, `SHA256SUMS`, `SHA512SUMS`,
+  and lists `dist-manifest.json`, three archives, `SHA256SUMS`, `SHA512SUMS`,
   and the per-archive checksum files.
 
 ## 8. Post-release checks

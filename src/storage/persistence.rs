@@ -486,12 +486,10 @@ impl IndexPersistence {
         Ok((id, facade))
     }
 
-    /// Save metadata for an IndexFacade
-    #[must_use = "Save errors should be handled to ensure data is persisted"]
-    pub fn save_facade(&self, facade: &IndexFacade) -> IndexResult<()> {
+    /// Persist the index metadata: counts, stamps, tracked paths. The
+    /// semantic snapshot is left alone.
+    pub fn save_metadata(&self, facade: &IndexFacade) -> IndexResult<()> {
         let gen_dir = facade.generation_dir();
-
-        // Update metadata
         let mut metadata = IndexMetadata::load(&gen_dir).unwrap_or_else(|_| IndexMetadata::new());
 
         metadata.update_counts(facade.symbol_count() as u32, facade.file_count());
@@ -539,7 +537,14 @@ impl IndexPersistence {
             timestamp: crate::indexing::get_utc_timestamp(),
         };
 
-        self.persist_metadata(&metadata, &gen_dir)?;
+        self.persist_metadata(&metadata, &gen_dir)
+    }
+
+    /// Persist the index metadata and, when the facade carries semantic
+    /// search, the semantic snapshot.
+    #[must_use = "Save errors should be handled to ensure data is persisted"]
+    pub fn save_facade(&self, facade: &IndexFacade) -> IndexResult<()> {
+        self.save_metadata(facade)?;
 
         // Save semantic search if enabled
         if facade.has_semantic_search() {
@@ -570,6 +575,24 @@ impl IndexPersistence {
     /// generation that is still current, or is refused with
     /// [`IndexError::GenerationSuperseded`].
     pub(crate) fn save_facade_current_checked(&self, facade: &IndexFacade) -> IndexResult<()> {
+        self.with_current_checked(facade, |p| p.save_facade(facade))
+    }
+
+    /// Metadata-only counterpart of [`Self::save_facade_current_checked`]:
+    /// saves `facade`'s metadata (the semantic snapshot is left alone) only
+    /// if its bound generation is still `current`, else refuses with
+    /// [`IndexError::GenerationSuperseded`].
+    pub(crate) fn save_metadata_current_checked(&self, facade: &IndexFacade) -> IndexResult<()> {
+        self.with_current_checked(facade, |p| p.save_metadata(facade))
+    }
+
+    /// Run `save` under the publish lock iff `current` still names
+    /// `facade`'s generation.
+    fn with_current_checked(
+        &self,
+        facade: &IndexFacade,
+        save: impl FnOnce(&Self) -> IndexResult<()>,
+    ) -> IndexResult<()> {
         std::fs::create_dir_all(self.layout.root()).map_err(|e| IndexError::FileWrite {
             path: self.layout.root().to_path_buf(),
             source: e,
@@ -591,7 +614,7 @@ impl IndexPersistence {
 
         let observed = self.layout.read_current()?;
         let result = if observed.as_ref() == Some(facade.generation_id()) {
-            self.save_facade(facade)
+            save(self)
         } else {
             Err(IndexError::GenerationSuperseded {
                 expected: facade.generation_id().to_string(),
@@ -1110,6 +1133,69 @@ mod tests {
             .expect("reload facade");
         let reloaded_paths: Vec<PathBuf> = reloaded.get_indexed_paths().iter().cloned().collect();
         assert_eq!(reloaded_paths, new_paths);
+    }
+
+    #[test]
+    fn save_metadata_current_checked_refuses_when_current_moved_off_bound_generation() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = IndexPersistence::new(temp_dir.path().to_path_buf());
+        let settings = settings_for(&temp_dir);
+
+        let base = persistence
+            .open_build(settings.clone(), BuildMode::Fresh)
+            .expect("open fresh base build");
+        let g1 = persistence.publish(base).expect("publish base");
+        let mut facade = persistence
+            .load_facade_lite(settings.clone())
+            .expect("load facade bound to G1");
+
+        let g1_meta_path = persistence.layout.gen_dir(&g1).join("index.meta");
+        let before = std::fs::read(&g1_meta_path).expect("G1 index.meta must exist");
+
+        let other = persistence
+            .open_build(settings, BuildMode::Fresh)
+            .expect("open fresh other build");
+        persistence.publish(other).expect("publish other as G2");
+
+        facade.set_indexed_paths(vec![temp_dir.path().to_path_buf()]);
+
+        match persistence
+            .save_metadata_current_checked(&facade)
+            .expect_err("save must be refused once current moved")
+        {
+            IndexError::GenerationSuperseded { expected, actual } => {
+                assert_eq!(expected, g1.to_string());
+                assert_ne!(actual, g1.to_string());
+            }
+            other => panic!("expected GenerationSuperseded, got {other:?}"),
+        }
+        let after = std::fs::read(&g1_meta_path).expect("G1 index.meta must still exist");
+        assert_eq!(before, after, "no stale write may land in G1");
+    }
+
+    #[test]
+    fn save_metadata_current_checked_saves_when_current_is_unchanged() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = IndexPersistence::new(temp_dir.path().to_path_buf());
+        let settings = settings_for(&temp_dir);
+
+        let build = persistence
+            .open_build(settings.clone(), BuildMode::Fresh)
+            .expect("open fresh build");
+        persistence.publish(build).expect("publish");
+        let mut facade = persistence
+            .load_facade_lite(settings.clone())
+            .expect("load facade");
+
+        let new_paths = vec![temp_dir.path().to_path_buf()];
+        facade.set_indexed_paths(new_paths.clone());
+        persistence
+            .save_metadata_current_checked(&facade)
+            .expect("save must succeed when current has not moved");
+
+        let reloaded = persistence.load_facade_lite(settings).expect("reload");
+        let paths: Vec<PathBuf> = reloaded.get_indexed_paths().iter().cloned().collect();
+        assert_eq!(paths, new_paths);
     }
 
     #[test]

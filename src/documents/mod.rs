@@ -43,8 +43,11 @@ pub fn load_from_settings(settings: &Settings) -> Option<Arc<RwLock<DocumentStor
         return None;
     }
 
-    let generator = match FastEmbedGenerator::from_settings(&settings.semantic_search.model, false)
-    {
+    let generator = match FastEmbedGenerator::from_settings(
+        &settings.semantic_search.model,
+        false,
+        settings.semantic_search.embedding_threads,
+    ) {
         Ok(g) => g,
         Err(e) => {
             tracing::warn!(target: "documents", "failed to create embedding generator: {e}");
@@ -108,9 +111,13 @@ mod load_tests {
         let settings = settings_in(&dir, true);
         assert!(load_from_settings(&settings).is_none());
 
-        let dimension = FastEmbedGenerator::from_settings(&settings.semantic_search.model, false)
-            .unwrap()
-            .dimension();
+        let dimension = FastEmbedGenerator::from_settings(
+            &settings.semantic_search.model,
+            false,
+            settings.semantic_search.embedding_threads,
+        )
+        .unwrap()
+        .dimension();
         DocumentStore::new(settings.index_path.join("documents"), dimension).unwrap();
 
         assert!(load_from_settings(&settings).is_some());

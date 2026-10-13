@@ -1366,6 +1366,7 @@ impl PhpParser {
                     if !path.is_empty() {
                         imports.push(Import {
                             path,
+                            name: None,
                             alias,
                             is_glob: false,
                             file_id,
@@ -1392,6 +1393,7 @@ impl PhpParser {
                 .to_string();
             imports.push(Import {
                 path,
+                name: None,
                 alias: None,
                 is_glob: false,
                 file_id,

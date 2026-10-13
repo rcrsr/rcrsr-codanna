@@ -16,13 +16,12 @@ use std::path::Path;
 /// Rust target triple paired with the release-matrix platform name its assets
 /// must carry (`.github/workflows/release.yml`, `build` job matrix).
 ///
-/// The platform half is asserted, not just carried: without it all four
+/// The platform half is asserted, not just carried: without it all three
 /// overrides could name `-linux-x64` archives and every other assertion in
 /// this file would still pass, leaving macOS and Windows users resolving a
 /// Linux binary.
-const OVERRIDE_TARGETS: [(&str, &str); 4] = [
+const OVERRIDE_TARGETS: [(&str, &str); 3] = [
     ("x86_64-unknown-linux-gnu", "linux-x64"),
-    ("x86_64-apple-darwin", "macos-x64"),
     ("aarch64-apple-darwin", "macos-arm64"),
     ("x86_64-pc-windows-msvc", "windows-x64"),
 ];
@@ -148,7 +147,7 @@ fn top_level_bin_dir_is_removed() {
 
     assert!(
         !binstall.contains_key("bin-dir"),
-        "top-level [package.metadata.binstall] bin-dir is unreachable for all four \
+        "top-level [package.metadata.binstall] bin-dir is unreachable for all three \
          supported targets (each override supplies its own) and is a fifth site \
          deriving a name from the raw version; it must be deleted"
     );

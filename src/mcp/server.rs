@@ -200,7 +200,7 @@ pub(crate) fn list_tools_result(tools: Vec<Tool>) -> ListToolsResult {
 
 /// Build the server info advertised at `initialize`. `file_watch` is
 /// `None` when the watch state is unknown (e.g. a proxy answering locally).
-pub(crate) fn codanna_server_info(file_watch: Option<bool>) -> ServerInfo {
+pub(crate) fn codanna_server_info(file_watch: Option<bool>) -> ServerConfig {
     let watch_sentence = match file_watch {
         Some(true) => {
             "A file watcher is active for this server, so on-disk source changes - including uncommitted edits and new files - are picked up automatically after a short debounce; this is not instant, so a read immediately after an edit can still race the watcher. "
@@ -218,7 +218,7 @@ pub(crate) fn codanna_server_info(file_watch: Option<bool>) -> ServerInfo {
         {watch_sentence}\
         Call 'get_index_info' to check index health and the current file-watch state rather than assuming the index is stale. "
     );
-    ServerInfo::new(
+    ServerConfig::new(
         ServerCapabilities::builder()
             .enable_tools()
             .enable_resources()
@@ -314,7 +314,7 @@ impl ServerHandler for CodeIntelligenceServer {
         Ok(())
     }
 
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         codanna_server_info(self.file_watch)
     }
 

@@ -521,11 +521,6 @@ async fn main() {
         config.indexing.parallelism = *t;
     }
 
-    // Cap ONNX Runtime threads for every embedding session this process
-    // creates; without it each fastembed session spins ncpu threads
-    // (src/semantic/onnx.rs).
-    codanna::semantic::set_onnx_thread_cap(config.semantic_search.embedding_threads);
-
     // Set up persistence based on config
     // Use global path resolution that handles --config properly
     let index_path = codanna::init::resolve_index_path(&config, cli.config.as_deref());
@@ -853,10 +848,10 @@ async fn main() {
     fn run_sync(
         on: &mut IndexFacade,
         stored_paths: Option<Vec<PathBuf>>,
-        config: &Settings,
+        config_paths: &[PathBuf],
         show_progress: bool,
     ) -> codanna::indexing::SyncStats {
-        match on.sync_with_config(stored_paths, &config.indexed_paths_cache, show_progress) {
+        match on.sync_with_config(stored_paths, config_paths, show_progress) {
             Ok(stats) => {
                 if stats.added_dirs > 0 {
                     tracing::info!(
@@ -908,8 +903,12 @@ async fn main() {
                         .as_mut()
                         .expect("index build always populates handle")
                         .facade_mut();
-                    let stats =
-                        run_sync(idx, metadata.indexed_paths.clone(), &config, show_progress);
+                    let stats = run_sync(
+                        idx,
+                        metadata.indexed_paths.clone(),
+                        &config.indexed_paths_cache,
+                        show_progress,
+                    );
                     sync_made_changes = Some(stats.has_changes());
                 }
                 None => {
@@ -942,11 +941,45 @@ async fn main() {
                 IndexFacade::canonical_path_set(metadata.indexed_paths.iter().flatten());
             let config_set = IndexFacade::canonical_path_set(&config.indexed_paths_cache);
 
-            if IndexFacade::indexed_paths_need_sync(&stored_set, &config_set) {
+            // A root indexed while no embedder is loaded gets its hashes
+            // stored and no embeddings, and every later sync reads it as
+            // cached. Leave such roots to `codanna index`, which loads the
+            // embedder, but still sync everything else: removed roots are
+            // purged here rather than lingering until the next index run.
+            let awaiting: std::collections::HashSet<PathBuf> =
+                if config.semantic_search.enabled && !needs_semantic_search {
+                    config_set
+                        .difference(&stored_set)
+                        .filter(|p| p.is_dir())
+                        .cloned()
+                        .collect()
+                } else {
+                    std::collections::HashSet::new()
+                };
+            if !awaiting.is_empty() {
+                eprintln!(
+                    "{} configured root(s) not yet indexed; run 'codanna index' to index them",
+                    awaiting.len()
+                );
+            }
+            let sync_paths: Vec<PathBuf> = config
+                .indexed_paths_cache
+                .iter()
+                .filter(|p| {
+                    !awaiting.contains(&p.canonicalize().unwrap_or_else(|_| p.to_path_buf()))
+                })
+                .cloned()
+                .collect();
+            let sync_set = IndexFacade::canonical_path_set(&sync_paths);
+            if IndexFacade::indexed_paths_need_sync(&stored_set, &sync_set) {
                 match persistence.open_build(settings.clone(), BuildMode::CloneCurrent) {
                     Ok(mut build) => {
-                        let stats =
-                            run_sync(&mut build, metadata.indexed_paths, &config, show_progress);
+                        let stats = run_sync(
+                            &mut build,
+                            metadata.indexed_paths,
+                            &sync_paths,
+                            show_progress,
+                        );
                         if stats.has_changes() {
                             match persistence.publish(build) {
                                 Ok(_) => {

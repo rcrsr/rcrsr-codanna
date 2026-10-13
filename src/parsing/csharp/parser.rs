@@ -965,6 +965,7 @@ impl CSharpParser {
                     let import_path = code[name_node.byte_range()].to_string();
                     imports.push(Import {
                         path: import_path,
+                        name: None,
                         alias: None,
                         file_id,
                         is_glob: false,
@@ -980,6 +981,7 @@ impl CSharpParser {
                             let import_path = code[child.byte_range()].to_string();
                             imports.push(Import {
                                 path: import_path,
+                                name: None,
                                 alias: None,
                                 file_id,
                                 is_glob: false,

@@ -2,7 +2,7 @@
 name = "codanna"
 # Fork version: <upstream base>+rcrsr.<private addition counter>
 #
-#   0.16.0   -- the upstream release this fork is built from. Bump ONLY when
+#   0.17.1   -- the upstream release this fork is built from. Bump ONLY when
 #               rebasing/merging onto a new upstream release. Moving the base
 #               does NOT touch the counter.
 #   +rcrsr.N -- N counts private additions across the fork's whole life, NOT
@@ -14,12 +14,12 @@ name = "codanna"
 #               connected client reports exactly which build it is talking to.
 #
 # `+` is BUILD METADATA, which semver ignores in precedence: every +rcrsr.N
-# compares EQUAL to a bare 0.16.0, and +rcrsr.7 does NOT sort above +rcrsr.1.
-# That is deliberate -- a `-rcrsr` pre-release would instead sort BELOW 0.16.0,
+# compares EQUAL to a bare 0.17.1, and +rcrsr.7 does NOT sort above +rcrsr.1.
+# That is deliberate -- a `-rcrsr` pre-release would instead sort BELOW 0.17.1,
 # making a fork with strictly more code compare as older than the upstream it
 # was built from. The counter is informational, not orderable. Do not rely on
 # it for version-range gating.
-version = "0.16.0+rcrsr.12"
+version = "0.17.1+rcrsr.12"
 authors = ["Angel Bartolli <bartolli@gmail.com>"]
 edition = "2024"
 rust-version = "1.89"
@@ -49,21 +49,17 @@ publish = false
 pkg-fmt = "txz"
 
 [package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
-pkg-url = "https://github.com/rcrsr/rcrsr-codanna/releases/download/v{ version }/{ name }-0.16.0-rcrsr.12-linux-x64.tar.xz"
-bin-dir = "{ name }-0.16.0-rcrsr.12-linux-x64/{ bin }"
-
-[package.metadata.binstall.overrides.x86_64-apple-darwin]
-pkg-url = "https://github.com/rcrsr/rcrsr-codanna/releases/download/v{ version }/{ name }-0.16.0-rcrsr.12-macos-x64.tar.xz"
-bin-dir = "{ name }-0.16.0-rcrsr.12-macos-x64/{ bin }"
+pkg-url = "https://github.com/rcrsr/rcrsr-codanna/releases/download/v{ version }/{ name }-0.17.1-rcrsr.12-linux-x64.tar.xz"
+bin-dir = "{ name }-0.17.1-rcrsr.12-linux-x64/{ bin }"
 
 [package.metadata.binstall.overrides.aarch64-apple-darwin]
-pkg-url = "https://github.com/rcrsr/rcrsr-codanna/releases/download/v{ version }/{ name }-0.16.0-rcrsr.12-macos-arm64.tar.xz"
-bin-dir = "{ name }-0.16.0-rcrsr.12-macos-arm64/{ bin }"
+pkg-url = "https://github.com/rcrsr/rcrsr-codanna/releases/download/v{ version }/{ name }-0.17.1-rcrsr.12-macos-arm64.tar.xz"
+bin-dir = "{ name }-0.17.1-rcrsr.12-macos-arm64/{ bin }"
 
 [package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
-pkg-url = "https://github.com/rcrsr/rcrsr-codanna/releases/download/v{ version }/{ name }-0.16.0-rcrsr.12-windows-x64.zip"
+pkg-url = "https://github.com/rcrsr/rcrsr-codanna/releases/download/v{ version }/{ name }-0.17.1-rcrsr.12-windows-x64.zip"
 pkg-fmt = "zip"
-bin-dir = "{ name }-0.16.0-rcrsr.12-windows-x64/{ bin }{ binary-ext }"
+bin-dir = "{ name }-0.17.1-rcrsr.12-windows-x64/{ bin }{ binary-ext }"
 
 [dependencies]
 anyhow = "1.0.104"
@@ -87,7 +83,7 @@ serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = "1.0.151"
 sha2 = "0.11.0"
 hex = "0.4"
-tantivy = "0.26.1"
+tantivy = "0.26.2"
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["full"] }
 toml = { version = "1.1.4", features = ["preserve_order"] }
@@ -104,15 +100,18 @@ tree-sitter-python = "0.25.0"
 tree-sitter-rust = "0.24.2"
 tree-sitter-typescript = "0.23.2"
 walkdir = "2.5.0"
-# Pinned: fastembed >=5.7 uses ort 2.0.0-rc.11 (ONNX Runtime 1.23) whose
-# prebuilt binaries require glibc 2.38+. Homebrew Linux CI runs Ubuntu 22.04
-# (glibc 2.35), so the bottle build fails with undefined __isoc23_strtol.
-# Upgrade when ort ships glibc 2.35 binaries or Homebrew moves to Ubuntu 24.04.
-fastembed = "=5.6.0"
-# Same pin as fastembed's own ort dependency (one crate instance). Used only
-# to commit a capped global ONNX thread pool before fastembed creates
-# sessions -- see src/semantic/onnx.rs.
-ort = { version = "=2.0.0-rc.10", default-features = false }
+# Pinned to the exact version so the ort pin below stays the same crate
+# instance. Model files and the ONNX Runtime binaries download over rustls:
+# no OpenSSL in the graph. On Linux the prebuilt ONNX Runtime binaries need
+# glibc 2.38+ and libstdc++ from GCC 13+.
+fastembed = { version = "=7.1.1", default-features = false, features = [
+    "hf-hub-rustls-tls",
+    "ort-download-binaries-rustls-tls",
+] }
+# The same crate instance as fastembed's own ort dependency: the two pins move
+# together, or the build links two ONNX runtimes. Used to commit the capped
+# global thread pool before fastembed creates its sessions.
+ort = { version = "=2.0.0-rc.13", default-features = false }
 rand = "0.10.2"
 indicatif = "0.18.6"
 comfy-table = "7.2.2"
