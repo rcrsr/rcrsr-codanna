@@ -39,7 +39,7 @@ sudo yum install pkgconfig
 
 **Linux (Fedora):**
 ```bash
-sudo dnf install pkgconfig openssl-devel
+sudo dnf install pkgconfig
 ```
 
 ### Getting Started

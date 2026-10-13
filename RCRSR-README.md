@@ -47,7 +47,7 @@ how, see the commit history.
 ## Installing the fork
 
 The fork is distributed through its own [GitHub Releases](https://github.com/rcrsr/rcrsr-codanna/releases),
-not crates.io or Homebrew. CI builds Linux, macOS (x64 + arm64), and Windows
+not crates.io or Homebrew. CI builds Linux x64, macOS arm64, and Windows x64
 binaries for every `v<version>` tag.
 
 ### Quick install (recommended)

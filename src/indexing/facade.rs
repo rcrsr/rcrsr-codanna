@@ -2275,9 +2275,10 @@ impl ReindexHandles {
                             // Mirrors the original `run_reindex` handler
                             // (server.rs), which counted any successfully
                             // processed explicit file path as reindexed
-                            // regardless of cache status, since
-                            // `IndexFacade::index_file` never actually
-                            // produced `IndexingResult::Cached`.
+                            // regardless of cache status. This over-counts
+                            // an unchanged file (`index_file` can return
+                            // `IndexingResult::Cached`); kept so the explicit
+                            // lane reports the same as before.
                             total_reindexed += 1;
                         }
                         Err(e) => {

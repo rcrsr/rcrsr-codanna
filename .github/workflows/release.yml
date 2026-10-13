@@ -74,7 +74,7 @@ jobs:
 
       # Fail fast. The release body comes from the matching CHANGELOG.md
       # section, but the step that extracts it lives in the `upload` job,
-      # behind the gated test suite and all four platform builds. Checking
+      # behind the gated test suite and all three platform builds. Checking
       # here (the checkout is already in hand) turns a missing section into a
       # seconds-long failure instead of a ~30-minute one.
       - name: Validate CHANGELOG section
