@@ -309,3 +309,67 @@ fn non_semantic_command_leaves_an_added_root_for_codanna_index() {
         "codanna index embeds the added root"
     );
 }
+
+/// Deferring an added root to `codanna index` must not also defer the
+/// removal of a dropped root: a settings change that swaps one root for
+/// another purges the dropped root on the next command's startup sync,
+/// while the added root still waits for `codanna index`.
+#[test]
+fn test_non_semantic_command_purges_a_removed_root_while_deferring_an_added_one() {
+    let workspace = TempDir::new().expect("temp dir");
+    write_fixture_source(&workspace.path().join("src"));
+    write_extra_source(&workspace.path().join("extra"));
+    let third = workspace.path().join("third");
+    std::fs::create_dir_all(&third).expect("create third dir");
+    std::fs::write(
+        third.join("third.rs"),
+        "/// Third-root fixture.\npub fn third_root_function(value: i32) -> i32 {\n    value - 1\n}\n",
+    )
+    .expect("write third source");
+    let base_url = spawn_embedding_server(64, 4);
+    write_settings_with_roots(workspace.path(), &base_url, &["src", "extra"]);
+    let (code, stdout, stderr) = run_cli(workspace.path(), &["index", "--no-progress"]);
+    assert_eq!(code, 0, "index\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    let (code, stdout, stderr) = run_cli(workspace.path(), &["dump", "--symbols"]);
+    assert_eq!(code, 0, "dump\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stdout.contains("extra_root_function"),
+        "both roots are indexed before the swap\nstdout:\n{stdout}"
+    );
+    let before = embedding_count(workspace.path());
+
+    write_settings_with_roots(workspace.path(), &base_url, &["src", "third"]);
+    let (code, stdout, stderr) = run_cli(workspace.path(), &["dump", "--symbols"]);
+    assert_eq!(code, 0, "dump\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    let hint = "1 configured root(s) not yet indexed; run 'codanna index' to index them";
+    assert_eq!(
+        stderr.lines().filter(|line| line.contains(hint)).count(),
+        1,
+        "the added root is still deferred\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("extra_root_function"),
+        "the removed root is purged by the startup sync\nstdout:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("third_root_function"),
+        "a non-semantic command must not index the added root\nstdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("documented_function"),
+        "the surviving root keeps its symbols\nstdout:\n{stdout}"
+    );
+    assert!(
+        embedding_count(workspace.path()) < before,
+        "the removed root's embeddings are purged too"
+    );
+
+    let (code, stdout, stderr) = run_cli(workspace.path(), &["index", "--no-progress"]);
+    assert_eq!(code, 0, "index\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    let (code, stdout, stderr) = run_cli(workspace.path(), &["dump", "--symbols"]);
+    assert_eq!(code, 0, "dump\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stdout.contains("third_root_function") && !stdout.contains("extra_root_function"),
+        "codanna index indexes the added root and the removed one stays gone\nstdout:\n{stdout}"
+    );
+}

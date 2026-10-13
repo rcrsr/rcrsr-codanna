@@ -957,11 +957,10 @@ impl PipelineSymbolCache for SymbolLookupCache {
 impl SymbolLookupCache {
     /// Build cache from all symbols in a DocumentIndex.
     ///
-    /// [PIPELINE API] Used for single-file indexing when we need a complete cache
-    /// for Phase 2 resolution but don't have symbols in memory.
+    /// [PIPELINE API] Seeds Phase 2 resolution on every index path, so the cache
+    /// reflects all registered roots and can prove a file is absent.
     ///
     /// Note: This queries Tantivy for all symbols, which is expensive for large indexes.
-    /// For bulk indexing, prefer building the cache during INDEX stage.
     pub fn from_index(index: &crate::storage::DocumentIndex) -> PipelineResult<Self> {
         // Get total count to pre-allocate
         let count = index

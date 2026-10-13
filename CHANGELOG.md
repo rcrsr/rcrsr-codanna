@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A configured root awaiting `codanna index` no longer blocks purging removed roots:** upstream 0.17.0 skips the whole startup sync of a non-semantic command (`retrieve`, `dump`, `mcp`) while any newly configured root is unindexed, so a settings change that swapped one root for another left the dropped root's symbols and embeddings in the index until the next `codanna index`. Only the added root is deferred now; removed roots are purged by the startup sync as before 0.17.0. ([#118](https://github.com/rcrsr/rcrsr-codanna/pull/118))
+- **Phase 1 no longer builds a symbol cache nothing reads:** every indexing path seeds Phase 2 from the index, so the in-memory cache Phase 1 filled with every symbol was discarded on every run, costing time and peak memory. It is gone, and `Pipeline::index_and_resolve` now seeds Phase 2 from the index like the other paths, so it sees other roots' symbols and the dangling-relative-import check. ([#118](https://github.com/rcrsr/rcrsr-codanna/pull/118))
 - **CLI index progress rate decayed between batches:** the files/s figure on the progress bars divided the count by live wall-clock time since the bar started, but the count only advances when a batch finishes, so the rate fell continuously while a batch was running and jumped when it completed. The rate is now measured up to the last counter change, so it holds steady mid-batch and updates only when a batch lands. The elapsed time shown beside it is still live wall-clock. ([#117](https://github.com/rcrsr/rcrsr-codanna/pull/117))
 
 ## [0.17.1] - 2026-10-11

@@ -21,11 +21,13 @@ impl Pipeline {
         index: Arc<DocumentIndex>,
     ) -> PipelineResult<(IndexStats, Phase2Stats)> {
         // Phase 1: Index files
-        let (index_stats, unresolved, bindings, barriers, symbol_cache) =
+        let (index_stats, unresolved, bindings, barriers) =
             self.index_directory(root, Arc::clone(&index))?;
 
-        // Phase 2: Resolve relationships
-        let symbol_cache = Arc::new(symbol_cache);
+        // Phase 2: Resolve relationships.
+        // Seed from the persisted index: a run-scoped cache would hide other
+        // registered roots' symbols from resolution.
+        let symbol_cache = Arc::new(super::SymbolLookupCache::from_index(&index)?);
         let phase2_stats = self.run_phase2(unresolved, bindings, barriers, symbol_cache, index)?;
 
         Ok((index_stats, phase2_stats))
@@ -52,7 +54,7 @@ impl Pipeline {
             }),
             _ => None,
         };
-        let (index_stats, unresolved, bindings, barriers, _run_cache, metrics) = self.run_phase1(
+        let (index_stats, unresolved, bindings, barriers, metrics) = self.run_phase1(
             FileSource::Walk(root.to_path_buf()),
             Arc::clone(&index),
             Phase1Options {

@@ -448,7 +448,7 @@ impl Pipeline {
                     .as_ref()
                     .map(|bar| StatusLine::new(Arc::clone(bar)));
 
-                let (stats, unresolved, bindings, barriers, _cache, metrics) = self.run_phase1(
+                let (stats, unresolved, bindings, barriers, metrics) = self.run_phase1(
                     FileSource::Walk(root.to_path_buf()),
                     Arc::clone(&index),
                     Phase1Options {
@@ -507,7 +507,7 @@ impl Pipeline {
 
                 // has_embedding is false here, so semantic and pool are never
                 // both present: the embed stage cannot run in this arm.
-                let (stats, unresolved, bindings, barriers, _cache, metrics) = self.run_phase1(
+                let (stats, unresolved, bindings, barriers, metrics) = self.run_phase1(
                     FileSource::Walk(root.to_path_buf()),
                     Arc::clone(&index),
                     Phase1Options {
@@ -645,7 +645,7 @@ impl Pipeline {
                 }),
                 _ => None,
             };
-            let (stats, unresolved, bindings, barriers, _run_cache, metrics) = self.run_phase1(
+            let (stats, unresolved, bindings, barriers, metrics) = self.run_phase1(
                 FileSource::List(files_to_index),
                 Arc::clone(&index),
                 Phase1Options {
@@ -887,7 +887,7 @@ impl Pipeline {
             }),
             _ => None,
         };
-        let (index_stats, unresolved, variable_bindings, this_barriers, _run_cache, metrics) = self
+        let (index_stats, unresolved, variable_bindings, this_barriers, metrics) = self
             .run_phase1(
                 FileSource::List(files_to_index),
                 Arc::clone(&index),

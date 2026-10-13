@@ -4,7 +4,7 @@ use super::stages::{CollectStage, DiscoverStage, IndexStage, ReadStage};
 use super::{
     EmbedOptions, FileBarriers, FileBindings, FileSource, ParseStage, Phase1Options, Pipeline,
     PipelineError, PipelineMetrics, PipelineResult, ProgressSink, SemanticEmbedStage, StageMetrics,
-    StageTracker, SymbolLookupCache, UnresolvedRelationship, init_parser_cache,
+    StageTracker, UnresolvedRelationship, init_parser_cache,
 };
 use crate::indexing::IndexStats;
 use crate::storage::DocumentIndex;
@@ -21,7 +21,6 @@ type Phase1Result = (
     Vec<UnresolvedRelationship>,
     FileBindings,
     FileBarriers,
-    SymbolLookupCache,
     Option<Arc<PipelineMetrics>>,
 );
 
@@ -38,7 +37,6 @@ impl Pipeline {
     /// Returns:
     /// - IndexStats: Statistics about the indexing operation
     /// - `Vec<UnresolvedRelationship>`: Pending references for Phase 2 resolution
-    /// - SymbolLookupCache: In-memory cache for O(1) Phase 2 resolution
     pub fn index_directory(
         &self,
         root: &Path,
@@ -48,20 +46,13 @@ impl Pipeline {
         Vec<UnresolvedRelationship>,
         FileBindings,
         FileBarriers,
-        SymbolLookupCache,
     )> {
-        let (
-            stats,
-            pending_relationships,
-            pending_bindings,
-            pending_barriers,
-            symbol_cache,
-            metrics,
-        ) = self.run_phase1(
-            FileSource::Walk(root.to_path_buf()),
-            index,
-            Phase1Options::default(),
-        )?;
+        let (stats, pending_relationships, pending_bindings, pending_barriers, metrics) = self
+            .run_phase1(
+                FileSource::Walk(root.to_path_buf()),
+                index,
+                Phase1Options::default(),
+            )?;
 
         // Log pipeline metrics report (no StatusLine in this path)
         if let Some(m) = metrics {
@@ -73,7 +64,6 @@ impl Pipeline {
             pending_relationships,
             pending_bindings,
             pending_barriers,
-            symbol_cache,
         ))
     }
 
@@ -100,7 +90,6 @@ impl Pipeline {
                 Vec::new(),
                 HashMap::new(),
                 HashMap::new(),
-                SymbolLookupCache::with_capacity(0),
                 None,
             ));
         }
@@ -386,7 +375,7 @@ impl Pipeline {
                 }
 
                 // Record items and wait times before finalizing
-                if let (Some(t), Ok((stats, _, _, _, _, input_wait))) = (&tracker, &result) {
+                if let (Some(t), Ok((stats, _, _, _, input_wait))) = (&tracker, &result) {
                     t.record_items(stats.symbols_found);
                     t.record_input_wait(*input_wait);
                 }
@@ -462,7 +451,7 @@ impl Pipeline {
         // If INDEX succeeded, we MUST save counters regardless of EMBED status.
         let (index_result, index_metrics) = index_join
             .map_err(|_| PipelineError::ChannelRecv("INDEX thread panicked".to_string()))?;
-        let (mut stats, pending_relationships, pending_bindings, pending_barriers, symbol_cache, _) =
+        let (mut stats, pending_relationships, pending_bindings, pending_barriers, _) =
             index_result?;
 
         // Add INDEX metrics
@@ -567,13 +556,12 @@ impl Pipeline {
 
         tracing::info!(
             target: "pipeline",
-            "Phase 1 complete: discovered={}, read={}, parsed={}, indexed={} files, {} symbols, {} cached, {} pending refs in {:?}",
+            "Phase 1 complete: discovered={}, read={}, parsed={}, indexed={} files, {} symbols, {} pending refs in {:?}",
             files_discovered,
             read_files,
             parsed_files,
             stats.files_indexed,
             stats.symbols_found,
-            symbol_cache.len(),
             pending_relationships.len(),
             stats.elapsed
         );
@@ -583,7 +571,6 @@ impl Pipeline {
             pending_relationships,
             pending_bindings,
             pending_barriers,
-            symbol_cache,
             metrics,
         ))
     }
@@ -593,7 +580,7 @@ impl Pipeline {
 mod tests {
     use super::*;
     use crate::Settings;
-    use crate::indexing::pipeline::PipelineConfig;
+    use crate::indexing::pipeline::{PipelineConfig, SymbolLookupCache};
     use std::fs;
     use tempfile::TempDir;
 
@@ -703,10 +690,11 @@ export { processUser, main };
         let pipeline = Pipeline::with_settings(settings);
 
         // Run Phase 1
+        let index_for_cache = Arc::clone(&index);
         let result = pipeline.index_directory(&src_dir, index);
 
         match result {
-            Ok((stats, pending_relationships, _bindings, _barriers, symbol_cache)) => {
+            Ok((stats, pending_relationships, _bindings, _barriers)) => {
                 // Categorize relationships by kind
                 let calls: Vec<_> = pending_relationships
                     .iter()
@@ -726,10 +714,6 @@ export { processUser, main };
                 println!("  Files indexed:        {}", stats.files_indexed);
                 println!("  Symbols found:        {}", stats.symbols_found);
                 println!("  Time elapsed:         {:?}", stats.elapsed);
-                println!();
-                println!("SYMBOL CACHE (for O(1) Phase 2 resolution):");
-                println!("  Symbols cached:       {}", symbol_cache.len());
-                println!("  Unique names:         {}", symbol_cache.unique_names());
                 println!();
                 println!("PENDING FOR PHASE 2 RESOLUTION:");
                 println!("  Total relationships:  {}", pending_relationships.len());
@@ -785,11 +769,13 @@ export { processUser, main };
                 );
                 assert!(!calls.is_empty(), "Expected cross-file call relationships");
 
-                // Verify symbol cache matches indexed symbols
+                // Verify the persisted index (Phase 2's cache source) holds all indexed symbols
+                let cache = SymbolLookupCache::from_index(&index_for_cache)
+                    .expect("cache must build from index");
                 assert_eq!(
-                    symbol_cache.len(),
+                    cache.len(),
                     stats.symbols_found,
-                    "Symbol cache must contain all indexed symbols"
+                    "Index-seeded cache must contain all indexed symbols"
                 );
 
                 // Verify range data for disambiguation

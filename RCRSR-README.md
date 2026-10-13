@@ -207,6 +207,12 @@ with the fork's caveats:
   workspace; semantic workspaces re-embed. **Fork note:** the rebuild runs as a
   normal build-and-publish into a new generation, so a running server keeps
   serving the old one until the new one is published.
+- **v0.17.0 defers newly configured roots to `codanna index`** when a command
+  that loads no embedder (`retrieve`, `dump`, `mcp`) starts, so the root is not
+  stored without embeddings. **Fork difference:** upstream skips the whole
+  startup sync in that case, so a root removed from the config in the same
+  edit lingers in the index. The fork defers only the added roots and still
+  purges removed ones.
 - **v0.17.0 caps local embedding CPU** with one ONNX Runtime pool shared by
   every embedding session, sized from `semantic_search.embedding_threads`.
   This is the fork's earlier fix taken upstream; the fork now uses upstream's

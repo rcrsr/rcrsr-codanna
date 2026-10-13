@@ -21,7 +21,7 @@ impl Pipeline {
     ///
     /// # Arguments
     /// * `unresolved` - Pending relationships from Phase 1
-    /// * `symbol_cache` - SymbolLookupCache populated by Phase 1
+    /// * `symbol_cache` - SymbolLookupCache seeded from the persisted index (`SymbolLookupCache::from_index`)
     /// * `index` - DocumentIndex for reading imports and writing relationships
     ///
     /// # Returns
