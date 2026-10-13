@@ -426,17 +426,29 @@ impl IndexFacade {
     /// place.
     pub(crate) async fn swap_in(
         shared: &Arc<tokio::sync::RwLock<IndexFacade>>,
+        new: IndexFacade,
+        broadcaster: Option<&crate::mcp::notifications::NotificationBroadcaster>,
+    ) {
+        let mut guard = shared.write().await;
+        Self::swap_in_locked(&mut guard, new, broadcaster);
+    }
+
+    /// Swap `new` into an already write-locked facade slot.
+    ///
+    /// Carries the outgoing facade's reindex gate into the replacement
+    /// BEFORE assigning it, so a permit held by an in-flight
+    /// `reindex_locked` call is still respected by callers that read the
+    /// gate handle after this swap (see the invariant documented on
+    /// `IndexFacade::reindex_gate`). Then re-attaches semantic search and
+    /// broadcasts `IndexReloaded`. For callers that must hold the write
+    /// lock across other work; [`Self::swap_in`] acquires the lock itself.
+    pub(crate) fn swap_in_locked(
+        guard: &mut tokio::sync::RwLockWriteGuard<'_, IndexFacade>,
         mut new: IndexFacade,
         broadcaster: Option<&crate::mcp::notifications::NotificationBroadcaster>,
     ) {
-        // Get write lock and replace the facade. Carry the outgoing
-        // facade's reindex gate into the replacement BEFORE assigning it, so
-        // a permit held by an in-flight `reindex_locked` call is still
-        // respected by callers that read the gate handle after this swap
-        // (see the invariant documented on `IndexFacade::reindex_gate`).
-        let mut guard = shared.write().await;
         new.adopt_reindex_gate(guard.reindex_gate());
-        *guard = new;
+        **guard = new;
 
         // Ensure semantic search stays attached after hot reloads. The
         // incoming facade already carries its own indexed_paths, so no
@@ -572,7 +584,10 @@ impl IndexFacade {
             )
         } else {
             let model = &self.settings.semantic_search.model;
-            SimpleSemanticSearch::from_model_name(model)?
+            SimpleSemanticSearch::from_model_name(
+                model,
+                self.settings.semantic_search.embedding_threads,
+            )?
         };
 
         self.semantic_search = Some(Arc::new(Mutex::new(semantic)));
@@ -629,7 +644,7 @@ impl IndexFacade {
             let load_result = if is_remote {
                 SimpleSemanticSearch::load_remote(path)
             } else {
-                SimpleSemanticSearch::load(path)
+                SimpleSemanticSearch::load(path, self.settings.semantic_search.embedding_threads)
             };
             match load_result {
                 Ok(semantic) => {
@@ -1442,9 +1457,6 @@ impl IndexFacade {
     // Mutation Methods (delegate to Pipeline)
     // =========================================================================
 
-    /// Index a single file using the parallel pipeline.
-    ///
-    /// Returns `IndexingResult::Indexed` with the file ID on success.
     /// File records key off path text: an uncanonical root or file path
     /// (`./src`, `x/../x`) addresses a key space disjoint from the
     /// registered indexed_paths walks, re-indexing every file as new and
@@ -1608,6 +1620,7 @@ impl IndexFacade {
         ))
     }
 
+    /// Index a single file, returning `Cached` when its content hash is unchanged.
     pub fn index_file(
         &mut self,
         path: impl AsRef<std::path::Path>,
@@ -1625,7 +1638,11 @@ impl IndexFacade {
             self.embedding_pool.clone(),
         )?;
 
-        Ok(crate::IndexingResult::Indexed(stats.file_id))
+        if stats.cached {
+            Ok(crate::IndexingResult::Cached(stats.file_id))
+        } else {
+            Ok(crate::IndexingResult::Indexed(stats.file_id))
+        }
     }
 
     /// Index a single file with optional force re-indexing.
@@ -1751,9 +1768,13 @@ impl IndexFacade {
     }
 
     /// Resolve everything accumulated by `index_directory_deferred` calls.
+    ///
+    /// Borrows `pending`: after an `Err` for which
+    /// `IndexError::is_writer_unavailable` holds, nothing was written and
+    /// the same value may be passed again.
     pub fn resolve_deferred(
         &mut self,
-        pending: crate::indexing::pipeline::PendingResolution,
+        pending: &crate::indexing::pipeline::PendingResolution,
     ) -> FacadeResult<()> {
         self.pipeline.resolve_pending(
             pending,
@@ -1920,7 +1941,7 @@ impl IndexFacade {
 
         if !dry_run {
             self.pipeline.resolve_pending(
-                pending,
+                &pending,
                 Arc::clone(&self.document_index),
                 self.semantic_search.clone(),
                 progress,
@@ -1956,12 +1977,12 @@ impl IndexFacade {
             tracing::warn!("Failed to initialize embedding pool: {e}");
         }
 
-        // Index new directories with progress if enabled.
-        // Force only on an empty index (clean index behaves like --force);
-        // otherwise run the incremental lane so unchanged files are
-        // hash-skipped instead of re-parsed and re-embedded. Resolution is
-        // deferred until every new root has walked so cross-root imports
-        // bind regardless of add order.
+        // Index new directories with progress if enabled. Discovery diffs
+        // each root against the index: a root missing from the stored paths
+        // may already be indexed (serve's settings reload does not persist
+        // them), and the force lane would add its files a second time.
+        // Resolution is deferred until every new root has walked so
+        // cross-root imports bind regardless of add order.
         let mut pending = crate::indexing::pipeline::PendingResolution::default();
         let mut skipped: Vec<PathBuf> = Vec::new();
         for path in &to_add {
@@ -1975,10 +1996,6 @@ impl IndexFacade {
                 continue;
             }
 
-            // Decided per root: the first forced root makes the index
-            // non-empty, so later roots take the incremental lane.
-            let force = self.document_count()? == 0;
-
             // Visual separator and directory label (stderr syncs with progress bars)
             eprintln!();
             eprintln!(
@@ -1986,13 +2003,12 @@ impl IndexFacade {
                 crate::parsing::paths::render_absolute_path(path).display()
             );
 
-            // Count files first for an accurate progress bar (forced lane
-            // only; the incremental lane derives its count from discovery).
-            // Uses `walk_quiet` because the pipeline below walks the same
+            // Count files first for an accurate progress bar. Uses
+            // `walk_quiet` because the pipeline below walks the same
             // directory via `DiscoverStage`, and both walks call
             // `warn_if_skipped_symlink_dir` per entry; `walk` here would
             // log a symlinked-directory skip twice per run.
-            let file_count = if force && progress {
+            let file_count = if progress {
                 use crate::indexing::FileWalker;
                 let walker = FileWalker::new(Arc::clone(&self.settings));
                 walker.walk_quiet(path)?.count()
@@ -2005,7 +2021,7 @@ impl IndexFacade {
                 Arc::clone(&self.document_index),
                 self.semantic_search.clone(),
                 self.embedding_pool.clone(),
-                force, // forced only on an empty index; else incremental hash-skip
+                false,
                 progress,
                 file_count,
                 &mut pending,
@@ -2017,7 +2033,7 @@ impl IndexFacade {
             stats.symbols_found += result.index_stats.symbols_found;
         }
         self.pipeline.resolve_pending(
-            pending,
+            &pending,
             Arc::clone(&self.document_index),
             self.semantic_search.clone(),
             progress,
@@ -2223,19 +2239,6 @@ impl ReindexHandles {
         let mut paths_failed = 0usize;
 
         let reindexed = if let Some(paths) = paths {
-            // The single-root symbol-cache fast path in `index_full` is
-            // only safe when the walk it applies to is both the sole
-            // directory being processed in *this* batch and the sole
-            // registered root overall -- otherwise cross-directory
-            // symbols outside the current walk (e.g. another explicit
-            // path in this same scoped reindex) are hidden from
-            // resolution. `resolved_indexed_paths().len() <= 1` alone is not enough
-            // signal here: a single registered root can still be
-            // force-reindexed over several explicit sub-paths in one
-            // call.
-            let dir_path_count = paths.iter().filter(|p| Path::new(p).is_dir()).count();
-            let single_root_batch =
-                dir_path_count <= 1 && pipeline.settings().resolved_indexed_paths().len() <= 1;
             let mut total_reindexed = 0;
             for path in &paths {
                 let path = Path::new(path);
@@ -2283,13 +2286,12 @@ impl ReindexHandles {
                         }
                     }
                 } else if path.is_dir() {
-                    match pipeline.index_incremental_scoped(
+                    match pipeline.index_incremental(
                         path,
                         Arc::clone(&document_index),
                         semantic_search.clone(),
                         embedding_pool.clone(),
                         force,
-                        single_root_batch,
                     ) {
                         Ok(stats) => {
                             total_reindexed += stats.new_files + stats.modified_files;
@@ -3142,11 +3144,7 @@ pub fn build_embedding_backend(
     }
 
     // Local fastembed pool
-    // Library callers reach model loading without going through `main`, so the
-    // ORT thread cap is recorded here, before any session exists. The value is
-    // fixed once the first session is created; later calls have no effect.
-    crate::semantic::set_onnx_thread_cap(cfg.embedding_threads);
-    let pool_size = crate::semantic::clamp_embedding_threads(cfg.embedding_threads);
+    let pool_size = cfg.embedding_threads;
     let embedding_model = crate::vector::parse_embedding_model(&cfg.model)
         .map_err(|e| IndexError::General(format!("Failed to parse embedding model: {e}")))?;
     let pool = EmbeddingPool::new(pool_size, embedding_model)
@@ -6232,7 +6230,7 @@ mod tests {
     // that matches no candidate and the import binding starves. The twin
     // file makes the ladder's exactly-one rescue ambiguous, so only a
     // path-domain resolution of the relative specifier can bind. force:
-    // the full lane resolves on the run-scoped cache (see the
+    // the full lane seeds from `SymbolLookupCache::from_index` (see the
     // out-of-tree lock above).
     #[test]
     fn js_relative_import_between_dotted_stem_files_binds() {
@@ -6377,6 +6375,105 @@ mod tests {
         assert!(
             callees[0].file_path.ends_with("app.core.ts"),
             "the binding must pick the imported file, got {}",
+            callees[0].file_path
+        );
+    }
+
+    // Aliased named import: the local binding (`renamed`) is not the
+    // imported member's name (`sharedTarget`). A builder that searches the
+    // target file by the local binding finds nothing, marks the binding
+    // External, installs no scope entry, and the call through the alias
+    // never gets a Calls edge. force: the full lane seeds from
+    // `SymbolLookupCache::from_index` (see the out-of-tree lock above).
+    #[test]
+    fn ts_aliased_named_import_call_resolves_to_imported_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("lib");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("target.ts"),
+            "export function sharedTarget(): number {\n  return 1;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("caller.ts"),
+            "import { sharedTarget as renamed } from './target';\n\n\
+             export function entry(): number {\n  return renamed();\n}\n",
+        )
+        .unwrap();
+
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(src.clone()).unwrap();
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        facade.index_directory(&src, true).unwrap();
+
+        let entry = facade
+            .find_symbols_by_name("entry", None)
+            .into_iter()
+            .next()
+            .expect("entry indexed");
+        let callees = facade.get_called_functions(entry.id);
+        assert_eq!(
+            callees.len(),
+            1,
+            "entry must resolve the call through the import alias: {callees:?}"
+        );
+        assert_eq!(&*callees[0].name, "sharedTarget");
+        assert!(
+            callees[0].file_path.ends_with("target.ts"),
+            "the edge must target the imported member's file, got {}",
+            callees[0].file_path
+        );
+    }
+
+    // JavaScript twin of the aliased named import lock.
+    #[test]
+    fn js_aliased_named_import_call_resolves_to_imported_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("lib");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("target.js"),
+            "export function sharedTarget() {\n  return 1;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("caller.js"),
+            "import { sharedTarget as renamed } from './target';\n\n\
+             export function entry() {\n  return renamed();\n}\n",
+        )
+        .unwrap();
+
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(src.clone()).unwrap();
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        facade.index_directory(&src, true).unwrap();
+
+        let entry = facade
+            .find_symbols_by_name("entry", None)
+            .into_iter()
+            .next()
+            .expect("entry indexed");
+        let callees = facade.get_called_functions(entry.id);
+        assert_eq!(
+            callees.len(),
+            1,
+            "entry must resolve the call through the import alias: {callees:?}"
+        );
+        assert_eq!(&*callees[0].name, "sharedTarget");
+        assert!(
+            callees[0].file_path.ends_with("target.js"),
+            "the edge must target the imported member's file, got {}",
             callees[0].file_path
         );
     }
@@ -7831,6 +7928,8 @@ mod tests {
         let mut facade = workspace_facade(outside.path(), &root);
         facade.index_directory(&parent, false).unwrap();
 
+        // Second session: tests added to config; sync indexes the new
+        // root through incremental discovery.
         facade
             .sync_with_config(
                 Some(vec![parent.clone()]),
@@ -7874,6 +7973,40 @@ mod tests {
             &set_of(&[&existing]),
             &set_of(&[&existing])
         ));
+    }
+
+    // A root indexed outside the CLI (serve's settings reload) is absent
+    // from the stored paths the next start diffs against. Sync must diff
+    // that root against the index; indexing it as new duplicates every
+    // symbol and edge under it.
+    #[test]
+    fn sync_of_an_already_indexed_root_duplicates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (src, tests) = write_two_root_python_fixture(dir.path());
+        let src = src.canonicalize().unwrap();
+        let tests = tests.canonicalize().unwrap();
+        let mut facade = two_root_facade(dir.path(), &src, &tests);
+        facade.index_directory(&src, false).unwrap();
+        let mut pending = crate::indexing::pipeline::PendingResolution::default();
+        facade
+            .index_directory_deferred(&tests, false, &mut pending)
+            .unwrap();
+        facade.resolve_deferred(&pending).unwrap();
+        let (symbols, relationships) = (facade.symbol_count(), facade.relationship_count());
+
+        facade
+            .sync_with_config(
+                Some(vec![src.clone()]),
+                &[src.clone(), tests.clone()],
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(
+            (facade.symbol_count(), facade.relationship_count()),
+            (symbols, relationships)
+        );
+        assert_cross_root_edge(&facade, "sync over an indexed root");
     }
 
     // Serve-lane shape: a settled burst creates the importing and the
@@ -7921,7 +8054,7 @@ mod tests {
         facade
             .index_directory_deferred(&src, false, &mut pending)
             .unwrap();
-        facade.resolve_deferred(pending).unwrap();
+        facade.resolve_deferred(&pending).unwrap();
         assert_cross_root_edge(&facade, "deferred burst sync, tests root first");
     }
 
@@ -8150,6 +8283,740 @@ mod tests {
             meta_after_first_open,
             std::fs::read(gen_dir.join("index.meta")).unwrap(),
             "reopen must leave index.meta untouched"
+        );
+    }
+
+    // Lock for the pipeline's cached result: a second index of unchanged
+    // content is `Cached`; an edit is `Indexed` again and replaces the
+    // symbols.
+    #[test]
+    fn index_file_returns_cached_for_unchanged_content_and_indexed_for_an_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("src");
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("a.py");
+        std::fs::write(&file, "def alpha():\n    pass\n").unwrap();
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(root.clone()).unwrap();
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+
+        let first = facade.index_file(&file).unwrap();
+        let crate::IndexingResult::Indexed(file_id) = first else {
+            panic!("first index: expected Indexed, got {first:?}");
+        };
+        assert_eq!(
+            facade.index_file(&file).unwrap(),
+            crate::IndexingResult::Cached(file_id)
+        );
+
+        std::fs::write(&file, "def beta():\n    pass\n").unwrap();
+        assert!(matches!(
+            facade.index_file(&file).unwrap(),
+            crate::IndexingResult::Indexed(_)
+        ));
+        assert!(facade.find_symbols_by_name("alpha", None).is_empty());
+        assert_eq!(facade.find_symbols_by_name("beta", None).len(), 1);
+    }
+
+    // S4: with the index writer held by another handle, a deferred
+    // resolution must report failure, not success with zero rows.
+    #[test]
+    fn deferred_resolution_with_writer_held_elsewhere_is_an_error_and_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("src");
+        std::fs::create_dir_all(root.join("pkg")).unwrap();
+        std::fs::write(root.join("pkg/__init__.py"), "").unwrap();
+        std::fs::write(root.join("pkg/mod.py"), "def callee():\n    return 42\n").unwrap();
+        std::fs::write(
+            root.join("use_mod.py"),
+            "from pkg.mod import callee\n\ndef caller():\n    return callee()\n",
+        )
+        .unwrap();
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(root.clone()).unwrap();
+        let settings = std::sync::Arc::new(settings);
+        let mut facade = IndexFacade::new(std::sync::Arc::clone(&settings)).unwrap();
+
+        let mut pending = crate::indexing::pipeline::PendingResolution::default();
+        facade
+            .index_directory_deferred(&root, false, &mut pending)
+            .unwrap();
+
+        let other = DocumentIndex::new(facade.document_index().path(), &settings).unwrap();
+        other.start_batch().unwrap();
+
+        let err = match facade.resolve_deferred(&pending) {
+            Ok(()) => {
+                other.rollback_batch().unwrap();
+                panic!(
+                    "resolution with the writer held elsewhere must fail, got Ok with {} relationship rows",
+                    facade.relationship_count()
+                );
+            }
+            Err(e) => e,
+        };
+        assert!(
+            err.is_writer_unavailable(),
+            "expected the nothing-written error, got: {err}"
+        );
+        // The storage source rides along in the message; the watcher
+        // classifies lock contention from it.
+        assert!(
+            err.to_string().contains("Failed to acquire Lockfile"),
+            "source not carried: {err}"
+        );
+        let callers = facade.find_symbols_by_name("caller", None);
+        assert_eq!(callers.len(), 1, "one caller symbol expected");
+        let caller_id = callers[0].id;
+        let rows_before = facade
+            .document_index()
+            .get_relationships_from(caller_id, RelationKind::Calls)
+            .unwrap();
+        assert!(rows_before.is_empty(), "nothing written: {rows_before:?}");
+
+        // The value is still held; the retry succeeds once the writer is free.
+        other.rollback_batch().unwrap();
+        facade.resolve_deferred(&pending).unwrap();
+        let rows = facade
+            .document_index()
+            .get_relationships_from(caller_id, RelationKind::Calls)
+            .unwrap();
+        assert_eq!(rows.len(), 1, "exactly one Calls row expected: {rows:?}");
+        let callee = facade.get_symbol(rows[0].1).unwrap();
+        assert_eq!(callee.name.as_ref(), "callee");
+    }
+
+    // S1 (story 10): a Defines-only resolution releases the writer. The
+    // Defines row is durable and a second handle on the same directory
+    // can start a batch once resolve_deferred returns.
+    #[test]
+    fn deferred_resolution_of_defines_only_set_releases_the_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("src");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("decl.py"),
+            "class Widget:\n    def alpha(self):\n        pass\n",
+        )
+        .unwrap();
+        let mut settings = Settings {
+            index_path: dir.path().join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(root.clone()).unwrap();
+        let settings = std::sync::Arc::new(settings);
+        let mut facade = IndexFacade::new(std::sync::Arc::clone(&settings)).unwrap();
+
+        let mut pending = crate::indexing::pipeline::PendingResolution::default();
+        facade
+            .index_directory_deferred(&root, false, &mut pending)
+            .unwrap();
+        facade.resolve_deferred(&pending).unwrap();
+
+        let classes = facade.find_symbols_by_name("Widget", None);
+        assert_eq!(classes.len(), 1, "one class symbol expected");
+        let rows = facade
+            .document_index()
+            .get_relationships_from(classes[0].id, RelationKind::Defines)
+            .unwrap();
+        assert_eq!(rows.len(), 1, "exactly one Defines row expected: {rows:?}");
+        assert_eq!(facade.get_symbol(rows[0].1).unwrap().name.as_ref(), "alpha");
+
+        let other = DocumentIndex::new(facade.document_index().path(), &settings).unwrap();
+        other
+            .start_batch()
+            .expect("writer must be released after a Defines-only resolution");
+        other.rollback_batch().unwrap();
+    }
+
+    // Dangling relative import locks: each fixture's expected row set is a
+    // golden captured from the release binary of the tree before typed
+    // negative evidence landed, normalized to the relationship multiset
+    // (session-scoped ids stripped, endpoints identified by
+    // `<root>/<file>`, every metadata field kept, no dedup). Equality
+    // proves the fix moved no row these fixtures cover.
+
+    /// The relationship multiset of `facade`, one tab-separated row per
+    /// relationship, sorted. Mirrors the golden normalization exactly.
+    fn normalized_edges(facade: &IndexFacade) -> String {
+        use crate::dump::{DumpFilter, DumpStamp, Rows, write_dump};
+
+        let mut buf = Vec::new();
+        let filter = DumpFilter {
+            rows: Rows::Relationships,
+            ..Default::default()
+        };
+        let summary = write_dump(facade, DumpStamp::default(), &filter, &mut buf).unwrap();
+        assert_eq!(summary.orphan_edges_dropped, 0, "dump dropped orphan edges");
+        assert_eq!(summary.duplicate_symbol_ids, 0, "dump saw duplicate ids");
+
+        fn cell(value: &serde_json::Value) -> String {
+            match value {
+                serde_json::Value::Null => "-".to_string(),
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            }
+        }
+        fn ident(value: &serde_json::Value) -> String {
+            let path = value.as_str().unwrap_or("-").replace('\\', "/");
+            let parts: Vec<&str> = path.rsplit('/').take(2).collect();
+            parts.into_iter().rev().collect::<Vec<_>>().join("/")
+        }
+
+        let mut rows: Vec<String> = std::str::from_utf8(&buf)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|env| env["type"] == "result" && env["meta"]["entity_type"] == "relationship")
+            .map(|env| {
+                let d = &env["data"];
+                let m = &d["metadata"];
+                let meta_cell = |key: &str| {
+                    if m.is_null() {
+                        "-".to_string()
+                    } else {
+                        cell(&m[key])
+                    }
+                };
+                [
+                    cell(&d["relation"]),
+                    cell(&d["from"]["name"]),
+                    cell(&d["from"]["kind"]),
+                    ident(&d["from"]["file_path"]),
+                    cell(&d["from"]["line"]),
+                    cell(&d["to"]["name"]),
+                    cell(&d["to"]["kind"]),
+                    ident(&d["to"]["file_path"]),
+                    cell(&d["to"]["line"]),
+                    meta_cell("line"),
+                    meta_cell("column"),
+                    meta_cell("receiver"),
+                    meta_cell("static_call"),
+                    meta_cell("context"),
+                ]
+                .join("\t")
+            })
+            .collect();
+        rows.sort();
+        rows.into_iter().map(|r| r + "\n").collect()
+    }
+
+    /// Index `lib` on the force lane and return its relationship multiset.
+    fn force_indexed_edges(dir: &Path, lib: &Path) -> String {
+        let mut settings = Settings {
+            index_path: dir.join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(lib.to_path_buf()).unwrap();
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+        facade.index_directory(lib, true).unwrap();
+        normalized_edges(&facade)
+    }
+
+    fn write_lib(dir: &Path, files: &[(&str, &str)]) -> PathBuf {
+        let lib = dir.join("lib");
+        for (rel, content) in files {
+            let path = lib.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        lib
+    }
+
+    const SHARED_TARGET: &str = "export function sharedTarget() { return 42; }\n";
+    const CALL_SHARED_TARGET: &str = "import { sharedTarget } from './target';\nexport function entry() { return sharedTarget(); }\n";
+
+    /// One `f` at `<dep>` and a caller importing it through `<specifier>`,
+    /// indexed on the force lane: the relationship multiset.
+    fn single_import_edges(dep: &str, dep_source: &str, caller: &str, specifier: &str) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = write_lib(
+            dir.path(),
+            &[
+                (dep, dep_source),
+                (
+                    caller,
+                    &format!(
+                        "import {{ f }} from '{specifier}';\nexport function entry() {{ return f(); }}\n"
+                    ),
+                ),
+            ],
+        );
+        force_indexed_edges(dir.path(), &lib)
+    }
+
+    // A specifier naming a sibling the path generator does not model
+    // (`./dep.js` for `dep.ts`, `dep.jsx`, `dep.tsx`, `dep.d.ts`) shares
+    // the file's first-dot stem with it, so absence of the literal path
+    // is not evidence and main's row survives.
+    #[test]
+    fn ts_substituted_extension_specifier_rows_equal_golden() {
+        assert_eq!(
+            single_import_edges(
+                "repo_a/dep.ts",
+                "export function f() { return 1; }\n",
+                "repo_a/caller.ts",
+                "./dep.js"
+            ),
+            include_str!("../../tests/fixtures/dangling_import/f5-ts.rows")
+        );
+    }
+
+    #[test]
+    fn js_specifier_with_jsx_sibling_rows_equal_golden() {
+        assert_eq!(
+            single_import_edges(
+                "repo_a/dep.jsx",
+                "export function f() { return 1; }\n",
+                "repo_a/caller.js",
+                "./dep.js"
+            ),
+            include_str!("../../tests/fixtures/dangling_import/f5b-js-jsx.rows")
+        );
+    }
+
+    #[test]
+    fn ts_jsx_specifier_with_tsx_sibling_rows_equal_golden() {
+        assert_eq!(
+            single_import_edges(
+                "repo_a/dep.tsx",
+                "export function f() { return 1; }\n",
+                "repo_a/caller.ts",
+                "./dep.jsx"
+            ),
+            include_str!("../../tests/fixtures/dangling_import/f5b-ts-jsx-tsx.rows")
+        );
+    }
+
+    #[test]
+    fn ts_js_specifier_with_declaration_sibling_rows_equal_golden() {
+        assert_eq!(
+            single_import_edges(
+                "repo_a/dep.d.ts",
+                "export declare const f: () => number;\n",
+                "repo_a/caller.ts",
+                "./dep.js"
+            ),
+            include_str!("../../tests/fixtures/dangling_import/f5b-ts-dts.rows")
+        );
+    }
+
+    // A barrel: `./index` is present but does not define `f`, so the
+    // lookup is `Unknown` and main's row through the ladder survives.
+    #[test]
+    fn ts_barrel_reexport_rows_equal_golden() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = write_lib(
+            dir.path(),
+            &[
+                ("repo_a/impl.ts", "export function f() { return 1; }\n"),
+                ("repo_a/index.ts", "export { f } from './impl';\n"),
+                (
+                    "repo_a/caller.ts",
+                    "import { f } from './index';\nexport function entry() { return f(); }\n",
+                ),
+            ],
+        );
+        assert_eq!(
+            force_indexed_edges(dir.path(), &lib),
+            include_str!("../../tests/fixtures/dangling_import/f6-ts.rows")
+        );
+    }
+
+    #[test]
+    fn js_barrel_reexport_rows_equal_golden() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = write_lib(
+            dir.path(),
+            &[
+                ("repo_a/impl.js", "export function f() { return 1; }\n"),
+                ("repo_a/index.js", "export { f } from './impl';\n"),
+                (
+                    "repo_a/caller.js",
+                    "import { f } from './index';\nexport function entry() { return f(); }\n",
+                ),
+            ],
+        );
+        assert_eq!(
+            force_indexed_edges(dir.path(), &lib),
+            include_str!("../../tests/fixtures/dangling_import/f6-js.rows")
+        );
+    }
+
+    // A package specifier is not relative: `Unknown`, and main's row
+    // through the ladder survives.
+    #[test]
+    fn ts_package_specifier_rows_equal_golden() {
+        assert_eq!(
+            single_import_edges(
+                "repo_b/somepkg.ts",
+                "export function f() { return 1; }\n",
+                "repo_a/caller.ts",
+                "somepkg"
+            ),
+            include_str!("../../tests/fixtures/dangling_import/f8-pkg-ts.rows")
+        );
+    }
+
+    #[test]
+    fn js_package_specifier_rows_equal_golden() {
+        assert_eq!(
+            single_import_edges(
+                "repo_b/somepkg.js",
+                "export function f() { return 1; }\n",
+                "repo_a/caller.js",
+                "somepkg"
+            ),
+            include_str!("../../tests/fixtures/dangling_import/f8-pkg-js.rows")
+        );
+    }
+
+    /// Seed `lib` on the force lane and require the golden (positive
+    /// control), delete `deleted` under `lib`, then re-index on the
+    /// incremental lane and on the force lane: after each, no `kind` row
+    /// targets `foreign`.
+    fn assert_deletion_kills_kind_rows(
+        dir: &Path,
+        lib: &Path,
+        golden: &str,
+        deleted: &str,
+        kind: &str,
+        foreign: &str,
+    ) {
+        let mut settings = Settings {
+            index_path: dir.join("index"),
+            workspace_root: None,
+            ..Default::default()
+        };
+        settings.add_indexed_path(lib.to_path_buf()).unwrap();
+        let mut facade = IndexFacade::new(std::sync::Arc::new(settings)).unwrap();
+        facade.index_directory(lib, true).unwrap();
+        assert_eq!(normalized_edges(&facade), golden, "positive control");
+
+        std::fs::remove_file(lib.join(deleted)).unwrap();
+        let mut wrong: Vec<String> = Vec::new();
+        for (lane, force) in [("incremental", false), ("force", true)] {
+            facade.index_directory(lib, force).unwrap();
+            let rows = normalized_edges(&facade);
+            let hits: Vec<&str> = rows
+                .lines()
+                .filter(|row| {
+                    row.starts_with(&format!("{kind}\t")) && row.contains(&format!("\t{foreign}\t"))
+                })
+                .collect();
+            if !hits.is_empty() {
+                wrong.push(format!("{lane}:\n{}\n", hits.join("\n")));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{kind} rows into {foreign} after deleting {deleted}:\n{}",
+            wrong.join("")
+        );
+    }
+
+    const BASE_CLASS: &str = "export class Base {\n  greet() { return 1; }\n}\n";
+    const FOREIGN_BASE_CLASS: &str = "export class Base {\n  greet() { return 2; }\n}\n";
+    const CHILD_CLASS: &str = "import { Base } from './base';\nexport class Child extends Base {\n  run() { return this.greet(); }\n}\n";
+    const SHAPE_INTERFACE: &str = "export interface Shape {\n  area(): number;\n}\n";
+
+    // Every relation kind honors the negative evidence: after the
+    // imported file is deleted, no Extends / Implements / Uses row lands
+    // on the foreign namesake.
+    #[test]
+    fn ts_extends_into_deleted_import_binds_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = write_lib(
+            dir.path(),
+            &[
+                ("repo_a/base.ts", BASE_CLASS),
+                ("repo_b/base.ts", FOREIGN_BASE_CLASS),
+                ("repo_a/child.ts", CHILD_CLASS),
+            ],
+        );
+        assert_deletion_kills_kind_rows(
+            dir.path(),
+            &lib,
+            include_str!("../../tests/fixtures/dangling_import/f10-extends-ts.rows"),
+            "repo_a/base.ts",
+            "Extends",
+            "repo_b/base.ts",
+        );
+    }
+
+    #[test]
+    fn js_extends_into_deleted_import_binds_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = write_lib(
+            dir.path(),
+            &[
+                ("repo_a/base.js", BASE_CLASS),
+                ("repo_b/base.js", FOREIGN_BASE_CLASS),
+                ("repo_a/child.js", CHILD_CLASS),
+            ],
+        );
+        assert_deletion_kills_kind_rows(
+            dir.path(),
+            &lib,
+            include_str!("../../tests/fixtures/dangling_import/f10-extends-js.rows"),
+            "repo_a/base.js",
+            "Extends",
+            "repo_b/base.js",
+        );
+    }
+
+    #[test]
+    fn ts_implements_into_deleted_import_binds_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = write_lib(
+            dir.path(),
+            &[
+                ("repo_a/shape.ts", SHAPE_INTERFACE),
+                ("repo_b/shape.ts", SHAPE_INTERFACE),
+                (
+                    "repo_a/square.ts",
+                    "import { Shape } from './shape';\nexport class Square implements Shape {\n  area() { return 4; }\n}\n",
+                ),
+            ],
+        );
+        assert_deletion_kills_kind_rows(
+            dir.path(),
+            &lib,
+            include_str!("../../tests/fixtures/dangling_import/f10-implements-ts.rows"),
+            "repo_a/shape.ts",
+            "Implements",
+            "repo_b/shape.ts",
+        );
+    }
+
+    #[test]
+    fn ts_uses_into_deleted_import_binds_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = write_lib(
+            dir.path(),
+            &[
+                ("repo_a/shape.ts", SHAPE_INTERFACE),
+                ("repo_b/shape.ts", SHAPE_INTERFACE),
+                (
+                    "repo_a/measure.ts",
+                    "import { Shape } from './shape';\nexport function measure(s: Shape): number {\n  return s.area();\n}\n",
+                ),
+            ],
+        );
+        assert_deletion_kills_kind_rows(
+            dir.path(),
+            &lib,
+            include_str!("../../tests/fixtures/dangling_import/f10-uses-ts.rows"),
+            "repo_a/shape.ts",
+            "Uses",
+            "repo_b/shape.ts",
+        );
+    }
+
+    // `./target.js` with no `target.*` sibling indexed and a foreign
+    // namesake: no same-stem file a substitution could name, so the
+    // specifier is dangling and the namesake must not bind. The shape has
+    // no positive control (binding through the substitution is out of
+    // scope); the sibling-present cases are the goldens above.
+    #[test]
+    fn ts_substituted_specifier_with_no_twin_binds_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = write_lib(
+            dir.path(),
+            &[
+                ("repo_b/target.ts", SHARED_TARGET),
+                (
+                    "repo_a/caller.ts",
+                    "import { sharedTarget } from './target.js';\nexport function entry() { return sharedTarget(); }\n",
+                ),
+            ],
+        );
+        let rows = force_indexed_edges(dir.path(), &lib);
+        assert!(
+            !rows.lines().any(|row| row.starts_with("Calls\tentry\t")),
+            "a dangling substituted specifier must not bind the foreign namesake:\n{rows}"
+        );
+    }
+
+    // An indexed target with zero symbols is present: file rows, not
+    // symbols, decide presence, so the import is not dangling.
+    #[test]
+    fn ts_empty_target_file_is_present_rows_equal_golden() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = write_lib(
+            dir.path(),
+            &[
+                ("repo_a/target.ts", ""),
+                ("repo_b/target.ts", SHARED_TARGET),
+                ("repo_a/caller.ts", CALL_SHARED_TARGET),
+            ],
+        );
+        assert_eq!(
+            force_indexed_edges(dir.path(), &lib),
+            include_str!("../../tests/fixtures/dangling_import/f7-ts.rows")
+        );
+    }
+
+    #[test]
+    fn js_empty_target_file_is_present_rows_equal_golden() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = write_lib(
+            dir.path(),
+            &[
+                ("repo_a/target.js", ""),
+                ("repo_b/target.js", SHARED_TARGET),
+                ("repo_a/caller.js", CALL_SHARED_TARGET),
+            ],
+        );
+        assert_eq!(
+            force_indexed_edges(dir.path(), &lib),
+            include_str!("../../tests/fixtures/dangling_import/f7-js.rows")
+        );
+    }
+
+    // A dangling import and a same-name function in the caller file: the
+    // scope hit on the file's own definition is independent evidence.
+    #[test]
+    fn ts_local_definition_wins_over_dangling_import_rows_equal_golden() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = write_lib(
+            dir.path(),
+            &[
+                (
+                    "repo_b/helper.ts",
+                    "export function helper() { return 2; }\n",
+                ),
+                (
+                    "repo_a/caller.ts",
+                    "import { helper } from './missing';\nfunction helper() { return 1; }\nexport function entry() { return helper(); }\n",
+                ),
+            ],
+        );
+        let rows = force_indexed_edges(dir.path(), &lib);
+        assert_eq!(
+            rows,
+            include_str!("../../tests/fixtures/dangling_import/f9-ts.rows")
+        );
+        assert!(
+            rows.contains("\thelper\tFunction\trepo_a/caller.ts\t"),
+            "the call resolves to the local function: {rows}"
+        );
+    }
+
+    #[test]
+    fn js_local_definition_wins_over_dangling_import_rows_equal_golden() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = write_lib(
+            dir.path(),
+            &[
+                (
+                    "repo_b/helper.js",
+                    "export function helper() { return 2; }\n",
+                ),
+                (
+                    "repo_a/caller.js",
+                    "import { helper } from './missing';\nfunction helper() { return 1; }\nexport function entry() { return helper(); }\n",
+                ),
+            ],
+        );
+        let rows = force_indexed_edges(dir.path(), &lib);
+        assert_eq!(
+            rows,
+            include_str!("../../tests/fixtures/dangling_import/f9-js.rows")
+        );
+        assert!(
+            rows.contains("\thelper\tFunction\trepo_a/caller.js\t"),
+            "the call resolves to the local function: {rows}"
+        );
+    }
+
+    // Aliased named import with the target indexed: the lookup keys on the
+    // member name and the file is present, never dangling.
+    #[test]
+    fn ts_aliased_named_import_rows_equal_golden() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = write_lib(
+            dir.path(),
+            &[
+                ("repo_a/dep.ts", "export function f() { return 1; }\n"),
+                ("repo_b/dep.ts", "export function f() { return 2; }\n"),
+                (
+                    "repo_a/caller.ts",
+                    "import { f as g } from './dep';\nexport function entry() { return g(); }\n",
+                ),
+            ],
+        );
+        assert_eq!(
+            force_indexed_edges(dir.path(), &lib),
+            include_str!("../../tests/fixtures/dangling_import/f12-ts.rows")
+        );
+    }
+
+    #[test]
+    fn js_aliased_named_import_rows_equal_golden() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = write_lib(
+            dir.path(),
+            &[
+                ("repo_a/dep.js", "export function f() { return 1; }\n"),
+                ("repo_b/dep.js", "export function f() { return 2; }\n"),
+                (
+                    "repo_a/caller.js",
+                    "import { f as g } from './dep';\nexport function entry() { return g(); }\n",
+                ),
+            ],
+        );
+        assert_eq!(
+            force_indexed_edges(dir.path(), &lib),
+            include_str!("../../tests/fixtures/dangling_import/f12-js.rows")
+        );
+    }
+
+    // Receiver-bearing calls (static and typed receiver) whose receiver
+    // type names a dangling import keep the pre-existing rows: the gate
+    // classifies by emitted metadata, and these rows carry a receiver.
+    const WIDGET: &str = "export class Widget {\n  render() { return 1; }\n  static create() { return new Widget(); }\n}\n";
+    const CALL_WIDGET: &str = "import { Widget } from './widget';\nexport function build() {\n  const w = new Widget();\n  w.render();\n  return Widget.create();\n}\n";
+
+    #[test]
+    fn ts_receiver_bearing_calls_on_dangling_import_rows_equal_golden() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = write_lib(
+            dir.path(),
+            &[
+                ("repo_b/widget.ts", WIDGET),
+                ("repo_a/caller.ts", CALL_WIDGET),
+            ],
+        );
+        assert_eq!(
+            force_indexed_edges(dir.path(), &lib),
+            include_str!("../../tests/fixtures/dangling_import/f13-ts.rows")
+        );
+    }
+
+    #[test]
+    fn js_receiver_bearing_calls_on_dangling_import_rows_equal_golden() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = write_lib(
+            dir.path(),
+            &[
+                ("repo_b/widget.js", WIDGET),
+                ("repo_a/caller.js", CALL_WIDGET),
+            ],
+        );
+        assert_eq!(
+            force_indexed_edges(dir.path(), &lib),
+            include_str!("../../tests/fixtures/dangling_import/f13-js.rows")
         );
     }
 }

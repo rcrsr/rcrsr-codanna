@@ -29,7 +29,7 @@
 //! impl SimpleIndexer {
 //!     pub fn with_vector_search(mut self, vector_path: PathBuf) -> Result<Self, VectorError> {
 //!         let engine = Arc::new(VectorSearchEngine::new(vector_path, VectorDimension::dimension_384())?);
-//!         let generator = Arc::new(FastEmbedGenerator::new()?);
+//!         let generator = Arc::new(FastEmbedGenerator::new(3)?);
 //!         self.vector_engine = Some(engine);
 //!         self.embedding_generator = Some(generator);
 //!         self.pending_symbols = Vec::new();
@@ -145,7 +145,7 @@
 //! 5. **Clean Separation**: Vector logic isolated in vector module
 
 use crate::vector::{VectorDimension, VectorError};
-use fastembed::{EmbeddingModel, InitOptions, QuantizationMode, TextEmbedding};
+use fastembed::{EmbeddingModel, QuantizationMode, TextEmbedding, TextInitOptions};
 use std::sync::Mutex;
 
 /// Parse a model name string into an EmbeddingModel enum.
@@ -313,16 +313,16 @@ impl FastEmbedGenerator {
     ///
     /// # Errors
     /// Returns an error if the model fails to initialize or download.
-    pub fn new() -> Result<Self, VectorError> {
-        Self::with_model(EmbeddingModel::AllMiniLML6V2, false)
+    pub fn new(embedding_threads: usize) -> Result<Self, VectorError> {
+        Self::with_model(EmbeddingModel::AllMiniLML6V2, false, embedding_threads)
     }
 
     /// Create a new generator with progress display during model download.
     ///
     /// # Errors
     /// Returns an error if the model fails to initialize or download.
-    pub fn new_with_progress() -> Result<Self, VectorError> {
-        Self::with_model(EmbeddingModel::AllMiniLML6V2, true)
+    pub fn new_with_progress(embedding_threads: usize) -> Result<Self, VectorError> {
+        Self::with_model(EmbeddingModel::AllMiniLML6V2, true, embedding_threads)
     }
 
     /// Create a new generator with a specific model.
@@ -330,18 +330,23 @@ impl FastEmbedGenerator {
     /// # Arguments
     /// * `model` - The embedding model to use
     /// * `show_progress` - Whether to show download progress
+    /// * `embedding_threads` - Cap for the shared ONNX Runtime thread pool
     ///
     /// # Errors
     /// Returns an error if the model fails to initialize or download.
-    pub fn with_model(model: EmbeddingModel, show_progress: bool) -> Result<Self, VectorError> {
+    pub fn with_model(
+        model: EmbeddingModel,
+        show_progress: bool,
+        embedding_threads: usize,
+    ) -> Result<Self, VectorError> {
         let model_name = model_to_string(&model);
         let batch_size = model_batch_size(&model);
 
-        crate::semantic::init_onnx_runtime();
-        let mut text_model = TextEmbedding::try_new(
-            InitOptions::new(model)
+        let mut text_model = crate::semantic::new_text_embedding(
+            TextInitOptions::new(model)
                 .with_cache_dir(crate::init::models_dir())
                 .with_show_download_progress(show_progress),
+            embedding_threads,
         )
         .map_err(|e| VectorError::EmbeddingFailed(
             format!("Failed to initialize embedding model '{model_name}': {e}. Ensure you have internet connection for first-time model download")
@@ -375,9 +380,13 @@ impl FastEmbedGenerator {
     ///
     /// # Errors
     /// Returns an error if the model name is invalid or initialization fails.
-    pub fn from_settings(model_name: &str, show_progress: bool) -> Result<Self, VectorError> {
+    pub fn from_settings(
+        model_name: &str,
+        show_progress: bool,
+        embedding_threads: usize,
+    ) -> Result<Self, VectorError> {
         let model = parse_embedding_model(model_name)?;
-        Self::with_model(model, show_progress)
+        Self::with_model(model, show_progress, embedding_threads)
     }
 
     /// Get the name of the model being used.
@@ -754,7 +763,7 @@ mod tests {
     #[test]
     #[ignore = "needs cached embedding model; run manually"]
     fn test_generate_embeddings_batched_matches_individual() {
-        let generator = FastEmbedGenerator::new().unwrap();
+        let generator = FastEmbedGenerator::new(1).unwrap();
         let owned = [
             "fn a()".to_string(),
             "word ".repeat(300),
@@ -799,7 +808,7 @@ mod tests {
     #[test]
     #[ignore = "needs cached embedding model; run manually for measurements"]
     fn bench_mixed_length_batch() {
-        let generator = FastEmbedGenerator::new().unwrap();
+        let generator = FastEmbedGenerator::new(1).unwrap();
         let owned: Vec<String> = (0..256usize)
             .map(|i| "word ".repeat((20 + (i * 7919) % 3980) / 5))
             .collect();

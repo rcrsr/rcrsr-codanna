@@ -7,9 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Fork base advanced from upstream v0.16.0 to v0.17.1.** This release carries upstream's 0.17.0 and 0.17.1 changes (see those sections below). **Every existing index is rebuilt once:** emission semantics moved to version 4, so run `codanna index` once per workspace. Intel macOS (x86_64) release binaries are dropped, because ONNX Runtime 1.28 has no Intel macOS build. Building from source no longer needs OpenSSL.
+- **Process-wide ONNX thread cap now uses upstream's implementation:** the fork's global cap (#111) is retired in favor of upstream's shared, capped pool, which takes `semantic_search.embedding_threads` as a parameter and has a capped fallback for each session. The fork's length-sorted batch-of-8 embedding in `FastEmbedGenerator` (#114) is kept, because upstream's generator path still embeds unsorted.
+- **Single-root force reindex seeds Phase 2 from the index:** the fork's shortcut that reused Phase 1's in-memory symbol cache for single-root force reindexes is removed. That cache cannot prove a file is absent, and upstream's dangling-relative-import check needs that. Force reindexing a single-root workspace now pays one symbol scan of the index, the same as upstream.
+
 ### Fixed
 
 - **CLI index progress rate decayed between batches:** the files/s figure on the progress bars divided the count by live wall-clock time since the bar started, but the count only advances when a batch finishes, so the rate fell continuously while a batch was running and jumped when it completed. The rate is now measured up to the last counter change, so it holds steady mid-batch and updates only when a batch lands. The elapsed time shown beside it is still live wall-clock. ([#117](https://github.com/rcrsr/rcrsr-codanna/pull/117))
+
+## [0.17.1] - 2026-10-11
+
+Dependency release: local embedding runs on ONNX Runtime 1.28 through fastembed 7.1.1, OpenSSL leaves the dependency graph on every platform, and the lockfile moves past the open advisories in the HTTP stack. No index or emission change; existing indexes keep working without a rebuild.
+
+### Changed
+
+- fastembed `=7.1.1` and ort `=2.0.0-rc.13` (ONNX Runtime 1.28). The thread cap from 0.17.0 now also applies per session: when the shared pool cannot be committed, each session runs `embedding_threads` intra-op threads with spin-waiting off instead of every CPU.
+- Every network path uses rustls: model downloads, the ONNX Runtime binary download at build time, and remote embedding. `openssl-sys` is absent from the dependency graph; building from source no longer needs `libssl-dev`.
+- Lockfile refreshed within semver: h2 0.4.20, quinn-proto 0.11.19, rustls-webpki 0.103.15 (past RUSTSEC-2026-0258, RUSTSEC-2026-0185, RUSTSEC-2026-0049 and their siblings), rmcp 3.5.1, tantivy 0.26.2, tokenizers 0.23.2.
+- Linux floor for `cargo install`: glibc 2.38+ and libstdc++ from GCC 13+, set by the prebuilt ONNX Runtime binaries (Ubuntu 24.04, Debian 13, Fedora 39 and later). The release binaries are built on Ubuntu 24.04 (glibc 2.39). README states both.
+- Search results on an index embedded by 0.17.0 or earlier are unchanged: the same ranking, scores within 1e-6. Indexing with semantic search uses about 40 percent less CPU on the reference machine than 0.17.0.
+
+### Added
+
+- `contributing/scripts/brew-formula-check.sh`: runs the homebrew-core formula through Homebrew's CI shape (`brew style`, from-source install with the fetch hook and `cargo install --offline`, `brew test`, `brew audit --strict`) in the `ghcr.io/homebrew/brew` image before a pull request.
+
+### Removed
+
+- macOS x86_64 (Intel) release binaries and the cargo-binstall override for that target. ONNX Runtime 1.28 has no Intel macOS build, in Microsoft's releases or in the ort crate's prebuilt binaries, so neither the release binary nor `cargo install` can target it. Release binaries are Apple Silicon only; 0.17.0 is the last release for Intel Macs.
+- The `brew-update.yml` workflow and the tap `bartolli/homebrew-codanna`. Homebrew installs come from homebrew-core (`brew install codanna`).
+
+## [0.17.0] - 2026-10-11
+
+Watcher, indexing-pipeline, resolution, and local-embedding fixes from the contributor PR batch and reported issues. Emission semantics version 4: existing indexes are rebuilt once (see the note at the end of this section).
+
+### Changed
+
+- `semantic_search.embedding_threads` also sizes one process-wide ONNX Runtime thread pool shared by every local embedding session: about `2N-1` busy threads at peak, clamped to `1..=logical CPUs`, fixed at the first embedding in a process. Before, each of the N sessions ran its own pool sized to every logical CPU with spin-waiting on, so a reindex kept `N x CPUs` threads busy whatever `indexing.parallelism` said. Embedding batches are length-sorted and 8 texts per call (was 64, unsorted) in symbol indexing and in the document store, which bounds the ONNX arena by the batch instead of the corpus mix. Embeddings and search scores are unchanged. (GH #138)
+- TypeScript and JavaScript `import { member as local }` records the imported member name; calls through the alias resolve to the member. Emission semantics version 4.
+- macOS watcher: each handler root registers one recursive FSEvents watch, once per process, instead of one watch per directory; FSEvents stopped delivering events above 4,096 registered paths. Other platforms keep one non-recursive watch per directory, registered in one batch per site.
+
+### Fixed
+
+- TypeScript and JavaScript relative imports whose target file is absent from the index are negative evidence: a name imported through such a path no longer resolves by name to an unrelated symbol, including symbols in other languages. Files governed by a tsconfig or jsconfig with `moduleSuffixes` or `rootDirs` are exempt.
+- The resolution cache loaded at most 1,000,000 symbols; larger indexes lost cross-file edges. Every symbol loads. (PR #125)
+- A watch event for an unchanged file rewrote the semantic snapshot and sent a notification; the cached result is preserved. (PR #137)
+- Vector payload writes are buffered; one write syscall per `f32` before. (PR #131)
+- Watcher event delivery never blocks the FSEvents thread; a full channel could wedge the watcher and keep a stdio server from exiting.
+- `serve --watch`: a settings reload watches the roots it adds and records them in index metadata, so the next command does not re-index them (GH #129); hot reload holds the facade write guard across the load, so a commit cannot land between the load and the swap.
+- `codanna index` beside a busy index writer fails with the error instead of reporting success with zero relationships; the watcher reports the affected roots and the heal.
+- A failed relationship store or commit in Phase 2 is an error and nothing from that batch is reported written. Phase 2 releases the Tantivy writer when it returns; a reindex that resolved only definitions used to hold the lockfile, and `codanna index` beside `serve --watch` failed with `LockBusy`.
+
+### Added
+
+- `contributing/scripts/resource-profile.py`: wall, CPU, peak RSS, and running-thread profile of one `codanna index` run in a fresh workspace.
+
+Indexes written by 0.16.0 or earlier carry emission version 3. Every command except `codanna index` refuses them with exit code 7 and the rebuild instruction; an MCP server started on one serves no tools and names the rebuild. Run `codanna index` once per workspace: it rebuilds from scratch, and workspaces with semantic search enabled re-embed.
 
 ## [0.16.0+rcrsr.12] - 2026-10-02
 

@@ -521,11 +521,6 @@ async fn main() {
         config.indexing.parallelism = *t;
     }
 
-    // Cap ONNX Runtime threads for every embedding session this process
-    // creates; without it each fastembed session spins ncpu threads
-    // (src/semantic/onnx.rs).
-    codanna::semantic::set_onnx_thread_cap(config.semantic_search.embedding_threads);
-
     // Set up persistence based on config
     // Use global path resolution that handles --config properly
     let index_path = codanna::init::resolve_index_path(&config, cli.config.as_deref());
@@ -942,7 +937,19 @@ async fn main() {
                 IndexFacade::canonical_path_set(metadata.indexed_paths.iter().flatten());
             let config_set = IndexFacade::canonical_path_set(&config.indexed_paths_cache);
 
-            if IndexFacade::indexed_paths_need_sync(&stored_set, &config_set) {
+            // A root indexed while no embedder is loaded gets its hashes
+            // stored and no embeddings, and every later sync reads it as
+            // cached. Leave such roots to `codanna index`, which loads the
+            // embedder.
+            let awaiting_index = config_set
+                .difference(&stored_set)
+                .filter(|p| p.is_dir())
+                .count();
+            if awaiting_index > 0 && config.semantic_search.enabled && !needs_semantic_search {
+                eprintln!(
+                    "{awaiting_index} configured root(s) not yet indexed; run 'codanna index' to index them"
+                );
+            } else if IndexFacade::indexed_paths_need_sync(&stored_set, &config_set) {
                 match persistence.open_build(settings.clone(), BuildMode::CloneCurrent) {
                     Ok(mut build) => {
                         let stats =

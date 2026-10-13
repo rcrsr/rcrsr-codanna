@@ -11,8 +11,7 @@ mod simple;
 mod storage;
 
 pub use metadata::{EmbeddingBackendKind, SemanticMetadata};
-pub use onnx::set_onnx_thread_cap;
-pub(crate) use onnx::{clamp_embedding_threads, init_onnx_runtime};
+pub(crate) use onnx::{clamp_embedding_threads, new_text_embedding};
 pub use pool::{EmbeddingBackend, EmbeddingPool};
 pub use remote::RemoteEmbedder;
 pub use simple::{SemanticSearchError, SimpleSemanticSearch};

@@ -7,7 +7,7 @@
 
 use crate::SymbolId;
 use crossbeam_channel::{Receiver, Sender, bounded};
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -223,7 +223,7 @@ impl EmbeddingPool {
     ///
     /// Each model instance uses ~86MB of memory for AllMiniLML6V2.
     pub fn new(pool_size: usize, model: EmbeddingModel) -> Result<Self, SemanticSearchError> {
-        let pool_size = pool_size.max(1);
+        let pool_size = super::clamp_embedding_threads(pool_size);
 
         let cache_dir = crate::init::models_dir();
         let model_name = crate::vector::model_to_string(&model);
@@ -238,12 +238,12 @@ impl EmbeddingPool {
             (0..pool_size).map(|_| AtomicUsize::new(0)).collect();
         let mut models = Vec::with_capacity(pool_size);
 
-        super::init_onnx_runtime();
         for i in 0..pool_size {
-            let mut text_model = TextEmbedding::try_new(
-                InitOptions::new(model.clone())
+            let mut text_model = super::new_text_embedding(
+                TextInitOptions::new(model.clone())
                     .with_cache_dir(cache_dir.clone())
                     .with_show_download_progress(i == 0),
+                pool_size,
             )
             .map_err(|e| {
                 SemanticSearchError::ModelInitError(format!(
@@ -357,9 +357,11 @@ impl EmbeddingPool {
 
     /// Generate embeddings for multiple items in parallel using rayon.
     ///
-    /// Uses length-sorted batches of 8 docs per model call: measured faster
-    /// and far smaller in peak memory than larger padded batches.
-    /// Failed embeddings are logged and skipped.
+    /// Items are embedded longest-first in batches of 8: fastembed pads a
+    /// batch to its longest text, so mixed-length batches spend most of
+    /// their compute and attention memory on padding, and the ORT arena
+    /// keeps the peak for the process lifetime. Failed embeddings are
+    /// logged and skipped.
     pub fn embed_parallel(
         &self,
         items: &[(SymbolId, &str, &str)],
@@ -418,13 +420,10 @@ impl EmbeddingPool {
     }
 }
 
-/// Drop blank docs and order the rest longest-first.
-///
-/// fastembed pads every text in a call to the longest one, so mixed lengths
-/// waste most of a batch's compute and attention memory; grouping by length
-/// keeps batches near-uniform. Longest-first also schedules the slowest
-/// batches earliest, avoiding a tail of big batches. Results carry their
-/// SymbolId, so order does not matter.
+/// Drop blank docs and order the rest longest-first. Results carry their
+/// `SymbolId` and `par_bridge` never preserved order, so the sort changes
+/// batch composition only. Longest-first schedules the slowest batches
+/// before the tail.
 fn sorted_valid_items<'a>(
     items: &'a [(SymbolId, &'a str, &'a str)],
 ) -> Vec<&'a (SymbolId, &'a str, &'a str)> {
@@ -432,7 +431,7 @@ fn sorted_valid_items<'a>(
         .iter()
         .filter(|(_, doc, _)| !doc.trim().is_empty())
         .collect();
-    valid_items.sort_unstable_by_key(|(_, doc, _)| std::cmp::Reverse(doc.len()));
+    valid_items.sort_by_key(|(_, doc, _)| std::cmp::Reverse(doc.len()));
     valid_items
 }
 
@@ -442,7 +441,7 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn test_sorted_valid_items_orders_longest_first_and_keeps_ids_with_text() {
+    fn sorted_valid_items_drops_blanks_and_orders_longest_first() {
         let a = SymbolId::new(1).unwrap();
         let b = SymbolId::new(2).unwrap();
         let c = SymbolId::new(3).unwrap();

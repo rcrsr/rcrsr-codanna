@@ -1523,6 +1523,7 @@ impl KotlinParser {
                 imports.push(Import {
                     file_id,
                     path,
+                    name: None,
                     alias: None,
                     is_glob,
                     is_type_only: false,

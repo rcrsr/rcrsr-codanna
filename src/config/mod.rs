@@ -266,11 +266,12 @@ pub struct SemanticSearchConfig {
     #[serde(default = "default_similarity_threshold")]
     pub threshold: f32,
 
-    /// Number of parallel embedding model instances. Also the size of the
-    /// process-wide ONNX Runtime thread pool shared by all local embedding
-    /// (including document embedding), so 1 makes inference effectively serial.
-    /// Clamped to `1..=available_parallelism`; fixed at first embedding use,
-    /// so a config reload under `serve --watch` needs a restart.
+    /// Number of local embedding model instances and the size of the
+    /// process-wide ONNX Runtime thread pool they share, so about `2N-1`
+    /// threads are busy at peak (`N-1` pool threads plus the `N` workers
+    /// calling into it). Clamped to `1..=available_parallelism`. Fixed at
+    /// the first embedding in a process; a reload under `serve --watch`
+    /// takes effect after a restart.
     #[serde(default = "default_embedding_threads")]
     pub embedding_threads: usize,
 

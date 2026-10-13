@@ -59,8 +59,9 @@
 
 use crate::parsing::paths::{strip_extension, strip_source_root};
 use crate::parsing::resolution::{
-    GenericInheritanceResolver, GenericResolutionContext, ImportBinding, ImportOrigin,
-    InheritanceResolver, PipelineSymbolCache, ResolutionScope, ScopeLevel,
+    FilePresence, GenericInheritanceResolver, GenericResolutionContext, ImportBinding,
+    ImportOrigin, InheritanceResolver, PipelineSymbolCache, RelativeImportLookup, ResolutionScope,
+    ScopeLevel,
 };
 use crate::relationship::RelationKind;
 use crate::{FileId, Symbol, SymbolId, SymbolKind, Visibility};
@@ -441,8 +442,15 @@ pub trait LanguageBehavior: Send + Sync {
     /// never leaves the path domain. Exactly-one discipline: multiple
     /// same-name matches across the accepted paths fail closed.
     ///
-    /// Returns `None` for non-relative specifiers; callers fall through
-    /// to their module-domain arms.
+    /// Zero matches split by file rows: `NoIndexedFile` only when every
+    /// accepted path is absent from a complete cache, no indexed sibling
+    /// shares the resolved path's first-dot stem (extension substitution),
+    /// and no indexed file lies below it as a directory (a directory
+    /// index). A present file without the name, such a sibling or
+    /// directory, a cache that cannot prove absence, or a non-relative
+    /// specifier is `Unknown`. Configured redirection of relative
+    /// specifiers is the callers' boundary; they fall through to their
+    /// module-domain arms on `Unknown`.
     fn resolve_relative_import(
         &self,
         cache: &dyn PipelineSymbolCache,
@@ -450,11 +458,12 @@ pub trait LanguageBehavior: Send + Sync {
         specifier: &str,
         importing_file: &str,
         extensions: &[&str],
-    ) -> Option<SymbolId> {
-        let expected = crate::parsing::paths::resolve_relative_specifier(
-            Path::new(importing_file),
-            specifier,
-        )?;
+    ) -> RelativeImportLookup {
+        let Some(expected) =
+            crate::parsing::paths::resolve_relative_specifier(Path::new(importing_file), specifier)
+        else {
+            return RelativeImportLookup::Unknown;
+        };
 
         // A specifier stem can contain dots that are not an extension at
         // all (e.g. `./app.core` resolving to `app.core.ts`), so bare
@@ -490,8 +499,23 @@ pub trait LanguageBehavior: Send + Sync {
             }
         }
         match matched.as_slice() {
-            [id] => Some(*id),
-            _ => None,
+            [id] => RelativeImportLookup::Bound(*id),
+            [_, _, ..] => RelativeImportLookup::Unknown,
+            [] => {
+                let absent = accepted
+                    .iter()
+                    .map(|path| cache.file_presence(path))
+                    .chain([
+                        cache.sibling_stem_present(&expected),
+                        cache.directory_present(&expected),
+                    ])
+                    .all(|presence| presence == FilePresence::Absent);
+                if absent {
+                    RelativeImportLookup::NoIndexedFile
+                } else {
+                    RelativeImportLookup::Unknown
+                }
+            }
         }
     }
 
@@ -546,6 +570,7 @@ pub trait LanguageBehavior: Send + Sync {
                 crate::parsing::Import {
                     path: enhanced_path,
                     file_id: import.file_id,
+                    name: None,
                     alias: import.alias.clone(),
                     is_glob: import.is_glob,
                     is_type_only: import.is_type_only,

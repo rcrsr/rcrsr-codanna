@@ -222,14 +222,12 @@ impl Settings {
                     .push_str("# Each instance uses ~86MB RAM. Higher values = faster indexing.\n");
                 result.push_str("# Set to 1 for low-memory systems, 4-6 for high-end machines.\n");
                 result.push_str(
-                    "# Also caps the shared ONNX Runtime thread pool used by all embedding\n",
+                    "# Also sizes the ONNX Runtime thread pool every local embedding session\n",
                 );
                 result.push_str(
-                    "# (documents too), so 1 makes inference effectively serial. Values are\n",
+                    "# shares (about 2N-1 busy threads at peak). Clamped to 1..=logical CPUs.\n",
                 );
-                result.push_str(
-                    "# clamped to 1..=logical CPUs. Fixed at first use; restart to change.\n",
-                );
+                result.push_str("# Fixed at first use in a process; restart serve to change it.\n");
                 result
                     .push_str("\n# Remote embedding server (optional, replaces local fastembed)\n");
                 result.push_str("# Supports OpenAI, Ollama, vLLM, Infinity, or any OpenAI-compatible endpoint.\n");
