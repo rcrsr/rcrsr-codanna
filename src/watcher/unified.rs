@@ -1225,15 +1225,18 @@ impl UnifiedWatcher {
 
             match resolve_result {
                 Ok(()) => {}
+                // Contention first: a `WriterUnavailable` carrying the
+                // lockfile text is the benign multi-serve case, not a
+                // failed writer start.
+                Err(e) if is_writer_lock_contention(&e) => {
+                    tracing::info!(
+                        "[watcher] batch sync resolution skipped: another serve process holds the index writer; hot-reload converges"
+                    );
+                }
                 Err(e) if e.is_writer_unavailable() => {
                     tracing::error!(
                         "[watcher] batch sync resolution failed: index writer could not start: {e}; run 'codanna index --force' to re-derive edges under {}",
                         render_roots(&roots)
-                    );
-                }
-                Err(e) if is_writer_lock_contention(&e) => {
-                    tracing::info!(
-                        "[watcher] batch sync resolution skipped: another serve process holds the index writer; hot-reload converges"
                     );
                 }
                 Err(e) => {

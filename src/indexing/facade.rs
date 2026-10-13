@@ -7126,7 +7126,12 @@ mod tests {
             .expect("bootstrap must publish an initial current generation");
 
         let facade = Arc::new(tokio::sync::RwLock::new(facade));
+        // Cancelled before the call, not mid-flight: the walk of a one-file
+        // fixture can finish and publish before a late `cancel()` lands on a
+        // loaded runner, and the phase-3 checkpoint is the only place the
+        // token is read, so cancelling up front tests it deterministically.
         let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
         let (phase2_tx, phase2_rx) = tokio::sync::oneshot::channel();
 
         let facade_for_task = Arc::clone(&facade);
@@ -7161,12 +7166,10 @@ mod tests {
             .find(|id| *id != current_before)
             .expect("phase 1 must have opened a new build generation");
 
-        // Cancel before awaiting the task, not by aborting it -- the task
-        // is left to run phase 2 and phase 3 for real so the in-closure
-        // checkpoint is what is exercised, not `spawn_blocking`'s
-        // detach-on-drop behavior (that's the W-1 test above).
-        token.cancel();
-
+        // The task is not aborted -- it runs phase 2 and phase 3 for real so
+        // the in-closure checkpoint is what is exercised, not
+        // `spawn_blocking`'s detach-on-drop behavior (that's the W-1 test
+        // above).
         let result = task.await.expect("reindex task must not panic");
         assert!(
             matches!(result, Err(IndexError::ReindexCancelled)),
