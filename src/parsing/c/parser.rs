@@ -75,7 +75,7 @@ impl CParser {
 
         // Recursively process children
         for i in 0..node.child_count() {
-            if let Some(child) = node.child(i as u32) {
+            if let Some(child) = node.child(i) {
                 Self::extract_imports_from_node(child, code, file_id, imports);
             }
         }
@@ -837,7 +837,7 @@ impl CParser {
 
         // Process children
         for i in 0..node.child_count() {
-            if let Some(child) = node.child(i as u32) {
+            if let Some(child) = node.child(i) {
                 Self::extract_calls_from_node(child, code, enclosing, calls);
             }
         }
@@ -866,7 +866,7 @@ impl CParser {
 
         // Process children
         for i in 0..node.child_count() {
-            if let Some(child) = node.child(i as u32) {
+            if let Some(child) = node.child(i) {
                 Self::find_calls_in_node(child, code, enclosing, calls);
             }
         }
@@ -891,7 +891,7 @@ impl CParser {
 
         // Process children
         for i in 0..node.child_count() {
-            if let Some(child) = node.child(i as u32) {
+            if let Some(child) = node.child(i) {
                 Self::find_uses_in_node(child, code, uses);
             }
         }
@@ -944,7 +944,7 @@ impl CParser {
 
         // Process children
         for i in 0..node.child_count() {
-            if let Some(child) = node.child(i as u32) {
+            if let Some(child) = node.child(i) {
                 Self::find_defines_in_node(child, code, defines);
             }
         }

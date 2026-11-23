@@ -62,13 +62,13 @@ pub enum TlsClientError {
     CertParse {
         path: PathBuf,
         #[source]
-        source: rmcp_reqwest::Error,
+        source: reqwest::Error,
     },
 
     #[error("failed to build the cert-pinned HTTPS client: {source}")]
     ClientBuild {
         #[source]
-        source: rmcp_reqwest::Error,
+        source: reqwest::Error,
     },
 
     #[error(
@@ -85,7 +85,7 @@ pub type TlsResult<T> = Result<T, TlsClientError>;
 ///
 /// `reqwest`'s `rustls-no-provider` backend (the one this module uses via
 /// [`pinned_client`]) requires a default [`rustls::crypto::CryptoProvider`]
-/// to already be installed before the FIRST `rmcp_reqwest::Client` is built
+/// to already be installed before the FIRST `reqwest::Client` is built
 /// anywhere in the process, or that build panics. This crate already pins
 /// the shared `rustls` dependency to the `ring` backend only (see the
 /// `[features].https-server` comment in `Cargo.toml`), so installing `ring`
@@ -115,7 +115,7 @@ fn ensure_crypto_provider_installed() {
 /// caller-supplied custom headers (e.g. the bearer token). Dropping either
 /// silently changes transport behavior, not just decoration.
 #[cfg(feature = "https-server")]
-pub fn pinned_client() -> TlsResult<rmcp_reqwest::Client> {
+pub fn pinned_client() -> TlsResult<reqwest::Client> {
     let (cert_path, _key_path) = cert_paths().ok_or_else(|| TlsClientError::CertNotFound {
         path: PathBuf::from("<unresolvable config directory>/codanna/certs/server.pem"),
     })?;
@@ -130,26 +130,26 @@ pub fn pinned_client() -> TlsResult<rmcp_reqwest::Client> {
     })?;
 
     let cert =
-        rmcp_reqwest::Certificate::from_pem(&pem).map_err(|source| TlsClientError::CertParse {
+        reqwest::Certificate::from_pem(&pem).map_err(|source| TlsClientError::CertParse {
             path: cert_path.clone(),
             source,
         })?;
 
     ensure_crypto_provider_installed();
 
-    rmcp_reqwest::Client::builder()
+    reqwest::Client::builder()
         .tls_certs_only([cert])
         .pool_max_idle_per_host(0)
-        .redirect(rmcp_reqwest::redirect::Policy::none())
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|source| TlsClientError::ClientBuild { source })
 }
 
-/// Without the `https-server` feature there is no TLS backend compiled into
-/// the pinned client's `reqwest` dependency, so a `--https` backing server
-/// can never be dialed from this build.
+/// Without the `https-server` feature this build cannot serve `--https`, so
+/// it never persists a server certificate to pin and never dials a `--https`
+/// backing server.
 #[cfg(not(feature = "https-server"))]
-pub fn pinned_client() -> TlsResult<rmcp_reqwest::Client> {
+pub fn pinned_client() -> TlsResult<reqwest::Client> {
     Err(TlsClientError::HttpsSupportNotCompiled)
 }
 

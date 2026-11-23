@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Fork base advanced from upstream v0.17.1 to v0.18.0.** This release carries upstream's 0.18.0 dependency release (see `[0.18.0]` below): tree-sitter 0.27, Tantivy 0.27, fastembed 7.7.1 / ONNX Runtime 1.31 with CPU-only embedding sessions, rmcp 3.11, reqwest 0.13, sysinfo 0.40, and Rust 1.95 as the minimum toolchain. Emission semantics and the Tantivy index format are unchanged; existing indexes keep working without a rebuild.
+- **One `reqwest` crate instead of two:** upstream moved `reqwest` to 0.13 with `rustls-no-provider`, so the fork's `rmcp_reqwest` alias (a second reqwest 0.13 instance for the proxy's rmcp transport and `serve_tls::pinned_client`) is folded into the single `reqwest` dependency. Because the rustls backend is now compiled into every build, the `ring` crypto provider is installed at startup in every feature configuration, not only with `https-server`.
+- **`pid_is_alive` treats an unreadable process table as alive:** upstream's guard (sysinfo 0.40 can fail to open the process table) is combined with the fork's zombie check, so lock and staging reclaim only proceed on a completed lookup that finds the pid gone, exited, or a zombie.
+
+## [0.18.0] - 2026-11-22
+
+Dependency release: tree-sitter 0.27, Tantivy 0.27, ONNX Runtime 1.31 through fastembed 7.7.1 with embedding sessions kept on the CPU, and reqwest 0.13 for remote embedding. Emission semantics version is unchanged (4) and so is the Tantivy index format; existing indexes keep working without a rebuild.
+
+### Changed
+
+- fastembed `=7.7.1` and ort `=2.0.0-rc.15` (ONNX Runtime 1.31). Embedding sessions request the CPU device policy. ONNX Runtime 1.31 and later select an execution provider automatically and register CoreML on macOS, which re-plans on every sequence length codanna sends. The Homebrew build of 0.17.1 links Homebrew's ONNX Runtime (1.32 when measured) and ran embedding through CoreML; the 0.17.1 release binaries and source builds on its own pins (ONNX Runtime 1.28) did not. Search results on an index embedded by 0.17.1 are unchanged: the same ranking, scores within 1e-6.
+- tree-sitter 0.27.2 (was 0.26.13). The runtime's error recovery changed, so a file the grammar cannot fully parse can yield different symbols. Across eighteen test corpora 16 symbol rows differ, all in three files that contain parse errors under both versions. In one of them, a Kotlin file where an anonymous object delegates to a call and has a body (`object : T by f() { ... }`), the enclosing class and one field are no longer indexed and six methods index as functions. No difference was found in files that parse without errors. Rows change as files are re-indexed, or at once with `codanna index --force`.
+- Grammar crates: tree-sitter-php 0.25.2, tree-sitter-c-sharp 0.24.0, tree-sitter-clojure-orchard 0.2.9. Parser output on the test fixtures is unchanged.
+- Remote embedding client on reqwest 0.13.5 (rustls with the ring provider). Certificate trust is the operating system's store plus bundled roots; it was bundled roots only.
+- Building from source needs Rust 1.95 (was 1.85), set by sysinfo 0.40 and parking_lot 0.13.
+- The Linux release binary is built on the pinned `ubuntu-24.04` runner instead of `ubuntu-latest`.
+- Tantivy 0.27.0, rmcp 3.11.0, tokio 1.54.1, sysinfo 0.40.4, comfy-table 8.0.1, dirs 7.0.0, parking_lot 0.13.0, axum-server 0.9.2, notify 8.2.2, and patch bumps across the rest of the manifest.
+
+### Fixed
+
+- A `.codanna/settings.toml` that fails to parse is an error: every command except `init` exits 6 and names `codanna init --force`. Before, the command ran on default settings. A `--config <path>` that fails to load also exits 6.
+- `install.sh` on an Intel Mac names 0.17.0 as the last release for that platform and prints the command that installs it.
+
+### Removed
+
+- Cargo features `tower-http` and `rustls`. `tower-http` was an unused optional dependency; `rustls` is now a required dependency. `http-server` and `https-server` build the same servers as before.
+
 ## [0.17.1+rcrsr.13] - 2026-10-13
 
 ### Changed

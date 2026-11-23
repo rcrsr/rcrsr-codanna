@@ -1,13 +1,21 @@
 //! Process liveness for lock and staging ownership checks.
 
-/// True when a process with this pid currently exists and is not a zombie.
+/// True when a process with this pid currently exists and is not a zombie,
+/// or when the process table cannot be queried.
 ///
 /// A zombie process has exited but not yet been reaped by its parent; it
 /// holds no resources and must be treated as dead by lock/staging-ownership
-/// checks.
+/// checks. Callers reclaim locks and staging directories on `false`, so only
+/// a completed lookup may report a process as dead.
 pub fn pid_is_alive(pid: u32) -> bool {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System};
-    let mut sys = System::new();
+    let mut sys = match System::new() {
+        Ok(sys) => sys,
+        Err(e) => {
+            tracing::warn!("process table unavailable, treating pid {pid} as alive: {e}");
+            return true;
+        }
+    };
     let pid = Pid::from_u32(pid);
     sys.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[pid]),
@@ -45,9 +53,20 @@ pub fn pid_is_alive(pid: u32) -> bool {
 /// requiring a stronger (and platform-fragile) process-identity mechanism.
 /// A dead pid is not "looks like codanna serve"; callers combine this with
 /// [`pid_is_alive`] to decide staleness (dead OR doesn't-look-like-codanna).
+/// When the process table cannot be queried this returns `true`, mirroring
+/// [`pid_is_alive`]: only a completed lookup may mark an entry stale.
 pub fn looks_like_codanna_serve(pid: u32) -> bool {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
-    let mut sys = System::new();
+    // An unreadable process table cannot disprove identity. Callers treat
+    // `false` as stale and reap the entry; every signal path re-reads the
+    // table for a `Process` handle and cannot signal without one.
+    let mut sys = match System::new() {
+        Ok(sys) => sys,
+        Err(e) => {
+            tracing::warn!("process table unavailable, keeping pid {pid} as codanna serve: {e}");
+            return true;
+        }
+    };
     let target = Pid::from_u32(pid);
     sys.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[target]),
@@ -110,7 +129,8 @@ pub(crate) fn process_looks_like_codanna_serve(process: &sysinfo::Process) -> bo
 /// text, which matters far more when scanning system-wide than when
 /// re-checking a single already-trusted pid.
 ///
-/// Read-only: performs no signal, kill, or write side effects.
+/// Read-only: performs no signal, kill, or write side effects. Returns an
+/// empty list when the process table cannot be queried.
 ///
 /// Restricted to processes owned by the invoking user's own uid. Without
 /// this, a full-system scan would surface other users' `codanna serve`
@@ -119,7 +139,13 @@ pub(crate) fn process_looks_like_codanna_serve(process: &sysinfo::Process) -> bo
 /// (0700/0600 permissions) otherwise guarantees.
 pub fn scan_codanna_serve_pids() -> Vec<u32> {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
-    let mut sys = System::new();
+    let mut sys = match System::new() {
+        Ok(sys) => sys,
+        Err(e) => {
+            tracing::warn!("process table unavailable, scan found no codanna serve pids: {e}");
+            return Vec::new();
+        }
+    };
     sys.refresh_processes_specifics(
         ProcessesToUpdate::All,
         true,
@@ -310,7 +336,7 @@ mod tests {
         // `Command::spawn()` returns before `exe()`/`cmd()` are populated
         // for the new pid, so poll briefly rather than refreshing once.
         let deadline = Instant::now() + Duration::from_secs(5);
-        let mut sys = System::new();
+        let mut sys = System::new().expect("process table readable");
         let codanna_matches = loop {
             sys.refresh_processes_specifics(
                 ProcessesToUpdate::Some(&[codanna_pid, sleeper_pid]),

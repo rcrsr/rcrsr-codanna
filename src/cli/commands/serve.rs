@@ -445,7 +445,10 @@ async fn stop_server(selector: &str, force: bool, timeout: u64, no_force: bool) 
         eprintln!("pid {pid} was not registered; stopping anyway.");
     }
 
-    let mut sys = System::new();
+    let mut sys = System::new().unwrap_or_else(|e| {
+        eprintln!("Cannot read the process table to verify pid {pid}; refusing to signal it: {e}");
+        std::process::exit(1);
+    });
     let target = Pid::from_u32(pid);
     sys.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[target]),
@@ -526,7 +529,12 @@ async fn stop_server(selector: &str, force: bool, timeout: u64, no_force: bool) 
             deadline.as_secs()
         );
 
-        let mut sys = System::new();
+        let mut sys = System::new().unwrap_or_else(|e| {
+            eprintln!(
+                "Cannot read the process table to verify pid {pid}; refusing SIGKILL escalation: {e}"
+            );
+            std::process::exit(1);
+        });
         sys.refresh_processes_specifics(
             ProcessesToUpdate::Some(&[target]),
             true,
@@ -728,7 +736,13 @@ async fn stop_all_servers(force: bool, include_proxies: bool, include_unknown: b
 fn stop_one_registered_target(pid: u32, force: bool) -> bool {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System, UpdateKind};
 
-    let mut sys = System::new();
+    let mut sys = match System::new() {
+        Ok(sys) => sys,
+        Err(e) => {
+            eprintln!("Cannot read the process table to verify pid {pid}; skipping: {e}");
+            return false;
+        }
+    };
     let target = Pid::from_u32(pid);
     sys.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[target]),
@@ -815,7 +829,13 @@ async fn wait_for_registered_target(pid: u32, force: bool) -> bool {
 fn stop_one_unknown_target(pid: u32, force: bool) -> bool {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System, UpdateKind};
 
-    let mut sys = System::new();
+    let mut sys = match System::new() {
+        Ok(sys) => sys,
+        Err(e) => {
+            eprintln!("Cannot read the process table to verify pid {pid}; skipping: {e}");
+            return false;
+        }
+    };
     let target = Pid::from_u32(pid);
     sys.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[target]),

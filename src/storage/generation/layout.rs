@@ -1116,10 +1116,14 @@ fn fsync_dir(_dir: &Path) -> IndexResult<()> {
 /// *does* find a match, the match is trusted and a real shortfall is a
 /// hard [`IndexError::IndexNotSpaceForBuild`].
 pub fn free_space_preflight(layout: &IndexLayout, needed_bytes: u64) -> IndexResult<()> {
-    let disks = sysinfo::Disks::new_with_refreshed_list();
+    // An unreadable disk list leaves no candidates, which the preflight
+    // already treats as "nothing to compare against" and skips with a WARN.
+    let disks = sysinfo::Disks::new_with_refreshed_list()
+        .inspect_err(|e| tracing::warn!("disk list unavailable for free-space preflight: {e}"))
+        .ok();
     let candidates = disks
-        .list()
         .iter()
+        .flat_map(|disks| disks.iter())
         .map(|disk| (disk.mount_point(), disk.available_space()));
     free_space_preflight_against(layout.root(), needed_bytes, candidates)
 }

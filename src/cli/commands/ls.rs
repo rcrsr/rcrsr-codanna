@@ -68,7 +68,9 @@ fn resolve_unknown(
     Option<std::path::PathBuf>,
 ) {
     let target = Pid::from_u32(pid);
-    let mut sys = System::new();
+    let Ok(mut sys) = System::new() else {
+        return (None, None, None, RowKind::Server, None);
+    };
     sys.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[target]),
         true,

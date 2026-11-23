@@ -302,7 +302,7 @@ fn test_server_cert_path(ws: &Path) -> PathBuf {
 fn count_http_children(ws: &Path) -> usize {
     let canonical_root = ws.canonicalize().expect("canonicalize workspace root");
 
-    let mut sys = System::new();
+    let mut sys = System::new().expect("process table readable");
     let refresh_kind = ProcessRefreshKind::nothing()
         .with_cwd(UpdateKind::Always)
         .with_cmd(UpdateKind::Always);
@@ -329,7 +329,7 @@ fn count_http_children(ws: &Path) -> usize {
 /// backing server and to reap it at test teardown.
 fn kill_pid(pid: u32) {
     let target = Pid::from_u32(pid);
-    let mut sys = System::new();
+    let mut sys = System::new().expect("process table readable");
     sys.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[target]),
         true,
@@ -346,7 +346,7 @@ fn kill_pid(pid: u32) {
 /// being reaped abruptly.
 fn interrupt_pid(pid: u32) {
     let target = Pid::from_u32(pid);
-    let mut sys = System::new();
+    let mut sys = System::new().expect("process table readable");
     sys.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[target]),
         true,

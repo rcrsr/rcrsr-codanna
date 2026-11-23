@@ -328,7 +328,18 @@ fn decide(record: Option<&ServeRecord>) -> Decision {
 /// this check only needs to confirm the PID is *some* codanna serve process.
 fn pid_looks_like_codanna_serve(record: &ServeRecord) -> bool {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
-    let mut sys = System::new();
+    // An unreadable process table cannot disprove identity; the health probe
+    // that follows a `Discover` decision still rejects a dead endpoint.
+    let mut sys = match System::new() {
+        Ok(sys) => sys,
+        Err(e) => {
+            tracing::warn!(
+                "process table unavailable, keeping pid {} as codanna serve: {e}",
+                record.pid
+            );
+            return true;
+        }
+    };
     let pid = Pid::from_u32(record.pid);
     sys.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[pid]),

@@ -291,7 +291,7 @@ fn registry_entries_for_workspace(home: &Path, ws: &Path) -> Vec<RegistryEntry> 
 
 fn pid_alive(pid: u32) -> bool {
     let target = Pid::from_u32(pid);
-    let mut sys = System::new();
+    let mut sys = System::new().expect("process table readable");
     sys.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[target]),
         true,

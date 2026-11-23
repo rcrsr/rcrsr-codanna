@@ -5,7 +5,7 @@ This file lists what the fork adds or changes for you as a user, on top of its
 upstream base. Everything not listed here behaves as it does upstream; for the
 how, see the commit history.
 
-- **Upstream base:** v0.17.1 — the `codanna` release the fork is built on
+- **Upstream base:** v0.18.0 — the `codanna` release the fork is built on
 - **Fork build:** the upstream version with a `+rcrsr.N` suffix (see [Identifying the fork](#identifying-the-fork))
 
 ## Contents
@@ -130,7 +130,7 @@ publishes a release, even against a tag.
 
 ## Upstream base
 
-The fork tracks upstream **v0.17.1**. Moving the base never touches the
+The fork tracks upstream **v0.18.0**. Moving the base never touches the
 `+rcrsr.N` counter (see [Identifying the fork](#identifying-the-fork)).
 
 Two fork-private capabilities are kept alongside upstream's newer equivalents
@@ -223,6 +223,18 @@ with the fork's caveats:
   libstdc++ from GCC 13+ on Linux. **There are no Intel macOS (x86_64)
   release binaries any more**, upstream or fork: ONNX Runtime 1.28 has no Intel
   macOS build. Fork release assets are linux-x64, macos-arm64 and windows-x64.
+- **v0.18.0 is a dependency release; no re-index is needed.** Emission
+  semantics (4) and the Tantivy index format are unchanged. Notable effects:
+  building from source needs **Rust 1.95+**; local embedding sessions always
+  run on the CPU (fastembed 7.7.1 / ONNX Runtime 1.31); tree-sitter 0.27 can
+  extract different symbols from files that contain parse errors (files that
+  parse cleanly are unchanged), which shows up as files are re-indexed or at
+  once with `codanna index --force`.
+- **v0.18.0 makes an unparsable `.codanna/settings.toml` fatal.** Every command
+  except `init` exits 6 and names `codanna init --force`, instead of running
+  on defaults. **Fork note:** this includes `codanna serve --proxy` and the
+  backing servers a proxy spawns, so a broken settings file now fails loudly
+  rather than serving an index under default settings.
 
 ## Improvements
 
