@@ -248,6 +248,17 @@ fn is_serve_management_op(command: &Commands) -> bool {
     )
 }
 
+/// Commands that run without reading `.codanna/settings.toml`, so an
+/// unparsable file is reported but not fatal for them: `init` (whose
+/// `--force` is the recovery), `ls`, and the serve management ops
+/// ([`is_serve_management_op`]), which read only the user-level server
+/// registry and the process table. Fork-private: upstream exits 6 for every
+/// command but `init`, which would leave `codanna serve --stop` unable to
+/// stop a server whose workspace settings broke after it started.
+fn runs_without_settings(command: &Commands) -> bool {
+    matches!(command, Commands::Init { .. } | Commands::Ls) || is_serve_management_op(command)
+}
+
 /// Resolve whether a `Commands::Index` invocation is a read-only or
 /// metadata-only generation operation (`--status`, `--gc`, `--rollback`,
 /// `--prune-indexed-paths`) rather than a request to build or rebuild the
@@ -404,7 +415,7 @@ async fn main() {
     // which never touches `serve_tls` at all, and the remote embedder.
     // Installing it once, here, before any command dispatch, covers every
     // `reqwest::Client` construction site regardless of which one runs first.
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    codanna::serve_tls::ensure_crypto_provider_installed();
 
     let cli = Cli::parse();
 
@@ -441,11 +452,13 @@ async fn main() {
             eprintln!("Configuration error: {e}");
             eprintln!("codanna init --force rewrites .codanna/settings.toml");
             // A missing file loads as defaults, so Err means an existing file
-            // failed to parse. `init --force` is the recovery and runs after
-            // this load; it alone continues on defaults.
-            if !matches!(cli.command, Commands::Init { .. }) {
+            // failed to parse. Only commands that never read settings continue
+            // on defaults: `init --force` (the recovery) and the server
+            // management ops, so a broken file cannot block stopping servers.
+            if !runs_without_settings(&cli.command) {
                 std::process::exit(codanna::io::ExitCode::ConfigError as i32);
             }
+            eprintln!("Continuing: this command does not read settings.");
             Settings::default()
         })
     };

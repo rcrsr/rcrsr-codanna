@@ -52,8 +52,8 @@ detect_platform() {
 
 no_artifact() {
     case "$platform" in
-        macos-x64) err "no Intel macOS build in codanna $version: the prebuilt ONNX Runtime binaries have no Intel macOS build, so 0.17.1 and later target Apple Silicon only. The last release for Intel Macs is 0.17.0:
-  curl -fsSL --proto '=https' --tlsv1.2 https://install.codanna.sh | CODANNA_VERSION=v0.17.0 sh" ;;
+        macos-x64) err "no Intel macOS build in codanna $version: the prebuilt ONNX Runtime binaries have no Intel macOS build, so fork releases from v0.17.1+rcrsr.13 on target Apple Silicon only. The last fork release for Intel Macs is v0.16.0+rcrsr.12:
+  curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/$REPO/main/scripts/install.sh | CODANNA_VERSION=v0.16.0+rcrsr.12 sh" ;;
         *) err "no artifact found for $platform in $version" ;;
     esac
 }

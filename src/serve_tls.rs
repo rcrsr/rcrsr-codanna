@@ -80,21 +80,19 @@ pub enum TlsClientError {
 /// Result alias for this module's fallible operations (§RS.3).
 pub type TlsResult<T> = Result<T, TlsClientError>;
 
-/// One-time, idempotent install of the `ring` rustls crypto provider as the
-/// process default.
+/// Installs `ring` as the process-default rustls [`rustls::crypto::CryptoProvider`].
 ///
-/// `reqwest`'s `rustls-no-provider` backend (the one this module uses via
-/// [`pinned_client`]) requires a default [`rustls::crypto::CryptoProvider`]
-/// to already be installed before the FIRST `reqwest::Client` is built
-/// anywhere in the process, or that build panics. This crate already pins
-/// the shared `rustls` dependency to the `ring` backend only (see the
-/// `[features].https-server` comment in `Cargo.toml`), so installing `ring`
-/// here is consistent with, not additional to, that existing pin.
-/// `install_default` failing (a provider is already installed, e.g. by the
-/// HTTPS server binding via `axum-server`) is expected and ignored: either
-/// provider being `ring` is equally correct for this process.
-#[cfg(feature = "https-server")]
-fn ensure_crypto_provider_installed() {
+/// `reqwest`'s `rustls-no-provider` backend is compiled into every build (see
+/// the `[features]` comments in `Cargo.toml`) and panics with "No rustls
+/// crypto provider is configured" when the FIRST `reqwest::Client` in the
+/// process is built without a default provider. The pinned `rustls` carries
+/// only the `ring` backend, so `ring` is the one choice. This is the single
+/// install site: `main` calls it before command dispatch, and every library
+/// entry point that can build a client first (`pinned_client`,
+/// `mcp::serve_proxy`, `semantic::RemoteEmbedder::new`) repeats the call so it
+/// holds without `main`. Idempotent; `install_default` failing means a
+/// provider is already installed, which serves equally.
+pub fn ensure_crypto_provider_installed() {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();

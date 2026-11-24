@@ -1221,7 +1221,7 @@ pub async fn serve_proxy(
     // idempotently here guards against a panic on the first
     // `reqwest::Client` built by rmcp's bundled HTTP transport when this
     // function is the entry point. Mirrors the install in `main.rs`.
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    crate::serve_tls::ensure_crypto_provider_installed();
 
     let workspace_root =
         serve_discovery::resolve_workspace_root(&config).ok_or(ProxyError::NoWorkspaceRoot)?;

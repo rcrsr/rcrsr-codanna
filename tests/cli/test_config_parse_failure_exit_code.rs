@@ -2,8 +2,10 @@
 //!
 //! `Settings::load` treats a missing file as defaults, so a load error means
 //! an existing `.codanna/settings.toml` did not parse. That is
-//! `ExitCode::ConfigError` (6) for every command that loads settings, and
-//! `init --force` stays reachable as the recovery.
+//! `ExitCode::ConfigError` (6) for every command that reads settings, and
+//! `init --force` stays reachable as the recovery. Commands that never read
+//! settings (`ls` and the serve management ops) report the error and run, so
+//! a broken file cannot block stopping servers (fork-private).
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -99,6 +101,20 @@ fn settings_parse_failure_exits_config_error_and_init_force_recovers() {
         assert!(
             !stderr.contains("Using default configuration"),
             "a parse failure is not a fallback to defaults for {args:?}\nstderr:\n{stderr}"
+        );
+    }
+
+    // Server management reads only the user registry and the process table:
+    // it reports the broken file and still runs.
+    for args in [&["ls"][..], &["serve", "--reap"][..]] {
+        let (code, stdout, stderr) = run_cli(ws, args);
+        assert_eq!(
+            code, 0,
+            "{args:?} must not be blocked by an unparsable settings file\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("Configuration error"),
+            "stderr still reports the configuration error for {args:?}\nstderr:\n{stderr}"
         );
     }
 

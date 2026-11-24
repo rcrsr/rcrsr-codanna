@@ -1,5 +1,33 @@
 //! Process liveness for lock and staging ownership checks.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Opens the OS process table, or returns `None` when it cannot be read
+/// (a restricted procfs or a sandbox).
+///
+/// Every caller degrades fail-safe on `None`: liveness and identity checks
+/// keep the pid, scans find nothing, and metrics read zero. Those checks run
+/// in polling loops (the proxy's spawn wait polls [`pid_is_alive`]), so only
+/// the first failure in the process logs; it names the degradation once
+/// instead of once per poll.
+pub fn open_process_table() -> Option<sysinfo::System> {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    match sysinfo::System::new() {
+        Ok(sys) => Some(sys),
+        Err(e) => {
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "process table unavailable: {e}. Known pids are treated as alive \
+                     (locks, staging and registry entries are kept), `codanna ls` rows \
+                     and memory metrics stay empty, and the proxy cannot detect a \
+                     backing server dying during spawn, so it waits out the spawn timeout"
+                );
+            }
+            None
+        }
+    }
+}
+
 /// True when a process with this pid currently exists and is not a zombie,
 /// or when the process table cannot be queried.
 ///
@@ -8,13 +36,9 @@
 /// checks. Callers reclaim locks and staging directories on `false`, so only
 /// a completed lookup may report a process as dead.
 pub fn pid_is_alive(pid: u32) -> bool {
-    use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System};
-    let mut sys = match System::new() {
-        Ok(sys) => sys,
-        Err(e) => {
-            tracing::warn!("process table unavailable, treating pid {pid} as alive: {e}");
-            return true;
-        }
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate};
+    let Some(mut sys) = open_process_table() else {
+        return true;
     };
     let pid = Pid::from_u32(pid);
     sys.refresh_processes_specifics(
@@ -56,16 +80,12 @@ pub fn pid_is_alive(pid: u32) -> bool {
 /// When the process table cannot be queried this returns `true`, mirroring
 /// [`pid_is_alive`]: only a completed lookup may mark an entry stale.
 pub fn looks_like_codanna_serve(pid: u32) -> bool {
-    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, UpdateKind};
     // An unreadable process table cannot disprove identity. Callers treat
     // `false` as stale and reap the entry; every signal path re-reads the
     // table for a `Process` handle and cannot signal without one.
-    let mut sys = match System::new() {
-        Ok(sys) => sys,
-        Err(e) => {
-            tracing::warn!("process table unavailable, keeping pid {pid} as codanna serve: {e}");
-            return true;
-        }
+    let Some(mut sys) = open_process_table() else {
+        return true;
     };
     let target = Pid::from_u32(pid);
     sys.refresh_processes_specifics(
@@ -138,13 +158,9 @@ pub(crate) fn process_looks_like_codanna_serve(process: &sysinfo::Process) -> bo
 /// enrichment, breaking the per-user isolation the server registry
 /// (0700/0600 permissions) otherwise guarantees.
 pub fn scan_codanna_serve_pids() -> Vec<u32> {
-    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
-    let mut sys = match System::new() {
-        Ok(sys) => sys,
-        Err(e) => {
-            tracing::warn!("process table unavailable, scan found no codanna serve pids: {e}");
-            return Vec::new();
-        }
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, UpdateKind};
+    let Some(mut sys) = open_process_table() else {
+        return Vec::new();
     };
     sys.refresh_processes_specifics(
         ProcessesToUpdate::All,

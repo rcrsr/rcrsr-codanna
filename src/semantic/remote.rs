@@ -103,10 +103,8 @@ impl RemoteEmbedder {
         api_key: Option<String>,
     ) -> Result<Self, SemanticSearchError> {
         // reqwest reads the process-default rustls provider and panics without
-        // one. A lost install race means another thread set one; either serves.
-        if rustls::crypto::CryptoProvider::get_default().is_none() {
-            let _ = rustls::crypto::ring::default_provider().install_default();
-        }
+        // one; this may be the first client built when `main` is not the entry.
+        crate::serve_tls::ensure_crypto_provider_installed();
         // Bundled roots merged into the platform store: a host with no system
         // CA certificates still builds a client.
         let bundled = webpki_root_certs::TLS_SERVER_ROOT_CERTS

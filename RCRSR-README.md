@@ -221,12 +221,16 @@ with the fork's caveats:
   OpenSSL leaves the dependency graph, so building from source no longer needs
   `libssl-dev`. The prebuilt ONNX Runtime binaries need glibc 2.38+ and
   libstdc++ from GCC 13+ on Linux. **There are no Intel macOS (x86_64)
-  release binaries any more**, upstream or fork: ONNX Runtime 1.28 has no Intel
-  macOS build. Fork release assets are linux-x64, macos-arm64 and windows-x64.
+  release binaries any more**, upstream or fork: ONNX Runtime has no Intel
+  macOS build (1.28 in v0.17.1, 1.31 from v0.18.0). Fork release assets are
+  linux-x64, macos-arm64 and windows-x64; the last fork release with an Intel
+  macOS binary is `v0.16.0+rcrsr.12`.
 - **v0.18.0 is a dependency release; no re-index is needed.** Emission
   semantics (4) and the Tantivy index format are unchanged. Notable effects:
   building from source needs **Rust 1.95+**; local embedding sessions always
-  run on the CPU (fastembed 7.7.1 / ONNX Runtime 1.31); tree-sitter 0.27 can
+  run on the CPU (fastembed 7.7.1 / ONNX Runtime 1.31); the linux-x64 release
+  binary is built on Ubuntu 24.04 and needs **glibc 2.39+** (building from
+  source still needs only glibc 2.38+); tree-sitter 0.27 can
   extract different symbols from files that contain parse errors (files that
   parse cleanly are unchanged), which shows up as files are re-indexed or at
   once with `codanna index --force`.
@@ -234,7 +238,12 @@ with the fork's caveats:
   except `init` exits 6 and names `codanna init --force`, instead of running
   on defaults. **Fork note:** this includes `codanna serve --proxy` and the
   backing servers a proxy spawns, so a broken settings file now fails loudly
-  rather than serving an index under default settings.
+  rather than serving an index under default settings. **Fork difference:**
+  `codanna ls` and the server management ops (`serve --stop`, `--stop-all`,
+  `--reap`, `--list`) read no settings, so they report the error and still
+  run. Upstream exits 6 for them too, which leaves a server whose workspace
+  settings broke after it started impossible to stop with `codanna serve
+  --stop`.
 
 ## Improvements
 

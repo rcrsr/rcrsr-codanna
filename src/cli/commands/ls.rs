@@ -20,7 +20,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, UpdateKind};
 
 use crate::serve_discovery::{self, ServeScheme};
 use crate::serve_registry::{RegistryEntry, ServerRole, ServerStatus, paths_match};
@@ -68,7 +68,7 @@ fn resolve_unknown(
     Option<std::path::PathBuf>,
 ) {
     let target = Pid::from_u32(pid);
-    let Ok(mut sys) = System::new() else {
+    let Some(mut sys) = crate::io::process::open_process_table() else {
         return (None, None, None, RowKind::Server, None);
     };
     sys.refresh_processes_specifics(
