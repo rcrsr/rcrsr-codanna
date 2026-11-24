@@ -162,7 +162,7 @@ async fn wait_until_ready(client: &RunningService<RoleClient, ()>) -> rmcp::mode
 /// signal handling.
 fn kill_pid(pid: u32) {
     let target = Pid::from_u32(pid);
-    let mut sys = System::new();
+    let mut sys = System::new().expect("process table readable");
     sys.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[target]),
         true,
@@ -178,7 +178,7 @@ fn kill_pid(pid: u32) {
 /// reaped and removed, not merely transitioned out of `Zombie`).
 fn process_status(pid: u32) -> Option<ProcessStatus> {
     let target = Pid::from_u32(pid);
-    let mut sys = System::new();
+    let mut sys = System::new().expect("process table readable");
     sys.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[target]),
         true,

@@ -212,7 +212,7 @@ fn await_upstream(child: &mut Child) -> (u32, u16) {
 /// handling.
 fn kill_pid(pid: u32) {
     let target = Pid::from_u32(pid);
-    let mut sys = System::new();
+    let mut sys = System::new().expect("process table readable");
     sys.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[target]),
         true,

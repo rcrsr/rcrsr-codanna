@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-use sysinfo::{Pid, ProcessRefreshKind, System};
+use sysinfo::{Pid, ProcessRefreshKind};
 
 /// Metrics for a single pipeline stage.
 #[derive(Debug, Default)]
@@ -147,7 +147,9 @@ pub struct MemorySnapshot {
 impl MemorySnapshot {
     /// Get current process memory usage.
     pub fn current() -> Self {
-        let mut sys = System::new();
+        let Some(mut sys) = crate::io::process::open_process_table() else {
+            return Self::default();
+        };
         let pid = Pid::from_u32(std::process::id());
         sys.refresh_processes_specifics(
             sysinfo::ProcessesToUpdate::Some(&[pid]),

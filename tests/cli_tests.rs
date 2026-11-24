@@ -97,3 +97,6 @@ mod test_ls;
 
 #[path = "cli/test_relative_indexed_paths_subdir.rs"]
 mod test_relative_indexed_paths_subdir;
+
+#[path = "cli/test_config_parse_failure_exit_code.rs"]
+mod test_config_parse_failure_exit_code;

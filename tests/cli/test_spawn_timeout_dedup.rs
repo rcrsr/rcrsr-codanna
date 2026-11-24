@@ -351,7 +351,7 @@ fn wait_until(mut predicate: impl FnMut() -> bool, deadline: Duration, what: &st
 
 fn pid_alive(pid: u32) -> bool {
     let target = Pid::from_u32(pid);
-    let mut sys = System::new();
+    let mut sys = System::new().expect("process table readable");
     sys.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[target]),
         true,
@@ -364,7 +364,7 @@ fn pid_alive(pid: u32) -> bool {
 /// that the backing server is NEVER killed by `discover_or_spawn` itself.
 fn kill_pid_externally(pid: u32) {
     let target = Pid::from_u32(pid);
-    let mut sys = System::new();
+    let mut sys = System::new().expect("process table readable");
     sys.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[target]),
         true,

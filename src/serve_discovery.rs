@@ -327,8 +327,12 @@ fn decide(record: Option<&ServeRecord>) -> Decision {
 /// The record's own `scheme` field already carries which mode was recorded;
 /// this check only needs to confirm the PID is *some* codanna serve process.
 fn pid_looks_like_codanna_serve(record: &ServeRecord) -> bool {
-    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
-    let mut sys = System::new();
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, UpdateKind};
+    // An unreadable process table cannot disprove identity; the health probe
+    // that follows a `Discover` decision still rejects a dead endpoint.
+    let Some(mut sys) = crate::io::process::open_process_table() else {
+        return true;
+    };
     let pid = Pid::from_u32(record.pid);
     sys.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[pid]),
@@ -718,6 +722,8 @@ async fn wait_on_spawning_pid(
     loop {
         // See `wait_until_healthy`'s equivalent comment: `pid_is_alive` is a
         // blocking procfs call, run via `block_in_place` for the same reason.
+        // An unreadable process table reads as alive, so this fast exit
+        // degrades to waiting out `max_wait` (`open_process_table` logs once).
         if !tokio::task::block_in_place(|| pid_is_alive(spawning_pid)) {
             return None;
         }

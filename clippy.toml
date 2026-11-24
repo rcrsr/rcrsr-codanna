@@ -4,9 +4,9 @@
 # `cargo clippy --all-targets --all-features -- -D warnings`.
 
 # Minimum supported Rust version
-# Since we use edition 2024, we require at least Rust 1.89, which also
-# covers stable std::fs::File::try_lock/unlock.
-msrv = "1.89"
+# Rust 1.95 is set by sysinfo 0.40 and parking_lot 0.13 (upstream v0.18.0); it
+# also covers edition 2024 and stable std::fs::File::try_lock/unlock.
+msrv = "1.95"
 
 # Allow more arguments since we have functions with many parameters
 # (e.g., add_document in tantivy.rs has 11 arguments)

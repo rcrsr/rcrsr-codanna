@@ -238,10 +238,14 @@ impl IndexPersistence {
     /// [`BuildMode`] for what "seeding" means for each mode.
     #[must_use = "Build errors should be handled appropriately"]
     pub fn open_build(&self, settings: Arc<Settings>, mode: BuildMode) -> IndexResult<BuildFacade> {
-        let disks = sysinfo::Disks::new_with_refreshed_list();
+        // An unreadable disk list leaves no candidates, which the preflight
+        // already treats as "nothing to compare against" and skips with a WARN.
+        let disks = sysinfo::Disks::new_with_refreshed_list()
+            .inspect_err(|e| tracing::warn!("disk list unavailable for free-space preflight: {e}"))
+            .ok();
         let candidates = disks
-            .list()
             .iter()
+            .flat_map(|disks| disks.iter())
             .map(|disk| (disk.mount_point(), disk.available_space()));
         self.open_build_in(settings, mode, candidates)
     }

@@ -248,6 +248,17 @@ fn is_serve_management_op(command: &Commands) -> bool {
     )
 }
 
+/// Commands that run without reading `.codanna/settings.toml`, so an
+/// unparsable file is reported but not fatal for them: `init` (whose
+/// `--force` is the recovery), `ls`, and the serve management ops
+/// ([`is_serve_management_op`]), which read only the user-level server
+/// registry and the process table. Fork-private: upstream exits 6 for every
+/// command but `init`, which would leave `codanna serve --stop` unable to
+/// stop a server whose workspace settings broke after it started.
+fn runs_without_settings(command: &Commands) -> bool {
+    matches!(command, Commands::Init { .. } | Commands::Ls) || is_serve_management_op(command)
+}
+
 /// Resolve whether a `Commands::Index` invocation is a read-only or
 /// metadata-only generation operation (`--status`, `--gc`, `--rollback`,
 /// `--prune-indexed-paths`) rather than a request to build or rebuild the
@@ -396,41 +407,33 @@ fn load_current_or_recover(
 /// Auto-initializes config for index command. Persists index after modifications.
 #[tokio::main]
 async fn main() {
-    // reqwest's `rustls-no-provider` backend (enabled transitively by the
-    // `https-server` feature, see Cargo.toml) requires a default rustls
-    // crypto provider installed before the FIRST `reqwest::Client` is built
-    // anywhere in this process, or that build panics with "No rustls crypto
-    // provider is configured" -- including the plain `--http` proxy path's
-    // client (src/mcp/proxy.rs), which never touches `serve_tls` at all.
+    // reqwest's `rustls-no-provider` backend (always compiled in, see
+    // Cargo.toml) requires a default rustls crypto provider installed before
+    // the FIRST `reqwest::Client` is built anywhere in this process, or that
+    // build panics with "No rustls crypto provider is configured" --
+    // including the plain `--http` proxy path's client (src/mcp/proxy.rs),
+    // which never touches `serve_tls` at all, and the remote embedder.
     // Installing it once, here, before any command dispatch, covers every
     // `reqwest::Client` construction site regardless of which one runs first.
-    #[cfg(feature = "https-server")]
-    {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    }
+    codanna::serve_tls::ensure_crypto_provider_installed();
 
     let cli = Cli::parse();
 
     // For index command, auto-initialize if needed (but not when using --config)
-    if matches!(cli.command, Commands::Index { .. }) && cli.config.is_none() {
-        if Settings::check_init().is_err() {
-            // Auto-initialize for index command
-            eprintln!("Initializing project configuration...");
-            match Settings::init_config_file(false) {
-                Ok(path) => {
-                    eprintln!("Created configuration file at: {}", path.display());
-                }
-                Err(e) => {
-                    eprintln!("Warning: Could not create config file: {e}");
-                    eprintln!("Using default configuration.");
-                }
+    if matches!(cli.command, Commands::Index { .. })
+        && cli.config.is_none()
+        && Settings::check_init().is_err()
+    {
+        // Auto-initialize for index command
+        eprintln!("Initializing project configuration...");
+        match Settings::init_config_file(false) {
+            Ok(path) => {
+                eprintln!("Created configuration file at: {}", path.display());
             }
-        }
-    } else if !matches!(cli.command, Commands::Init { .. }) && cli.config.is_none() {
-        // For other commands without --config flag, just warn
-        if let Err(warning) = Settings::check_init() {
-            eprintln!("Warning: {warning}");
-            eprintln!("Using default configuration for now.");
+            Err(e) => {
+                eprintln!("Warning: Could not create config file: {e}");
+                eprintln!("Using default configuration.");
+            }
         }
     }
 
@@ -442,14 +445,32 @@ async fn main() {
                 config_path.display(),
                 e
             );
-            std::process::exit(1);
+            std::process::exit(codanna::io::ExitCode::ConfigError as i32);
         })
     } else {
         Settings::load().unwrap_or_else(|e| {
             eprintln!("Configuration error: {e}");
+            eprintln!("codanna init --force rewrites .codanna/settings.toml");
+            // A missing file loads as defaults, so Err means an existing file
+            // failed to parse. Only commands that never read settings continue
+            // on defaults: `init --force` (the recovery) and the server
+            // management ops, so a broken file cannot block stopping servers.
+            if !runs_without_settings(&cli.command) {
+                std::process::exit(codanna::io::ExitCode::ConfigError as i32);
+            }
+            eprintln!("Continuing: this command does not read settings.");
             Settings::default()
         })
     };
+
+    // After a successful load, a check_init error can only be a missing file.
+    if cli.config.is_none()
+        && !matches!(cli.command, Commands::Init { .. } | Commands::Index { .. })
+        && let Err(warning) = Settings::check_init()
+    {
+        eprintln!("Warning: {warning}");
+        eprintln!("Using default configuration for now.");
+    }
 
     // Initialize logging with config (supports RUST_LOG env var override)
     // All logging goes to stderr to avoid polluting stdout (JSON output, piping)

@@ -50,6 +50,14 @@ detect_platform() {
     echo "${os}-${arch}"
 }
 
+no_artifact() {
+    case "$platform" in
+        macos-x64) err "no Intel macOS build in codanna $version: the prebuilt ONNX Runtime binaries have no Intel macOS build, so fork releases from v0.17.1+rcrsr.13 on target Apple Silicon only. The last fork release for Intel Macs is v0.16.0+rcrsr.12:
+  curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/$REPO/main/scripts/install.sh | CODANNA_VERSION=v0.16.0+rcrsr.12 sh" ;;
+        *) err "no artifact found for $platform in $version" ;;
+    esac
+}
+
 # Get latest release tag
 get_latest_version() {
     curl -sL "https://api.github.com/repos/$REPO/releases/latest" \
@@ -110,10 +118,10 @@ main() {
         p=0; url=""; sha=""
     }
     END { if (!found) exit 1 }
-    ') || err "no artifact found for $platform"
+    ') || no_artifact
 
     eval "$artifact_vars"
-    [ -z "${url:-}" ] && err "no artifact found for $platform"
+    [ -z "${url:-}" ] && no_artifact
     filename=$(basename "$url")
 
     # Download

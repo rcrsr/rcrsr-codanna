@@ -2,7 +2,7 @@
 name = "codanna"
 # Fork version: <upstream base>+rcrsr.<private addition counter>
 #
-#   0.17.1   -- the upstream release this fork is built from. Bump ONLY when
+#   0.18.0   -- the upstream release this fork is built from. Bump ONLY when
 #               rebasing/merging onto a new upstream release. Moving the base
 #               does NOT touch the counter.
 #   +rcrsr.N -- N counts private additions across the fork's whole life, NOT
@@ -14,18 +14,17 @@ name = "codanna"
 #               connected client reports exactly which build it is talking to.
 #
 # `+` is BUILD METADATA, which semver ignores in precedence: every +rcrsr.N
-# compares EQUAL to a bare 0.17.1, and +rcrsr.7 does NOT sort above +rcrsr.1.
-# That is deliberate -- a `-rcrsr` pre-release would instead sort BELOW 0.17.1,
+# compares EQUAL to a bare 0.18.0, and +rcrsr.7 does NOT sort above +rcrsr.1.
+# That is deliberate -- a `-rcrsr` pre-release would instead sort BELOW 0.18.0,
 # making a fork with strictly more code compare as older than the upstream it
 # was built from. The counter is informational, not orderable. Do not rely on
 # it for version-range gating.
-version = "0.17.1+rcrsr.13"
+version = "0.18.0+rcrsr.13"
 authors = ["Angel Bartolli <bartolli@gmail.com>"]
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.95"
 description = "Local code intelligence MCP server and CLI for AI coding agents"
 documentation = "https://docs.codanna.sh"
-homepage = "https://docs.codanna.sh"
 repository = "https://github.com/bartolli/codanna"
 license = "Apache-2.0"
 readme = "README.md"
@@ -49,53 +48,53 @@ publish = false
 pkg-fmt = "txz"
 
 [package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
-pkg-url = "https://github.com/rcrsr/rcrsr-codanna/releases/download/v{ version }/{ name }-0.17.1-rcrsr.13-linux-x64.tar.xz"
-bin-dir = "{ name }-0.17.1-rcrsr.13-linux-x64/{ bin }"
+pkg-url = "https://github.com/rcrsr/rcrsr-codanna/releases/download/v{ version }/{ name }-0.18.0-rcrsr.13-linux-x64.tar.xz"
+bin-dir = "{ name }-0.18.0-rcrsr.13-linux-x64/{ bin }"
 
 [package.metadata.binstall.overrides.aarch64-apple-darwin]
-pkg-url = "https://github.com/rcrsr/rcrsr-codanna/releases/download/v{ version }/{ name }-0.17.1-rcrsr.13-macos-arm64.tar.xz"
-bin-dir = "{ name }-0.17.1-rcrsr.13-macos-arm64/{ bin }"
+pkg-url = "https://github.com/rcrsr/rcrsr-codanna/releases/download/v{ version }/{ name }-0.18.0-rcrsr.13-macos-arm64.tar.xz"
+bin-dir = "{ name }-0.18.0-rcrsr.13-macos-arm64/{ bin }"
 
 [package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
-pkg-url = "https://github.com/rcrsr/rcrsr-codanna/releases/download/v{ version }/{ name }-0.17.1-rcrsr.13-windows-x64.zip"
+pkg-url = "https://github.com/rcrsr/rcrsr-codanna/releases/download/v{ version }/{ name }-0.18.0-rcrsr.13-windows-x64.zip"
 pkg-fmt = "zip"
-bin-dir = "{ name }-0.17.1-rcrsr.13-windows-x64/{ bin }{ binary-ext }"
+bin-dir = "{ name }-0.18.0-rcrsr.13-windows-x64/{ bin }{ binary-ext }"
 
 [dependencies]
 anyhow = "1.0.104"
-bitflags = "2.13.1"
-clap = { version = "4.6.6", features = ["derive", "color", "env"] }
-crossbeam-channel = "0.5.16"
+bitflags = "2.13.2"
+clap = { version = "4.6.9", features = ["derive", "color", "env"] }
+crossbeam-channel = "0.5.17"
 dashmap = "6.2.1"
-dirs = "6.0.0"
+dirs = "7.0.0"
 figment = { version = "0.10.19", features = ["toml", "env"] }
-ignore = "0.4.33"
-memmap2 = "0.9.11"
-notify = "8.2.0"
+ignore = "0.4.34"
+memmap2 = "0.9.12"
+notify = "8.2.2"
 num_cpus = "1.17.0"
-parking_lot = "0.12.5"
+parking_lot = "0.13.0"
 rayon = "1.12.0"
 # transport-streamable-http-client-reqwest gives the stdio<->HTTP proxy (src/mcp/proxy.rs) a
 # reqwest::Client that implements rmcp's StreamableHttpClient trait, so it can dial the loopback
-# backing "codanna serve --http" without a hand-rolled HTTP client (pulls in rmcp's own reqwest dep).
-rmcp = { version = "3.1.4", features = ["server", "client", "transport-io", "transport-child-process", "transport-streamable-http-server", "transport-streamable-http-client", "transport-streamable-http-client-reqwest", "transport-worker"] }
+# backing "codanna serve --http" without a hand-rolled HTTP client (the same reqwest 0.13 crate instance as the `reqwest` dep below).
+rmcp = { version = "3.11.0", features = ["server", "client", "transport-io", "transport-child-process", "transport-streamable-http-server", "transport-streamable-http-client", "transport-streamable-http-client-reqwest", "transport-worker"] }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
-serde_json = "1.0.151"
-sha2 = "0.11.0"
-hex = "0.4"
-tantivy = "0.26.2"
-thiserror = "2.0.20"
-tokio = { version = "1.53.1", features = ["full"] }
-toml = { version = "1.1.4", features = ["preserve_order"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+hex = "0.4.3"
+tantivy = "0.27.0"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["full"] }
+toml = { version = "1.2.1", features = ["preserve_order"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-tree-sitter = "0.26.13"
+tree-sitter = "0.27.2"
 tree-sitter-go = "0.25.0"
 tree-sitter-gdscript = "6.1.0"
 tree-sitter-java = "0.23.5"
 tree-sitter-javascript = "0.25.0"
 tree-sitter-kotlin-codanna = "0.3.9"
-tree-sitter-php = "0.24.1"
+tree-sitter-php = "0.25.2"
 tree-sitter-python = "0.25.0"
 tree-sitter-rust = "0.24.2"
 tree-sitter-typescript = "0.23.2"
@@ -104,47 +103,44 @@ walkdir = "2.5.0"
 # instance. Model files and the ONNX Runtime binaries download over rustls:
 # no OpenSSL in the graph. On Linux the prebuilt ONNX Runtime binaries need
 # glibc 2.38+ and libstdc++ from GCC 13+.
-fastembed = { version = "=7.1.1", default-features = false, features = [
+fastembed = { version = "=7.7.1", default-features = false, features = [
     "hf-hub-rustls-tls",
     "ort-download-binaries-rustls-tls",
 ] }
 # The same crate instance as fastembed's own ort dependency: the two pins move
-# together, or the build links two ONNX runtimes. Used to commit the capped
-# global thread pool before fastembed creates its sessions.
-ort = { version = "=2.0.0-rc.13", default-features = false }
-rand = "0.10.2"
+# together, or the build links two ONNX runtimes. Used to build the
+# environment with the capped global thread pool that fastembed's sessions
+# run in, and to name the CPU device policy.
+ort = { version = "=2.0.0-rc.15", default-features = false }
+rand = "0.10.4"
 indicatif = "0.18.6"
-comfy-table = "7.2.2"
-console = "0.16.4"
-owo-colors = "4.3.0"
+comfy-table = "8.0.1"
+console = "0.16.6"
+owo-colors = "4.4.0"
 axum = { version = "0.8.9", optional = true }
 tower = { version = "0.5.3", optional = true }
-tower-http = { version = "0.7.0", features = ["cors"], optional = true }
-serde_urlencoded = "0.7"
-tokio-util = "0.7.19"
-axum-server = { version = "0.8.0", features = ["tls-rustls-no-provider"], optional = true }
-rustls = { version = "0.23.43", default-features = false, features = ["ring"], optional = true }
-rcgen = { version = "0.14.9", optional = true }
+serde_urlencoded = "0.7.1"
+tokio-util = "0.7.20"
+axum-server = { version = "0.9.2", features = ["tls-rustls-no-provider"], optional = true }
+rustls = { version = "0.23.46", default-features = false, features = ["ring"] }
+rcgen = { version = "0.14.10", optional = true }
 is-terminal = "0.4.17"
-regex = "1.13.1"
+regex = "1.13.2"
 tree-sitter-c = "0.24.2"
-tree-sitter-c-sharp = "0.23.5"
+tree-sitter-c-sharp = "0.24.0"
 tree-sitter-cpp = "0.23.4"
 chrono = "0.4.45"
 tempfile = "3.27.0"
 serde_json5 = "0.2.1"
-tree-sitter-swift = "0.7.3"
+tree-sitter-swift = "0.7.4"
 tree-sitter-lua = "0.5.0"
-tree-sitter-clojure-orchard = "0.2.8"
+tree-sitter-clojure-orchard = "0.2.9"
 glob = "0.3.4"
 async-trait = "0.1.92"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-# rmcp's `impl StreamableHttpClient for reqwest::Client` is against reqwest 0.13
-# (rmcp 3.1.0 -> reqwest 0.13.x). The 0.12 dep above is a DIFFERENT crate instance
-# and its Client does not implement that trait. Renamed so both can coexist.
-rmcp_reqwest = { package = "reqwest", version = "0.13", default-features = false }
-sysinfo = "0.39.6"
-indexmap = { version = "2.14.0", features = ["serde"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls-no-provider"] }
+webpki-root-certs = "1.0.12"
+sysinfo = "0.40.4"
+indexmap = { version = "2.14.2", features = ["serde"] }
 
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["html_reports"] }
@@ -157,34 +153,23 @@ tokio = { version = "1.52.3", features = ["test-util"] }
 
 [features]
 default = ["http-server"]
-http-server = ["axum", "tower", "tower-http"]
-# reqwest 0.13's `rustls` feature selects aws-lc-rs as the crypto provider. codanna
-# pins `rustls` (above) to `ring` only. If rmcp_reqwest also enabled aws-lc-rs, two
-# competing default CryptoProviders would coexist in the same rustls instance, and
-# CryptoProvider::get_default_or_install_from_crate_features() would return None,
-# causing a runtime panic in `serve --https` and in semantic/remote.rs. Use
-# `rustls-no-provider` (no bundled crypto backend) so `ring` (pinned above) remains
-# the sole provider. Do NOT change this to `rustls`.
+http-server = ["axum", "tower"]
+# reqwest's `rustls` feature selects aws-lc-rs as the crypto provider. codanna
+# pins `rustls` (above) to `ring` only, and `reqwest` uses `rustls-no-provider`
+# (no bundled crypto backend) so `ring` remains the sole provider. Two competing
+# providers would make CryptoProvider::get_default_or_install_from_crate_features()
+# return None and panic at the first `reqwest::Client` build. Do NOT change
+# `rustls-no-provider` to `rustls`.
 #
-# `rmcp_reqwest/rustls-no-provider` is required by `serve_tls::pinned_client`
-# (the cert-pinned client used to dial a `--https` backing server), which calls
-# `ClientBuilder::tls_certs_only`, gated behind reqwest's `__tls` feature --
-# without a TLS backend enabled here that method does not exist at all. Wiring
-# this feature in requires the one-time
-# `rustls::crypto::ring::default_provider().install_default()` call described
-# above, or every `reqwest::Client` built through rmcp's streamable-HTTP
-# transport (including the plain `--http` proxy path, which never touches
-# `serve_tls`) panics with "No rustls crypto provider is configured" the first
-# time one is built in the process. `main.rs` makes that install call, once,
-# before any command dispatch, so every `reqwest::Client` construction site in
-# the process is covered by the same installed provider, whether it is built
-# via `serve --https`, the stdio<->HTTP proxy, or `serve_tls::pinned_client`.
-https-server = ["http-server", "axum-server", "rustls", "rcgen", "rmcp_reqwest/rustls-no-provider"]
+# Because every build now carries reqwest's rustls backend, every
+# `reqwest::Client` build -- `serve --https`, the stdio<->HTTP proxy (rmcp's
+# streamable-HTTP transport), `serve_tls::pinned_client`, the remote embedder --
+# needs a process-default provider. `main.rs` installs `ring` once, before any
+# command dispatch, in every feature configuration.
+https-server = ["http-server", "axum-server", "rcgen"]
 axum = ["dep:axum"]
 tower = ["dep:tower"]
-tower-http = ["dep:tower-http"]
 axum-server = ["dep:axum-server"]
-rustls = ["dep:rustls"]
 rcgen = ["dep:rcgen"]
 
 [profile.release]
