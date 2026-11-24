@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0+rcrsr.14] - 2026-11-23
+
 ### Changed
 
 - **Fork base advanced from upstream v0.17.1 to v0.18.0.** This release carries upstream's 0.18.0 dependency release (see `[0.18.0]` below): tree-sitter 0.27, Tantivy 0.27, fastembed 7.7.1 / ONNX Runtime 1.31 with CPU-only embedding sessions, rmcp 3.11, reqwest 0.13, sysinfo 0.40, and Rust 1.95 as the minimum toolchain. Emission semantics and the Tantivy index format are unchanged; existing indexes keep working without a rebuild. ([#120](https://github.com/rcrsr/rcrsr-codanna/pull/120))
@@ -14,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`pid_is_alive` treats an unreadable process table as alive:** upstream's guard (sysinfo 0.40 can fail to open the process table) is combined with the fork's zombie check, so lock and staging reclaim only proceed on a completed lookup that finds the pid gone, exited, or a zombie. ([#120](https://github.com/rcrsr/rcrsr-codanna/pull/120))
 - **A broken `settings.toml` no longer blocks server management:** upstream v0.18.0 exits 6 for every command but `init` when `.codanna/settings.toml` fails to parse. `codanna ls` and `codanna serve --stop`/`--stop-all`/`--reap`/`--list` read no settings, so the fork reports the error and runs them. ([#120](https://github.com/rcrsr/rcrsr-codanna/pull/120))
 - **One-time process-table warning:** when the process table cannot be read, codanna logs one warning per process that names the fail-safe effects (locks and registry entries are kept; the proxy waits out the spawn timeout), instead of one warning per liveness poll. `codanna ls` and memory metrics now report that case instead of staying silent. ([#120](https://github.com/rcrsr/rcrsr-codanna/pull/120))
+- **Fork version counter moves to `+rcrsr.14`** for the private additions above (server management that runs on a broken `settings.toml`, the one-time process-table warning, and the fork-pointed Intel Mac installer message). ([#120](https://github.com/rcrsr/rcrsr-codanna/pull/120))
 - **Installer points Intel Macs at the fork's last Intel release:** `install.sh` on an Intel Mac names `v0.16.0+rcrsr.12` and the fork's installer, instead of upstream's installer and 0.17.0. ([#120](https://github.com/rcrsr/rcrsr-codanna/pull/120))
 
 ## [0.18.0] - 2026-11-22
